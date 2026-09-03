@@ -154,6 +154,11 @@ pub struct LiveWorkbench {
     provenance: RwLock<String>,
     prompt_pending: Mutex<HashMap<u64, mpsc::Sender<CredentialPromptAnswer>>>,
     prompt_next_id: AtomicU64,
+    /// Flow-id fallback used only before a durable store is attached (early setup
+    /// and store-less tests). Once a store is attached, `allocate_flow_id`
+    /// delegates to the store's single authoritative allocator so live capture
+    /// and every other source share one id sequence.
+    fallback_flow_id: AtomicU64,
 }
 
 impl LiveWorkbench {
@@ -184,6 +189,7 @@ impl LiveWorkbench {
             provenance: RwLock::new("proxy.observer".to_owned()),
             prompt_pending: Mutex::new(HashMap::new()),
             prompt_next_id: AtomicU64::new(1),
+            fallback_flow_id: AtomicU64::new(1),
         }
     }
 
@@ -387,6 +393,17 @@ impl Default for LiveWorkbench {
 }
 
 impl FlowObserver for LiveWorkbench {
+    fn allocate_flow_id(&self) -> u64 {
+        // The attached durable store is the single authority for flow ids across
+        // all concurrent sources. Only when no store is attached yet (early setup
+        // or a store-less test) does allocation fall back to a local monotonic
+        // counter, which never coexists with a shared persistence layer.
+        if let Some(store) = self.store.read().ok().and_then(|store| store.clone()) {
+            return store.allocate_flow_id();
+        }
+        self.fallback_flow_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn observe(&self, event: FlowEvent) {
         if self.is_closed() {

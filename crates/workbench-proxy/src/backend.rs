@@ -344,6 +344,18 @@ pub enum WebSocketDirection {
 pub trait FlowObserver: Send + Sync {
     /// Receives an in-memory protocol observation.
     fn observe(&self, event: FlowEvent);
+
+    /// Allocates a globally-unique flow id for a new request.
+    ///
+    /// The persisting observer overrides this to draw from the durable store's
+    /// single authoritative allocator, so ids are unique across every concurrent
+    /// traffic source and no flow can silently overwrite another. The default is a
+    /// process-monotonic fallback for non-persisting observers (which have no
+    /// shared store to collide with).
+    fn allocate_flow_id(&self) -> u64 {
+        static FALLBACK_FLOW_ID: AtomicU64 = AtomicU64::new(1);
+        FALLBACK_FLOW_ID.fetch_add(1, Ordering::SeqCst)
+    }
 }
 
 /// No-op observer useful for callers that only need a live listener.
@@ -631,13 +643,20 @@ impl Drop for ProxyCore {
     }
 }
 
+/// hudsucker clones the handler per request (`self.clone().proxy(req)`) and runs
+/// `handle_request` then `handle_response` sequentially on that same clone, so a
+/// request's flow id lives in a per-request field on the clone. This is correct
+/// under HTTP/2 multiplexing (each stream is its own clone) and across multiple
+/// concurrent clients (each request is independent) — unlike the former
+/// `client_addr`-keyed map, where concurrent streams sharing one address
+/// overwrote each other and responses were mis-attributed to the last request.
 #[derive(Clone)]
 struct ObserveHandler {
     session_id: Arc<str>,
     observer: Arc<dyn FlowObserver>,
-    next_flow_id: Arc<AtomicU64>,
     intercept: Option<Arc<InterceptController>>,
-    flow_ids: Arc<Mutex<HashMap<SocketAddr, u64>>>,
+    /// Flow id of the request currently being handled by this per-request clone.
+    current_flow_id: Option<u64>,
 }
 
 impl ObserveHandler {
@@ -649,14 +668,13 @@ impl ObserveHandler {
         Self {
             session_id: session_id.into(),
             observer,
-            next_flow_id: Arc::new(AtomicU64::new(1)),
             intercept,
-            flow_ids: Arc::new(Mutex::new(HashMap::new())),
+            current_flow_id: None,
         }
     }
 
     fn observe_request(&self, req: &Request<Body>) -> u64 {
-        let flow_id = self.next_flow_id.fetch_add(1, Ordering::Relaxed);
+        let flow_id = self.observer.allocate_flow_id();
         self.observer.observe(FlowEvent::Request {
             flow_id,
             method: req.method().to_string(),
@@ -697,7 +715,7 @@ fn normalize_origin_form(req: &mut Request<Body>) {
 impl HttpHandler for ObserveHandler {
     async fn handle_request(
         &mut self,
-        ctx: &HttpContext,
+        _ctx: &HttpContext,
         mut req: Request<Body>,
     ) -> RequestOrResponse {
         normalize_origin_form(&mut req);
@@ -709,9 +727,10 @@ impl HttpHandler for ObserveHandler {
                 .observe(FlowEvent::Diagnostic(rfc8441_diagnostic()));
         }
         let flow_id = self.observe_request(&req);
-        if let Ok(mut flow_ids) = self.flow_ids.lock() {
-            flow_ids.insert(ctx.client_addr, flow_id);
-        }
+        // Record on this per-request handler clone so `handle_response` correlates
+        // to exactly this request — never to another concurrent stream on the same
+        // connection or another client sharing transport attributes.
+        self.current_flow_id = Some(flow_id);
         if let Some(intercept) = &self.intercept {
             intercept.wait().await;
             match intercept.await_decision(flow_id, req.uri().host()).await {
@@ -757,13 +776,10 @@ impl HttpHandler for ObserveHandler {
     }
 
     async fn handle_response(&mut self, ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+        // Correlate to the request this same per-request clone handled.
+        let flow_id = self.current_flow_id.unwrap_or_default();
         self.observer.observe(FlowEvent::Response {
-            flow_id: self
-                .flow_ids
-                .lock()
-                .ok()
-                .and_then(|flow_ids| flow_ids.get(&ctx.client_addr).copied())
-                .unwrap_or_default(),
+            flow_id,
             client_addr: ctx.client_addr,
             status: res.status().as_u16(),
             version: format!("{:?}", res.version()),
@@ -774,11 +790,7 @@ impl HttpHandler for ObserveHandler {
             parts,
             capture_body(
                 body,
-                self.flow_ids
-                    .lock()
-                    .ok()
-                    .and_then(|flow_ids| flow_ids.get(&ctx.client_addr).copied())
-                    .unwrap_or_default(),
+                flow_id,
                 BodyDirection::Response,
                 Arc::clone(&self.observer),
             ),

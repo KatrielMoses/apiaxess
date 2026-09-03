@@ -5,7 +5,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
@@ -20,6 +23,10 @@ use sha2::{Digest, Sha256};
 pub const TRAFFIC_SCHEMA_VERSION: u32 = 1;
 const TRAFFIC_SCHEMA_ID: &str = "workbench.traffic";
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Process-wide sequence for unique content-addressed blob temp filenames, so
+/// concurrent writers of the same blob never share (and stomp) a temp path.
+static BLOB_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One captured flow accepted by the durable store.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -427,6 +434,14 @@ pub struct TrafficStore {
     blobs: PathBuf,
     connection: Mutex<Connection>,
     redactor: RwLock<Option<Arc<dyn FlowRedactor>>>,
+    /// Single authoritative flow-id allocator for this store. Seeded from the
+    /// persisted `MAX(id)` at open and advanced atomically, it is the ONE source
+    /// of globally-unique flow ids across every concurrent traffic source (live
+    /// capture via the proxy, HAR import, and any future source). Reconciling the
+    /// former split allocation (a proxy `AtomicU64` plus the store's `MAX(id)+1`)
+    /// into this single sequence is what makes concurrent inserts collision-proof,
+    /// so no two flows can ever receive the same id and silently overwrite.
+    next_flow_id: AtomicU64,
 }
 
 impl std::fmt::Debug for TrafficStore {
@@ -534,12 +549,28 @@ impl TrafficStore {
                 &integrity,
             ));
         }
+        // Seed the id allocator above every persisted flow so a reopened session
+        // (resume) never reissues an id that already exists on disk.
+        let seed = seed_next_flow_id(&connection, &database)?;
         Ok(Self {
             root,
             blobs,
             connection: Mutex::new(connection),
             redactor: RwLock::new(None),
+            next_flow_id: AtomicU64::new(seed),
         })
+    }
+
+    /// Allocates the next globally-unique flow id for this store.
+    ///
+    /// This is the single authority for flow ids. Every traffic source — live
+    /// capture (through the proxy), HAR import, and any future concurrent source —
+    /// must obtain ids here, so simultaneous allocations can never collide and
+    /// silently overwrite one another in the `flows` table. The allocation is a
+    /// single atomic step, correct under concurrent access.
+    #[must_use]
+    pub fn allocate_flow_id(&self) -> u64 {
+        self.next_flow_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Installs a redactor consulted on every durable write.
@@ -858,9 +889,11 @@ impl TrafficStore {
     ) -> Result<usize, Diagnostic> {
         let document: HarDocument = serde_json::from_slice(bytes)
             .map_err(|e| interchange_diag("import", &e.to_string()))?;
-        let mut id = self.next_id()?;
         let mut count = 0;
         for entry in document.log.entries {
+            // Draw each id from the store's single authoritative allocator so a
+            // concurrent import and live capture can never collide on an id.
+            let id = self.allocate_flow_id();
             let (host, path) = split_url(&entry.request.url);
             // Classify against the active engagement scope exactly as live capture
             // does, instead of leaving imported flows `Undetermined`. Dynamic
@@ -908,7 +941,6 @@ impl TrafficStore {
                 provenance: provenance.to_owned(),
             };
             self.upsert(&flow)?;
-            id = id.saturating_add(1);
             count += 1;
         }
         Ok(count)
@@ -1365,30 +1397,6 @@ impl TrafficStore {
         })
     }
 
-    fn next_id(&self) -> Result<u64, Diagnostic> {
-        let connection = self.connection.lock().map_err(|_| {
-            storage_diag(
-                catalogue::PROXY_STORE_WRITE_FAILED,
-                "lock",
-                &self.root,
-                "database mutex poisoned",
-            )
-        })?;
-        let id: i64 = connection
-            .query_row("SELECT COALESCE(MAX(id),0)+1 FROM flows", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| {
-                storage_diag(
-                    catalogue::PROXY_STORE_WRITE_FAILED,
-                    "next-id",
-                    &self.root,
-                    &e.to_string(),
-                )
-            })?;
-        Ok(u64::try_from(id).unwrap_or(u64::MAX))
-    }
-
     fn write_blob(&self, body: Option<&[u8]>) -> Result<Option<String>, Diagnostic> {
         let Some(body) = body else { return Ok(None) };
         if body.len() > MAX_BODY_BYTES {
@@ -1404,35 +1412,28 @@ impl TrafficStore {
         if path.exists() {
             return Ok(Some(hash));
         }
-        let tmp = self.blobs.join(format!(".{hash}.tmp"));
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&tmp) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A crashed writer may leave an incomplete temp blob. It is
-                // never referenced by SQLite, so it is safe to replace.
-                let _ = fs::remove_file(&tmp);
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)
-                    .map_err(|retry| {
-                        storage_diag(
-                            catalogue::PROXY_STORE_WRITE_FAILED,
-                            "blob-create",
-                            &tmp,
-                            &retry.to_string(),
-                        )
-                    })?
-            }
-            Err(error) => {
-                return Err(storage_diag(
+        // A unique temp name per write. A shared `.{hash}.tmp` let a second writer
+        // of the same content-addressed blob remove the first writer's in-progress
+        // temp, corrupting its rename ("file not found") — a real hazard once two
+        // sources capture the same body concurrently. The atomic nonce makes the
+        // temp path unique, so writers never stomp each other; the identical final
+        // blob is reconciled at rename below.
+        let unique = BLOB_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .blobs
+            .join(format!(".{hash}.{}.{unique}.tmp", std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|error| {
+                storage_diag(
                     catalogue::PROXY_STORE_WRITE_FAILED,
                     "blob-create",
                     &tmp,
                     &error.to_string(),
-                ));
-            }
-        };
+                )
+            })?;
         if let Err(error) = file.write_all(body).and_then(|()| file.sync_all()) {
             let _ = fs::remove_file(&tmp);
             return Err(storage_diag(
@@ -1602,6 +1603,22 @@ struct StoredIntruderResult {
     scope: ScopeDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic: Option<Diagnostic>,
+}
+
+/// Computes the initial flow-id allocator value: one above the highest persisted
+/// id, so a reopened store never reissues an id already on disk.
+fn seed_next_flow_id(connection: &Connection, database: &Path) -> Result<u64, Diagnostic> {
+    let max_id: i64 = connection
+        .query_row("SELECT COALESCE(MAX(id),0) FROM flows", [], |row| row.get(0))
+        .map_err(|error| {
+            storage_diag(
+                catalogue::PROXY_STORE_OPEN_FAILED,
+                "seed-id",
+                database,
+                &error.to_string(),
+            )
+        })?;
+    Ok(u64::try_from(max_id).unwrap_or(0).saturating_add(1))
 }
 
 fn ensure_flows_url_column(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
@@ -2393,5 +2410,71 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn concurrent_flow_id_allocation_is_globally_unique() {
+        use std::collections::BTreeSet;
+        // Many sources allocating simultaneously from the single store authority
+        // must never produce a duplicate id — the exact condition the multi-client
+        // system creates.
+        let store = Arc::new(store());
+        let threads = 8;
+        let per_thread = 1_000;
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    (0..per_thread)
+                        .map(|_| store.allocate_flow_id())
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        let mut all = Vec::new();
+        for handle in handles {
+            all.extend(handle.join().expect("allocator thread"));
+        }
+        let unique: BTreeSet<u64> = all.iter().copied().collect();
+        assert_eq!(all.len(), threads * per_thread);
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "every concurrently-allocated flow id must be unique"
+        );
+    }
+
+    #[test]
+    fn concurrent_two_source_inserts_never_overwrite() {
+        // Simulate two concurrent traffic sources (live capture + HAR import) each
+        // allocating from the store authority and inserting. Every flow must
+        // persist; none may silently clobber another via an id collision.
+        let store = Arc::new(store());
+        let per_source = 300;
+        let source = |store: Arc<TrafficStore>, provenance: &'static str| {
+            std::thread::spawn(move || {
+                for _ in 0..per_source {
+                    let id = store.allocate_flow_id();
+                    let mut flow = flow(id);
+                    flow.provenance = provenance.to_owned();
+                    // Distinct path per id so an overwrite would be detectable as a
+                    // missing row, not a same-content merge.
+                    flow.path = Some(format!("/{provenance}/{id}"));
+                    store.upsert(&flow).expect("insert");
+                }
+            })
+        };
+        let live = source(Arc::clone(&store), "proxy.capture");
+        let import = source(Arc::clone(&store), "har.import");
+        live.join().expect("live source");
+        import.join().expect("import source");
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(
+            summaries.len(),
+            per_source * 2,
+            "both sources' flows must all persist with no overwrite"
+        );
+        let ids: std::collections::BTreeSet<u64> = summaries.iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), summaries.len(), "all stored ids are unique");
     }
 }

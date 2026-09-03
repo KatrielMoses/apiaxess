@@ -113,6 +113,68 @@ async fn hudsucker_captures_http2_flows_into_the_store() {
     let _ = std::fs::remove_dir_all(store_path);
 }
 
+/// Concurrency proof for the request↔response correlation fix: three multiplexed
+/// h2 streams share ONE connection (one `client_addr`), and the upstream delays
+/// `/stream-1` so responses return OUT OF ORDER. The upstream echoes each request
+/// path as its response body, so each captured flow's response body must equal its
+/// OWN request path. Under the former `client_addr`-keyed correlation every
+/// response resolved to the last request's flow id and bodies were mis-attributed;
+/// the per-request-clone correlation ties each response to its own request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hudsucker_correlates_multiplexed_h2_responses_to_the_right_request() {
+    let store_path = std::env::temp_dir().join(format!(
+        "apiaxess-h2-correlate-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let store =
+        Arc::new(TrafficStore::open(&store_path, "session:h2-correlate").expect("traffic store"));
+    let workbench = Arc::new(LiveWorkbench::new());
+    workbench.attach_store(Arc::clone(&store));
+
+    run_h2_case(H2Case::Multiplex, Some(Arc::clone(&workbench)))
+        .await
+        .expect("hudsucker h2 multiplex capture");
+    // Let the response-body capture streams finish persisting.
+    sleep(Duration::from_millis(300)).await;
+
+    let summaries = store.summaries().expect("traffic summaries");
+    let streams: std::collections::BTreeMap<String, u64> = summaries
+        .iter()
+        .filter_map(|summary| {
+            summary
+                .path
+                .as_deref()
+                .filter(|path| path.starts_with("/stream-"))
+                .map(|path| (path.to_owned(), summary.id))
+        })
+        .collect();
+    assert_eq!(
+        streams.len(),
+        3,
+        "each multiplexed stream must be captured as its own flow: {summaries:?}"
+    );
+    // Every id is distinct (a single authoritative allocator, no collision).
+    let ids: std::collections::BTreeSet<u64> = streams.values().copied().collect();
+    assert_eq!(ids.len(), 3, "multiplexed flows must have unique ids");
+
+    for (path, id) in streams {
+        let flow = store.get(id).expect("read flow").expect("flow present");
+        assert_eq!(flow.status, Some(200), "{path} status");
+        assert_eq!(
+            flow.response_body.as_deref(),
+            Some(path.as_bytes()),
+            "response for {path} must correlate to its OWN request (flow {id}), not another concurrent stream"
+        );
+    }
+
+    drop(workbench);
+    drop(store);
+    let _ = std::fs::remove_dir_all(store_path);
+}
+
 #[derive(Clone, Debug)]
 struct WireObservation {
     status: u16,
