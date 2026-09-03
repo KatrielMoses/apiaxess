@@ -1,0 +1,40 @@
+# APIaxess bundled Android tools — apktool + jadx acquisition manifest.
+#
+# apktool and jadx are plain JVM applications. APIaxess bundles them and runs
+# both through the one shared, trimmed OpenJDK runtime (see java-runtime.toml)
+# by absolute path — never a host-installed apktool, jadx, or java.
+#
+#   apktool -> <runtime>/bin/java -jar tools/apktool/apktool.jar ...
+#   jadx    -> <runtime>/bin/java <jvm-opts> -cp tools/jadx/lib/*-all.jar
+#              jadx.cli.JadxCLI ...
+#
+# apktool bundles its own per-OS native aapt/aapt2 inside its jar and extracts
+# them at runtime, so that native sub-dependency needs nothing on the host
+# beyond the platform C runtime that ships with the OS.
+#
+# Licensing: apktool and jadx are both Apache-2.0 and clean to redistribute, but
+# jadx's distributed dependencies carry mixed notices (LGPL/EPL logback
+# components), so the complete upstream NOTICE/LICENSE files travel with the
+# jadx distribution and are recorded in the SBOM. The payload is NOT labeled
+# merely "Apache" — see apk-tools-NOTICES.md. Archive hashes are pinned so the
+# build never substitutes a host-installed tool.
+schema_version = 1
+product = "APIaxess bundled Android tools"
+
+[apktool]
+version = "3.0.3"
+archive = "apktool_3.0.3.jar"
+url = "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
+sha256 = "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423"
+license = "Apache-2.0"
+# Install-relative location of the executable jar.
+install_path = "tools/apktool/apktool.jar"
+
+[jadx]
+version = "1.5.5"
+archive = "jadx-1.5.5.zip"
+url = "https://github.com/skylot/jadx/releases/download/v1.5.5/jadx-1.5.5.zip"
+sha256 = "38a5766d3c8170c41566b4b13ea0ede2430e3008421af4927235c2880234d51a"
+license = "Apache-2.0 AND (mixed distributed-dependency notices: LGPL/EPL logback)"
+# Install-relative root of the extracted distribution (contains bin/ and lib/).
+install_path = "tools/jadx"

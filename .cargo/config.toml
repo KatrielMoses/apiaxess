@@ -1,0 +1,18 @@
+[alias]
+xtask = "run --package xtask --"
+
+# Keep MSVC builds resilient on memory-constrained Windows machines. `rust-lld`
+# is bundled with the Rust toolchain and uses less memory than `link.exe` for
+# the large link units in this workspace. This target-specific setting is
+# intentionally isolated from Linux and other targets.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+# Line tables retain source-level stepping and backtraces while avoiding the
+# full-variable debug information that produces very large PDBs during dev
+# and test links. Release profiles keep Cargo's normal debuginfo defaults.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1

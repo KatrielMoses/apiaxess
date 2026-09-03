@@ -1,0 +1,137 @@
+syntax = "proto3";
+
+package apiaxess.plugin.v1;
+
+import "apiaxess/plugin/v1/capabilities.proto";
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.v1";
+
+message ResourceLimits {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  uint64 cpu_time_millis = 1;
+  uint64 wall_clock_millis = 2;
+  uint64 memory_bytes = 3;
+  uint64 max_message_bytes = 4;
+  uint64 max_output_bytes = 5;
+  uint32 max_concurrency = 6;
+}
+
+message FeatureFlag {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string feature_id = 1;
+  EvolutionGate evolution = 2;
+}
+
+message InitializePluginRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  ImplementationIdentity host = 1;
+  repeated Version supported_protocol_versions = 2;
+  repeated InterfaceVersion supported_interfaces = 3;
+  repeated string supported_capability_ids = 4;
+  repeated HostCapabilityOffer host_capabilities = 5;
+  ResourceLimits resource_ceiling = 6;
+  repeated FeatureFlag offered_features = 7;
+  bool hard_containment_available = 8;
+}
+
+message InitializePluginResponse {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  Version selected_protocol_version = 1;
+  ImplementationIdentity plugin = 2;
+  repeated InterfaceVersion interfaces = 3;
+  repeated CapabilityRequest requested_capabilities = 4;
+  ResourceLimits requested_resources = 5;
+  repeated FeatureFlag supported_features = 6;
+  bool requires_hard_containment = 7;
+  // Any non-zero minimum that cannot be met produces an explicit deny/degrade.
+  ResourceLimits minimum_resources = 8;
+}
+
+enum ActivationState {
+  ACTIVATION_STATE_UNSPECIFIED = 0;
+  ACTIVATION_STATE_ACTIVE = 1;
+  ACTIVATION_STATE_DEGRADED = 2;
+  ACTIVATION_STATE_DENIED = 3;
+}
+
+message CompleteInitializationRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  Version protocol_version = 1;
+  repeated InterfaceVersion negotiated_interfaces = 2;
+  repeated CapabilityGrant grants = 3;
+  ResourceLimits effective_resources = 4;
+  repeated string enabled_feature_ids = 5;
+  ActivationState activation_state = 6;
+  repeated Diagnostic diagnostics = 7;
+  ContainmentMode effective_containment = 8;
+}
+
+message CancelRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  string operation_id = 1;
+  string reason = 2;
+}
+
+message ShutdownPluginRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  uint64 grace_period_millis = 1;
+}
+
+message CheckHealthRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+}
+
+message PluginHealth {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  bool ready = 1;
+  uint32 active_operations = 2;
+  repeated Diagnostic diagnostics = 3;
+}
+
+message CompleteInitializationResponse {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  PluginHealth health = 1;
+}
+
+message CancelResponse {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  PluginHealth health = 1;
+}
+
+message CheckHealthResponse {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  PluginHealth health = 1;
+}
+
+message ShutdownPluginResponse {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  PluginHealth health = 1;
+}
+
+service PluginLifecycleService {
+  option (service_evolution) = { since: { major: 1 minor: 0 } };
+
+  rpc InitializePlugin(InitializePluginRequest) returns (InitializePluginResponse) {
+    option (method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc CompleteInitialization(CompleteInitializationRequest) returns (CompleteInitializationResponse) {
+    option (method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Cancel(CancelRequest) returns (CancelResponse) {
+    option (method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc CheckHealth(CheckHealthRequest) returns (CheckHealthResponse) {
+    option (method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc ShutdownPlugin(ShutdownPluginRequest) returns (ShutdownPluginResponse) {
+    option (method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

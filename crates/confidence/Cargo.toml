@@ -1,0 +1,15 @@
+[package]
+name = "apiaxess-confidence"
+description = "Phase 5.2 confidence recomputation and static-to-dynamic handoff resolution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+chrono.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package apiaxess.plugin.v1;
+
+import "apiaxess/plugin/v1/capabilities.proto";
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+import "apiaxess/plugin/v1/handshake.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.v1";
+
+message WasmEntrypoint {
+  ArtifactRef component = 1;
+  string exported_world = 2;
+}
+
+message ProcessEntrypoint {
+  ArtifactRef executable = 1;
+  repeated string arguments = 2;
+}
+
+message TrustedBuiltinEntrypoint {
+  string builtin_id = 1;
+}
+
+message PluginEntrypoint {
+  oneof entrypoint {
+    TrustedBuiltinEntrypoint trusted_builtin = 1;
+    WasmEntrypoint wasm = 2;
+    ProcessEntrypoint process = 3;
+  }
+}
+
+// Canonical package metadata. Distributed plugins encode this as protobuf JSON
+// in plugin.json; the initialize handshake remains authoritative for negotiation.
+message PluginPackageManifest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  Version manifest_version = 1;
+  ImplementationIdentity plugin = 2;
+  repeated InterfaceVersion interfaces = 3;
+  PluginEntrypoint entrypoint = 4;
+  repeated CapabilityRequest anticipated_capabilities = 5;
+  ResourceLimits anticipated_resources = 6;
+  repeated FeatureFlag feature_flags = 7;
+}
+

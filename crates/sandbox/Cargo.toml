@@ -1,0 +1,65 @@
+[package]
+name = "apiaxess-sandbox"
+description = "Pluggable local and remote sandbox backend seam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-diagnostics = { path = "../diagnostics" }
+apiaxess-crypto-capture = { path = "../crypto-capture" }
+apiaxess-artifact-intake = { path = "../artifact-intake" }
+apiaxess-external-tools = { path = "../external-tools" }
+apiaxess-host-capabilities = { path = "../host-capabilities" }
+apiaxess-session = { path = "../session" }
+apiaxess-workbench-proxy = { path = "../workbench-proxy" }
+chrono.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+# Phase 11.4: frida-core linked via the first-party Rust bindings, replacing the
+# host Python/CLI Frida path. Optional + off by default so the standard build
+# needs no Frida devkit; Phase 12 packaging enables `frida-embedded` with the
+# bundled, pinned devkit (see packaging/assets/frida.toml). The crate major
+# tracks the frida release, so this must stay aligned with the pinned devkit +
+# device-side frida-server version.
+frida = { version = "0.17.2", optional = true, default-features = false }
+
+# Free-disk preflight for the bundled emulator (see `available_space`). The
+# emulator writes a multi-GB userdata image on each cold boot; checking free
+# space first turns a disk-full condition into a legible diagnostic instead of a
+# cryptic mid-boot failure. Both crates are already in the workspace lock, so
+# this adds no new download. `nix` gives the `statvfs` wrapper on Unix (no
+# `unsafe` at the call site); `windows-sys` exposes `GetDiskFreeSpaceExW`.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[features]
+# Drive instrumentation through the linked frida-core library instead of the
+# host Frida CLI. Requires the frida-core devkit at build/link time.
+frida-embedded = ["dep:frida"]
+
+# This crate links `frida-core` (behind the optional `frida-embedded` feature)
+# through the first-party FFI bindings, whose runtime init (`Frida::obtain`) is an
+# `unsafe fn`. The workspace otherwise forbids unsafe entirely; this crate relaxes
+# that single lint to `deny` so the one audited FFI-init site can carry an explicit
+# `#[allow(unsafe_code)]`, and re-declares the rest of the workspace lint posture
+# so nothing else is loosened.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package apiaxess.plugin.pinning_bypass.v1;
+
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.pinning_bypass.v1";
+
+// Logical interface ID: apiaxess.pinning-bypass, interface version 1.0.
+enum ReturnStrategy {
+  RETURN_STRATEGY_UNSPECIFIED = 0;
+  RETURN_BOOLEAN_FALSE = 1;
+  RETURN_NULL = 2;
+  RETURN_EMPTY_COLLECTION = 3;
+  RETURN_BOOLEAN_TRUE = 4;
+  RETURN_PASS_THROUGH = 5;
+}
+
+// Community-extensible technique data. A plugin adds a sibling spec instead
+// of editing a host-side lane switch.
+message DeclarativeHookSpec {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  string technique_id = 1;
+  string package_pattern = 2;
+  string target_class = 3;
+  string target_method = 4;
+  string signature = 5;
+  ReturnStrategy return_strategy = 6;
+}
+
+message BypassPlan {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  string selected_lane = 1;
+  string selection_reason = 2;
+  repeated DeclarativeHookSpec specs = 3;
+  repeated string escalation_boundaries = 4;
+}
+
+message PlanRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  apiaxess.plugin.v1.ArtifactRef target_inventory = 2;
+  repeated string strategy_preferences = 3;
+}
+
+message PlanResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  // Plan may reference Frida scripts; it never embeds them in the response.
+  apiaxess.plugin.v1.ArtifactRef plan = 1;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 2;
+  BypassPlan normalized_plan = 3;
+}
+
+message ApplyRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  apiaxess.plugin.v1.SandboxLeaseRef sandbox = 2;
+  apiaxess.plugin.v1.ArtifactRef plan = 3;
+}
+
+message ApplyResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  string attachment_id = 1;
+  repeated apiaxess.plugin.v1.ArtifactRef evidence = 2;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 3;
+  string selected_lane = 4;
+}
+
+message RemoveRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  apiaxess.plugin.v1.SandboxLeaseRef sandbox = 2;
+  string attachment_id = 3;
+}
+
+message RemoveResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 1;
+}
+
+service PinningBypassService {
+  option (apiaxess.plugin.v1.service_evolution) = { since: { major: 1 minor: 0 } };
+  rpc Plan(PlanRequest) returns (PlanResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Apply(ApplyRequest) returns (ApplyResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Remove(RemoveRequest) returns (RemoveResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

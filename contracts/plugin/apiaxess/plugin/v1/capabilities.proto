@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package apiaxess.plugin.v1;
+
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.v1";
+
+enum RequirementLevel {
+  REQUIREMENT_LEVEL_UNSPECIFIED = 0;
+  REQUIREMENT_LEVEL_OPTIONAL = 1;
+  REQUIREMENT_LEVEL_REQUIRED = 2;
+}
+
+enum Availability {
+  AVAILABILITY_UNSPECIFIED = 0;
+  AVAILABILITY_SUPPORTED = 1;
+  AVAILABILITY_DEGRADED = 2;
+  AVAILABILITY_UNAVAILABLE = 3;
+  AVAILABILITY_UNKNOWN = 4;
+}
+
+enum FileAccessMode {
+  FILE_ACCESS_MODE_UNSPECIFIED = 0;
+  FILE_ACCESS_MODE_READ = 1;
+  FILE_ACCESS_MODE_WRITE = 2;
+  FILE_ACCESS_MODE_READ_WRITE = 3;
+}
+
+message FilesystemScope {
+  repeated string absolute_roots = 1;
+  FileAccessMode mode = 2;
+}
+
+message NetworkScope {
+  repeated string host_patterns = 1;
+  repeated uint32 ports = 2;
+  repeated string protocols = 3;
+}
+
+message ExecutableConstraint {
+  string executable_id = 1;
+  bytes sha256 = 2;
+  repeated string allowed_argument_prefixes = 3;
+}
+
+message ProcessScope {
+  repeated ExecutableConstraint executables = 1;
+  bool inherit_environment = 2;
+}
+
+message DeviceScope {
+  repeated string device_ids = 1;
+  repeated string allowed_operations = 2;
+}
+
+message InstrumentationScope {
+  repeated string target_ids = 1;
+  repeated string allowed_operations = 2;
+}
+
+message SecretScope {
+  repeated string secret_names = 1;
+}
+
+message ArtifactScope {
+  repeated string artifact_ids = 1;
+  bool allow_new_artifacts = 2;
+  uint64 write_quota_bytes = 3;
+}
+
+message CapabilityScope {
+  oneof scope {
+    FilesystemScope filesystem = 1;
+    NetworkScope network = 2;
+    ProcessScope process = 3;
+    DeviceScope device = 4;
+    InstrumentationScope instrumentation = 5;
+    SecretScope secret = 6;
+    ArtifactScope artifact = 7;
+  }
+}
+
+// Stable permission IDs in v1:
+// fs.read, fs.write, network.connect, process.spawn, device.adb,
+// instrumentation.frida.attach, secret.read, artifact.read, artifact.write.
+message CapabilityRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string request_id = 1;
+  string capability_id = 2;
+  RequirementLevel requirement = 3;
+  repeated CapabilityScope scopes = 4;
+  string user_facing_reason = 5;
+  repeated string required_host_capability_ids = 6;
+}
+
+enum ConsentSource {
+  CONSENT_SOURCE_UNSPECIFIED = 0;
+  CONSENT_SOURCE_USER = 1;
+  CONSENT_SOURCE_ADMIN_POLICY = 2;
+  CONSENT_SOURCE_BUILT_IN_POLICY = 3;
+}
+
+message CapabilityGrant {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string request_id = 1;
+  string capability_id = 2;
+  repeated CapabilityScope granted_scopes = 3;
+  ConsentSource consent_source = 4;
+  int64 granted_at_unix_millis = 5;
+  int64 expires_at_unix_millis = 6;
+}
+
+message HostCapabilityOffer {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string capability_id = 1;
+  Availability availability = 2;
+  string evidence = 3;
+  string remediation = 4;
+}
+

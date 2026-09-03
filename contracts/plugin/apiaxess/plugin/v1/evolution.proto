@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package apiaxess.plugin.v1;
+
+import "google/protobuf/descriptor.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.v1";
+
+// Numeric protocol/interface version. Major changes are incompatible; minor and
+// patch changes are additive and negotiated.
+message Version {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+// Schema evolution gate modeled on WIT's @since, @unstable, and @deprecated.
+// Exactly one of since or unstable_feature is set. deprecated_since may accompany
+// since but does not permit removal within the current major version.
+message EvolutionGate {
+  Version since = 1;
+  string unstable_feature = 2;
+  Version deprecated_since = 3;
+  string replacement = 4;
+}
+
+extend google.protobuf.MessageOptions {
+  EvolutionGate message_evolution = 51001;
+}
+
+extend google.protobuf.FieldOptions {
+  EvolutionGate field_evolution = 51002;
+}
+
+extend google.protobuf.MethodOptions {
+  EvolutionGate method_evolution = 51003;
+}
+
+extend google.protobuf.ServiceOptions {
+  EvolutionGate service_evolution = 51004;
+}
+

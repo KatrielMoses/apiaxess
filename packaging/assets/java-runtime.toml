@@ -1,0 +1,77 @@
+# APIaxess shared Java runtime — trimmed OpenJDK acquisition manifest.
+#
+# APIaxess bundles ONE shared, jlink-trimmed OpenJDK runtime and runs both
+# bundled Java tools (apktool and jadx) through it by absolute path. Nothing is
+# required on the host: no host `java`, no `JAVA_HOME`, no host-installed JDK.
+#
+# The runtime is an unmodified Eclipse Temurin (Adoptium) build, trimmed with
+# its own `jlink` and shipped with the `legal/` notices jlink emits. That keeps
+# the GPLv2 + Classpath-Exception clean-bundling posture: ship the binary, keep
+# the notices, do not modify upstream. The archive hashes are pinned so the
+# build never substitutes a host JDK or an unreviewed runtime.
+#
+# jlink cannot cross-compile, so a Windows image is built from the Windows JDK
+# and a Linux image from the Linux JDK, each on its own platform at build time.
+schema_version = 1
+product = "APIaxess shared Java runtime"
+source = "eclipse-temurin"
+release = "jdk-21.0.12.1+1"
+license = "GPL-2.0-with-classpath-exception"
+notice = "OpenJDK legal notices are shipped inside the trimmed image (legal/)."
+
+# Modules included in the trimmed image. apktool and jadx are classpath apps
+# (no module-info), so jlink cannot auto-compute the set; this generous, tested
+# set is verified by the Phase 11.1 clean-host integration test against the
+# pinned tool versions. jlink resolves transitive module dependencies
+# automatically, so only the leaf modules are listed here.
+#
+#   java.base            core runtime
+#   java.desktop         javax.imageio / AWT — apktool 9-patch + PNG resources
+#   java.xml             manifest and resource XML parsing (both tools)
+#   java.naming          JNDI used by transitive logging/config libraries
+#   java.management      runtime beans queried by bundled libraries
+#   java.sql             pulled by jadx/apktool dependency graphs
+#   java.logging         java.util.logging bridges (slf4j/logback in jadx)
+#   java.security.jgss   security providers used during cert/signature handling
+#   java.security.sasl   security providers used during cert/signature handling
+#   jdk.unsupported      sun.misc.Unsafe (kotlin/gson and friends)
+#   jdk.zipfs            zip filesystem provider — archive traversal
+#   jdk.crypto.ec        EC signature algorithms (APK signing certs)
+#   jdk.crypto.cryptoki  PKCS#11 provider completeness
+#   jdk.charsets         non-UTF charsets in resources/strings
+#   jdk.localedata       locale data for resource decoding
+modules = [
+    "java.base",
+    "java.desktop",
+    "java.xml",
+    "java.naming",
+    "java.management",
+    "java.sql",
+    "java.logging",
+    "java.security.jgss",
+    "java.security.sasl",
+    "jdk.unsupported",
+    "jdk.zipfs",
+    "jdk.crypto.ec",
+    "jdk.crypto.cryptoki",
+    "jdk.charsets",
+    "jdk.localedata",
+]
+
+# jlink trimming flags. Debug symbols, man pages, and headers are stripped and
+# the image is compressed; the target is a ~50-70 MB image.
+jlink_flags = ["--strip-debug", "--no-man-pages", "--no-header-files", "--compress=zip-6"]
+
+[windows_x64]
+archive = "OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip"
+url = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip"
+sha256 = "f9d6e191ab098c0d416e7d588a24420a8621cd2f4720dab2459b8b7b2d2d8b4e"
+# Install-relative location of the trimmed image home (contains bin/java.exe).
+install_path = "runtime/java/windows"
+
+[linux_x64]
+archive = "OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz"
+url = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz"
+sha256 = "ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94"
+# Install-relative location of the trimmed image home (contains bin/java).
+install_path = "runtime/java/linux"

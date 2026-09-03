@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" fill="none">
+  <!-- The identity kit's favicon at its 32px simplification: the outer chevron
+       is dropped and the strokes thicken to 20 units so the mark survives a
+       tab-strip render. The kit's reversed lockup replaces Ink with Paper on a
+       dark ground, which is what the media query does here — a browser with a
+       dark tab strip gets the reversed mark. -->
+  <style>
+    .ink { stroke: #0D0D0D; }
+    @media (prefers-color-scheme: dark) {
+      .ink { stroke: #FFFFFF; }
+    }
+  </style>
+  <path class="ink" d="M134 58 L100 24 L24 100 L100 176 L134 142" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M56 100 H140" stroke="#2D7FF9" stroke-width="20" stroke-linecap="round"/>
+  <path d="M116 76 L144 100 L116 124" stroke="#2D7FF9" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+description = "APIaxess repository policy checks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+syn.workspace = true
+
+[lints]
+workspace = true

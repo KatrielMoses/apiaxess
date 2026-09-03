@@ -1,0 +1,319 @@
+/*
+ * APIaxess design tokens — the single place the brand identity is defined.
+ *
+ * Values are extracted from the APIaxess identity kit (Identity kit / v2.1,
+ * `assets/brand/Apiaxess Logo Kit.html`, gitignored). The kit is the source of
+ * truth; this file is its durable, committed projection. Nothing else in the
+ * GUI may hardcode a colour, font, size, radius, or duration — every component
+ * consumes these variables so the identity can be retuned in one place.
+ *
+ * Structure
+ * ---------
+ *   :root                      theme-agnostic scales — palette, type, space,
+ *                              borders, motion, layout
+ *   :root                      the DARK semantic mapping, which is the app's
+ *                              default: no attribute is needed for it
+ *   :root[data-theme="light"]  the LIGHT semantic mapping, which restates every
+ *                              semantic colour rather than patching a subset
+ *
+ * Both themes are complete: every `--color-*` token defined for dark is
+ * redefined for light. The shell writes `data-theme` on <html> before first
+ * paint, so both mappings are always explicit at runtime.
+ *
+ * Tokens marked DERIVED are not in the kit. The kit defines a light ground, a
+ * reversed dark lockup, and three palette entries (Ink, Accent, Paper) plus a
+ * light neutral ramp; it defines no dark ramp, no destructive or cautionary
+ * colour, and no on-accent foreground. Those are constructed here to sit in the
+ * same register as the kit values and are kept clearly separate from them.
+ */
+
+:root {
+  /* ---------------------------------------------------------------- *
+   * 1. Palette — raw brand values (kit)
+   * ---------------------------------------------------------------- */
+  --brand-ink: #0d0d0d;
+  --brand-signal-blue: #2d7ff9;
+  --brand-signal-green: #00e676;
+
+  /* Neutral ramp, dark to light (kit). */
+  --brand-neutral-700: #4a4a4a;
+  --brand-neutral-500: #8a8a8a;
+  --brand-neutral-400: #c9c9c9;
+  --brand-neutral-300: #e8e8e8;
+  --brand-neutral-200: #f4f4f4;
+  --brand-paper: #ffffff;
+
+  /* DERIVED dark ramp — the neutral steps the kit's reversed/dark-UI ground
+     needs, spaced to mirror the light ramp's tonal jumps from Ink upward. */
+  --brand-ink-raised: #1a1a1a;
+  --brand-ink-rule: #262626;
+  --brand-ink-rule-strong: #3d3d3d;
+  --brand-ink-rule-bright: #545454;
+  --brand-ink-disabled: #5a5a5a;
+  --brand-ink-text-muted: #b0b0b0;
+  --brand-ink-text: #f0f0f0;
+
+  /* DERIVED signal siblings — same vividness as Signal Blue, other hues. */
+  --brand-signal-red: #f9382d;
+  --brand-signal-amber: #f9a62d;
+
+  /* DERIVED tints of Signal Blue. `-lift` carries the accent as text or as a
+     fill on a dark ground; `-deep` carries it as a fill under light text. */
+  --brand-signal-blue-lift: #5b9dff;
+  --brand-signal-blue-deep: #1c6ae0;
+  --brand-signal-blue-deeper: #1557be;
+
+  /* ---------------------------------------------------------------- *
+   * 3. Typography
+   * ---------------------------------------------------------------- */
+  --font-sans: "Outfit", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", "SF Mono",
+    "Menlo", "Consolas", monospace;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* Scale. Display sizes carry the kit's tight negative tracking and fluidly
+     step down so a view heading stays proportionate in a narrow window. */
+  --text-display: clamp(1.875rem, 1.35rem + 1.7vw, 2.75rem);
+  --text-title: clamp(1.25rem, 1.11rem + 0.45vw, 1.5rem);
+  --text-heading: 1.0625rem;
+  --text-subheading: 0.9375rem;
+  --text-body: 0.875rem;
+  --text-small: 0.8125rem;
+  --text-micro: 0.75rem;
+  --text-nano: 0.6875rem;
+
+  --leading-tight: 1.1;
+  --leading-snug: 1.35;
+  --leading-normal: 1.55;
+  --leading-relaxed: 1.7;
+
+  --tracking-display: -0.05em;
+  --tracking-title: -0.03em;
+  --tracking-normal: 0;
+  --tracking-label: 0.16em;
+  --tracking-micro-label: 0.24em;
+
+  /* ---------------------------------------------------------------- *
+   * 4. Space — 4px base
+   * ---------------------------------------------------------------- */
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+  --space-24: 6rem;
+
+  /* ---------------------------------------------------------------- *
+   * 5. Borders, radii
+   * ---------------------------------------------------------------- */
+  --border-hairline: 1px;
+  --border-thick: 2px;
+  --border: var(--border-hairline) solid var(--color-rule);
+  --border-strong: var(--border-hairline) solid var(--color-rule-strong);
+  --border-ink: var(--border-hairline) solid var(--color-rule-ink);
+
+  --radius-none: 0;
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
+  /* The kit's app-icon plate: radius 46 in a 200 box. */
+  --radius-plate: 23%;
+
+  --shadow-none: none;
+
+  /* ---------------------------------------------------------------- *
+   * 6. Motion
+   * ---------------------------------------------------------------- */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out: cubic-bezier(0, 0, 0, 1);
+  --duration-instant: 90ms;
+  --duration-fast: 140ms;
+  --duration-medium: 220ms;
+  --duration-slow: 360ms;
+  --transition-control: color var(--duration-fast) var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard);
+
+  /* ---------------------------------------------------------------- *
+   * 7. Layout
+   * ---------------------------------------------------------------- */
+  --layout-max: 1680px;
+  --layout-gutter: var(--space-8);
+  --header-height: 4.25rem;
+  /* The header's measured height. The shell keeps this in sync at runtime so
+     layers that sit beneath the header stay aligned when it wraps. */
+  --shell-header-height: 4.25rem;
+  --control-height: 2.125rem;
+  --control-height-lg: 2.5rem;
+  /* Comfortable pointer target on touch-sized viewports. */
+  --control-height-touch: 2.75rem;
+  --z-header: 20;
+  --z-drawer: 40;
+  --z-overlay: 60;
+  --z-toast: 80;
+}
+
+/* ================================================================== *
+ * 2a. Semantic colour — DARK (default)
+ *
+ * The ground is the kit's Ink, exactly as the kit's "Reversed / dark UI"
+ * lockup sits on it. Signal Blue is unchanged wherever it is a graphic; where
+ * it has to carry text it lifts to `--brand-signal-blue-lift` so it clears
+ * WCAG AA against the Ink ground (7.2:1) and against the accent wash (6.3:1).
+ * ================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces. The kit resolves depth with rules rather than elevation, so the
+     panel ground equals the page ground and `sunken` is the one step away. */
+  --color-surface: var(--brand-ink);
+  --color-surface-sunken: var(--brand-ink-raised);
+  --color-surface-raised: var(--brand-ink);
+  --color-surface-inverse: var(--brand-ink-text);
+  --color-surface-accent-wash: #101d33;
+  --color-surface-success-wash: #07241a;
+  --color-surface-caution-wash: #251b08;
+  --color-surface-danger-wash: #2a1210;
+
+  --color-text: var(--brand-ink-text);
+  --color-text-muted: var(--brand-ink-text-muted);
+  --color-text-subtle: var(--brand-neutral-500);
+  --color-text-hint: #9a9a9a;
+  --color-text-disabled: var(--brand-ink-disabled);
+  --color-text-inverse: var(--brand-ink);
+  --color-text-accent: var(--brand-signal-blue-lift);
+
+  --color-rule: var(--brand-ink-rule);
+  --color-rule-strong: var(--brand-ink-rule-strong);
+  /* The strongest rule in the theme — the header edge, view rules, modal
+     borders. Light's is Ink; dark's is the brightest neutral. */
+  --color-rule-ink: var(--brand-ink-rule-bright);
+
+  /* The brand mark's non-accent strokes: Ink on light, Paper on dark, which is
+     precisely the kit's reversed lockup. */
+  --color-brand-mark: var(--brand-paper);
+
+  --color-accent: var(--brand-signal-blue);
+  --color-accent-fill: var(--brand-signal-blue);
+  --color-accent-on: var(--brand-ink);
+  --color-accent-strong: var(--brand-signal-blue-lift);
+  --color-success: var(--brand-signal-green);
+  --color-success-ink: #34d879;
+  --color-caution: var(--brand-signal-amber);
+  --color-caution-ink: #ffb84d;
+  --color-danger: var(--brand-signal-red);
+  --color-danger-ink: #ff7a70;
+
+  --color-focus-ring: var(--brand-signal-blue-lift);
+  --color-selection: #1e3a63;
+
+  /* HTTP-method accents for traffic surfaces, drawn from the same family. */
+  --color-method-get: var(--brand-signal-blue-lift);
+  --color-method-post: var(--color-success-ink);
+  --color-method-put: var(--color-caution-ink);
+  --color-method-patch: var(--color-caution-ink);
+  --color-method-delete: var(--color-danger-ink);
+  --color-method-other: var(--color-text-muted);
+
+  /* Component-level derived values that have to flip with the ground. */
+  --color-skeleton-highlight: var(--brand-ink-rule);
+  --color-sheen: rgb(255 255 255 / 28%);
+  --check-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230d0d0d' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4.75 12.5 4.75 4.75 9.75-11'/%3E%3C/svg%3E");
+
+  /* Elevation is reserved for genuinely floating layers. On a dark ground a
+     shadow reads only if it is deeper than the ground itself. */
+  --shadow-overlay: 0 1px 2px rgb(0 0 0 / 55%), 0 16px 48px rgb(0 0 0 / 65%);
+  --shadow-popover: 0 1px 2px rgb(0 0 0 / 55%), 0 8px 24px rgb(0 0 0 / 55%);
+  --scrim: rgb(0 0 0 / 68%);
+}
+
+/* ================================================================== *
+ * 2b. Semantic colour — LIGHT (opt-in)
+ *
+ * The kit's primary ground: Paper, Ink type, the light neutral ramp. Signal
+ * Blue deepens to `--brand-signal-blue-deep` wherever it carries text or sits
+ * under white type, which is what lifts links and primary buttons past AA.
+ * ================================================================== */
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --color-surface: var(--brand-paper);
+  --color-surface-sunken: var(--brand-neutral-200);
+  --color-surface-raised: var(--brand-paper);
+  --color-surface-inverse: var(--brand-ink);
+  --color-surface-accent-wash: #f2f7ff;
+  --color-surface-success-wash: #eefdf4;
+  --color-surface-caution-wash: #fff8ec;
+  --color-surface-danger-wash: #fff1f0;
+
+  --color-text: var(--brand-ink);
+  --color-text-muted: var(--brand-neutral-700);
+  --color-text-subtle: var(--brand-neutral-500);
+  /* The kit's #8A8A8A is its own specimen tone for wide-tracked micro-labels
+     on Paper, and it stays that. Sentence-length helper copy needs to clear AA
+     as body text, though, which at 3.45:1 it does not — so it gets its own
+     step. On the Ink ground the same distinction is much smaller, because the
+     kit tone already clears AA there. */
+  --color-text-hint: #5f5f5f;
+  --color-text-disabled: #b4b4b4;
+  --color-text-inverse: var(--brand-paper);
+  --color-text-accent: var(--brand-signal-blue-deep);
+
+  --color-rule: var(--brand-neutral-300);
+  --color-rule-strong: var(--brand-neutral-400);
+  --color-rule-ink: var(--brand-ink);
+
+  --color-brand-mark: var(--brand-ink);
+
+  --color-accent: var(--brand-signal-blue);
+  --color-accent-fill: var(--brand-signal-blue-deep);
+  --color-accent-on: var(--brand-paper);
+  --color-accent-strong: var(--brand-signal-blue-deeper);
+  --color-success: var(--brand-signal-green);
+  --color-success-ink: #067a41;
+  --color-caution: var(--brand-signal-amber);
+  --color-caution-ink: #9a6407;
+  --color-danger: var(--brand-signal-red);
+  --color-danger-ink: #c0261d;
+
+  --color-focus-ring: var(--brand-signal-blue);
+  --color-selection: #d9e8ff;
+
+  --color-method-get: var(--brand-signal-blue-deep);
+  --color-method-post: var(--color-success-ink);
+  --color-method-put: var(--color-caution-ink);
+  --color-method-patch: var(--color-caution-ink);
+  --color-method-delete: var(--color-danger-ink);
+  --color-method-other: var(--brand-neutral-700);
+
+  --color-skeleton-highlight: var(--brand-neutral-300);
+  --color-sheen: rgb(255 255 255 / 45%);
+  --check-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4.75 12.5 4.75 4.75 9.75-11'/%3E%3C/svg%3E");
+
+  --shadow-overlay: 0 1px 2px rgb(13 13 13 / 6%), 0 12px 40px rgb(13 13 13 / 12%);
+  --shadow-popover: 0 1px 2px rgb(13 13 13 / 6%), 0 6px 20px rgb(13 13 13 / 10%);
+  --scrim: rgb(13 13 13 / 46%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-instant: 1ms;
+    --duration-fast: 1ms;
+    --duration-medium: 1ms;
+    --duration-slow: 1ms;
+  }
+}

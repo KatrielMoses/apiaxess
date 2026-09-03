@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "lib": ["DOM", "ESNext"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": ["node"],
+    "useDefineForClassFields": true
+  },
+  "include": ["src", "vite.config.ts"]
+}

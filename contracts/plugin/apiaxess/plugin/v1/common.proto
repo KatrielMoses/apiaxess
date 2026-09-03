@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package apiaxess.plugin.v1;
+
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.v1";
+
+enum ExecutionTier {
+  EXECUTION_TIER_UNSPECIFIED = 0;
+  EXECUTION_TIER_TRUSTED_IN_CORE_RUST = 1;
+  EXECUTION_TIER_WASM_WASI = 2;
+  EXECUTION_TIER_PROCESS_RPC = 3;
+}
+
+// HARD is enforceable by the selected runtime. COOPERATIVE is truthful for
+// trusted in-process Rust and cannot satisfy a hard-containment requirement.
+enum ContainmentMode {
+  CONTAINMENT_MODE_UNSPECIFIED = 0;
+  CONTAINMENT_MODE_COOPERATIVE = 1;
+  CONTAINMENT_MODE_HARD = 2;
+}
+
+message ImplementationIdentity {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string id = 1;
+  string display_name = 2;
+  string implementation_version = 3;
+  string spdx_license_expression = 4;
+  string source_url = 5;
+  ExecutionTier execution_tier = 6;
+  ContainmentMode containment_mode = 7;
+}
+
+message InterfaceVersion {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string interface_id = 1;
+  Version version = 2;
+}
+
+// A large immutable object owned by the local session store. sha256 and size
+// protect the caller against confused-reference and truncation failures.
+message ArtifactRef {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string artifact_id = 1;
+  bytes sha256 = 2;
+  uint64 size_bytes = 3;
+  string media_type = 4;
+  string schema_id = 5;
+  Version schema_version = 6;
+}
+
+message ArtifactSliceRef {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  ArtifactRef artifact = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}
+
+// Short-lived capability-bound stream lease. It contains no host filesystem path.
+message StreamRef {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string stream_id = 1;
+  ArtifactRef backing_artifact = 2;
+  uint64 offset = 3;
+  uint64 length = 4;
+}
+
+// Supplied on every operation so cancellation and limits are tier-neutral.
+message OperationContext {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string operation_id = 1;
+  int64 deadline_unix_millis = 2;
+  uint64 max_output_bytes = 3;
+  uint64 max_message_bytes = 4;
+}
+
+enum DiagnosticSeverity {
+  DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  DIAGNOSTIC_SEVERITY_INFO = 1;
+  DIAGNOSTIC_SEVERITY_WARNING = 2;
+  DIAGNOSTIC_SEVERITY_ERROR = 3;
+}
+
+message Diagnostic {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string code = 1;
+  DiagnosticSeverity severity = 2;
+  string message = 3;
+  string remediation = 4;
+  repeated string related_capability_ids = 5;
+}
+
+message StructuredLogEntry {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  int64 timestamp_unix_millis = 1;
+  DiagnosticSeverity severity = 2;
+  string target = 3;
+  string message = 4;
+  map<string, string> fields = 5;
+  string operation_id = 6;
+}
+
+message CrashReport {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  ImplementationIdentity plugin = 1;
+  string operation_id = 2;
+  string failure_kind = 3;
+  string summary = 4;
+  ArtifactRef details = 5;
+  bool restart_attempted = 6;
+}
+
+// Public projection of an endpoint key. Query parameters are deliberately absent.
+message EndpointKey {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string method = 1;
+  string path_template = 2;
+}
+
+message SandboxLeaseRef {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string lease_id = 1;
+  string backend_id = 2;
+  int64 expires_at_unix_millis = 3;
+}
+

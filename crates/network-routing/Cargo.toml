@@ -1,0 +1,17 @@
+[package]
+name = "apiaxess-network-routing"
+description = "Static networking-library detection and localization for Phase 1.2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aho-corasick = "1.1.5"
+apiaxess-artifact-intake = { path = "../artifact-intake" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+serde.workspace = true
+zip = "2.2.2"
+
+[lints]
+workspace = true

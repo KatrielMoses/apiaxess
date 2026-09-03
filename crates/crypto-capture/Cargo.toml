@@ -1,0 +1,16 @@
+[package]
+name = "apiaxess-crypto-capture"
+description = "Stateful Java/native crypto capture records and Frida payloads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-diagnostics = { path = "../diagnostics" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

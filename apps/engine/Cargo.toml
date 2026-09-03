@@ -1,0 +1,42 @@
+[package]
+name = "apiaxess"
+description = "APIaxess native composition root"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../../crates/api-model" }
+apiaxess-engine-shell = { path = "../../crates/engine-shell" }
+apiaxess-local-api = { path = "../../crates/local-api" }
+apiaxess-diagnostics = { path = "../../crates/diagnostics" }
+apiaxess-session = { path = "../../crates/session" }
+apiaxess-target-apk = { path = "../../plugins/targets/apk" }
+apiaxess-workbench-proxy = { path = "../../crates/workbench-proxy" }
+apiaxess-workbench-store = { path = "../../crates/workbench-store" }
+axum.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+# The frida-embedded packaging variant links frida-core into the product binary.
+# Off by default: the base installer needs no Frida devkit; the packaging build
+# enables this with the pinned devkit (see packaging/assets/frida.toml).
+frida-embedded = ["apiaxess-engine-shell/frida-embedded"]
+
+# The composition root applies persisted operator settings to the environment at
+# startup, before any thread exists — the one audited `std::env::set_var`. The
+# workspace otherwise forbids unsafe; this crate relaxes that single lint to
+# `deny` so that one site can carry an explicit `#[allow(unsafe_code)]`, and
+# re-declares the rest of the workspace lint posture so nothing else is loosened.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

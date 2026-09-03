@@ -1,0 +1,15 @@
+[package]
+name = "apiaxess-host-capabilities"
+description = "Capability declaration and host detection seam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-diagnostics = { path = "../diagnostics" }
+apiaxess-external-tools = { path = "../external-tools" }
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "apiaxess-openapi-emitter"
+description = "Phase 6.1 deterministic OpenAPI 3.1 emission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+chrono.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,52 @@
+# APIaxess bundled Frida — instrumentation acquisition manifest (Phase 11.4).
+#
+# Frida is embedded as a LINKED LIBRARY (frida-core, via the first-party Rust
+# bindings), not the Python `frida` CLI. Two artifact classes are pinned here:
+#
+#   1. Host frida-core devkits (per host platform) — linked into the Rust
+#      backend at build/link time when the `frida-embedded` feature is enabled.
+#      The `frida` crate major (0.17.x) must match these devkits (17.x).
+#   2. Device-side frida-server (per Android ABI) — baked into the owned
+#      Android-10 image (or pushed as a bundled data file). frida-core (host)
+#      and frida-server (device) MUST be the same version to interoperate.
+#
+# Licensing: Frida is the wxWindows Library Licence 3.1 (LGPL-2.1 with a
+# static-linking exception permitting linking into a product shipped under our
+# own terms). Unmodified upstream, license/notice shipped, source access not
+# obstructed — see frida-NOTICES.md. One of the two non-trivial licenses in the
+# bundle; worth a counsel skim, but the static-link exception makes commercial
+# bundling fine.
+#
+# Frida publishes no checksums file, so these SHA-256 values were computed from
+# the pinned release assets and are the trust anchor the fetch script verifies.
+schema_version = 1
+product = "APIaxess bundled Frida"
+version = "17.17.0"
+license = "wxWindows-3.1"
+frida_rust_crate = "0.17.2"
+
+# --- Host frida-core devkits (linked into the Rust backend) ---
+[devkit.windows_x64]
+archive = "frida-core-devkit-17.17.0-windows-x86_64.tar.xz"
+url = "https://github.com/frida/frida/releases/download/17.17.0/frida-core-devkit-17.17.0-windows-x86_64.tar.xz"
+sha256 = "84767bf9e2c55956c6c337071fe928de02a34f17f1dee4e9832b52a0798b8c1d"
+install_path = "frida/devkit/windows-x86_64"
+
+[devkit.linux_x64]
+archive = "frida-core-devkit-17.17.0-linux-x86_64.tar.xz"
+url = "https://github.com/frida/frida/releases/download/17.17.0/frida-core-devkit-17.17.0-linux-x86_64.tar.xz"
+sha256 = "483e1a25945cebaa69e61c09d7804692c42d234cab0c58261a73382163027a2e"
+install_path = "frida/devkit/linux-x86_64"
+
+# --- Device-side frida-server, per Android ABI (baked into the owned image) ---
+[server.android_x86_64]
+archive = "frida-server-17.17.0-android-x86_64.xz"
+url = "https://github.com/frida/frida/releases/download/17.17.0/frida-server-17.17.0-android-x86_64.xz"
+sha256 = "5f0671fbeaee0b1ee66b1536c3eae966d58765b7e3954ea49932e5931e43bd6c"
+install_path = "frida/frida-server/android-x86_64/frida-server"
+
+[server.android_arm64]
+archive = "frida-server-17.17.0-android-arm64.xz"
+url = "https://github.com/frida/frida/releases/download/17.17.0/frida-server-17.17.0-android-arm64.xz"
+sha256 = "09d1fad867b27d69562a79289f4c412e85867f5d38ab72877036ed35e4223021"
+install_path = "frida/frida-server/android-arm64/frida-server"

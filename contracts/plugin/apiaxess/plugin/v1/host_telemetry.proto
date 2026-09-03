@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package apiaxess.plugin.v1;
+
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.v1";
+
+message PublishLogsRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  repeated StructuredLogEntry entries = 1;
+}
+
+message PublishLogsResponse {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  uint32 accepted_count = 1;
+  repeated Diagnostic diagnostics = 2;
+}
+
+// Host callback surface supplied by every tier adapter. The host bounds and may
+// drop log traffic beyond negotiated output limits without blocking the core.
+message ReportCrashRequest {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  CrashReport crash = 1;
+}
+
+message ReportCrashResponse {
+  option (message_evolution) = { since: { major: 1 minor: 0 } };
+  uint32 accepted_count = 1;
+  repeated Diagnostic diagnostics = 2;
+}
+
+service HostTelemetryService {
+  option (service_evolution) = { since: { major: 1 minor: 0 } };
+  rpc PublishLogs(PublishLogsRequest) returns (PublishLogsResponse) {
+    option (method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc ReportCrash(ReportCrashRequest) returns (ReportCrashResponse) {
+    option (method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

@@ -1,0 +1,75 @@
+# APIaxess Phase 7.4 real-sample verification manifest.
+#
+# This file distinguishes real-sample evidence from the clean-room structural
+# seed corpus in ../clean-room-ledger.md. A positive packer row may be marked
+# verified only when an authorization-clean sample, its hash, and reproducible
+# detector evidence are recorded. No positive packed sample is present yet.
+
+schema_version = 1
+detector_version = "clean-room-1"
+reviewed_on = "2026-08-26"
+positive_real_samples = 0
+
+[[samples]]
+id = "feeder-fdroid-2.22.0-4050"
+path = "fixtures/capstone/feeder-2.22.0-4050.apk"
+kind = "unpacked-negative-control"
+authorization = "Project-designated authorization-clean F-Droid fixture; not a commercial-packed sample."
+sha256 = "1066f08e9e773fe0a5a4cd35d8e308634d8c4fbe9d3390be0095cbdaf0a39c"
+verified_on = "2026-08-26"
+verification_command = "cargo test -p apiaxess-protection-detector checked_in_feeder_fixture_is_a_reproducible_unpacked_negative_control -- --nocapture"
+detector_identity = "stock-r8-proguard"
+detector_tier = "tier_1_stock_r8"
+named_packer_markers = []
+named_packer_identity = false
+
+# Generic detector output is retained so later changes can distinguish an
+# expected negative-control result from a changed false-positive surface.
+generic_signals = [
+  "r8.compiler-marker: classes.dex, classes2.dex",
+  "android.native-loader-api: lib/arm64-v8a/libgojni.so, lib/armeabi-v7a/libgojni.so",
+  "payload.opaque-asset: classes.dex",
+  "rasp.integrity-marker: classes.dex, lib/arm64-v8a/libgojni.so, lib/armeabi-v7a/libgojni.so, lib/x86/libgojni.so, lib/x86_64/libgojni.so, res/bz.json",
+]
+
+[[packers]]
+signature_id = "jiagu.native-loader"
+name = "360 Jiagu"
+status = "pending"
+reason = "No authorized Jiagu SDK/trial output or research-corpus access was available in this validation environment; no unvetted sample was admitted."
+
+[[packers]]
+signature_id = "legu.native-loader"
+name = "Tencent Legu"
+status = "pending"
+reason = "No authorized Legu SDK/trial output or research-corpus access was available in this validation environment; no unvetted sample was admitted."
+
+[[packers]]
+signature_id = "bangcle.native-loader"
+name = "Bangcle SecShell"
+status = "pending"
+reason = "No authorized Bangcle SDK/trial output or research-corpus access was available in this validation environment; no unvetted sample was admitted."
+
+[[packers]]
+signature_id = "aliprotect.native-loader"
+name = "Alibaba Aliprotect"
+status = "pending"
+reason = "No authorized Aliprotect SDK/trial output or research-corpus access was available in this validation environment; no unvetted sample was admitted."
+
+[[packers]]
+signature_id = "ijiami.native-loader"
+name = "iJiami"
+status = "pending"
+reason = "No authorized iJiami SDK/trial output or research-corpus access was available in this validation environment; no unvetted sample was admitted."
+
+[[packers]]
+signature_id = "dexprotector.native-loader"
+name = "DexProtector"
+status = "pending"
+reason = "No authorized DexProtector trial/license output or research-corpus access was available in this validation environment; no unvetted sample was admitted."
+
+[[packers]]
+signature_id = "baidu.native-loader"
+name = "Baidu Protect"
+status = "pending"
+reason = "No authorized Baidu Protect SDK/trial output or research-corpus access was available in this validation environment; no unvetted sample was admitted."

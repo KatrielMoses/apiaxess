@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0d0d0d" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="alternate icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="preload" href="/fonts/outfit-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <title>APIaxess</title>
+    <!-- The theme is resolved before the first pixel is painted. Without this a
+         light-mode operator would see a dark flash on every load, while the
+         module bundle is still being fetched. Kept in sync with ui/theme.ts. -->
+    <script>
+      (function () {
+        try {
+          var stored = window.localStorage.getItem("apiaxess.theme");
+          var theme = stored === "light" || stored === "dark" ? stored : "dark";
+          document.documentElement.dataset.theme = theme;
+          document
+            .querySelector('meta[name="theme-color"]')
+            .setAttribute("content", theme === "light" ? "#ffffff" : "#0d0d0d");
+        } catch (error) {
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <!-- Splash. The mark is inlined so the brand is present on first paint,
+         before the module bundle has loaded. It inherits the same tokens. -->
+    <div id="splash" class="splash">
+      <svg width="72" height="72" viewBox="0 0 200 200" fill="none" role="img" aria-label="APIaxess">
+        <path d="M138 60 L100 22 L22 100 L100 178 L138 140" stroke="currentColor" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"></path>
+        <path d="M50 100 H140" stroke="var(--color-accent)" stroke-width="14" stroke-linecap="round"></path>
+        <path d="M118 78 L142 100 L118 122" stroke="var(--color-accent)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"></path>
+        <path d="M168 78 L142 100 L168 122" stroke="currentColor" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+      <div class="splash__rule" aria-hidden="true"></div>
+      <p class="t-label">Starting local engine</p>
+    </div>
+
+    <div class="app">
+      <!-- ============================================================
+           2. App shell — header, lockup, navigation, status
+           ============================================================ -->
+      <header class="app-header">
+        <div class="app-header__brand">
+          <span id="header-lockup"></span>
+          <div class="app-header__context">
+            <span class="app-header__context-label">Session</span>
+            <span id="header-session" class="app-header__context-value">No session</span>
+          </div>
+        </div>
+
+        <nav class="app-nav" id="app-nav" aria-label="Primary">
+          <button class="app-nav__item" type="button" data-nav="start" title="Start">
+            <span data-icon="spark" data-icon-size="17"></span><span class="app-nav__label">Start</span>
+          </button>
+          <button class="app-nav__item" type="button" data-nav="apk" title="APK analysis">
+            <span data-icon="apk" data-icon-size="17"></span><span class="app-nav__label">APK analysis</span>
+          </button>
+          <button class="app-nav__item" type="button" data-nav="web" title="Web capture">
+            <span data-icon="web" data-icon-size="17"></span><span class="app-nav__label">Web capture</span>
+          </button>
+          <button class="app-nav__item" type="button" data-nav="workbench" title="Workbench">
+            <span data-icon="traffic" data-icon-size="17"></span><span class="app-nav__label">Workbench</span>
+          </button>
+          <button class="app-nav__item" type="button" data-nav="surface" title="API surface">
+            <span data-icon="surface" data-icon-size="17"></span><span class="app-nav__label">API surface</span>
+          </button>
+          <button class="app-nav__item" type="button" data-nav="export" title="Export">
+            <span data-icon="export" data-icon-size="17"></span><span class="app-nav__label">Export</span>
+          </button>
+          <button class="app-nav__item" type="button" data-nav="session" title="Session">
+            <span data-icon="session" data-icon-size="17"></span><span class="app-nav__label">Session</span>
+          </button>
+        </nav>
+
+        <div class="app-header__aside">
+          <div class="engine-status" role="status" aria-live="polite">
+            <span id="status-dot" class="dot" aria-hidden="true"></span>
+            <span id="status-text" class="engine-status__text">Connecting…</span>
+          </div>
+          <button
+            id="diagnostics-toggle"
+            class="btn btn--quiet btn--icon diagnostics-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="diagnostics-drawer"
+            title="Diagnostics"
+          >
+            <span data-icon="alert" data-icon-size="18"></span><span class="visually-hidden">Diagnostics</span>
+            <span id="diagnostics-count" class="diagnostics-toggle__count" hidden>0</span>
+          </button>
+          <button
+            class="btn btn--quiet btn--icon"
+            type="button"
+            data-theme-toggle
+            title="Switch to light theme"
+          >
+            <span data-theme-glyph></span>
+          </button>
+          <button
+            class="btn btn--quiet btn--icon"
+            type="button"
+            data-nav="settings"
+            title="Settings"
+          >
+            <span data-icon="settings" data-icon-size="18"></span><span class="visually-hidden">Settings</span>
+          </button>
+          <button
+            class="btn btn--quiet btn--icon"
+            type="button"
+            data-nav="about"
+            title="About and help"
+          >
+            <span data-icon="help" data-icon-size="18"></span><span class="visually-hidden">About and help</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="app-main">
+        <!-- ==========================================================
+             3. Landing / entry
+             ========================================================== -->
+        <section class="view" id="view-start" data-view="start" hidden>
+          <div class="landing">
+            <div class="landing__hero">
+              <p class="t-label">API surface reconstruction</p>
+              <h1>Recover an application's real API surface from what it ships and what it does.</h1>
+              <p>
+                Pick an input. APIaxess reverse-engineers the reachable API from evidence — never
+                from guesswork — and reports honest coverage for everything it could not confirm.
+              </p>
+            </div>
+
+            <div class="landing__paths">
+              <button class="path-card" type="button" data-nav="apk" id="path-apk">
+                <span class="path-card__top">
+                  <span class="path-card__icon" data-icon="apk"></span>
+                  <span class="badge">Static + dynamic</span>
+                </span>
+                <h2>Android APK</h2>
+                <p>
+                  Unpack the artifact, extract network facts statically, exercise it in the sandbox,
+                  recover request signing, then fuse everything into one surface.
+                </p>
+                <span class="path-card__steps">
+                  <span class="path-card__step"><span>01</span><span>Load an APK from disk</span></span>
+                  <span class="path-card__step"><span>02</span><span>Run the analysis pipeline</span></span>
+                  <span class="path-card__step"><span>03</span><span>Review the fused surface and export</span></span>
+                </span>
+                <span class="path-card__go">Start APK analysis <span data-icon="arrowRight"></span></span>
+              </button>
+
+              <button class="path-card" type="button" data-nav="web" id="path-web">
+                <span class="path-card__top">
+                  <span class="path-card__icon" data-icon="web"></span>
+                  <span class="badge badge--accent">Start here</span>
+                </span>
+                <h2>Web domain</h2>
+                <p>
+                  Declare the target and your authorization, capture live traffic through the
+                  bundled browser, optionally run discovery, then fuse what was observed.
+                </p>
+                <span class="path-card__steps">
+                  <span class="path-card__step"><span>01</span><span>Enter a domain and affirm authorization</span></span>
+                  <span class="path-card__step"><span>02</span><span>Capture traffic in the bundled browser</span></span>
+                  <span class="path-card__step"><span>03</span><span>Fuse observations and export</span></span>
+                </span>
+                <span class="path-card__go">Start web capture <span data-icon="arrowRight"></span></span>
+              </button>
+            </div>
+
+            <div class="landing__foot">
+              <section>
+                <p class="t-label">Everything stays local</p>
+                <p>
+                  The engine, the capture proxy, and the session store all run on this machine at
+                  127.0.0.1. Nothing is uploaded.
+                </p>
+              </section>
+              <section>
+                <p class="t-label">Honest coverage</p>
+                <p>
+                  Endpoints carry confidence and provenance. What could not be confirmed is reported
+                  as unconfirmed rather than quietly filled in.
+                </p>
+              </section>
+              <section>
+                <p class="t-label">Authorization is yours</p>
+                <p>
+                  Active work against a live target is gated on your affirmation that you are
+                  authorized to test it. APIaxess records that affirmation in the session audit.
+                </p>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==========================================================
+             4. APK workflow
+             ========================================================== -->
+        <section class="view" id="view-apk" data-view="apk" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Input / Android APK</p>
+              <h1 class="t-display">APK analysis</h1>
+              <p>
+                Point the engine at an APK on this machine and run the pipeline. Each stage
+                contributes facts; the fused surface is assembled from all of them.
+              </p>
+            </div>
+            <div class="view-head__actions">
+              <button class="btn" type="button" data-nav="surface">View surface</button>
+              <button class="btn" type="button" data-nav="export">Export artifacts</button>
+            </div>
+          </div>
+
+          <div class="workflow">
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="apk"></span><h2>Artifact</h2></div>
+                  <span class="panel__hint">local path</span>
+                </div>
+                <div class="panel__body stack">
+                  <div class="field">
+                    <label class="field__label" for="apk-path">APK path</label>
+                    <div class="filepicker">
+                      <input
+                        class="input input--mono"
+                        id="apk-path"
+                        type="text"
+                        spellcheck="false"
+                        placeholder="C:\path\to\target.apk"
+                      />
+                      <button class="btn" id="apk-browse" type="button">Browse…</button>
+                    </div>
+                    <input id="apk-file" type="file" accept=".apk,.apks,.xapk,.aab" hidden />
+                    <p class="field__hint">
+                      The engine reads the file directly from disk, so the path must be reachable by
+                      this machine. Browsing fills in the file name; paste a full path if the
+                      browser does not expose one.
+                    </p>
+                  </div>
+
+                  <div class="form-grid form-grid--split">
+                    <div class="field">
+                      <label class="field__label" for="apk-run-id">Run ID</label>
+                      <input class="input input--mono" id="apk-run-id" type="text" placeholder="auto" />
+                      <p class="field__hint">Optional. Left blank, the engine assigns one.</p>
+                    </div>
+                    <div class="field">
+                      <label class="field__label" for="apk-intake-root">Intake output root</label>
+                      <input class="input input--mono" id="apk-intake-root" type="text" placeholder="default" />
+                      <p class="field__hint">Optional working directory for unpacked artifacts.</p>
+                    </div>
+                  </div>
+
+                  <div class="stack stack--tight">
+                    <p class="t-label">Passes</p>
+                    <label class="check">
+                      <input id="apk-dynamic" type="checkbox" checked />
+                      <span>
+                        Run the sandbox dynamic pass
+                        <br />
+                        <span class="t-subtle t-small"
+                          >Executes the app in the sandbox to observe live requests. Slower, and the
+                          single biggest source of confirmed facts.</span
+                        >
+                      </span>
+                    </label>
+                    <label class="check">
+                      <input id="apk-static-only" type="checkbox" />
+                      <span>
+                        Static only
+                        <br />
+                        <span class="t-subtle t-small"
+                          >Skips dynamic and signing recovery entirely. Fastest, lowest
+                          confidence.</span
+                        >
+                      </span>
+                    </label>
+                  </div>
+                </div>
+                <div class="panel__footer row">
+                  <button class="btn btn--primary btn--lg" id="apk-run" type="button">
+                    <span data-icon="play"></span> Run pipeline
+                  </button>
+                  <button class="btn" id="apk-refresh" type="button">
+                    <span data-icon="refresh"></span> Refresh status
+                  </button>
+                </div>
+              </article>
+
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="shield"></span><h2>Scope</h2></div>
+                  <span class="panel__hint">advisory</span>
+                </div>
+                <div class="panel__body">
+                  <div id="apk-scope-note" class="notice">
+                    <span class="notice__icon" data-icon="info"></span>
+                    <div class="notice__body">
+                      <p class="notice__title">Analysis stays inside the session's declared scope</p>
+                      <p>
+                        The dynamic pass exercises the app against its own hosts. Confirm you are
+                        authorized to analyse this artifact and to let it reach its backends.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </div>
+
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="pipeline"></span><h2>Analysis pipeline</h2></div>
+                  <span id="pipeline-status" class="panel__hint">No run loaded</span>
+                </div>
+                <div class="panel__body" id="pipeline-progress"></div>
+              </article>
+
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="alert"></span><h2>Pipeline diagnostics</h2></div>
+                  <span id="pipeline-diagnostics-count" class="panel__hint">none</span>
+                </div>
+                <div class="panel__body panel__body--flush scroll-region" id="pipeline-diagnostics"></div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==========================================================
+             5 + 6. Web workflow and discovery
+             ========================================================== -->
+        <section class="view" id="view-web" data-view="web" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Input / Web domain</p>
+              <h1 class="t-display">Web capture</h1>
+              <p>
+                Declare the target, capture real traffic through the bundled browser, and fuse what
+                was actually observed into an API surface.
+              </p>
+            </div>
+            <div class="view-head__actions">
+              <button class="btn" type="button" data-nav="workbench">Open workbench</button>
+              <button class="btn" type="button" data-nav="surface">View surface</button>
+            </div>
+          </div>
+
+          <div class="workflow">
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="web"></span><h2>Target</h2></div>
+                  <span id="web-session-badge" class="panel__hint">not started</span>
+                </div>
+                <div class="panel__body stack">
+                  <div class="field">
+                    <label class="field__label" for="web-target">Web target</label>
+                    <input
+                      class="input input--lg input--mono"
+                      id="web-target"
+                      type="url"
+                      placeholder="https://example.com"
+                      autocomplete="off"
+                      spellcheck="false"
+                    />
+                  </div>
+
+                  <!-- 16. Authorization affirmation: stated once, prominent,
+                       and not repeated once it has been recorded. -->
+                  <div class="notice notice--accent" id="web-authorization">
+                    <span class="notice__icon" data-icon="shield"></span>
+                    <div class="notice__body">
+                      <p class="notice__title">Authorization</p>
+                      <p>
+                        Starting a session establishes an active scope: APIaxess will send requests
+                        to this target. Affirm once; the affirmation is recorded in the session
+                        audit trail.
+                      </p>
+                      <label class="check">
+                        <input id="web-authorize" type="checkbox" />
+                        <span>I am authorized to test this target.</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div id="web-authorized-note" hidden>
+                    <div class="notice notice--success">
+                      <span class="notice__icon" data-icon="check"></span>
+                      <div class="notice__body">
+                        <p class="notice__title">Authorization recorded</p>
+                        <p id="web-session-status">Session active.</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="panel__footer row">
+                  <button class="btn btn--primary btn--lg" id="web-start" type="button">
+                    <span data-icon="play"></span> Start web session
+                  </button>
+                </div>
+              </article>
+
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="browser"></span><h2>Capture browser</h2></div>
+                  <span class="panel__hint">bundled chromium</span>
+                </div>
+                <div class="panel__body stack">
+                  <p class="t-small t-muted">
+                    Traffic is captured through the session proxy. Browse the target the way a user
+                    would; every in-scope request becomes evidence.
+                  </p>
+                  <div id="browser-state" class="notice">
+                    <span class="notice__icon" data-icon="info"></span>
+                    <div class="notice__body">
+                      <p class="notice__title">Browser not running</p>
+                      <p>Start a session first, then launch the capture browser.</p>
+                    </div>
+                  </div>
+                  <div id="capture-health"></div>
+                </div>
+                <div class="panel__footer row">
+                  <button class="btn btn--primary" id="capture-launch" type="button">
+                    <span data-icon="browser"></span> Launch capture browser
+                  </button>
+                  <button class="btn btn--danger" id="capture-stop" type="button">
+                    <span data-icon="stop"></span> Stop browser
+                  </button>
+                </div>
+              </article>
+
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="surface"></span><h2>Fuse and export</h2></div>
+                  <span class="panel__hint">observation-based</span>
+                </div>
+                <div class="panel__body">
+                  <p class="t-small t-muted">
+                    Fusion turns captured flows into a unified surface. Coverage reflects only what
+                    was observed — unvisited routes stay absent rather than inferred.
+                  </p>
+                </div>
+                <div class="panel__footer row">
+                  <button class="btn btn--primary" id="web-fuse" type="button">
+                    <span data-icon="surface"></span> Fuse captured traffic
+                  </button>
+                  <button class="btn" id="web-export" type="button">
+                    <span data-icon="export"></span> Export artifacts
+                  </button>
+                </div>
+              </article>
+            </div>
+
+            <div class="workflow__col">
+              <!-- 6. Discovery -->
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="discovery"></span><h2>Active discovery</h2></div>
+                  <span id="discovery-badge" class="panel__hint">idle</span>
+                </div>
+                <div class="panel__body stack">
+                  <div class="form-grid form-grid--split">
+                    <div class="field">
+                      <label class="field__label" for="discovery-kind">Discovery type</label>
+                      <select class="select" id="discovery-kind">
+                        <option value="directory">Directories / paths</option>
+                        <option value="subdomain">Subdomains</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label class="field__label" for="discovery-wordlist">Wordlist</label>
+                      <select class="select" id="discovery-wordlist">
+                        <option value="small">Small</option>
+                        <option value="medium">Medium</option>
+                        <option value="large">Large</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div id="discovery-estimate-view">
+                    <div class="state state--compact">
+                      <span class="state__icon" data-icon="clock" data-icon-size="24"></span>
+                      <p class="state__body">
+                        Estimate first to see how many requests this will send and how long it will
+                        take before anything is probed.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div id="discovery-progress"></div>
+                  <p id="discovery-status" class="t-small t-subtle" role="status" aria-live="polite"></p>
+                </div>
+                <div class="panel__footer row">
+                  <button class="btn" id="discovery-estimate" type="button">
+                    <span data-icon="clock"></span> Estimate
+                  </button>
+                  <button class="btn btn--primary" id="discovery-run" type="button">
+                    <span data-icon="discovery"></span> Run discovery
+                  </button>
+                  <button class="btn btn--danger" id="discovery-stop" type="button">
+                    <span data-icon="stop"></span> Cancel
+                  </button>
+                </div>
+              </article>
+
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="traffic"></span><h2>Discovery results</h2></div>
+                  <span id="discovery-results-count" class="panel__hint">0 hits</span>
+                </div>
+                <div class="panel__body panel__body--flush discovery-results" id="discovery-results"></div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==========================================================
+             7. Workbench
+             ========================================================== -->
+        <section class="view view--full" id="view-workbench" data-view="workbench" hidden>
+          <div class="workbench">
+            <div class="workbench__bar">
+              <span class="section-label"><span data-icon="traffic"></span> Workbench</span>
+              <label class="check">
+                <input id="intercept-toggle" type="checkbox" />
+                <span>Intercept matching requests</span>
+              </label>
+              <div class="field field--inline workbench__filter">
+                <label class="field__label" for="host-filter" title="Limits which hosts are paused when intercept is on. This is not the session engagement scope.">Intercept hosts</label>
+                <input
+                  class="input input--mono"
+                  id="host-filter"
+                  type="text"
+                  placeholder="blank = all hosts · api.example.com, *.internal"
+                  spellcheck="false"
+                />
+              </div>
+              <span class="spacer"></span>
+              <button class="btn btn--sm btn--quiet" id="har-import" type="button" title="Import a Burp/Chrome HAR into this session's traffic">
+                <span data-icon="folder"></span> Import HAR
+              </button>
+              <button class="btn btn--sm btn--quiet" id="har-export" type="button" title="Export this session's captured traffic as HAR">
+                <span data-icon="export"></span> Export HAR
+              </button>
+              <input id="har-file" type="file" accept=".har,application/json" hidden />
+              <span id="workbench-counts" class="t-small t-subtle t-numeric">0 flows</span>
+            </div>
+
+            <div class="workbench__grid">
+              <div class="workbench__pane workbench__pane--flows">
+                <article class="panel">
+                  <div class="panel__header">
+                    <div class="panel__heading"><span data-icon="traffic"></span><h2>Live traffic</h2></div>
+                    <span class="panel__hint">lossy telemetry</span>
+                  </div>
+                  <div class="workbench__scroll">
+                    <div class="list" id="flow-list" aria-live="polite"></div>
+                  </div>
+                </article>
+              </div>
+
+              <div class="workbench__pane workbench__pane--queue">
+                <article class="panel">
+                  <div class="panel__header">
+                    <div class="panel__heading"><span data-icon="pause"></span><h2>Intercept queue</h2></div>
+                    <span class="panel__hint">reliable control</span>
+                  </div>
+                  <div class="workbench__scroll">
+                    <div class="list" id="queue-list"></div>
+                  </div>
+                </article>
+              </div>
+
+              <div class="workbench__pane workbench__pane--detail">
+                <article class="panel">
+                  <div class="panel__header">
+                    <div class="panel__heading">
+                      <span data-icon="chevronRight"></span><h2 id="selected-label">Select a flow</h2>
+                    </div>
+                    <div class="row" id="detail-actions"></div>
+                  </div>
+                  <div class="workbench__scroll">
+                    <div class="panel__body" id="flow-detail"></div>
+
+                    <section id="editor" class="panel__body" hidden>
+                      <div class="stack">
+                        <p class="section-label">In-flight request editor</p>
+                        <div class="field">
+                          <label class="field__label" for="edit-method">Method</label>
+                          <input class="input input--mono" id="edit-method" />
+                        </div>
+                        <div class="field">
+                          <label class="field__label" for="edit-headers">Headers</label>
+                          <textarea class="textarea" id="edit-headers" spellcheck="false"></textarea>
+                        </div>
+                        <div class="field">
+                          <label class="field__label" for="edit-body">Body</label>
+                          <textarea class="textarea textarea--wrap" id="edit-body" spellcheck="false"></textarea>
+                        </div>
+                        <div class="row">
+                          <button class="btn btn--primary" id="forward" type="button" disabled>Forward</button>
+                          <button class="btn" id="forward-modified" type="button" disabled>Forward modified</button>
+                          <button class="btn btn--danger" id="drop" type="button" disabled>Drop</button>
+                        </div>
+                        <p id="intercept-note" class="t-small t-subtle" role="status" aria-live="polite"></p>
+                      </div>
+                    </section>
+                  </div>
+                </article>
+              </div>
+            </div>
+
+            <section class="workbench__drawer" id="repeater-panel" hidden></section>
+            <section class="workbench__drawer" id="intruder-panel" hidden></section>
+          </div>
+        </section>
+
+        <!-- ==========================================================
+             8. Unified API surface
+             ========================================================== -->
+        <section class="view" id="view-surface" data-view="surface" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Result / Unified API surface</p>
+              <h1 class="t-display">API surface</h1>
+              <p>
+                Every endpoint below is backed by evidence. Confidence is the weakest fact
+                supporting it, and coverage states plainly what remains unconfirmed.
+              </p>
+            </div>
+            <div class="view-head__actions">
+              <button class="btn" id="surface-refresh" type="button">
+                <span data-icon="refresh"></span> Refresh
+              </button>
+              <button class="btn btn--primary" type="button" data-nav="export">
+                <span data-icon="export"></span> Export artifacts
+              </button>
+            </div>
+          </div>
+          <div id="surface-view"></div>
+        </section>
+
+        <!-- ==========================================================
+             9. Artifact export
+             ========================================================== -->
+        <section class="view" id="view-export" data-view="export" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Output / Artifacts</p>
+              <h1 class="t-display">Export</h1>
+              <p>
+                Emit the current surface as machine-readable artifacts. Everything is written to a
+                local directory on this machine.
+              </p>
+            </div>
+          </div>
+
+          <div class="workflow">
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="export"></span><h2>Formats</h2></div>
+                  <span class="panel__hint">select one or more</span>
+                </div>
+                <div class="panel__body stack">
+                  <label class="check">
+                    <input type="checkbox" data-format="openapi" checked />
+                    <span>
+                      OpenAPI 3.1
+                      <br /><span class="t-subtle t-small">Specification document for the fused surface.</span>
+                    </span>
+                  </label>
+                  <label class="check">
+                    <input type="checkbox" data-format="sdk" checked />
+                    <span>
+                      Python SDK
+                      <br /><span class="t-subtle t-small">Typed client generated from the surface.</span>
+                    </span>
+                  </label>
+                  <label class="check">
+                    <input type="checkbox" data-format="postman" checked />
+                    <span>
+                      Postman collection
+                      <br /><span class="t-subtle t-small">Importable request collection.</span>
+                    </span>
+                  </label>
+                  <label class="check">
+                    <input type="checkbox" data-format="har" checked />
+                    <span>
+                      HAR
+                      <br /><span class="t-subtle t-small">Raw captured traffic archive.</span>
+                    </span>
+                  </label>
+
+                  <hr class="rule" />
+
+                  <div class="field">
+                    <label class="field__label" for="export-dir">Output directory</label>
+                    <input class="input input--mono" id="export-dir" type="text" value="artifacts/web" spellcheck="false" />
+                    <p class="field__hint">Relative paths resolve against the engine's working directory.</p>
+                  </div>
+                </div>
+                <div class="panel__footer row">
+                  <button class="btn btn--primary btn--lg" id="export-run" type="button">
+                    <span data-icon="export"></span> Export
+                  </button>
+                </div>
+              </article>
+            </div>
+
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="info"></span><h2>Result</h2></div>
+                  <span id="export-badge" class="panel__hint">not run</span>
+                </div>
+                <div class="panel__body" id="export-result"></div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==========================================================
+             10. Session management
+             ========================================================== -->
+        <section class="view" id="view-session" data-view="session" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Durable state</p>
+              <h1 class="t-display">Session</h1>
+              <p>
+                Sessions are durable: captured traffic, repeater history, intruder jobs, pipeline
+                state, and the audit trail all survive a restart.
+              </p>
+            </div>
+            <div class="view-head__actions">
+              <button class="btn" id="session-new" type="button"><span data-icon="plus"></span> New</button>
+              <button class="btn" id="session-open" type="button"><span data-icon="folder"></span> Open…</button>
+              <button class="btn btn--primary" id="session-save" type="button">
+                <span data-icon="save"></span> Save
+              </button>
+            </div>
+          </div>
+
+          <div class="workflow">
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="session"></span><h2>Status</h2></div>
+                  <span id="session-badge" class="panel__hint">unknown</span>
+                </div>
+                <div class="panel__body" id="session-detail"></div>
+              </article>
+            </div>
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="clock"></span><h2>Audit trail</h2></div>
+                  <span id="audit-count" class="panel__hint">0 records</span>
+                </div>
+                <div class="panel__body panel__body--flush audit-list" id="session-audit"></div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==========================================================
+             19. About / help
+             ========================================================== -->
+        <section class="view" id="view-settings" data-view="settings" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Settings</p>
+              <h1 class="t-display">Configuration</h1>
+              <p>
+                Operator settings. Saved values persist to the app config directory and are honored by the engine on
+                its next start. An environment variable set outside the app always takes precedence.
+              </p>
+            </div>
+            <div class="view-head__actions">
+              <button class="btn btn--primary btn--lg" id="settings-save" type="button">
+                <span data-icon="check" data-icon-size="18"></span> Save changes
+              </button>
+            </div>
+          </div>
+          <div class="settings">
+            <article class="panel">
+              <div class="panel__header">
+                <div class="panel__heading"><span data-icon="spark"></span><h2>Appearance</h2></div>
+                <span class="panel__hint">this machine</span>
+              </div>
+              <div class="panel__body stack">
+                <div class="field">
+                  <span class="field__label">Theme</span>
+                  <div class="choice-group" role="radiogroup" aria-label="Theme">
+                    <label class="choice">
+                      <input type="radio" name="theme" data-theme-option="dark" checked />
+                      <span class="choice__body">
+                        <span data-icon="moon" data-icon-size="18"></span>
+                        <span class="choice__text">
+                          <span class="choice__title">Dark</span>
+                          <span class="choice__hint">The kit's Ink ground. Default.</span>
+                        </span>
+                      </span>
+                    </label>
+                    <label class="choice">
+                      <input type="radio" name="theme" data-theme-option="light" />
+                      <span class="choice__body">
+                        <span data-icon="sun" data-icon-size="18"></span>
+                        <span class="choice__text">
+                          <span class="choice__title">Light</span>
+                          <span class="choice__hint">The kit's Paper ground.</span>
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                  <p class="field__hint">
+                    Applies immediately and is remembered on this machine. It is a display choice
+                    only — no engine setting changes and no restart is needed.
+                  </p>
+                </div>
+              </div>
+            </article>
+            <div id="settings-body" class="settings__engine"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-about" data-view="about" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">About</p>
+              <h1 class="t-display">APIaxess</h1>
+              <p>API surface reconstruction from Android artifacts and live web targets.</p>
+            </div>
+          </div>
+
+          <div class="about">
+            <article class="panel">
+              <div class="panel__header">
+                <div class="panel__heading"><span data-icon="info"></span><h2>Build</h2></div>
+              </div>
+              <div class="panel__body">
+                <dl class="kv" id="about-build"></dl>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel__header">
+                <div class="panel__heading"><span data-icon="help"></span><h2>Keyboard</h2></div>
+              </div>
+              <div class="panel__body">
+                <ul class="shortcut-list">
+                  <li><span>Diagnostics drawer</span><kbd>Esc</kbd></li>
+                  <li><span>Close dialog</span><kbd>Esc</kbd></li>
+                  <li><span>Confirm dialog</span><kbd>Enter</kbd></li>
+                </ul>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel__header">
+                <div class="panel__heading"><span data-icon="spark"></span><h2>Identity</h2></div>
+                <span class="panel__hint">kit v2.1</span>
+              </div>
+              <div class="about__mark" id="about-lockup"></div>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- ============================================================
+         11. Diagnostics drawer — what / why / fix, everywhere
+         ============================================================ -->
+    <aside
+      class="diagnostics-drawer"
+      id="diagnostics-drawer"
+      aria-label="Diagnostics"
+      hidden
+    >
+      <div class="diagnostics-drawer__head">
+        <span class="section-label"><span data-icon="alert"></span> Diagnostics</span>
+        <button class="btn btn--quiet btn--icon" id="diagnostics-close" type="button">
+          <span data-icon="close" data-icon-size="18"></span><span class="visually-hidden">Close diagnostics</span>
+        </button>
+      </div>
+      <div class="diagnostics-drawer__list" id="diagnostic-text"></div>
+      <div class="diagnostics-drawer__foot row row--between">
+        <span id="diagnostics-summary" class="t-small t-subtle">No diagnostics</span>
+        <button class="btn btn--sm" id="diagnostics-clear" type="button">Clear</button>
+      </div>
+    </aside>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+    <div id="overlay-root"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

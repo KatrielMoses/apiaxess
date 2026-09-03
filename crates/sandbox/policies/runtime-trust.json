@@ -1,0 +1,13 @@
+{
+  "policy_id": "apiaxess.runtime-trust",
+  "version": 1,
+  "vulnerabilities": [
+    {
+      "finding_id": "CVE-2026-0073",
+      "fixed_in_patch": "2026-05-01",
+      "exploitability": "adb.exposed",
+      "mitigation": "adb.loopback_only && adb.key_authenticated && adb.ephemeral",
+      "vex_justification": "inline_mitigations_already_exist"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package apiaxess.plugin.discovery_brain.v1;
+
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.discovery_brain.v1";
+
+// Logical interface ID: apiaxess.discovery-brain, interface version 1.0.
+message DiscoverRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  apiaxess.plugin.v1.OperationContext context = 1;
+  // application/vnd.apiaxess.public-surface+protobuf; immutable projection only.
+  apiaxess.plugin.v1.ArtifactRef surface_snapshot = 2;
+  // Target-specific public context, never an internal engine object.
+  repeated apiaxess.plugin.v1.ArtifactRef target_context = 3;
+  repeated string requested_goal_ids = 4;
+}
+
+message DiscoverResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  // application/vnd.apiaxess.discovery-proposals+protobuf.
+  apiaxess.plugin.v1.ArtifactRef proposal_batch = 1;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 2;
+  bool partial = 3;
+}
+
+message ExplainRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  apiaxess.plugin.v1.OperationContext context = 1;
+  apiaxess.plugin.v1.ArtifactRef proposal_batch = 2;
+  repeated string proposal_ids = 3;
+}
+
+message ExplainResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  // Explanations are artifact-backed to support large traces without copies.
+  apiaxess.plugin.v1.ArtifactRef explanation = 1;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 2;
+}
+
+service DiscoveryBrainService {
+  option (apiaxess.plugin.v1.service_evolution) = { since: { major: 1 minor: 0 } };
+
+  rpc Discover(DiscoverRequest) returns (DiscoverResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Explain(ExplainRequest) returns (ExplainResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

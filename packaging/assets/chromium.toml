@@ -1,0 +1,22 @@
+# APIaxess Browser — official Chromium snapshot acquisition manifest.
+#
+# These are official Chromium browser snapshots, not Google Chrome or Chrome
+# for Testing. The archive hashes are pinned so packaging never substitutes a
+# user-installed browser or an unreviewed runtime.
+schema_version = 1
+product = "APIaxess Browser"
+source = "official-chromium-snapshots"
+license = "BSD-3-Clause"
+notice = "Chromium and third-party notices are shipped beside the runtime."
+
+[windows_x64]
+revision = "1687903"
+archive = "chrome-win.zip"
+sha256 = "79caf3d38ddcc8d42ed61515112bf3349888a2c132ec1dcb503977b801980925"
+install_path = "runtime/chromium/chrome.exe"
+
+[linux_x64]
+revision = "1687922"
+archive = "chrome-linux.zip"
+sha256 = "0fa06bae3dd20c7f8abb26df69883cf0155c02fd39ec49285d3d9e6a85ff2a57"
+install_path = "share/apiaxess/chromium/chrome"

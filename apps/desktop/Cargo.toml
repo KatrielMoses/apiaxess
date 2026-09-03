@@ -1,0 +1,22 @@
+[package]
+name = "apiaxess-desktop"
+description = "APIaxess native desktop shell (Tauri) around the engine-served GUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+apiaxess-external-tools = { path = "../../crates/external-tools" }
+open = "5"
+# common-controls-v6 makes the custom button labels render on Windows.
+rfd = { version = "0.15", features = ["common-controls-v6"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+
+[lints]
+workspace = true

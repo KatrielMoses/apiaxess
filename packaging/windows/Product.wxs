@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="APIaxess"
+      Manufacturer="APIaxess"
+      Version="$(var.ProductVersion)"
+      ProductCode="$(var.ProductCode)"
+      UpgradeCode="6D8A6468-4687-4C79-A8BB-840DB1453CB6"
+      Scope="perUser"
+      InstallerVersion="500">
+    <SummaryInformation
+        Description="APIaxess local security analysis and workbench"
+        Keywords="API security, pentesting, workbench" />
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of APIaxess is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="PerUserProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="APIaxess" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="APIaxess" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="APIaxess" Level="1">
+      <ComponentGroupRef Id="ApplicationFiles" />
+    </Feature>
+  </Package>
+</Wix>

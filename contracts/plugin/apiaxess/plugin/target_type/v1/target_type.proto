@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package apiaxess.plugin.target_type.v1;
+
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.target_type.v1";
+
+// Logical interface ID: apiaxess.target-type, interface version 1.0.
+message ProbeRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  apiaxess.plugin.v1.OperationContext context = 1;
+  apiaxess.plugin.v1.ArtifactRef artifact = 2;
+  // A bounded prefix/suffix may be supplied without copying the full artifact.
+  repeated apiaxess.plugin.v1.ArtifactSliceRef hints = 3;
+}
+
+message ProbeResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  string target_type_id = 1;
+  // 0..10000 basis points; this is plugin routing confidence, not model confidence.
+  uint32 match_basis_points = 2;
+  repeated string observed_media_types = 3;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 4;
+}
+
+message InspectRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  apiaxess.plugin.v1.OperationContext context = 1;
+  string target_type_id = 2;
+  apiaxess.plugin.v1.ArtifactRef artifact = 3;
+  repeated string requested_inventory_ids = 4;
+}
+
+message InspectResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+
+  // Public inventory/observation schemas are versioned independently by schema_id.
+  apiaxess.plugin.v1.ArtifactRef target_inventory = 1;
+  repeated apiaxess.plugin.v1.ArtifactRef observation_batches = 2;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 3;
+  bool partial = 4;
+}
+
+service TargetTypeService {
+  option (apiaxess.plugin.v1.service_evolution) = { since: { major: 1 minor: 0 } };
+
+  rpc Probe(ProbeRequest) returns (ProbeResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Inspect(InspectRequest) returns (InspectResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "apiaxess-static-pass"
+description = "Phase 1.4 static-pass normalization, session commit, and honesty handoff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-artifact-intake = { path = "../artifact-intake" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+apiaxess-network-extraction = { path = "../network-extraction" }
+apiaxess-network-routing = { path = "../network-routing" }
+apiaxess-session = { path = "../session" }
+chrono.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

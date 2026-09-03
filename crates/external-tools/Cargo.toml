@@ -1,0 +1,14 @@
+[package]
+name = "apiaxess-external-tools"
+description = "Exclusive boundary for external tool discovery and execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+process-wrap.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

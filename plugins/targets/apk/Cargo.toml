@@ -1,0 +1,31 @@
+[package]
+name = "apiaxess-target-apk"
+description = "Android APK/AAB/APKS target intake and normalized decomposition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-artifact-intake = { path = "../../../crates/artifact-intake" }
+apiaxess-diagnostics = { path = "../../../crates/diagnostics" }
+apiaxess-external-tools = { path = "../../../crates/external-tools" }
+apiaxess-protection-detector = { path = "../../../crates/protection-detector" }
+serde.workspace = true
+zip = "2.2.2"
+
+[dev-dependencies]
+apiaxess-network-extraction = { path = "../../../crates/network-extraction" }
+apiaxess-network-routing = { path = "../../../crates/network-routing" }
+apiaxess-static-pass = { path = "../../../crates/static-pass" }
+apiaxess-sandbox = { path = "../../../crates/sandbox" }
+apiaxess-host-capabilities = { path = "../../../crates/host-capabilities" }
+apiaxess-dynamic-capture = { path = "../../../crates/dynamic-capture" }
+apiaxess-session = { path = "../../../crates/session" }
+apiaxess-workbench-proxy = { path = "../../../crates/workbench-proxy" }
+apiaxess-workbench-store = { path = "../../../crates/workbench-store" }
+chrono.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

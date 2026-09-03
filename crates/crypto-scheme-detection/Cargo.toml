@@ -1,0 +1,16 @@
+[package]
+name = "apiaxess-crypto-scheme-detection"
+description = "Template-based signing-scheme detection for Phase 4.2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-crypto-capture = { path = "../crypto-capture" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+serde.workspace = true
+
+[lints]
+workspace = true

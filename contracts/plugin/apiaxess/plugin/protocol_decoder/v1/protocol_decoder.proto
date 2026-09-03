@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package apiaxess.plugin.protocol_decoder.v1;
+
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.protocol_decoder.v1";
+
+// Logical interface ID: apiaxess.protocol-decoder, interface version 1.0.
+message ProbeRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  apiaxess.plugin.v1.ArtifactSliceRef sample = 2;
+  string transport_hint = 3;
+}
+
+message ProbeResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  string protocol_id = 1;
+  uint32 match_basis_points = 2;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 3;
+}
+
+message DecodeRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  string protocol_id = 2;
+  apiaxess.plugin.v1.StreamRef input = 3;
+  string direction = 4;
+}
+
+message DecodeResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  // Decoded frames/field trees are written once and returned by reference.
+  apiaxess.plugin.v1.ArtifactRef decoded_frames = 1;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 2;
+  bool partial = 3;
+}
+
+service ProtocolDecoderService {
+  option (apiaxess.plugin.v1.service_evolution) = { since: { major: 1 minor: 0 } };
+  rpc Probe(ProbeRequest) returns (ProbeResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Decode(DecodeRequest) returns (DecodeResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

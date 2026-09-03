@@ -1,0 +1,26 @@
+# APIaxess in-house clean-room structural corpus fixture v1
+# This fixture records independently collected structural facts and is not a
+# copy of any third-party detection rule set.
+compiler:~~D8{
+compiler:~~R8{
+jiagu:libjiagu.so
+jiagu:com.qihoo.util
+legu:liblegu.so
+legu:com.tencent.StubShell
+bangcle:libsecexe.so
+bangcle:com.secneo
+aliprotect:libmobisec.so
+aliprotect:com.ali.mobisec
+ijiami:libijiami.so
+ijiami:com.ijiami
+dexprotector:libdexprotector.so
+dexprotector:assets/eprotect.dat
+baidu:libbaiduprotect.so
+baidu:com.baidu.protect
+loader:dalvik.system.DexClassLoader
+loader:dalvik.system.InMemoryDexClassLoader
+loader:System.loadLibrary
+payload:assets/jiagu_data.bin
+payload:assets/secData0.jar
+rasp:ptrace
+rasp:integrity

@@ -1,0 +1,33 @@
+# APIaxess bundled ffuf — discovery/fuzzing binary acquisition manifest.
+#
+# ffuf is a statically-linked Go binary with no runtime. APIaxess bundles the
+# per-platform official release binary and invokes it by absolute path — never a
+# host-installed ffuf. The official release binaries are built with CGO disabled
+# (fully static, no dynamic loader deps); the Linux artifact is verified to have
+# no program interpreter / dynamic library dependencies at packaging time.
+#
+# Licensing: ffuf is MIT — clean to redistribute; the upstream LICENSE travels
+# with the payload and is recorded in the SBOM. (ffuf's "sponsorware" 30-day
+# early-access model does not affect released binaries, which are MIT.)
+#
+# Archive hashes are pinned to the values published in the release
+# `ffuf_<version>_checksums.txt` so the build never substitutes a host binary.
+schema_version = 1
+product = "APIaxess bundled ffuf"
+version = "2.2.1"
+license = "MIT"
+
+[windows_x64]
+archive = "ffuf_2.2.1_windows_amd64.zip"
+url = "https://github.com/ffuf/ffuf/releases/download/v2.2.1/ffuf_2.2.1_windows_amd64.zip"
+sha256 = "717e3d103ee36ce743a18605be66a4424fca27758eebed1e8ebb2eb0a3645589"
+# Name of the binary inside the archive, and its install-relative destination.
+binary = "ffuf.exe"
+install_path = "tools/ffuf/ffuf.exe"
+
+[linux_x64]
+archive = "ffuf_2.2.1_linux_amd64.tar.gz"
+url = "https://github.com/ffuf/ffuf/releases/download/v2.2.1/ffuf_2.2.1_linux_amd64.tar.gz"
+sha256 = "86307885810d3c36ba4a3e9ba5178c2d9027bba0dd7f4ea39e39e7c972b62396"
+binary = "ffuf"
+install_path = "tools/ffuf/ffuf"

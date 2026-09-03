@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>APIaxess — running in your browser</title>
+    <!--
+      This window is native shell chrome, not part of the engine-served GUI, so
+      it cannot import `tokens.css`. The literal values below are the same kit
+      values that file projects: Ink #0D0D0D as the ground, Signal Blue #2D7FF9
+      lifted to #5B9DFF where it carries text on Ink, Signal Green #00E676 for
+      the running indicator, and the kit's reversed mark in Paper white.
+    -->
+    <style>
+      :root {
+        --ink: #0d0d0d;
+        --raised: #1a1a1a;
+        --rule: #262626;
+        --text: #f0f0f0;
+        --muted: #b0b0b0;
+        --accent: #5b9dff;
+        --green: #00e676;
+      }
+
+      * { box-sizing: border-box; }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--ink);
+        color: var(--text);
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+
+      .wrap {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: clamp(10px, 2.4vh, 18px);
+        text-align: center;
+        padding: clamp(16px, 4vw, 28px);
+      }
+
+      /* The mark scales with the window so a resize never crops or crowds it. */
+      .mark {
+        width: clamp(48px, 16vh, 84px);
+        height: clamp(48px, 16vh, 84px);
+        flex: none;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(15px, 1.2vw + 12px, 18px);
+        font-weight: 600;
+        line-height: 1.35;
+      }
+
+      .url {
+        max-width: 100%;
+        padding: 10px 14px;
+        border: 1px solid var(--rule);
+        border-radius: 8px;
+        background: var(--raised);
+        color: var(--accent);
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: clamp(13px, 0.6vw + 11px, 15px);
+        overflow-wrap: anywhere;
+        user-select: all;
+      }
+
+      .muted {
+        max-width: 460px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        margin-right: 6px;
+        border-radius: 50%;
+        background: var(--green);
+        vertical-align: middle;
+      }
+
+      /* Short windows drop the explanatory copy rather than clipping it. */
+      @media (max-height: 300px) {
+        .muted { display: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <svg class="mark" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="APIaxess">
+        <path d="M134 58 L100 24 L24 100 L100 176 L134 142" stroke="#ffffff" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M56 100 H140" stroke="#2D7FF9" stroke-width="20" stroke-linecap="round"/>
+        <path d="M116 76 L144 100 L116 124" stroke="#2D7FF9" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <h1><span class="dot"></span>APIaxess is running in your browser</h1>
+      <div class="url" id="url">loading…</div>
+      <div class="muted">
+        Your browser was opened at this address. If it didn't open, paste the URL above.
+        <br />Keep this window open while you work — <strong>closing it stops APIaxess</strong>.
+      </div>
+    </div>
+    <script>
+      // The native shell injects the engine URL before this document loads.
+      var url = (typeof window.__APIAXESS_URL__ === "string") ? window.__APIAXESS_URL__ : "";
+      document.getElementById("url").textContent = url || "http://127.0.0.1:7777/";
+    </script>
+  </body>
+</html>

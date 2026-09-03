@@ -1,0 +1,24 @@
+[package]
+name = "apiaxess-app-crawler"
+description = "Autonomous state-graph UI crawler that drives an installed Android app to surface its API traffic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-diagnostics = { path = "../diagnostics" }
+apiaxess-sandbox = { path = "../sandbox" }
+apiaxess-workbench-store = { path = "../workbench-store" }
+chrono.workspace = true
+quick-xml = "0.41.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+[dev-dependencies]
+apiaxess-session = { path = "../session" }
+
+[lints]
+workspace = true

@@ -1,0 +1,1311 @@
+/*
+ * Surface layer: the app shell and the layout of every view.
+ * Values come from tokens.css; component styling lives in components.css.
+ */
+
+/* ================================================================== *
+ * Splash — shown until the first render replaces it
+ * ================================================================== */
+
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-6);
+  background: var(--color-surface);
+  color: var(--color-brand-mark);
+  transition: opacity var(--duration-medium) var(--ease-out);
+}
+
+.splash[hidden] {
+  display: none;
+}
+
+.splash.is-leaving {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.splash__rule {
+  width: 8rem;
+  height: var(--border-hairline);
+  background: var(--color-rule);
+  overflow: hidden;
+  position: relative;
+}
+
+.splash__rule::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--color-accent);
+  transform-origin: left;
+  animation: sweep 1.1s var(--ease-standard) infinite;
+}
+
+@keyframes sweep {
+  0% {
+    transform: scaleX(0);
+  }
+  60% {
+    transform: scaleX(1);
+  }
+  100% {
+    transform: scaleX(1);
+    opacity: 0;
+  }
+}
+
+/* ================================================================== *
+ * Shell
+ * ================================================================== */
+
+.app {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-header);
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  min-height: var(--header-height);
+  padding: 0 var(--layout-gutter);
+  border-bottom: var(--border-hairline) solid var(--color-rule-ink);
+  background: var(--color-surface);
+}
+
+.app-header__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex: none;
+}
+
+.app-header__brand .brand-lockup {
+  padding-right: var(--space-4);
+  border-right: var(--border);
+}
+
+.app-header__context {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.app-header__context-label {
+  font-size: var(--text-nano);
+  letter-spacing: var(--tracking-micro-label);
+  text-transform: uppercase;
+  color: var(--color-text-subtle);
+}
+
+.app-header__context-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  max-width: 11rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.app-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.app-nav__item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--header-height);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-bottom: var(--border-thick) solid transparent;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--text-small);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  transition: var(--transition-control);
+}
+
+.app-nav__item .icon {
+  color: var(--color-text-subtle);
+  transition: var(--transition-control);
+}
+
+.app-nav__label {
+  min-width: 0;
+}
+
+/* The rail is sized to fit at every breakpoint, so scrolling is a fallback
+   rather than the design. When it does engage, the shell marks it and the
+   edges fade, so the overflow is visible instead of silent. */
+.app-nav.is-scrollable {
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--space-4),
+    #000 calc(100% - var(--space-4)),
+    transparent 100%
+  );
+}
+
+.app-nav__item:hover {
+  color: var(--color-text);
+}
+
+.app-nav__item:hover .icon {
+  color: var(--color-text);
+}
+
+.app-nav__item[aria-current="page"] {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+}
+
+.app-nav__item[aria-current="page"] .icon {
+  color: var(--color-accent);
+}
+
+.app-nav__item:disabled {
+  color: var(--color-text-disabled);
+}
+
+.app-nav__item:disabled .icon {
+  color: var(--color-text-disabled);
+}
+
+.app-header__aside {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+}
+
+.engine-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border: var(--border);
+  border-radius: var(--radius-xs);
+  font-size: var(--text-micro);
+  color: var(--color-text-muted);
+  max-width: 20rem;
+}
+
+.engine-status__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagnostics-toggle {
+  position: relative;
+}
+
+.diagnostics-toggle__count {
+  position: absolute;
+  top: -0.3rem;
+  right: -0.3rem;
+  min-width: 1.05rem;
+  height: 1.05rem;
+  padding: 0 0.2rem;
+  border-radius: var(--radius-pill);
+  background: var(--color-caution-ink);
+  color: var(--color-text-inverse);
+  font-size: 0.625rem;
+  font-weight: var(--weight-semibold);
+  line-height: 1.05rem;
+  text-align: center;
+}
+
+.diagnostics-toggle__count[hidden] {
+  display: none;
+}
+
+/* ================================================================== *
+ * Main + views
+ * ================================================================== */
+
+.app-main {
+  min-width: 0;
+  min-height: 0;
+}
+
+.view {
+  display: block;
+  width: 100%;
+  max-width: var(--layout-max);
+  margin: 0 auto;
+  padding: var(--space-10) var(--layout-gutter) var(--space-20);
+}
+
+.view[hidden] {
+  display: none;
+}
+
+/* The workbench manages its own full-height scroll regions. */
+.view--full {
+  max-width: none;
+  padding: 0;
+  height: calc(100vh - var(--shell-header-height));
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.view-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-6);
+  flex-wrap: wrap;
+  padding-bottom: var(--space-5);
+  margin-bottom: var(--space-8);
+  border-bottom: var(--border-hairline) solid var(--color-rule-ink);
+}
+
+.view-head__text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.view-head__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.view-head p {
+  max-width: 46rem;
+  font-size: var(--text-body);
+  color: var(--color-text-muted);
+}
+
+/* ================================================================== *
+ * 3. Landing / entry
+ * ================================================================== */
+
+.landing {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-16);
+  padding-top: var(--space-8);
+}
+
+.landing__hero {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  max-width: 48rem;
+}
+
+.landing__hero h1 {
+  font-size: clamp(2.25rem, 4.5vw, 3.75rem);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-display);
+  line-height: var(--leading-tight);
+}
+
+.landing__hero p {
+  font-size: 1.0625rem;
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+}
+
+.landing__paths {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(24rem, 100%), 1fr));
+  gap: var(--space-6);
+}
+
+.path-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-8);
+  border: var(--border);
+  background: var(--color-surface);
+  text-align: left;
+  transition: var(--transition-control), transform var(--duration-fast) var(--ease-standard);
+}
+
+.path-card:hover {
+  border-color: var(--color-rule-ink);
+}
+
+.path-card:hover .path-card__go {
+  color: var(--color-text-accent);
+}
+
+.path-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.path-card__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 3rem;
+  height: 3rem;
+  border: var(--border-hairline) solid var(--color-rule-ink);
+  color: var(--color-text);
+}
+
+.path-card h2 {
+  font-size: var(--text-title);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-title);
+}
+
+.path-card p {
+  font-size: var(--text-body);
+  color: var(--color-text-muted);
+  line-height: var(--leading-normal);
+}
+
+.path-card__steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-4);
+  border-top: var(--border);
+}
+
+.path-card__step {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  font-size: var(--text-small);
+  color: var(--color-text-muted);
+}
+
+.path-card__step span:first-child {
+  flex: none;
+  width: 1.4rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-nano);
+  color: var(--color-text-subtle);
+}
+
+.path-card__go {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: auto;
+  padding-top: var(--space-4);
+  font-size: var(--text-small);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+  transition: var(--transition-control);
+}
+
+.landing__foot {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(16rem, 100%), 1fr));
+  gap: var(--space-8);
+  padding-top: var(--space-8);
+  border-top: var(--border);
+}
+
+.landing__foot section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.landing__foot p {
+  font-size: var(--text-small);
+  color: var(--color-text-muted);
+  line-height: var(--leading-normal);
+}
+
+/* ================================================================== *
+ * 4/5. Workflow views (APK, web) — form column + status column
+ * ================================================================== */
+
+.workflow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  gap: var(--space-6);
+  align-items: start;
+}
+
+.workflow__col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  min-width: 0;
+}
+
+.form-grid {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.form-grid--split {
+  grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr));
+}
+
+/* ================================================================== *
+ * 6. Discovery
+ * ================================================================== */
+
+.discovery-estimate {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border: var(--border);
+  background: var(--color-surface-sunken);
+}
+
+.discovery-estimate__item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.discovery-estimate__value {
+  font-size: var(--text-subheading);
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
+}
+
+.discovery-results {
+  max-height: 22rem;
+  overflow: auto;
+}
+
+/* ================================================================== *
+ * 7. Workbench
+ * ================================================================== */
+
+.workbench {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.workbench__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  flex-wrap: wrap;
+  padding: var(--space-3) var(--layout-gutter);
+  border-bottom: var(--border);
+  background: var(--color-surface);
+}
+
+.workbench__filter {
+  flex: 1 1 14rem;
+  min-width: 0;
+  /* Wide enough that the placeholder — which is the field's documentation —
+     is readable in full once there is room for it. */
+  max-width: 34rem;
+}
+
+.workbench__filter .input {
+  min-width: 0;
+}
+
+.workbench__grid {
+  display: grid;
+  grid-template-columns: minmax(18rem, 1fr) minmax(15rem, 0.62fr) minmax(22rem, 1.35fr);
+  gap: var(--border-hairline);
+  background: var(--color-rule);
+  flex: 1 1 auto;
+  /* The traffic list and the flow detail stay usable no matter what is open
+     beneath them; the drawers give way first. */
+  min-height: 12rem;
+}
+
+.workbench__pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--color-surface);
+}
+
+.workbench__pane .panel {
+  border: 0;
+  flex: 1;
+  min-height: 0;
+}
+
+.workbench__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Repeater and intruder open beneath the grid as full-width workspaces. */
+/* Repeater and intruder share the column with the grid rather than pushing the
+   page taller, so the traffic list never scrolls out from under the operator. */
+.workbench__drawer {
+  flex: 0 1 auto;
+  border-top: var(--border-hairline) solid var(--color-rule-ink);
+  background: var(--color-surface);
+  max-height: 46%;
+  overflow: auto;
+}
+
+/* The drawer scrolls inside itself, so its title bar stays put — otherwise the
+   boundary between two open drawers reads as content being cut off rather than
+   as a scroll region. */
+.workbench__drawer > .panel__header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--color-surface);
+}
+
+/* Both drawers open at 46% each left nothing for the grid, which then clipped
+   the flow detail mid-row. Two open share the space instead of each claiming
+   the same half. */
+.workbench:has(#repeater-panel:not([hidden]) + #intruder-panel:not([hidden]))
+  .workbench__drawer {
+  max-height: 34%;
+}
+
+.workbench__drawer[hidden] {
+  display: none;
+}
+
+.split-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+  gap: var(--space-5);
+}
+
+.split-4 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(10rem, 100%), 1fr));
+  gap: var(--space-4);
+}
+
+.history {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.history__entry {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: var(--border);
+  background: var(--color-surface);
+}
+
+.history__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.history__revision {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+/* ================================================================== *
+ * 8. Fused surface
+ * ================================================================== */
+
+.surface-endpoints {
+  max-height: 30rem;
+  overflow: auto;
+}
+
+.endpoint-row {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: var(--border);
+}
+
+.endpoint-row:last-child {
+  border-bottom: 0;
+}
+
+.endpoint-row:hover {
+  background: var(--color-surface-sunken);
+}
+
+.endpoint-row__path {
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.endpoint-row__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-micro);
+  color: var(--color-text-subtle);
+  white-space: nowrap;
+}
+
+/* Confidence is shown as a value plus a bar so honest coverage reads at a
+   glance rather than needing to be parsed. */
+.confidence {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.confidence__track {
+  width: 3.5rem;
+  height: 0.25rem;
+  background: var(--color-surface-sunken);
+  border: var(--border-hairline) solid var(--color-rule);
+}
+
+.confidence__fill {
+  height: 100%;
+  background: var(--color-accent);
+}
+
+.confidence--high .confidence__fill {
+  background: var(--color-success);
+}
+
+.confidence--low .confidence__fill {
+  background: var(--color-caution);
+}
+
+/* ================================================================== *
+ * 10. Session
+ * ================================================================== */
+
+.audit-list {
+  max-height: 32rem;
+  overflow: auto;
+}
+
+.audit-row {
+  display: grid;
+  grid-template-columns: minmax(9rem, auto) minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: var(--border);
+  align-items: baseline;
+}
+
+.audit-row:last-child {
+  border-bottom: 0;
+}
+
+.audit-row__time {
+  font-family: var(--font-mono);
+  font-size: var(--text-nano);
+  color: var(--color-text-subtle);
+  white-space: nowrap;
+}
+
+.audit-row__summary {
+  min-width: 0;
+  font-size: var(--text-small);
+}
+
+.audit-row__kind {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--text-nano);
+  color: var(--color-text-subtle);
+  overflow-wrap: anywhere;
+}
+
+/* ================================================================== *
+ * 11. Diagnostics drawer
+ * ================================================================== */
+
+.diagnostics-drawer {
+  position: fixed;
+  top: var(--shell-header-height);
+  right: 0;
+  bottom: 0;
+  z-index: var(--z-drawer);
+  display: flex;
+  flex-direction: column;
+  width: min(30rem, 100vw);
+  background: var(--color-surface);
+  border-left: var(--border-hairline) solid var(--color-rule-ink);
+  box-shadow: var(--shadow-overlay);
+  animation: slide-in var(--duration-medium) var(--ease-out);
+}
+
+.diagnostics-drawer[hidden] {
+  display: none;
+}
+
+@keyframes slide-in {
+  from {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .diagnostics-drawer {
+    animation: none;
+  }
+}
+
+.diagnostics-drawer__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: var(--border-hairline) solid var(--color-rule-ink);
+}
+
+.diagnostics-drawer__list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.diagnostics-drawer__foot {
+  padding: var(--space-3) var(--space-5);
+  border-top: var(--border);
+  background: var(--color-surface-sunken);
+}
+
+/* ================================================================== *
+ * 19. Settings / about
+ * ================================================================== */
+
+.about {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+  gap: var(--space-6);
+}
+
+.about__mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12) var(--space-6);
+  border: var(--border);
+}
+
+/* Two columns at most: with the advanced tool-path panel unbreakable, a third
+   column can only run far past the others. 26rem is the narrowest a settings
+   field reads well at, and it puts the second column in from 1024 up. */
+.settings {
+  columns: 2 26rem;
+  column-gap: var(--space-6);
+}
+
+/* `#settings-body` is a render target, not a layout box: its panels take part
+   in the column flow directly. */
+.settings__engine {
+  display: contents;
+}
+
+.settings > article,
+.settings__engine > article,
+.settings__foot {
+  break-inside: avoid;
+  margin-bottom: var(--space-6);
+}
+
+.settings__foot {
+  display: block;
+}
+
+.shortcut-list {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.shortcut-list li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-2) 0;
+  border-bottom: var(--border);
+  font-size: var(--text-small);
+  color: var(--color-text-muted);
+}
+
+kbd {
+  padding: 0.1rem var(--space-2);
+  border: var(--border-hairline) solid var(--color-rule-strong);
+  border-radius: var(--radius-xs);
+  background: var(--color-surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-nano);
+  color: var(--color-text);
+}
+
+/* ================================================================== *
+ * Responsive
+ *
+ * The ladder below is ordered widest-first so each step only has to describe
+ * what changes. The shape of it:
+ *
+ *   1640   the header's session context yields — it is restated on the Session
+ *          view and in the workbench, so it is the first thing to go
+ *   1440   the engine-status pill collapses to its dot; the label stays in the
+ *          live region and the tooltip
+ *   1400   the workbench drops from three panes to two
+ *   1320   the nav rail takes its own row, which frees enough space on the
+ *          first row to bring the context and the status label back
+ *    980   two-column workflows become one column
+ *    860   the workbench stacks to a single pane, and the nav rail collapses to
+ *          icons spread across the full width
+ *    620   surface padding tightens; key/value and split rows stack
+ *    460   the smallest supported window: minimum gutters and control padding
+ *
+ * The header thresholds carry ~40px of headroom above the width their contents
+ * actually need. A media query is evaluated against the viewport *including*
+ * a classic scrollbar, while the content is laid out in the ~15px that are left
+ * after it — so a threshold set to the exact requirement overflows on any host
+ * that draws one. The desktop shell's WebView2 does; that is what the headroom
+ * is for.
+ *
+ * Every step is exercised at a concrete viewport in the run doc under
+ * `testers/`, and `ui-widths.mjs` sweeps the whole range in between.
+ * ================================================================== */
+
+/* Measured: brand 327 + rail 825 + aside 323 + gaps 48 + gutters 64 = 1587. */
+@media (max-width: 1639px) {
+  .app-header__context {
+    display: none;
+  }
+}
+
+/* Measured: brand 135 + rail 825 + aside 323 + gaps 48 + gutters 64 = 1395. */
+@media (max-width: 1439px) {
+  .engine-status {
+    border-color: transparent;
+    padding: var(--space-1);
+    max-width: none;
+  }
+
+  .engine-status__text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    clip-path: inset(50%);
+  }
+
+  .engine-status .dot {
+    width: 0.5rem;
+    height: 0.5rem;
+  }
+}
+
+@media (max-width: 1400px) {
+  .workbench__grid {
+    grid-template-columns: minmax(16rem, 1fr) minmax(20rem, 1.4fr);
+    grid-template-rows: minmax(12rem, 0.9fr) minmax(0, 1.1fr);
+  }
+
+  .workbench__pane--queue {
+    grid-row: 2;
+  }
+
+  .workbench__pane--detail {
+    grid-row: 1 / span 2;
+    grid-column: 2;
+  }
+}
+
+/* Measured: brand 135 + rail 825 + aside 202 + gaps 48 + gutters 64 = 1274.
+   Below that the rail can no longer share the row without scrolling. */
+@media (max-width: 1319px) {
+  :root {
+    --layout-gutter: var(--space-6);
+  }
+
+  .app-header {
+    flex-wrap: wrap;
+    min-height: auto;
+    padding-top: var(--space-3);
+    padding-bottom: 0;
+    gap: var(--space-4);
+  }
+
+  /* The rail owns the second row, so the first row has room again. */
+  .app-header__context {
+    display: flex;
+  }
+
+  .engine-status {
+    border-color: var(--color-rule);
+    padding: var(--space-1) var(--space-3);
+    max-width: 20rem;
+  }
+
+  .engine-status__text {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    clip-path: none;
+  }
+
+  .engine-status .dot {
+    width: 0.4rem;
+    height: 0.4rem;
+  }
+
+  .app-header__aside {
+    margin-left: auto;
+  }
+
+  .app-nav {
+    order: 3;
+    width: 100%;
+    flex: 1 0 100%;
+  }
+
+  .app-nav__item {
+    height: 3rem;
+  }
+}
+
+@media (max-width: 980px) {
+  .workflow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+}
+
+@media (max-width: 860px) {
+  .app-header__brand .brand-lockup {
+    border-right: 0;
+    padding-right: 0;
+  }
+
+  .app-header__context {
+    display: none;
+  }
+
+  /* Stacked panes need the page to scroll, not the pane column. */
+  .view--full {
+    height: auto;
+    min-height: calc(100vh - var(--shell-header-height));
+    overflow: visible;
+  }
+
+  .workbench {
+    overflow: visible;
+  }
+
+  .workbench__grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+  }
+
+  .workbench__pane {
+    border-bottom: var(--border);
+  }
+
+  .workbench__pane--queue,
+  .workbench__pane--detail {
+    grid-row: auto;
+    grid-column: auto;
+  }
+
+  .workbench__scroll {
+    max-height: 26rem;
+  }
+
+  .workbench__drawer {
+    max-height: none;
+  }
+
+  .workbench__filter {
+    flex: 1 1 100%;
+    max-width: none;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+  }
+
+  .workbench__bar .spacer {
+    display: none;
+  }
+
+  .view {
+    padding-top: var(--space-6);
+    padding-bottom: var(--space-12);
+  }
+
+  .view-head {
+    margin-bottom: var(--space-6);
+  }
+
+  .landing {
+    gap: var(--space-10);
+    padding-top: var(--space-4);
+  }
+
+  .landing__foot {
+    gap: var(--space-6);
+    padding-top: var(--space-6);
+  }
+
+  .endpoint-row,
+  .audit-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2);
+    /* A single-column grid stretches its items, which would blow a status
+       badge out to the full row width. */
+    justify-items: start;
+  }
+
+  .endpoint-row__path {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  /* Icon-only rail, distributed across the width. The labelled rail needs 807px
+     of content (759 for the labels plus the gutters); below this step there is
+     no longer room for it, and seven icon targets fit a 360px window without
+     scrolling. Each keeps its name for assistive tech and as a tooltip. */
+  .app-nav {
+    gap: 0;
+    justify-content: space-between;
+    overflow-x: visible;
+  }
+
+  .app-nav__item {
+    flex: 1 1 0;
+    justify-content: center;
+    min-width: var(--control-height-touch);
+    padding: 0 var(--space-1);
+  }
+
+  .app-nav__item .icon {
+    margin: 0 auto;
+  }
+
+  .app-nav__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .app-nav.is-scrollable {
+    mask-image: none;
+  }
+
+  /* Rows are two or three lines tall once they stack, so a fixed cap shows
+     four of them and cuts the fifth in half. Below this width the page scrolls
+     instead — which also avoids trapping a touch scroll inside a pane. */
+  .scroll-region,
+  .surface-endpoints,
+  .audit-list,
+  .discovery-results {
+    max-height: none;
+  }
+}
+
+@media (max-width: 620px) {
+  :root {
+    --layout-gutter: var(--space-5);
+  }
+
+  /* Measured: brand 118 + aside 208 + gap 12 + gutters 40 = 378, so the header
+     stays on two rows instead of splitting into three. */
+  .engine-status {
+    border-color: transparent;
+    padding: var(--space-1);
+    max-width: none;
+  }
+
+  .engine-status__text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    clip-path: inset(50%);
+  }
+
+  .engine-status .dot {
+    width: 0.5rem;
+    height: 0.5rem;
+  }
+
+  .path-card {
+    gap: var(--space-4);
+    padding: var(--space-5);
+  }
+
+  .path-card__icon {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+
+  .landing__hero p {
+    font-size: var(--text-body);
+  }
+
+  .panel__header {
+    padding: var(--space-3) var(--space-4);
+    min-height: 0;
+  }
+
+  .panel__body {
+    padding: var(--space-4);
+  }
+
+  .panel__footer {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1) 0;
+  }
+
+  .kv dd {
+    margin-bottom: var(--space-2);
+  }
+
+  .about__mark {
+    padding: var(--space-8) var(--space-4);
+  }
+
+  .view-head__actions {
+    width: 100%;
+  }
+
+  .view-head__actions .btn {
+    flex: 1 1 auto;
+  }
+
+  .diagnostics-drawer__head,
+  .diagnostics-drawer__foot {
+    padding: var(--space-3) var(--space-4);
+  }
+}
+
+@media (max-width: 460px) {
+  :root {
+    --layout-gutter: var(--space-4);
+  }
+
+  .app-header {
+    gap: var(--space-3);
+  }
+
+  .app-header__aside {
+    gap: var(--space-1);
+  }
+
+  /* At the floor the rail gives up its comfortable target width so seven items
+     still fit without the row scrolling. */
+  .app-nav__item {
+    min-width: 0;
+  }
+
+  .view {
+    padding-bottom: var(--space-10);
+  }
+
+  .landing {
+    gap: var(--space-8);
+  }
+
+  .path-card {
+    padding: var(--space-4);
+  }
+
+  .endpoint-row,
+  .audit-row {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .list-row {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .discovery-estimate {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .metric {
+    padding: var(--space-3) var(--space-4);
+  }
+}
+
+/* A short window — a laptop with browser chrome, or a resized native window —
+   cannot host a viewport-height workbench without crushing it. */
+@media (max-height: 680px) {
+  .view--full {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .workbench {
+    overflow: visible;
+  }
+
+  .workbench__grid {
+    min-height: 26rem;
+  }
+
+  .workbench__drawer {
+    max-height: none;
+  }
+}

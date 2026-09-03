@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>APIaxess</title>
+    <!-- Kit values, inlined: this document cannot import `tokens.css`. -->
+    <style>
+      html, body { margin: 0; height: 100%; background: #0d0d0d; color: #f0f0f0;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+      .center { height: 100%; display: flex; align-items: center; justify-content: center;
+        flex-direction: column; gap: 14px; padding: 24px; box-sizing: border-box; }
+      .spinner { width: 26px; height: 26px; border: 3px solid #2d7ff9; border-top-color: transparent;
+        border-radius: 50%; animation: spin 0.8s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+      .muted { color: #b0b0b0; font-size: 13px; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <!--
+      This placeholder only satisfies the Tauri asset context at build time. The
+      real UI is the branded GUI served by the local engine; the native shell
+      navigates the webview to http://127.0.0.1:<port>/ once the engine is ready,
+      so this document is not normally shown.
+    -->
+    <div class="center">
+      <div class="spinner"></div>
+      <div class="muted">Starting APIaxess…</div>
+    </div>
+  </body>
+</html>

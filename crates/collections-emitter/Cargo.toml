@@ -1,0 +1,17 @@
+[package]
+name = "apiaxess-collections-emitter"
+description = "Phase 6.3 deterministic Postman collection and HAR emission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+base64.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

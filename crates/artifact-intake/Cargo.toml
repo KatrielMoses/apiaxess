@@ -1,0 +1,15 @@
+[package]
+name = "apiaxess-artifact-intake"
+description = "Stable target-type and normalized artifact handoff contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-diagnostics = { path = "../diagnostics" }
+serde.workspace = true
+zip = "2.2.2"
+
+[lints]
+workspace = true

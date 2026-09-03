@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package apiaxess.plugin.artifact_generator.v1;
+
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.artifact_generator.v1";
+
+// Logical interface ID: apiaxess.artifact-generator, interface version 1.0.
+message DescribeFormatsRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+}
+
+message OutputFormat {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  string format_id = 1;
+  string media_type = 2;
+  string display_name = 3;
+}
+
+message DescribeFormatsResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  repeated OutputFormat formats = 1;
+}
+
+message GenerateRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  string format_id = 2;
+  repeated apiaxess.plugin.v1.ArtifactRef inputs = 3;
+  // Small, format-public options only; secrets arrive through a secret grant.
+  map<string, string> options = 4;
+}
+
+message GenerateResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  repeated apiaxess.plugin.v1.ArtifactRef outputs = 1;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 2;
+  bool partial = 3;
+}
+
+service ArtifactGeneratorService {
+  option (apiaxess.plugin.v1.service_evolution) = { since: { major: 1 minor: 0 } };
+  rpc DescribeFormats(DescribeFormatsRequest) returns (DescribeFormatsResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Generate(GenerateRequest) returns (GenerateResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

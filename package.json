@@ -1,0 +1,10 @@
+{
+  "name": "apiaxess-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "ui:build": "pnpm --filter @apiaxess/gui build",
+    "ui:check": "pnpm --filter @apiaxess/gui check",
+    "ui:dev": "pnpm --filter @apiaxess/gui dev"
+  }
+}

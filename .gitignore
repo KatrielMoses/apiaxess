@@ -1,0 +1,30 @@
+/target/
+node_modules/
+/apps/gui/dist/
+/apps/desktop/gen/
+/artifacts/
+/testers/
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Raw brand identity kit bundle: referenced locally, never committed.
+# The extracted, durable brand values live in apps/gui/src/styles/tokens.css
+# and apps/gui/src/brand/, which are committed.
+/assets/brand/*.html
+
+# Local scratch / working directories — not part of the tracked source tree.
+/tmp/
+/Delzyn/
+/_patch_test.txt
+*.session
+
+# Bundled third-party tool binaries: provided by packaging/installers, not committed.
+/tools/jadx-*/
+/tools/*.zip
+
+# Large third-party copyrighted APK test fixtures: exceed GitHub's file limit and
+# are provided out-of-band for the capstone/bundled integration tests.
+/fixtures/capstone/*.apk
+/fixtures/capstone/*.apkm

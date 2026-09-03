@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package apiaxess.plugin.sandbox_backend.v1;
+
+import "apiaxess/plugin/v1/common.proto";
+import "apiaxess/plugin/v1/evolution.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.apiaxess.plugin.sandbox_backend.v1";
+
+enum SandboxTier {
+  SANDBOX_TIER_UNSPECIFIED = 0;
+  SANDBOX_TIER_AVD = 1;
+  SANDBOX_TIER_REDROID = 2;
+  SANDBOX_TIER_REMOTE_OFFLOAD = 3;
+}
+
+message DescribeRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+}
+
+message BackendDescription {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  string backend_id = 1;
+  SandboxTier tier = 2;
+  string isolation = 3;
+  string tradeoff = 4;
+  repeated string required_host_capability_ids = 5;
+}
+
+message DescribeResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  repeated BackendDescription backends = 1;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 2;
+}
+
+message StartRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  string session_id = 2;
+  string lease_id = 3;
+  SandboxTier tier = 4;
+}
+
+message StartResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.SandboxLeaseRef lease = 1;
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 2;
+}
+
+message TeardownRequest {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  apiaxess.plugin.v1.OperationContext context = 1;
+  apiaxess.plugin.v1.SandboxLeaseRef lease = 2;
+}
+
+message TeardownResponse {
+  option (apiaxess.plugin.v1.message_evolution) = { since: { major: 1 minor: 0 } };
+  repeated apiaxess.plugin.v1.Diagnostic diagnostics = 1;
+}
+
+service SandboxBackendService {
+  option (apiaxess.plugin.v1.service_evolution) = { since: { major: 1 minor: 0 } };
+  rpc Describe(DescribeRequest) returns (DescribeResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Start(StartRequest) returns (StartResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+  rpc Teardown(TeardownRequest) returns (TeardownResponse) {
+    option (apiaxess.plugin.v1.method_evolution) = { since: { major: 1 minor: 0 } };
+  }
+}

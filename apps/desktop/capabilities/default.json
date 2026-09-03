@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The native shell only hosts a webview pointed at the local engine's HTTP server; it exposes no Tauri IPC surface to the page.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

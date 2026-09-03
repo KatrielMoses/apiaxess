@@ -1,0 +1,13 @@
+[package]
+name = "apiaxess-crypto-canonicalization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-crypto-capture = { path = "../crypto-capture" }
+apiaxess-crypto-scheme-detection = { path = "../crypto-scheme-detection" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+serde.workspace = true

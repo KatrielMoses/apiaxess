@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy,rustfmt
+      # The apps/desktop Tauri shell links WebKitGTK on Linux, so the Linux leg
+      # needs its dev headers to compile the workspace.
+      - name: Install Linux desktop (Tauri/WebKitGTK) build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm ui:check
+      - run: pnpm ui:build
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: APKM capstone prerequisite result
+        run: cargo test -p apiaxess-target-apk --test capstone_apkm real_apkm_capstone_evidence -- --nocapture
+      - run: cargo xtask boundaries
+      - run: cargo xtask contracts
+      - run: cargo xtask foundations
+
+  windows-installer:
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - run: pnpm install --frozen-lockfile
+      - name: Build versioned MSI
+        shell: pwsh
+        run: ./packaging/windows/build-msi.ps1
+      - name: Verify installed product and clean uninstall
+        shell: pwsh
+        run: ./packaging/windows/test-installed.ps1 -MsiPath (Get-ChildItem ./artifacts/windows/*.msi -File | Select-Object -First 1).FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: APIaxess-${{ github.sha }}-windows-x64
+          path: |
+            artifacts/windows/*.msi
+            artifacts/windows/*.sha256
+            artifacts/windows/*.build.json
+          if-no-files-found: error
+
+  debian-installer:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      # The native desktop shell links WebKitGTK; the .deb build compiles it.
+      - name: Install Tauri/WebKitGTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+      - run: pnpm install --frozen-lockfile
+      - name: Build versioned .deb with bundled tools
+        run: bash ./packaging/debian/build-deb.sh
+      - name: Verify installed package and clean removal
+        run: bash ./packaging/debian/test-installed.sh "$(ls artifacts/linux/*.deb | head -n1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: APIaxess-${{ github.sha }}-linux-amd64
+          path: |
+            artifacts/linux/*.deb
+            artifacts/linux/*.sha256
+            artifacts/linux/*.build.json
+          if-no-files-found: error

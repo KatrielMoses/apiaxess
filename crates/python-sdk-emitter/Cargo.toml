@@ -1,0 +1,14 @@
+[package]
+name = "apiaxess-python-sdk-emitter"
+description = "Phase 6.2 deterministic typed Python httpx SDK emission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+
+[lints]
+workspace = true

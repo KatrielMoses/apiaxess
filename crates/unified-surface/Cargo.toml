@@ -1,0 +1,15 @@
+[package]
+name = "apiaxess-unified-surface"
+description = "Phase 5.3 signer integration and unified API surface assembly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-api-model = { path = "../api-model" }
+apiaxess-diagnostics = { path = "../diagnostics" }
+chrono.workspace = true
+
+[lints]
+workspace = true

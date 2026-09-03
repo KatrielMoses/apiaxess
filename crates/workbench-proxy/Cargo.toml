@@ -1,0 +1,38 @@
+[package]
+name = "apiaxess-workbench-proxy"
+description = "Session-scoped interception proxy and ephemeral TLS CA core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apiaxess-diagnostics = { path = "../diagnostics" }
+apiaxess-external-tools = { path = "../external-tools" }
+apiaxess-session = { path = "../session" }
+apiaxess-workbench-store = { path = "../workbench-store" }
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+h2.workspace = true
+getrandom.workspace = true
+http-body-util.workspace = true
+hudsucker.workspace = true
+hyper-rustls.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+http.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
+
+[lints]
+workspace = true

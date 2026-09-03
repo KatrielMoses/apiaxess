@@ -1,0 +1,59 @@
+# APIaxess analysis runtime — bundled dynamic-analysis payload manifest (11.5).
+#
+# The analysis runtime is the OPTIONAL, SEPARATELY-VERSIONED ~2 GB payload that
+# powers dynamic analysis: a bundled QEMU/SDK emulator engine + an APIaxess-owned
+# Android-10 (API 29) system image. It is NOT part of the ~400 MB base install;
+# most users (web / static-only) never download it. It has its own version, SBOM,
+# notices, and provenance (this manifest + the emitted analysis-runtime-sbom.json
+# and provenance record).
+#
+# Zero-config default: one owned, pure-AOSP Android-10 image. The advanced path
+# (fetch-analysis-runtime.ps1 -Package "system-images;android-<N>;default;x86_64")
+# lets a user pull a different public API-level image for their own use; the
+# owned Android-10 default is the verified one.
+#
+# Acquisition: the Android SDK components are installed with the Google
+# `sdkmanager`, which verifies each package against Google's signed repository
+# manifest. This file pins the sdkmanager command-line-tools bootstrap (URL +
+# build) and the exact package specifiers + versions; the payload SHA-256 set is
+# recorded in analysis-runtime-sbom.json after assembly.
+#
+# Licensing/provenance (see analysis-runtime-NOTICES.md, done as its own
+# inventory): AOSP userspace is Apache-2.0; the Linux kernel in the image is
+# GPLv2; QEMU (the emulator engine) is GPLv2 (shipped unmodified). The image is
+# pure AOSP with NO Google Play / GMS (not redistributable). All redistributable.
+schema_version = 1
+product = "APIaxess analysis runtime"
+payload_version = "1.0.0-android10"
+android_api_level = 29
+android_release = "10"
+image_variant = "default"                 # pure AOSP; NOT google_apis / playstore
+owned_avd_name = "apiaxess-android-10"
+
+# Android command-line tools bootstrap (provides sdkmanager/avdmanager).
+[cmdline_tools]
+build = "13114758"
+[cmdline_tools.windows_x64]
+url = "https://dl.google.com/android/repository/commandlinetools-win-13114758_latest.zip"
+[cmdline_tools.linux_x64]
+url = "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip"
+
+# SDK packages installed via sdkmanager (checksums verified by sdkmanager against
+# Google's signed repository manifest). These are the bundled engine + image.
+[sdk_packages]
+emulator = "emulator"                     # bundled QEMU-based emulator engine
+platform_tools = "platform-tools"         # adb
+system_image = "system-images;android-29;default;x86_64"
+
+# Owned-image provisioning: baked into the AVD/snapshot at build time.
+#   - session CA trust (writable-system install)
+#   - frida-server per ABI (see frida.toml)
+#   - the APIaxess analysis agent
+#   - a clean baseline snapshot for per-session reset
+[provisioning]
+install_session_ca = true
+install_frida_server = true
+install_analysis_agent = true
+create_baseline_snapshot = true
+# Install-relative payload root; the engine resolves this as ANDROID_SDK_ROOT.
+install_path = "analysis-runtime"
