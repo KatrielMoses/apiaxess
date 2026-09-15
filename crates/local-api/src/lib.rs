@@ -123,6 +123,10 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             axum::routing::post(discovery_estimate),
         )
         .route("/api/v1/discovery/run", axum::routing::post(discovery_run))
+        .route(
+            "/api/v1/discovery/wordlists",
+            axum::routing::get(discovery_wordlists),
+        )
         .route("/api/v1/web/fuse", axum::routing::post(fuse_web_capture))
         .route(
             "/api/v1/pipeline",
@@ -755,6 +759,11 @@ async fn discovery_run(
         )
         .map(Json)
         .map_err(session_response)
+}
+
+/// The bundled wordlist catalogue for the discovery picker (names, kinds, counts).
+async fn discovery_wordlists() -> Json<Vec<apiaxess_engine_shell::WordlistInfo>> {
+    Json(apiaxess_engine_shell::bundled_wordlist_catalogue())
 }
 
 async fn fuse_web_capture(

@@ -1104,43 +1104,9 @@
   border-bottom: 2px solid var(--s-rule);
   overflow: hidden;
 }
-.app-main .workbench__grid {
-  display: flex;
-  gap: 0;
-  background: transparent;
-  min-height: 0;
-}
-.workbench__pane--flows {
-  flex: 1;
-  min-width: 0;
-  border-right: 0;
-}
-.workbench__pane--queue {
-  /* Relocated to the shared dock. */
-  display: none;
-}
-.workbench__pane--detail {
-  flex: none;
-  width: var(--inspector-w);
-  min-width: 0;
-}
-.splitter--inspector {
-  width: 6px;
-  cursor: col-resize;
-  align-self: stretch;
-}
-.splitter--inspector::before {
-  top: 0;
-  bottom: 0;
-  left: 2px;
-  width: 2px;
-}
-.shell[data-inspector="collapsed"] .workbench__pane--detail,
+/* Workbench = three tools (Live traffic / Resend / Fuzz); the shell inspector
+   splitter is unused here (each tool owns its own list|detail splitter). */
 .shell[data-inspector="collapsed"] .splitter--inspector {
-  display: none;
-}
-.app-main .workbench__drawer {
-  /* Resend and fuzzer are dock tabs now. */
   display: none;
 }
 
@@ -1170,19 +1136,19 @@
   .rail__cell {
     height: 44px;
   }
-  .shell.is-narrow .workbench__grid {
+  .shell.is-narrow .wb-split {
     flex-direction: column;
   }
-  .shell.is-narrow .workbench__pane--detail {
-    width: auto;
-    height: 44%;
-    border-top: 2px solid var(--s-rule);
+  .shell.is-narrow .wb-split__pane--list {
+    flex: 0 0 40%;
   }
-  .shell.is-narrow .splitter--inspector {
+  .shell.is-narrow .wb-split__gutter {
     width: auto;
     height: 6px;
     cursor: row-resize;
-    align-self: auto;
+  }
+  .shell.is-narrow .wb-split__gutter::before {
+    inset: 2px 0;
   }
   .shell.is-narrow .splitter--inspector::before {
     left: 0;

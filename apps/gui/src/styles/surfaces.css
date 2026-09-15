@@ -572,14 +572,238 @@
   overflow: auto;
 }
 
-/* Resend and fuzzer open beneath the grid as full-width workspaces. */
-/* Resend and fuzzer share the column with the grid rather than pushing the
-   page taller, so the traffic list never scrolls out from under the operator. */
-.workbench__drawer {
-  flex: 0 1 auto;
-  border-top: var(--border-hairline) solid var(--color-rule-ink);
+/* --- Workbench tools: Live traffic / Resend (Repeater) / Fuzz (Intruder) --- */
+.wb-tabs {
+  display: flex;
+  flex: none;
+  align-items: stretch;
+  height: 30px;
+  border-bottom: 2px solid var(--color-rule);
   background: var(--color-surface);
-  max-height: 46%;
+}
+.wb-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-5);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  font-family: var(--font-ui);
+  font-size: var(--text-small);
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+.wb-tab:hover {
+  color: var(--color-text);
+}
+.wb-tab.is-active {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+  font-weight: var(--weight-medium);
+}
+.wb-tab__count {
+  min-width: 16px;
+  padding: 0 4px;
+  border: var(--border-hairline) solid var(--color-rule-strong);
+  font-family: var(--font-mono);
+  font-size: var(--text-nano);
+  text-align: center;
+}
+.wb-workspace {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.wb-workspace[hidden] {
+  display: none;
+}
+.wb-split {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  --wb-list: 50%;
+}
+.wb-split__pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--color-surface);
+}
+.wb-split__pane--list {
+  flex: 0 0 var(--wb-list);
+}
+.wb-split__pane--detail {
+  flex: 1 1 0;
+}
+.wb-split__gutter {
+  flex: none;
+  width: 6px;
+  cursor: col-resize;
+  position: relative;
+  background: var(--color-rule);
+}
+.wb-split__gutter::before {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: var(--color-rule-strong);
+}
+.wb-split__gutter:hover::before,
+.wb-split__gutter:focus-visible::before {
+  background: var(--color-accent);
+}
+.wb-list__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex: none;
+  padding: var(--space-2) var(--space-4);
+  border-bottom: var(--border-hairline) solid var(--color-rule);
+}
+.workbench__search {
+  flex: 1 1 16rem;
+  max-width: 30rem;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.workbench__search-icon {
+  position: absolute;
+  left: 8px;
+  opacity: 0.5;
+  pointer-events: none;
+}
+.workbench__search .input {
+  padding-left: 26px;
+}
+
+/* Resend/Fuzz queue rows */
+.qrow {
+  display: grid;
+  grid-template-columns: 3.4rem minmax(0, 1fr) 2.8rem;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-4);
+  background: none;
+  border: 0;
+  border-bottom: var(--border-hairline) solid var(--color-rule);
+  text-align: left;
+  cursor: pointer;
+}
+.qrow:hover {
+  background: var(--color-row);
+}
+.qrow.is-active {
+  background: var(--color-selection, var(--color-row));
+  box-shadow: inset 2px 0 0 var(--color-accent);
+}
+.qrow__method {
+  font-family: var(--font-mono);
+  font-size: var(--text-nano);
+  color: var(--color-text-muted);
+}
+.qrow__target {
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qrow__target b {
+  color: var(--color-text);
+  font-weight: var(--weight-medium);
+}
+.qrow__status {
+  font-family: var(--font-mono);
+  font-size: var(--text-nano);
+  color: var(--color-text-muted);
+  text-align: right;
+}
+
+/* API surface source sections (by web capture / by app) */
+.surface-sections {
+  display: flex;
+  margin-bottom: var(--space-4);
+  border-bottom: 2px solid var(--color-rule);
+}
+.surface-section {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  font-family: var(--font-ui);
+  font-size: var(--text-small);
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+.surface-section:hover {
+  color: var(--color-text);
+}
+.surface-section.is-active {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+  font-weight: var(--weight-medium);
+}
+
+/* Discovery wordlist picker + upload */
+.wordlist-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+.wordlist-row .select {
+  flex: 1;
+  min-width: 0;
+}
+.wordlist-upload {
+  flex: none;
+  padding: 0 var(--space-3);
+}
+
+/* Flow detail: request on the left, response on the right (Burp register). */
+.reqres {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.reqres__col {
+  min-width: 0;
+}
+.reqres__col .code {
+  overflow-x: auto;
+}
+@media (max-width: 1180px) {
+  .reqres {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* The Resend/Fuzz panel fills its detail pane inside the tool. */
+.wb-split__pane--detail .workbench__drawer {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  border-top: 0;
+  overflow: auto;
+}
+.workbench__drawer {
+  flex: 1;
+  background: var(--color-surface);
   overflow: auto;
 }
 

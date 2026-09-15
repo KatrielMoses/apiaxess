@@ -488,18 +488,22 @@
 
               <article class="panel">
                 <div class="panel__header">
-                  <div class="panel__heading"><span data-icon="surface"></span><h2>Fuse and export</h2></div>
-                  <span class="panel__hint">observation-based</span>
+                  <div class="panel__heading"><span data-icon="surface"></span><h2>API surface</h2></div>
+                  <span class="panel__hint">live · observation-based</span>
                 </div>
                 <div class="panel__body">
                   <p class="t-small t-muted">
-                    Fusion turns captured flows into a unified surface. Coverage reflects only what
-                    was observed — unvisited routes stay absent rather than inferred.
+                    Captured traffic is fused into the web API surface continuously while the capture
+                    browser runs — no manual step. Coverage reflects only what was observed; unvisited
+                    routes stay absent rather than inferred.
                   </p>
                 </div>
                 <div class="panel__footer row">
-                  <button class="btn btn--primary" id="web-fuse" type="button">
-                    <span data-icon="surface"></span> Fuse captured traffic
+                  <button class="btn btn--primary" type="button" data-nav="surface">
+                    <span data-icon="surface"></span> View API surface
+                  </button>
+                  <button class="btn btn--quiet" id="web-fuse" type="button" title="Re-fuse now (e.g. after importing a HAR while the browser is not running)">
+                    <span data-icon="refresh"></span> Re-fuse now
                   </button>
                   <button class="btn" id="web-export" type="button">
                     <span data-icon="export"></span> Export artifacts
@@ -526,11 +530,14 @@
                     </div>
                     <div class="field">
                       <label class="field__label" for="discovery-wordlist">Wordlist</label>
-                      <select class="select" id="discovery-wordlist">
-                        <option value="small">Small</option>
-                        <option value="medium">Medium</option>
-                        <option value="large">Large</option>
-                      </select>
+                      <div class="wordlist-row">
+                        <select class="select" id="discovery-wordlist"></select>
+                        <button class="btn btn--sm btn--quiet wordlist-upload" id="discovery-upload-btn" type="button" title="Upload a custom wordlist (.txt or .md)" aria-label="Upload a custom wordlist">
+                          <span data-icon="upload"></span>
+                        </button>
+                        <input id="discovery-upload" type="file" accept=".txt,.md,text/plain,text/markdown" hidden />
+                      </div>
+                      <p class="field__hint" id="discovery-wordlist-hint"></p>
                     </div>
                   </div>
 
@@ -652,85 +659,54 @@
              7. Workbench
              ========================================================== -->
         <section class="view view--full" id="view-workbench" data-view="workbench" hidden>
-          <div class="workbench">
-            <div class="workbench__bar">
-              <span class="section-label"><span data-icon="traffic"></span> Workbench</span>
-              <label class="check">
-                <input id="intercept-toggle" type="checkbox" />
-                <span>Intercept matching requests</span>
-              </label>
-              <div class="field field--inline workbench__filter">
-                <label class="field__label" for="host-filter" title="Limits which hosts are paused when intercept is on. This is not the session engagement scope.">Intercept hosts</label>
-                <input
-                  class="input input--mono"
-                  id="host-filter"
-                  type="text"
-                  placeholder="blank = all hosts · api.example.com, *.internal"
-                  spellcheck="false"
-                />
-              </div>
-              <span class="spacer"></span>
-              <button class="btn btn--sm btn--quiet" id="har-import" type="button" title="Import a Burp/Chrome HAR into this session's traffic">
-                <span data-icon="folder"></span> Import HAR
-              </button>
-              <button class="btn btn--sm btn--quiet" id="har-export" type="button" title="Export this session's captured traffic as HAR">
-                <span data-icon="export"></span> Export HAR
-              </button>
-              <input id="har-file" type="file" accept=".har,application/json" hidden />
-              <span id="workbench-counts" class="t-small t-subtle t-numeric">0 flows</span>
+          <div class="workbench" id="workbench">
+            <!-- Three tools, Burp/Caido register: Live traffic, Resend (Repeater),
+                 Fuzz (Intruder). Each is its own workspace; only the active one shows. -->
+            <div class="wb-tabs" role="tablist" aria-label="Workbench tools">
+              <button class="wb-tab is-active" type="button" role="tab" data-wbtab="live" aria-selected="true">Live traffic</button>
+              <button class="wb-tab" type="button" role="tab" data-wbtab="resend" aria-selected="false">Resend<span class="wb-tab__count" id="resend-tab-count" hidden>0</span></button>
+              <button class="wb-tab" type="button" role="tab" data-wbtab="fuzz" aria-selected="false">Fuzz<span class="wb-tab__count" id="fuzz-tab-count" hidden>0</span></button>
             </div>
 
-            <div class="workbench__grid">
-              <div class="workbench__pane workbench__pane--flows">
-                <article class="panel">
-                  <div class="panel__header">
-                    <div class="panel__heading"><span data-icon="traffic"></span><h2>Live traffic</h2></div>
-                    <span class="panel__hint">lossy telemetry</span>
-                  </div>
-                  <div class="workbench__scroll">
-                    <div class="list" id="flow-list" aria-live="polite"></div>
-                  </div>
-                </article>
+            <!-- Live traffic -->
+            <div class="wb-workspace is-active" data-wbpanel="live" role="tabpanel">
+              <div class="workbench__bar">
+                <label class="check">
+                  <input id="intercept-toggle" type="checkbox" />
+                  <span>Intercept matching requests</span>
+                </label>
+                <div class="field field--inline workbench__filter">
+                  <label class="field__label" for="host-filter" title="Limits which hosts are paused when intercept is on. This is not the session engagement scope.">Intercept hosts</label>
+                  <input class="input input--mono" id="host-filter" type="text" placeholder="blank = all hosts · api.example.com, *.internal" spellcheck="false" />
+                </div>
+                <div class="field field--inline workbench__search">
+                  <span class="workbench__search-icon" data-icon="discovery" aria-hidden="true"></span>
+                  <input class="input input--mono" id="flow-search" type="search" placeholder="Filter traffic — host, path, method, status" spellcheck="false" aria-label="Filter live traffic" />
+                </div>
+                <span class="spacer"></span>
+                <button class="btn btn--sm btn--quiet" id="har-import" type="button" title="Import a Burp/Chrome HAR into this session's traffic"><span data-icon="folder"></span> Import HAR</button>
+                <button class="btn btn--sm btn--quiet" id="har-export" type="button" title="Export this session's captured traffic as HAR"><span data-icon="export"></span> Export HAR</button>
+                <input id="har-file" type="file" accept=".har,application/json" hidden />
+                <span id="workbench-counts" class="t-small t-subtle t-numeric">0 flows</span>
               </div>
-
-              <div class="workbench__pane workbench__pane--queue">
-                <article class="panel">
+              <div class="wb-split" data-wbsplit="live">
+                <div class="wb-split__pane wb-split__pane--list">
+                  <div class="workbench__scroll"><div class="list" id="flow-list" aria-live="polite"></div></div>
+                </div>
+                <div class="wb-split__gutter" data-wbgutter="live" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize traffic list"></div>
+                <div class="wb-split__pane wb-split__pane--detail">
                   <div class="panel__header">
-                    <div class="panel__heading"><span data-icon="pause"></span><h2>Intercept queue</h2></div>
-                    <span class="panel__hint">reliable control</span>
-                  </div>
-                  <div class="workbench__scroll">
-                    <div class="list" id="queue-list"></div>
-                  </div>
-                </article>
-              </div>
-
-              <div class="workbench__pane workbench__pane--detail">
-                <article class="panel">
-                  <div class="panel__header">
-                    <div class="panel__heading">
-                      <span data-icon="chevronRight"></span><h2 id="selected-label">Select a flow</h2>
-                    </div>
+                    <div class="panel__heading"><span data-icon="chevronRight"></span><h2 id="selected-label">Select a flow</h2></div>
                     <div class="row" id="detail-actions"></div>
                   </div>
                   <div class="workbench__scroll">
                     <div class="panel__body" id="flow-detail"></div>
-
                     <section id="editor" class="panel__body" hidden>
                       <div class="stack">
                         <p class="section-label">In-flight request editor</p>
-                        <div class="field">
-                          <label class="field__label" for="edit-method">Method</label>
-                          <input class="input input--mono" id="edit-method" />
-                        </div>
-                        <div class="field">
-                          <label class="field__label" for="edit-headers">Headers</label>
-                          <textarea class="textarea" id="edit-headers" spellcheck="false"></textarea>
-                        </div>
-                        <div class="field">
-                          <label class="field__label" for="edit-body">Body</label>
-                          <textarea class="textarea textarea--wrap" id="edit-body" spellcheck="false"></textarea>
-                        </div>
+                        <div class="field"><label class="field__label" for="edit-method">Method</label><input class="input input--mono" id="edit-method" /></div>
+                        <div class="field"><label class="field__label" for="edit-headers">Headers</label><textarea class="textarea" id="edit-headers" spellcheck="false"></textarea></div>
+                        <div class="field"><label class="field__label" for="edit-body">Body</label><textarea class="textarea textarea--wrap" id="edit-body" spellcheck="false"></textarea></div>
                         <div class="row">
                           <button class="btn btn--primary" id="forward" type="button" disabled>Forward</button>
                           <button class="btn" id="forward-modified" type="button" disabled>Forward modified</button>
@@ -740,12 +716,41 @@
                       </div>
                     </section>
                   </div>
-                </article>
+                </div>
               </div>
             </div>
 
-            <section class="workbench__drawer" id="resend-panel" hidden></section>
-            <section class="workbench__drawer" id="fuzzer-panel" hidden></section>
+            <!-- Resend (Repeater) -->
+            <div class="wb-workspace" data-wbpanel="resend" role="tabpanel" hidden>
+              <div class="wb-split" data-wbsplit="resend">
+                <div class="wb-split__pane wb-split__pane--list">
+                  <div class="wb-list__head"><span class="section-label">Resend queue</span><span class="panel__hint">right-click traffic → Resend</span></div>
+                  <div class="workbench__scroll"><div class="list" id="resend-list" aria-live="polite"></div></div>
+                </div>
+                <div class="wb-split__gutter" data-wbgutter="resend" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize resend list"></div>
+                <div class="wb-split__pane wb-split__pane--detail">
+                  <section class="workbench__drawer" id="resend-panel"></section>
+                </div>
+              </div>
+            </div>
+
+            <!-- Fuzz (Intruder) -->
+            <div class="wb-workspace" data-wbpanel="fuzz" role="tabpanel" hidden>
+              <div class="wb-split" data-wbsplit="fuzz">
+                <div class="wb-split__pane wb-split__pane--list">
+                  <div class="wb-list__head"><span class="section-label">Fuzz queue</span><span class="panel__hint">right-click traffic → Fuzz</span></div>
+                  <div class="workbench__scroll"><div class="list" id="fuzz-list" aria-live="polite"></div></div>
+                </div>
+                <div class="wb-split__gutter" data-wbgutter="fuzz" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize fuzz list"></div>
+                <div class="wb-split__pane wb-split__pane--detail">
+                  <section class="workbench__drawer" id="fuzzer-panel"></section>
+                </div>
+              </div>
+            </div>
+
+            <!-- Intercept queue lives in the shared bottom dock; kept here as its
+                 adopt target so the shell can relocate it without a remount. -->
+            <div class="list" id="queue-list" hidden></div>
           </div>
         </section>
 
@@ -830,6 +835,14 @@
                 <span data-icon="export"></span> Export artifacts
               </button>
             </div>
+          </div>
+          <div class="surface-sections" role="tablist" aria-label="API surface source">
+            <button class="surface-section is-active" type="button" role="tab" data-surface-section="web" aria-selected="true">
+              <span data-icon="web"></span> By web capture
+            </button>
+            <button class="surface-section" type="button" role="tab" data-surface-section="app" aria-selected="false">
+              <span data-icon="apk"></span> By app (APK)
+            </button>
           </div>
           <div id="surface-view"></div>
         </section>
@@ -1069,8 +1082,6 @@
               <button class="dock__tab is-active" type="button" role="tab" data-docktab="queue" aria-selected="true">
                 Intercept queue <span class="dock__badge" id="dock-queue-badge" hidden>0</span>
               </button>
-              <button class="dock__tab" type="button" role="tab" data-docktab="resend" aria-selected="false">Resend</button>
-              <button class="dock__tab" type="button" role="tab" data-docktab="fuzzer" aria-selected="false">Fuzzer</button>
               <button class="dock__tab" type="button" role="tab" data-docktab="diagnostics" aria-selected="false">
                 Diagnostics <span class="dock__diag" id="dock-diag-count" hidden>0</span>
               </button>
@@ -1079,8 +1090,6 @@
             </div>
             <div class="dock__body">
               <div class="dock__panel is-active" role="tabpanel" data-dockpanel="queue" id="dock-queue"></div>
-              <div class="dock__panel" role="tabpanel" data-dockpanel="resend" id="dock-resend"></div>
-              <div class="dock__panel" role="tabpanel" data-dockpanel="fuzzer" id="dock-fuzzer"></div>
               <div class="dock__panel" role="tabpanel" data-dockpanel="diagnostics" id="dock-diagnostics"></div>
             </div>
           </section>

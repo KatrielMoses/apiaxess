@@ -610,4 +610,62 @@ mod tests {
         assert!(is_stripped("Connection", STRIPPED_REQUEST_HEADERS));
         assert!(!is_stripped("accept", STRIPPED_REQUEST_HEADERS));
     }
+
+    /// Router-level regression guard for the trailing-slash routing bug D4 caught
+    /// live: `/android-stream/` (the URL the embedded iframe loads and ws-scrcpy
+    /// serves from) must route to the proxy, not fall through to the GUI fallback.
+    /// The other `stream_proxy` tests call the handler directly and so cannot catch
+    /// a missing route registration — only driving the real `Router` can.
+    #[tokio::test]
+    async fn every_stream_path_shape_reaches_the_proxy_not_the_fallback() {
+        // A minimal GUI directory so `router_with_port` accepts (it requires an
+        // index.html), using the crate's temp-dir idiom (no `tempfile` dev-dep).
+        let gui_dir = std::env::temp_dir().join(format!(
+            "apiaxess-stream-route-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&gui_dir).expect("gui dir");
+        std::fs::write(gui_dir.join("index.html"), b"<!doctype html>").expect("index.html");
+
+        let router = crate::router_with_port(Engine::new(), &gui_dir, 7777).expect("router");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let client = reqwest::Client::new();
+        // Every shape of the stream path, with no auth, must hit the proxy gate
+        // (403), never the GUI fallback (404) — that is the trailing-slash guard.
+        for path in [
+            "/android-stream",
+            "/android-stream/",
+            "/android-stream/bundle.js",
+        ] {
+            let response = client
+                .get(format!("http://{addr}{path}"))
+                .header(reqwest::header::ORIGIN, "http://127.0.0.1:7777")
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::FORBIDDEN,
+                "{path} must reach the authenticated proxy gate, not the GUI fallback"
+            );
+        }
+        // A path outside the stream prefix still falls through to the GUI fallback,
+        // proving the routes are scoped and not swallowing everything.
+        let fallthrough = client
+            .get(format!("http://{addr}/not-the-stream"))
+            .send()
+            .await
+            .expect("request");
+        assert_ne!(fallthrough.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&gui_dir);
+    }
 }

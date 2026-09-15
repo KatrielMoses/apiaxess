@@ -212,13 +212,31 @@ pub struct DiscoveryEstimate {
     pub estimated_label: String,
 }
 
-/// Real, curated "large" discovery wordlist bundled with the application.
-///
-/// Hand-curated candidates common to production web and API deployments; every
-/// entry is a host/route a real target can plausibly expose. This replaces an
-/// earlier synthetic generator whose 500 `candidate-N` strings could never
-/// match anything but were presented as a co-equal choice.
+/// Real, widely-used wordlists bundled with the application (curated from
+/// `SecLists` and the APIaxess-curated `large` list). They are shipped in the
+/// binary so discovery works offline; anything else can be supplied by upload.
 const LARGE_WORDLIST: &str = include_str!("wordlists/large.txt");
+const COMMON_WORDLIST: &str = include_str!("wordlists/common.txt");
+const RAFT_SMALL_DIRECTORIES: &str = include_str!("wordlists/raft-small-directories.txt");
+const API_ENDPOINTS_WORDLIST: &str = include_str!("wordlists/api-endpoints.txt");
+const SUBDOMAINS_TOP_5000: &str = include_str!("wordlists/subdomains-top5000.txt");
+const SUBDOMAINS_TOP_20000: &str = include_str!("wordlists/subdomains-top20000.txt");
+
+/// One bundled wordlist's catalogue entry, surfaced to the GUI so the operator
+/// picks by real name rather than an opaque "small/medium/large".
+#[derive(Clone, serde::Serialize)]
+pub struct WordlistInfo {
+    /// Stable id sent back on a discovery request.
+    pub id: String,
+    /// Human name shown in the picker.
+    pub label: String,
+    /// "directory" or "subdomain" — which discovery type it suits.
+    pub kind: String,
+    /// Number of entries (so the request-count estimate is honest up front).
+    pub count: usize,
+    /// Provenance/source of the list.
+    pub source: String,
+}
 
 /// Parses a bundled wordlist file, dropping blank lines and `#` comments.
 fn parse_wordlist(contents: &str) -> Vec<String> {
@@ -232,23 +250,64 @@ fn parse_wordlist(contents: &str) -> Vec<String> {
         .collect()
 }
 
-/// Wordlists shipped with the application, intentionally small and useful by default.
+/// Every bundled wordlist keyed by id, with the raw content.
+fn bundled_wordlist_sources() -> &'static [(&'static str, &'static str, &'static str, &'static str)]
+{
+    // (id, label, kind, raw)
+    &[
+        ("quick", "Quick sample (8)", "directory", ""),
+        ("common", "SecLists common.txt", "directory", COMMON_WORDLIST),
+        ("raft-small-directories", "SecLists raft-small-directories", "directory", RAFT_SMALL_DIRECTORIES),
+        ("api-endpoints", "SecLists api-endpoints", "directory", API_ENDPOINTS_WORDLIST),
+        ("large", "APIaxess curated", "directory", LARGE_WORDLIST),
+        ("subdomains-top-5000", "SecLists subdomains top 5000", "subdomain", SUBDOMAINS_TOP_5000),
+        ("subdomains-top-20000", "SecLists subdomains top 20000", "subdomain", SUBDOMAINS_TOP_20000),
+    ]
+}
+
+/// The wordlist picker catalogue for the GUI.
+#[must_use]
+pub fn bundled_wordlist_catalogue() -> Vec<WordlistInfo> {
+    bundled_wordlist_sources()
+        .iter()
+        .map(|(id, label, kind, raw)| {
+            let count = if *id == "quick" { 8 } else { parse_wordlist(raw).len() };
+            WordlistInfo {
+                id: (*id).to_owned(),
+                label: (*label).to_owned(),
+                kind: (*kind).to_owned(),
+                count,
+                source: if *id == "large" { "APIaxess".to_owned() } else if *id == "quick" { "built-in".to_owned() } else { "SecLists".to_owned() },
+            }
+        })
+        .collect()
+}
+
+/// Wordlists shipped with the application. `quick` and the legacy `small`/`medium`
+/// are tiny built-ins; every other id resolves a bundled SecLists/curated file.
 pub fn bundled_wordlist(name: &str) -> Option<Vec<String>> {
-    if name == "large" {
-        let values = parse_wordlist(LARGE_WORDLIST);
-        return (!values.is_empty()).then_some(values);
+    match name {
+        "small" | "quick" => Some(
+            ["www", "api", "app", "dev", "staging", "admin", "v1", "health"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ),
+        "medium" => Some(
+            [
+                "www", "api", "app", "admin", "auth", "dev", "test", "staging", "cdn", "static",
+                "assets", "internal", "portal", "login", "health", "docs", "v1", "v2",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ),
+        other => bundled_wordlist_sources()
+            .iter()
+            .find(|(id, _, _, raw)| *id == other && !raw.is_empty())
+            .map(|(_, _, _, raw)| parse_wordlist(raw))
+            .filter(|values| !values.is_empty()),
     }
-    let values = match name {
-        "small" => vec![
-            "www", "api", "app", "dev", "staging", "admin", "v1", "health",
-        ],
-        "medium" => vec![
-            "www", "api", "app", "admin", "auth", "dev", "test", "staging", "cdn", "static",
-            "assets", "internal", "portal", "login", "health", "docs", "v1", "v2",
-        ],
-        _ => return None,
-    };
-    Some(values.into_iter().map(str::to_owned).collect())
 }
 
 impl Engine {

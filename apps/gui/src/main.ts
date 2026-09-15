@@ -181,6 +181,11 @@ let reconnectDelay = 1000;
 let selectedResend: ResendContext | null = null;
 let selectedFuzzer: FuzzerJob | null = null;
 let discoveryJob: FuzzerJob | null = null;
+/** Resend queue (Repeater): every request sent here, newest first. */
+const resendContexts = new Map<string, ResendContext>();
+/** Fuzz queue (Intruder): manually-created attacks only (discovery excluded). */
+const fuzzerJobsList = new Map<string, FuzzerJob>();
+let activeWorkbenchTab: "live" | "resend" | "fuzz" = "live";
 /** Endpoints of the currently rendered surface, so row expand and the
  * send-to-resend/fuzzer actions can resolve a clicked row by index. */
 let lastSurfaceEndpoints: readonly SurfaceEndpoint[] = [];
@@ -310,6 +315,10 @@ function renderFlows(): void {
     const method = (flow.method ?? "").toUpperCase();
     item.innerHTML = `<span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method === "" ? "—" : method)}</span><span class="list-row__target"><b>${escapeHtml(flow.host ?? "unknown")}</b>${escapeHtml(flow.path ?? "")}</span><span class="list-row__status" data-class="${statusClass(flow.status)}">${flow.status ?? "…"}</span>`;
     item.addEventListener("click", () => void selectFlow(flow.id));
+    item.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      showFlowMenu(event.clientX, event.clientY, flow.id);
+    });
     flowList.append(item);
   });
   updateWorkbenchCounts();
@@ -457,16 +466,18 @@ function renderDetail(flow: FlowDetail): string {
   <dt>Type</dt><dd class="t-mono">${escapeHtml(summary.contentType ?? "—")}</dd>
 </dl>
 <hr class="rule" />
-<section class="stack stack--tight">
-  <p class="section-label">Request headers</p>
-  <pre class="code">${escapeHtml(formatHeaders(flow.requestHeaders))}</pre>
-  <p class="t-small t-subtle">${escapeHtml(body(flow.requestBody))}</p>
-</section>
-<section class="stack stack--tight">
-  <p class="section-label">Response headers</p>
-  <pre class="code">${escapeHtml(formatHeaders(flow.responseHeaders))}</pre>
-  <p class="t-small t-subtle">${escapeHtml(body(flow.responseBody))}</p>
-</section>
+<div class="reqres">
+  <section class="reqres__col stack stack--tight">
+    <p class="section-label">Request</p>
+    <pre class="code">${escapeHtml(formatHeaders(flow.requestHeaders))}</pre>
+    <p class="t-small t-subtle">${escapeHtml(body(flow.requestBody))}</p>
+  </section>
+  <section class="reqres__col stack stack--tight">
+    <p class="section-label">Response</p>
+    <pre class="code">${escapeHtml(formatHeaders(flow.responseHeaders))}</pre>
+    <p class="t-small t-subtle">${escapeHtml(body(flow.responseBody))}</p>
+  </section>
+</div>
 </div>`;
 }
 
@@ -517,8 +528,10 @@ async function openFuzzer(flowId: number): Promise<void> {
     },
     results: [], diagnostics: [],
   };
+  currentFuzzDraft = selectedFuzzer;
   renderFuzzer();
-  revealDrawer(fuzzerPanel);
+  renderFuzzList();
+  showWorkbenchTab("fuzz");
 }
 
 /** Config is only editable before the job is created; the backend snapshots it. */
@@ -786,6 +799,7 @@ async function launchFuzzer(): Promise<void> {
     await requireOk(started, "fuzzer " + action + " failed");
     selectedFuzzer = (await started.json()) as FuzzerJob;
     renderFuzzer();
+    syncFuzzToList();
     if (fuzzerPoll !== undefined) window.clearInterval(fuzzerPoll);
     fuzzerPoll = window.setInterval(() => void refreshFuzzer(), 500);
   } catch (error) {
@@ -801,6 +815,7 @@ async function refreshFuzzer(): Promise<void> {
     selectedFuzzer = (await response.json()) as FuzzerJob;
     selectedFuzzer.diagnostics.forEach(showDiagnostic);
     renderFuzzer();
+    syncFuzzToList();
     if (["completed", "failed", "stopped"].includes(selectedFuzzer.state) && fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
   } catch (error) {
     if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
@@ -840,9 +855,10 @@ async function createResend(flowId: number): Promise<void> {
   try {
     const response = await fetch("/api/v1/workbench/resend", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ flowId }) });
     await requireOk(response, "resend context unavailable");
-    selectedResend = (await response.json()) as ResendContext;
+    registerResend((await response.json()) as ResendContext);
     renderResend();
-    revealDrawer(resendPanel);
+    showView("workbench");
+    showWorkbenchTab("resend");
   } catch (error) {
     reportUnexpected(error, { id: "proxy.resend-history-failed", what: "The Resend context could not be created.", why: "", fix: "Check the selected flow and session store, then retry." });
   }
@@ -939,9 +955,11 @@ async function sendResend(): Promise<void> {
     }
     if (context === null || typeof context.id !== "string") throw new Error("resend response did not include a valid context");
     selectedResend = context;
+    resendContexts.set(context.id, context);
     (result.diagnostics ?? []).forEach(showDiagnostic);
     showDiagnostic(result.revision?.diagnostic);
     renderResend();
+    renderResendList();
   } catch (error) {
     reportUnexpected(error, { id: "proxy.resend-request-failed", what: "The resend send failed.", why: "", fix: "Review the request and confirm the session proxy is running." });
   }
@@ -1125,8 +1143,41 @@ async function startPipeline(): Promise<void> {
  * 8. Unified API surface
  * ==================================================================== */
 
+/** Whether the surface currently loaded was built from web capture or an APK. */
+let surfaceSource: "app" | "web" = "web";
+
+/** Activates the API-surface source section; the section that matches the loaded
+ *  surface shows it, the other explains how to build one. */
+function showSurfaceSection(section: "app" | "web"): void {
+  document.querySelectorAll<HTMLElement>(".surface-section").forEach((tab) => {
+    const on = tab.dataset.surfaceSection === section;
+    tab.classList.toggle("is-active", on);
+    tab.setAttribute("aria-selected", String(on));
+  });
+  if (surfaceView === null) return;
+  if (section === surfaceSource) {
+    void refreshStoredSurface();
+  } else {
+    surfaceView.innerHTML = stateBlock({
+      icon: section === "app" ? "apk" : "web",
+      title: section === "app" ? "No app surface in this session" : "No web surface in this session",
+      body:
+        section === "app"
+          ? "Run an APK analysis to reconstruct an application's API surface from what it ships and does."
+          : "Start a web session and capture traffic; the web surface builds live as you browse.",
+    });
+  }
+}
+
 function renderSurface(surface: SurfaceSummary): void {
   if (surfaceView === null) return;
+  // Tag the surface by its source (web capture vs APK) and activate that section.
+  surfaceSource = lastSessionStatus?.scope?.target?.target_type === "web.url" ? "web" : "app";
+  document.querySelectorAll<HTMLElement>(".surface-section").forEach((tab) => {
+    const on = tab.dataset.surfaceSection === surfaceSource;
+    tab.classList.toggle("is-active", on);
+    tab.setAttribute("aria-selected", String(on));
+  });
   const coverage = surface.coverage;
   // Demote static-inferred candidates below dynamic-confirmed endpoints so the
   // tester reads the real (observed) surface first; a stable sort preserves the
@@ -1308,10 +1359,10 @@ async function sendEndpointToResend(index: number): Promise<void> {
   try {
     const response = await fetch("/api/v1/workbench/resend", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ request: endpointRequest(endpoint) }) });
     await requireOk(response, "resend context unavailable");
-    selectedResend = (await response.json()) as ResendContext;
+    registerResend((await response.json()) as ResendContext);
     renderResend();
     showView("workbench");
-    revealDrawer(resendPanel);
+    showWorkbenchTab("resend");
     toast(`Sent ${endpoint.method.toUpperCase()} ${endpoint.pathTemplate} to Resend`, "success");
   } catch (error) {
     reportUnexpected(error, { id: "proxy.resend-history-failed", what: "The endpoint could not be sent to Resend.", why: "", fix: "Confirm a session is active, then retry." });
@@ -1335,10 +1386,243 @@ function sendEndpointToFuzzer(index: number): void {
     },
     results: [], diagnostics: [],
   };
+  currentFuzzDraft = selectedFuzzer;
   renderFuzzer();
+  renderFuzzList();
   showView("workbench");
-  revealDrawer(fuzzerPanel);
-  toast(`Loaded ${endpoint.method.toUpperCase()} ${endpoint.pathTemplate} into the Fuzzer`, "success");
+  showWorkbenchTab("fuzz");
+  toast(`Loaded ${endpoint.method.toUpperCase()} ${endpoint.pathTemplate} into Fuzz`, "success");
+}
+
+/* ==================================================================== *
+ * 7c. Workbench tools — Live traffic / Resend (Repeater) / Fuzz (Intruder)
+ * ==================================================================== */
+
+/** The in-progress, not-yet-run Fuzz attack (its own list row until it starts). */
+let currentFuzzDraft: FuzzerJob | null = null;
+
+/** Switches the Workbench between its three tools; nothing remounts. */
+function showWorkbenchTab(name: "live" | "resend" | "fuzz"): void {
+  activeWorkbenchTab = name;
+  document.querySelectorAll<HTMLElement>(".wb-tab").forEach((tab) => {
+    const on = tab.dataset.wbtab === name;
+    tab.classList.toggle("is-active", on);
+    tab.setAttribute("aria-selected", String(on));
+  });
+  document.querySelectorAll<HTMLElement>(".wb-workspace").forEach((panel) => {
+    panel.hidden = panel.dataset.wbpanel !== name;
+  });
+}
+
+/** METHOD host/path label for a Resend/Fuzz queue row. */
+function requestRowLabel(method: string, url: string): string {
+  let host = url;
+  let path = "";
+  try {
+    const parsed = new URL(url);
+    host = parsed.host;
+    path = parsed.pathname + parsed.search;
+  } catch {
+    /* relative/template url — show as-is */
+  }
+  const m = method.toUpperCase() || "GET";
+  return `<span class="qrow__method" data-method="${escapeHtml(m)}">${escapeHtml(m)}</span><span class="qrow__target"><b>${escapeHtml(host)}</b>${escapeHtml(path)}</span>`;
+}
+
+function registerResend(ctx: ResendContext): void {
+  resendContexts.set(ctx.id, ctx);
+  selectedResend = ctx;
+  renderResendList();
+}
+
+function renderResendList(): void {
+  const list = document.getElementById("resend-list");
+  const count = document.getElementById("resend-tab-count");
+  if (list === null) return;
+  const items = [...resendContexts.values()].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  if (count !== null) {
+    count.textContent = String(items.length);
+    count.hidden = items.length === 0;
+  }
+  if (items.length === 0) {
+    list.innerHTML = stateBlock({ icon: "send", title: "Resend queue is empty", body: "Right-click a request in Live traffic or the API surface and choose Resend.", compact: true });
+    return;
+  }
+  list.innerHTML = items
+    .map((ctx) => {
+      const last = ctx.history[ctx.history.length - 1]?.response?.status;
+      const active = selectedResend?.id === ctx.id;
+      return `<button class="qrow${active ? " is-active" : ""}" type="button" data-resend-id="${escapeHtml(ctx.id)}">${requestRowLabel(ctx.current.method, ctx.current.url)}<span class="qrow__status">${last === undefined ? "—" : last}</span></button>`;
+    })
+    .join("");
+  list.querySelectorAll<HTMLElement>("[data-resend-id]").forEach((row) => {
+    row.addEventListener("click", () => {
+      const ctx = resendContexts.get(row.dataset.resendId ?? "");
+      if (ctx !== undefined) {
+        selectedResend = ctx;
+        renderResend();
+        renderResendList();
+      }
+    });
+  });
+}
+
+async function refreshResendList(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/workbench/resend");
+    if (!response.ok) return;
+    const contexts = (await response.json()) as ResendContext[];
+    resendContexts.clear();
+    contexts.forEach((ctx) => resendContexts.set(ctx.id, ctx));
+    if (selectedResend !== null) selectedResend = resendContexts.get(selectedResend.id) ?? selectedResend;
+    renderResendList();
+  } catch {
+    /* the list is a convenience; the detail pane still holds the selection */
+  }
+}
+
+/** Keeps the Fuzz queue in sync with the selected job's persisted state. */
+function syncFuzzToList(): void {
+  if (selectedFuzzer !== null && selectedFuzzer.id !== "") {
+    fuzzerJobsList.set(selectedFuzzer.id, selectedFuzzer);
+    if (currentFuzzDraft !== null && currentFuzzDraft.id === "") currentFuzzDraft = null;
+  }
+  renderFuzzList();
+}
+
+function renderFuzzList(): void {
+  const list = document.getElementById("fuzz-list");
+  const count = document.getElementById("fuzz-tab-count");
+  if (list === null) return;
+  const rows: { key: string; job: FuzzerJob }[] = [];
+  if (currentFuzzDraft !== null) rows.push({ key: "draft", job: currentFuzzDraft });
+  [...fuzzerJobsList.values()].forEach((job) => rows.push({ key: job.id, job }));
+  if (count !== null) {
+    count.textContent = String(rows.length);
+    count.hidden = rows.length === 0;
+  }
+  if (rows.length === 0) {
+    list.innerHTML = stateBlock({ icon: "discovery", title: "Fuzz queue is empty", body: "Right-click a request in Live traffic or the API surface and choose Fuzz.", compact: true });
+    return;
+  }
+  list.innerHTML = rows
+    .map(({ key, job }) => {
+      const active = key === "draft" ? selectedFuzzer?.id === "" : selectedFuzzer?.id === job.id;
+      const req = job.config.baseRequest;
+      const state = key === "draft" ? "draft" : job.state;
+      return `<button class="qrow${active ? " is-active" : ""}" type="button" data-fuzz-key="${escapeHtml(key)}">${requestRowLabel(req.method, req.url)}<span class="qrow__status">${escapeHtml(state)}</span></button>`;
+    })
+    .join("");
+  list.querySelectorAll<HTMLElement>("[data-fuzz-key]").forEach((row) => {
+    row.addEventListener("click", () => {
+      const key = row.dataset.fuzzKey ?? "";
+      const job = key === "draft" ? currentFuzzDraft : fuzzerJobsList.get(key);
+      if (job !== null && job !== undefined) {
+        selectedFuzzer = job;
+        renderFuzzer();
+        renderFuzzList();
+      }
+    });
+  });
+}
+
+async function refreshFuzzList(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/workbench/fuzzer");
+    if (!response.ok) return;
+    const jobs = (await response.json()) as FuzzerJob[];
+    fuzzerJobsList.clear();
+    // The discovery job belongs to Web capture, not the Fuzz tool.
+    jobs.filter((job) => job.id !== discoveryJob?.id).forEach((job) => fuzzerJobsList.set(job.id, job));
+    renderFuzzList();
+  } catch {
+    /* optional */
+  }
+}
+
+/** Filters the Live-traffic list to rows matching the search box. */
+function applyFlowSearch(): void {
+  const query = (document.querySelector<HTMLInputElement>("#flow-search")?.value ?? "").trim().toLowerCase();
+  document.querySelectorAll<HTMLElement>("#flow-list .list-row").forEach((row) => {
+    row.hidden = query !== "" && !row.textContent?.toLowerCase().includes(query);
+  });
+}
+
+function initWorkbenchTools(): void {
+  document.querySelectorAll<HTMLElement>(".wb-tab").forEach((tab) => {
+    tab.addEventListener("click", () => showWorkbenchTab((tab.dataset.wbtab as "live" | "resend" | "fuzz") ?? "live"));
+  });
+  document.querySelector<HTMLInputElement>("#flow-search")?.addEventListener("input", applyFlowSearch);
+  initWorkbenchSplitters();
+  renderResendList();
+  renderFuzzList();
+}
+
+/** Right-click menu on a Live-traffic row: Resend or Fuzz that request. */
+function showFlowMenu(x: number, y: number, flowId: number): void {
+  document.querySelector(".context-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.className = "context-menu";
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.innerHTML = `<button class="context-menu__item" type="button" data-flow-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" data-flow-fuzz>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>`;
+  const close = (): void => {
+    menu.remove();
+    document.removeEventListener("click", close);
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (event: KeyboardEvent): void => {
+    if (event.key === "Escape") close();
+  };
+  menu.querySelector("[data-flow-resend]")?.addEventListener("click", () => {
+    close();
+    void createResend(flowId);
+  });
+  menu.querySelector("[data-flow-fuzz]")?.addEventListener("click", () => {
+    close();
+    void selectFlow(flowId).then(() => openFuzzer(flowId));
+  });
+  document.body.append(menu);
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${Math.max(4, window.innerWidth - rect.width - 4)}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${Math.max(4, window.innerHeight - rect.height - 4)}px`;
+  setTimeout(() => {
+    document.addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+  }, 0);
+}
+
+/** Drag-resize the list|detail split in each Workbench tool (30–70%). */
+function initWorkbenchSplitters(): void {
+  document.querySelectorAll<HTMLElement>(".wb-split__gutter").forEach((gutter) => {
+    const split = gutter.closest<HTMLElement>(".wb-split");
+    if (split === null) return;
+    const setRatio = (ratio: number): void => {
+      const clamped = Math.max(0.3, Math.min(0.7, ratio));
+      split.style.setProperty("--wb-list", `${(clamped * 100).toFixed(1)}%`);
+    };
+    gutter.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      gutter.setPointerCapture(event.pointerId);
+      const move = (e: PointerEvent): void => {
+        const rect = split.getBoundingClientRect();
+        setRatio((e.clientX - rect.left) / rect.width);
+      };
+      const up = (): void => {
+        gutter.releasePointerCapture(event.pointerId);
+        gutter.removeEventListener("pointermove", move);
+        gutter.removeEventListener("pointerup", up);
+      };
+      gutter.addEventListener("pointermove", move);
+      gutter.addEventListener("pointerup", up);
+    });
+    gutter.addEventListener("dblclick", () => setRatio(0.5));
+    gutter.addEventListener("keydown", (event) => {
+      const current = parseFloat(getComputedStyle(split).getPropertyValue("--wb-list")) || 50;
+      if (event.key === "ArrowLeft") { setRatio((current - 4) / 100); event.preventDefault(); }
+      else if (event.key === "ArrowRight") { setRatio((current + 4) / 100); event.preventDefault(); }
+    });
+  });
 }
 
 function renderSurfaceEmpty(): void {
@@ -1821,6 +2105,12 @@ async function refreshBrowserStatus(): Promise<void> {
     renderBrowserState(status);
     if (status.running && browserPoll === undefined) browserPoll = window.setInterval(() => void refreshBrowserStatus(), 2000);
     if (!status.running && browserPoll !== undefined) { window.clearInterval(browserPoll); browserPoll = undefined; }
+    // Build the API surface live while capturing, so the operator never has to
+    // hit "Fuse" to see what has been observed — it is already assembled.
+    if (status.running) {
+      autoFuseTick += 1;
+      if (autoFuseTick % 3 === 0) void autoFuseWebTraffic();
+    }
   } catch {
     // Transient; the next poll re-reads the real process state.
   }
@@ -1890,8 +2180,77 @@ async function exportHar(): Promise<void> {
  * 6. Discovery
  * ==================================================================== */
 
-function discoveryRequestBody(): string {
-  return JSON.stringify({ kind: discoveryKind?.value ?? "directory", wordlist: discoveryWordlist?.value ?? "small" });
+/** An uploaded custom wordlist (.txt/.md), sent as `custom` on the request. */
+let customWordlist: string[] | null = null;
+
+function discoveryRequestBody(confirmed = false): string {
+  const wordlist = discoveryWordlist?.value ?? "quick";
+  const body: Record<string, unknown> = { kind: discoveryKind?.value ?? "directory", wordlist };
+  if (wordlist === "custom" && customWordlist !== null) body.custom = customWordlist;
+  if (confirmed) body.confirmed = true;
+  return JSON.stringify(body);
+}
+
+interface WordlistInfo {
+  id: string;
+  label: string;
+  kind: string;
+  count: number;
+  source: string;
+}
+
+/** Populates the discovery wordlist picker from the bundled catalogue, grouped
+ *  by kind, plus any uploaded custom list. */
+async function populateWordlists(): Promise<void> {
+  if (discoveryWordlist === null) return;
+  let catalogue: WordlistInfo[] = [];
+  try {
+    const response = await fetch("/api/v1/discovery/wordlists");
+    if (response.ok) catalogue = (await response.json()) as WordlistInfo[];
+  } catch {
+    /* fall back to the built-ins below */
+  }
+  const previous = discoveryWordlist.value;
+  const group = (kind: string, label: string): string => {
+    const items = catalogue.filter((w) => w.kind === kind);
+    if (items.length === 0) return "";
+    return `<optgroup label="${escapeHtml(label)}">${items.map((w) => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.label)} · ${w.count.toLocaleString()}</option>`).join("")}</optgroup>`;
+  };
+  const custom = customWordlist === null ? "" : `<optgroup label="Custom"><option value="custom">Uploaded list · ${customWordlist.length.toLocaleString()}</option></optgroup>`;
+  const built =
+    catalogue.length === 0
+      ? `<option value="quick">Quick sample · 8</option><option value="medium">Medium · 18</option><option value="large">APIaxess curated</option>`
+      : group("directory", "Directories / paths") + group("subdomain", "Subdomains");
+  discoveryWordlist.innerHTML = built + custom;
+  discoveryWordlist.value = customWordlist !== null ? "custom" : previous !== "" && Array.from(discoveryWordlist.options).some((o) => o.value === previous) ? previous : "common";
+  updateWordlistHint();
+}
+
+function updateWordlistHint(): void {
+  const hint = document.querySelector<HTMLElement>("#discovery-wordlist-hint");
+  if (hint === null || discoveryWordlist === null) return;
+  const opt = discoveryWordlist.selectedOptions[0];
+  hint.textContent = discoveryWordlist.value === "custom" ? "Custom list uploaded — Estimate to see the request count." : `${opt?.textContent ?? ""}. Upload your own with the button, or pick a bundled SecLists list.`;
+}
+
+/** Reads an uploaded .txt/.md wordlist into the custom list and selects it. */
+function loadCustomWordlist(file: File): void {
+  const reader = new FileReader();
+  reader.onload = (): void => {
+    const text = typeof reader.result === "string" ? reader.result : "";
+    const values = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    if (values.length === 0) {
+      showDiagnostic({ id: "discovery.wordlist-empty", what: "The uploaded wordlist was empty.", why: "No non-comment, non-blank lines were found in the file.", fix: "Upload a .txt or .md file with one entry per line." });
+      return;
+    }
+    customWordlist = values;
+    void populateWordlists();
+    toast(`Loaded ${values.length.toLocaleString()} entries from ${file.name}`, "success");
+  };
+  reader.readAsText(file);
 }
 
 function renderDiscoveryEstimate(estimate: DiscoveryEstimate): void {
@@ -1945,7 +2304,7 @@ async function runDiscovery(): Promise<void> {
   if (!confirmed) return;
 
   try {
-    const response = await fetch("/api/v1/discovery/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: discoveryKind?.value ?? "directory", wordlist: discoveryWordlist?.value ?? "small", confirmed: true }) });
+    const response = await fetch("/api/v1/discovery/run", { method: "POST", headers: { "content-type": "application/json" }, body: discoveryRequestBody(true) });
     await requireOk(response, "discovery could not start");
     discoveryJob = await response.json() as FuzzerJob;
     renderDiscovery();
@@ -2046,6 +2405,18 @@ async function stopDiscovery(): Promise<void> {
 /* ==================================================================== *
  * Fusion
  * ==================================================================== */
+
+/** Best-effort live fusion while capturing: keeps the API surface current with
+ *  no toast and no navigation, so it is ready the instant the operator opens it. */
+let autoFuseTick = 0;
+async function autoFuseWebTraffic(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/web/fuse", { method: "POST" });
+    if (response.ok) renderSurface(normalizeFusedSurface(await response.json()));
+  } catch {
+    /* the next tick retries; a fuse with no in-scope traffic simply no-ops */
+  }
+}
 
 async function fuseWebTraffic(): Promise<void> {
   const button = document.querySelector<HTMLButtonElement>("#web-fuse");
@@ -2342,6 +2713,13 @@ harFile?.addEventListener("change", () => { const file = harFile.files?.[0]; if 
 document.querySelector("#discovery-estimate")?.addEventListener("click", () => void estimateDiscovery());
 document.querySelector("#discovery-run")?.addEventListener("click", () => void runDiscovery());
 document.querySelector("#discovery-stop")?.addEventListener("click", () => void stopDiscovery());
+document.querySelector("#discovery-upload-btn")?.addEventListener("click", () => document.querySelector<HTMLInputElement>("#discovery-upload")?.click());
+document.querySelector<HTMLInputElement>("#discovery-upload")?.addEventListener("change", (event) => {
+  const file = (event.target as HTMLInputElement).files?.[0];
+  if (file !== undefined) loadCustomWordlist(file);
+  (event.target as HTMLInputElement).value = "";
+});
+discoveryWordlist?.addEventListener("change", updateWordlistHint);
 document.querySelector("#web-fuse")?.addEventListener("click", () => void fuseWebTraffic());
 document.querySelector("#web-export")?.addEventListener("click", () => showView("export"));
 document.querySelector("#apk-run")?.addEventListener("click", () => void startPipeline());
@@ -2398,6 +2776,9 @@ document.querySelector("#session-new")?.addEventListener("click", () => void new
 document.querySelector("#session-open")?.addEventListener("click", () => void openSession());
 document.querySelector("#session-save")?.addEventListener("click", () => void saveSession());
 document.querySelector("#surface-refresh")?.addEventListener("click", () => void refreshStoredSurface());
+document.querySelectorAll<HTMLElement>(".surface-section").forEach((tab) => {
+  tab.addEventListener("click", () => showSurfaceSection((tab.dataset.surfaceSection as "app" | "web") ?? "web"));
+});
 
 /* ==================================================================== *
  * Boot
@@ -2619,6 +3000,11 @@ function paintShell(): void {
   onViewChange((view) => {
     if (view === "session") void refreshSession();
     if (view === "surface") void refreshStoredSurface();
+    if (view === "web") void populateWordlists();
+    if (view === "workbench") {
+      void refreshResendList();
+      void refreshFuzzList();
+    }
     if (view === "settings") void refreshSettings();
     if (view === "devices") enterDevicesView();
     else leaveDevicesView();
@@ -2644,10 +3030,11 @@ function paintShell(): void {
     ?.addEventListener("click", () => void refreshDevices());
 
   initShell();
-  // The dock now owns the Resend/Fuzzer panels (relocated by initShell); give
-  // each a resting empty state so its tab is never a blank void.
+  // Resend/Fuzz are Workbench tools now; seed each detail pane's resting empty
+  // state and wire the tool tabs, lists, search, and split resizers.
   seedResendEmpty();
   seedFuzzerEmpty();
+  initWorkbenchTools();
   initNavigation();
   initDiagnosticsDrawer(diagnostics);
   diagnostics.render();

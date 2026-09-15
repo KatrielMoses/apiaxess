@@ -60,7 +60,9 @@ const PANE_DEFAULTS = { sidebar: 192, inspector: 340, dock: 132 } as const;
 const PANE_LIMITS = {
   sidebar: { min: 160, max: 320 },
   inspector: { min: 280, max: 520 },
-  dock: { min: 88, max: 360 },
+  // The dock is a real working pane (traffic queue, diagnostics); let it grow to
+  // roughly two-thirds of a 900px viewport so it is genuinely usable, not a sliver.
+  dock: { min: 88, max: 620 },
 } as const;
 
 let shell: HTMLElement;
@@ -145,9 +147,10 @@ function syncActiveView(view: ViewName): void {
  * Bottom dock
  * ------------------------------------------------------------------ */
 
-/** Relocates the workbench's live queue/resend/fuzzer nodes into the shared
- *  dock. Moving (not cloning) keeps element identity — and every socket and
- *  listener wired to them — intact. */
+/** Relocates the intercept queue into the shared bottom dock. Resend and Fuzz
+ *  are full Workbench tools (Repeater/Intruder register), so they stay in the
+ *  Workbench — only the queue and diagnostics are dock-resident. Moving (not
+ *  cloning) keeps element identity and every wired socket/listener intact. */
 function adoptDock(): void {
   const move = (id: string, into: string): void => {
     const node = document.getElementById(id);
@@ -155,12 +158,7 @@ function adoptDock(): void {
     if (node !== null && host !== null) host.appendChild(node);
   };
   move("queue-list", "dock-queue");
-  move("resend-panel", "dock-resend");
-  move("fuzzer-panel", "dock-fuzzer");
-  // The relocated resend/fuzzer panels are shown by removing `hidden`; in
-  // the dock they are always their tab's body, so clear it.
-  document.getElementById("resend-panel")?.removeAttribute("hidden");
-  document.getElementById("fuzzer-panel")?.removeAttribute("hidden");
+  document.getElementById("queue-list")?.removeAttribute("hidden");
 
   const tabs = Array.from(shell.querySelectorAll<HTMLElement>(".dock__tab"));
   const panels = Array.from(shell.querySelectorAll<HTMLElement>(".dock__panel"));
