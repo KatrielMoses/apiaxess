@@ -54,10 +54,10 @@ the crate-boundary rules live in [`docs/architecture/repository-map.md`](docs/ar
 - **Fusion** — merge static + dynamic + capture into the canonical surface, retaining every
   candidate and its provenance: [`crates/fusion/src/lib.rs`](crates/fusion/src/lib.rs); final
   assembly + signer binding in [`crates/unified-surface/src/lib.rs`](crates/unified-surface/src/lib.rs).
-- **Workbench proxy (repeater / intruder / live proxy)** — capture and replay:
+- **Workbench proxy (resend / fuzzer / live proxy)** — capture and replay:
   [`crates/workbench-proxy/src/`](crates/workbench-proxy/src/): `backend.rs` (`ProxyBackend`
   trait + hudsucker backend + flow-id/observer wiring), `live.rs` (`FlowEvent`/`FlowObserver`),
-  `repeater.rs`, `intruder.rs`, CA/trust in `ca.rs`/`trust.rs`, bundled Chromium in `bundled.rs`.
+  `resend.rs`, `fuzzer.rs`, CA/trust in `ca.rs`/`trust.rs`, bundled Chromium in `bundled.rs`.
 - **Web capture + fusion** — HAR import and live web session capture flow into the same store
   and fusion path; import/classification entry in [`crates/workbench-store/src/lib.rs`](crates/workbench-store/src/lib.rs)
   (`import_har`, `TrafficStore::upsert`, `FlowRedactor` choke-point).

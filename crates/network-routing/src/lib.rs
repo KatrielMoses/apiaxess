@@ -1120,9 +1120,7 @@ fn add_path_scoped(
         }
         Ok(())
     } else if path.is_dir() {
-        if !package_markers.is_empty()
-            && matches!(source_kind, SourceKind::Smali)
-        {
+        if !package_markers.is_empty() && matches!(source_kind, SourceKind::Smali) {
             let mut found_package_root = false;
             for marker in package_markers {
                 let package_path = marker

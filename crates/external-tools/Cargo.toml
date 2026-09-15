@@ -10,5 +10,11 @@ license.workspace = true
 process-wrap.workspace = true
 thiserror.workspace = true
 
+# Windows-only: CREATE_NO_WINDOW so spawned console-subsystem children (the engine
+# under the GUI shell, and java/apktool/jadx/ffuf during intake) never pop a
+# visible terminal window. Already in the workspace lock via process-wrap.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
+
 [lints]
 workspace = true

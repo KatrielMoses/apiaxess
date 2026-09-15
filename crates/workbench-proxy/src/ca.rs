@@ -11,6 +11,7 @@ use std::{
 };
 
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
+use md5::Md5;
 use hudsucker::{
     certificate_authority::CertificateAuthority,
     rcgen::{
@@ -106,6 +107,28 @@ impl SessionCa {
     #[must_use]
     pub fn fingerprint(&self) -> &str {
         &self.0.fingerprint
+    }
+
+    /// Returns OpenSSL's legacy `subject_hash_old` of the root CA subject, as the
+    /// 8-hex-digit lowercase string Android uses for the `<hash>.0` filename in
+    /// the pre-14 `/system/etc/security/cacerts` trust store.
+    ///
+    /// This reproduces OpenSSL's `X509_NAME_hash_old`: the MD5 of the DER-encoded
+    /// subject `Name`, with the first four digest bytes read little-endian.
+    /// Computing it in-process removes the runtime dependency on a host `openssl`
+    /// binary, so system-CA provisioning works in a self-contained install.
+    ///
+    /// # Errors
+    ///
+    /// Returns the canonical CA-generation diagnostic if the root certificate
+    /// cannot be parsed.
+    pub fn android_subject_hash_old(&self) -> Result<String, Diagnostic> {
+        let (_, certificate) = x509_parser::parse_x509_certificate(&self.0.root_der)
+            .map_err(|error| ca_generation_diagnostic_text(&error.to_string()))?;
+        let subject_der = certificate.tbs_certificate.subject.as_raw();
+        let digest = Md5::digest(subject_der);
+        let value = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        Ok(format!("{value:08x}"))
     }
 
     /// Number of cached per-host leaf configurations.
@@ -384,6 +407,28 @@ mod tests {
             .expect("cached leaf");
         assert_eq!(first_leaf, second_leaf);
         assert_eq!(first.cached_leaf_count(), 1);
+    }
+
+    #[test]
+    fn subject_hash_old_matches_openssl_for_the_fixed_subject() {
+        // Authoritative cross-check: `openssl x509 -subject_hash_old` on the real
+        // rcgen-issued root cert yields exactly this value (the subject is the
+        // fixed common name `APIaxess ephemeral interception CA`, UTF8String), so
+        // the in-process MD5 computation must reproduce it byte-for-byte. Pinning
+        // the literal turns any drift in the algorithm or the CA subject into a
+        // test failure instead of a silent trust-store mismatch on device.
+        const OPENSSL_SUBJECT_HASH_OLD: &str = "b335eae3";
+        let first = SessionCa::generate().expect("first CA");
+        let second = SessionCa::generate().expect("second CA");
+        let hash = first.android_subject_hash_old().expect("subject hash");
+        assert_eq!(hash, OPENSSL_SUBJECT_HASH_OLD, "hash was {hash:?}");
+        // The subject is constant, so the hash is stable across sessions even
+        // though each CA has a distinct key and fingerprint.
+        assert_ne!(first.fingerprint(), second.fingerprint());
+        assert_eq!(
+            hash,
+            second.android_subject_hash_old().expect("second hash")
+        );
     }
 
     #[test]

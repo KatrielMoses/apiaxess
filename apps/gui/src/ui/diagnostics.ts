@@ -30,6 +30,44 @@ export function diagnosticHtml(diagnostic: Diagnostic): string {
 }
 
 /**
+ * Renders diagnostics grouped by cause (their `id`), newest cause first. A single
+ * pass can raise the same cause many times with a different `why` each — e.g. one
+ * static-analysis note per unbound endpoint — so one card per cause with an
+ * occurrence count and its distinct reasons is legible where dozens of near-
+ * identical cards are not. The what and fix are stable per cause; only the reasons vary.
+ */
+export function aggregatedDiagnosticsHtml(entries: readonly Diagnostic[]): string {
+  const groups = new Map<string, Diagnostic[]>();
+  for (const entry of entries) {
+    const group = groups.get(entry.id);
+    if (group === undefined) groups.set(entry.id, [entry]);
+    else group.push(entry);
+  }
+  return [...groups.values()]
+    .reverse()
+    .map((group) => {
+      const head = group[0];
+      if (head === undefined) return "";
+      const reasons = [...new Set(group.map((entry) => entry.why).filter((why) => why !== ""))];
+      const count = group.length;
+      const whyBlock =
+        reasons.length <= 1
+          ? `<div class="diagnostic__line"><span>Why</span><p>${escapeHtml(head.why)}</p></div>`
+          : `<div class="diagnostic__line"><span>Why</span><ul class="diagnostic__causes">${reasons
+              .slice(0, 5)
+              .map((why) => `<li>${escapeHtml(why)}</li>`)
+              .join("")}${reasons.length > 5 ? `<li class="t-subtle">+${reasons.length - 5} more</li>` : ""}</ul></div>`;
+      return `<article class="diagnostic diagnostic--${tone(head)}">
+<p class="diagnostic__id">${escapeHtml(head.id)}${count > 1 ? `<span class="diagnostic__count">×${count}</span>` : ""}</p>
+<p class="diagnostic__what">${escapeHtml(head.what)}</p>
+${whyBlock}
+<div class="diagnostic__line"><span>Fix</span><p>${escapeHtml(head.fix)}</p></div>
+</article>`;
+    })
+    .join("");
+}
+
+/**
  * Renders a list of diagnostics, or a branded empty state when there are none.
  * Null entries — how the engine encodes "no diagnostic" inside a collection —
  * are dropped rather than rendered as empty blocks.
@@ -89,20 +127,38 @@ export class DiagnosticsLog {
 
   render(): void {
     const list = document.querySelector<HTMLElement>("#diagnostic-text");
+    const dockList = document.querySelector<HTMLElement>("#dock-diagnostics");
+    const dockCount = document.querySelector<HTMLElement>("#dock-diag-count");
+    const statusCell = document.querySelector<HTMLElement>("#statusbar-diag");
     const count = document.querySelector<HTMLElement>("#diagnostics-count");
     const summary = document.querySelector<HTMLElement>("#diagnostics-summary");
     const toggle = document.querySelector<HTMLElement>("#diagnostics-toggle");
+    const total = this.#entries.length;
 
-    if (list !== null) {
-      list.innerHTML =
-        this.#entries.length === 0
-          ? stateBlock({
-              icon: "check",
-              title: "No diagnostics",
-              body: "Anything the engine cannot do, or can only do partially, is reported here with its cause and its fix.",
-              compact: true,
-            })
-          : [...this.#entries].reverse().map(diagnosticHtml).join("");
+    // Count distinct causes, not raw events: the cards are grouped by cause, so
+    // the badges must agree with what the operator actually sees.
+    const causes = new Set(this.#entries.map((entry) => entry.id)).size;
+    const body =
+      total === 0
+        ? stateBlock({
+            icon: "check",
+            title: "No diagnostics",
+            body: "Anything the engine cannot do, or can only do partially, is reported here with its cause and its fix.",
+            compact: true,
+          })
+        : aggregatedDiagnosticsHtml(this.#entries);
+    if (list !== null) list.innerHTML = body;
+    if (dockList !== null) dockList.innerHTML = body;
+
+    // The dock badge and the status-bar cell are failure indicators: they carry
+    // red and appear only when there is something to show — never at zero.
+    if (dockCount !== null) {
+      dockCount.textContent = String(causes);
+      dockCount.hidden = causes === 0;
+    }
+    if (statusCell !== null) {
+      statusCell.textContent = `${causes} DIAGNOSTIC${causes === 1 ? "" : "S"}`;
+      statusCell.hidden = causes === 0;
     }
 
     const unread = Math.max(0, this.#entries.length - this.#seen);
@@ -111,16 +167,10 @@ export class DiagnosticsLog {
       count.hidden = unread === 0;
     }
     if (summary !== null) {
-      summary.textContent =
-        this.#entries.length === 0
-          ? "No diagnostics"
-          : `${this.#entries.length} diagnostic${this.#entries.length === 1 ? "" : "s"} this session`;
+      summary.textContent = causes === 0 ? "No diagnostics" : `${causes} cause${causes === 1 ? "" : "s"} this session`;
     }
     if (toggle !== null) {
-      toggle.title =
-        this.#entries.length === 0
-          ? "Diagnostics"
-          : `Diagnostics — ${this.#entries.length} recorded`;
+      toggle.title = causes === 0 ? "Diagnostics" : `Diagnostics — ${causes} cause${causes === 1 ? "" : "s"}`;
     }
   }
 }

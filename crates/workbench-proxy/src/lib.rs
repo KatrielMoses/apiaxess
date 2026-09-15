@@ -9,14 +9,14 @@ mod backend;
 mod bundled;
 pub use bundled::resolved_ffuf;
 pub mod ca;
-pub mod intruder;
+pub mod fuzzer;
 pub mod live;
-pub mod repeater;
+pub mod resend;
 pub mod transparent;
 pub mod trust;
 
 pub use apiaxess_workbench_store::{
-    RepeaterContext, RepeaterRequest, RepeaterResponse, RepeaterRevision, TrafficStore,
+    ResendContext, ResendRequest, ResendResponse, ResendRevision, TrafficStore,
 };
 pub use backend::{
     BackendHealth, BackendKind, BodyDirection, FlowEvent, FlowObserver, HudsuckerBackend,
@@ -24,12 +24,12 @@ pub use backend::{
     ProxyHandle, WebSocketDirection,
 };
 pub use ca::{CaExport, SessionCa};
-pub use intruder::IntruderWorkbench;
+pub use fuzzer::FuzzerWorkbench;
 pub use live::{
     CredentialPrompt, CredentialPromptAnswer, CredentialPromptField, FlowDetail, FlowRecord,
-    FlowSummary, LiveWorkbench, LiveUpdate,
+    FlowSummary, LiveUpdate, LiveWorkbench,
 };
-pub use repeater::{ProxyRepeaterSender, RepeaterSendResult, RepeaterSender, RepeaterWorkbench};
+pub use resend::{ProxyResendSender, ResendSendResult, ResendSender, ResendWorkbench};
 pub use transparent::TransparentFrontend;
 pub use trust::{
     BrowserKind, BrowserPlatform, BrowserProfileInstall, BrowserTrustController,

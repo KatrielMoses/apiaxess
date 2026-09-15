@@ -1,0 +1,20 @@
+[package]
+name = "apiaxess-native-dialog"
+description = "Windows-only helper to parent a native dialog to the foreground window"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Intentionally does NOT set `[lints] workspace = true`: this crate contains the
+# small, audited Win32 unsafe (a foreground-window query and a borrowed raw handle)
+# that the workspace's `unsafe_code = "forbid"` lint blocks elsewhere. Keeping it in
+# one tiny, windows-only crate lets the rest of the workspace stay unsafe-free while
+# the native file dialog can still open owned by (on top of) the app window.
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

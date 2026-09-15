@@ -19,6 +19,7 @@ getrandom.workspace = true
 http-body-util.workspace = true
 hudsucker.workspace = true
 hyper-rustls.workspace = true
+md-5.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
 regex.workspace = true
@@ -27,6 +28,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 webpki-roots.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 http.workspace = true

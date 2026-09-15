@@ -373,7 +373,7 @@ fn evidence_sidecar(
 ) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec_pretty(&json!({
         "schema_version": 1,
-        "description": "APIxess retained evidence sidecar; primary artifacts reference this file instead of inlining high-volume evidence.",
+        "description": "APIaxess retained evidence sidecar; primary artifacts reference this file instead of inlining high-volume evidence.",
         "coverage": surface.confidence.coverage,
         "handoffs": surface.confidence.handoffs,
         "provenance": surface.surface.provenance,

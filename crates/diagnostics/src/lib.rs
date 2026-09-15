@@ -150,7 +150,8 @@ pub fn bounded_status_diagnostics(
     per_id: usize,
     total: usize,
 ) -> Vec<Diagnostic> {
-    let mut per_id_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut per_id_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
     let mut bounded = Vec::new();
     for diagnostic in diagnostics {
         if bounded.len() >= total {
@@ -780,6 +781,27 @@ pub mod catalogue {
         fix: "Activate the session before starting the proxy, or close and recreate an invalid session.",
     };
 
+    /// A web-only action (discovery, capture browser) was requested without an
+    /// active web-target session.
+    pub const WEB_TARGET_REQUIRED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "web.target-required",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "This action needs an active web capture session.",
+        why: "Discovery and the capture browser run against a declared web target, and the current session has none.",
+        fix: "Start a web session on the Web capture surface (enter a target and affirm authorization), then retry.",
+    };
+
+    /// A discovery run named a wordlist that is not bundled.
+    pub const DISCOVERY_WORDLIST_UNKNOWN: DiagnosticDefinition = DiagnosticDefinition {
+        id: "discovery.wordlist-unknown",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "The requested discovery wordlist is not available.",
+        why: "Only the bundled wordlists (small, medium, large) or an explicit custom list can be run.",
+        fix: "Choose one of the bundled wordlists and retry.",
+    };
+
     /// The per-session CA could not be generated.
     pub const PROXY_CA_GENERATION_FAILED: DiagnosticDefinition = DiagnosticDefinition {
         id: "proxy.ca-generation-failed",
@@ -1042,6 +1064,43 @@ pub mod catalogue {
         fix: "Refresh the live session and act only on a currently paused flow; the proxy keeps the flow outcome authoritative.",
     };
 
+    /// The device-pairing CA endpoint was queried before a session CA exists.
+    pub const PAIRING_CA_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "pairing.ca-unavailable",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "The session interception CA is not available yet.",
+        why: "A device requested the pairing CA before the workbench finished provisioning the per-session root certificate.",
+        fix: "Wait for the workbench to report ready, then retry the pairing request; the CA is provisioned once at session startup.",
+    };
+
+    /// A device presented an invalid, expired, or already-used pairing token.
+    pub const PAIRING_TOKEN_REJECTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "pairing.token-rejected",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "The device pairing token was rejected.",
+        why: "The presented one-time pairing token is unknown, has expired, or was already exchanged for a session token.",
+        fix: "Generate a fresh pairing token from the workbench and pair the device again before it expires; each token is single-use.",
+    };
+
+    /// A device control connection presented no valid session bearer token.
+    pub const PAIRING_DEVICE_AUTH_REJECTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "pairing.device-auth-rejected",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "The device control connection was not authenticated.",
+        why: "The connection did not present a valid, unexpired session bearer token issued by the pairing exchange for this session.",
+        fix: "Re-run device pairing to obtain a current session token; a device cannot open the control channel without one.",
+    };
+
+    /// Every device-pairing (phase C1) definition, used by conformance tests.
+    pub const PHASE_C1: &[DiagnosticDefinition] = &[
+        PAIRING_CA_UNAVAILABLE,
+        PAIRING_TOKEN_REJECTED,
+        PAIRING_DEVICE_AUTH_REJECTED,
+    ];
+
     /// Every phase 0.4 definition, used by catalogue conformance tests.
     pub const PHASE_0_4: &[DiagnosticDefinition] = &[
         SCOPE_OUTSIDE_DECLARATION,
@@ -1106,6 +1165,8 @@ pub mod catalogue {
         PROXY_PORT_IN_USE,
         PROXY_BACKEND_START_FAILED,
         PROXY_SESSION_NOT_ACTIVE,
+        WEB_TARGET_REQUIRED,
+        DISCOVERY_WORDLIST_UNKNOWN,
         PROXY_CA_GENERATION_FAILED,
         PROXY_CA_EXPORT_FAILED,
         PROXY_UPSTREAM_UNREACHABLE,
@@ -1259,75 +1320,75 @@ pub mod catalogue {
         PROXY_SESSION_SCOPE_NOT_SET,
     ];
 
-    /// A repeater request could not be parsed or sent through the proxy path.
-    pub const PROXY_REPEATER_REQUEST_FAILED: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.repeater-request-failed",
+    /// A resend request could not be parsed or sent through the proxy path.
+    pub const PROXY_RESEND_REQUEST_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.resend-request-failed",
         category: DiagnosticCategory::Session,
         severity: DiagnosticSeverity::Error,
-        what: "The repeater request was rejected or could not be sent.",
+        what: "The resend request was rejected or could not be sent.",
         why: "The edited method, URL, headers, body, proxy transport, TLS setup, or upstream exchange was invalid or unavailable.",
         fix: "Correct the request fields, ensure the session proxy is running, and retry; the original captured request remains unchanged.",
     };
 
-    /// Repeater history could not be durably persisted.
-    pub const PROXY_REPEATER_HISTORY_FAILED: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.repeater-history-failed",
+    /// Resend history could not be durably persisted.
+    pub const PROXY_RESEND_HISTORY_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.resend-history-failed",
         category: DiagnosticCategory::Persistence,
         severity: DiagnosticSeverity::Error,
-        what: "The repeater revision could not be saved.",
+        what: "The resend revision could not be saved.",
         why: "The append-only context or revision record could not be committed to the session traffic store.",
         fix: "Keep the edited request visible, repair session storage, and retry persistence; no revision is reported as saved until the commit succeeds.",
     };
 
-    /// A repeater request was attempted outside the declared engagement scope.
-    pub const PROXY_REPEATER_OUTSIDE_SCOPE: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.repeater-outside-scope",
+    /// A resend request was attempted outside the declared engagement scope.
+    pub const PROXY_RESEND_OUTSIDE_SCOPE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.resend-outside-scope",
         category: DiagnosticCategory::AuthorizationScope,
         severity: DiagnosticSeverity::Warning,
-        what: "The repeater request targets outside the declared engagement scope.",
+        what: "The resend request targets outside the declared engagement scope.",
         why: "The honor-system scope assessment classified the edited request host as outside the session declaration.",
         fix: "Confirm authorization and the target before continuing; the attempt is recorded and is not silently blocked.",
     };
 
-    /// No running routed proxy was available for a repeater send.
-    pub const PROXY_REPEATER_TRANSPORT_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.repeater-transport-unavailable",
+    /// No running routed proxy was available for a resend send.
+    pub const PROXY_RESEND_TRANSPORT_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.resend-transport-unavailable",
         category: DiagnosticCategory::Session,
         severity: DiagnosticSeverity::Error,
-        what: "The repeater has no running session proxy transport.",
-        why: "Repeater sends are required to use the active routed ProxyBackend, but no sender has been attached to this workbench session.",
-        fix: "Start the session proxy and attach its sender before retrying; the repeater will not fall back to a direct request.",
+        what: "Resend has no running session proxy transport.",
+        why: "A resend must go through the active routed ProxyBackend, but no sender has been attached to this workbench session.",
+        fix: "Start the session proxy and attach its sender before retrying; a resend will not fall back to a direct request.",
     };
 
-    /// Every Phase 2.4 repeater definition.
+    /// Every Phase 2.4 resend definition.
     pub const PHASE_2_4: &[DiagnosticDefinition] = &[
-        PROXY_REPEATER_REQUEST_FAILED,
-        PROXY_REPEATER_HISTORY_FAILED,
-        PROXY_REPEATER_OUTSIDE_SCOPE,
-        PROXY_REPEATER_TRANSPORT_UNAVAILABLE,
+        PROXY_RESEND_REQUEST_FAILED,
+        PROXY_RESEND_HISTORY_FAILED,
+        PROXY_RESEND_OUTSIDE_SCOPE,
+        PROXY_RESEND_TRANSPORT_UNAVAILABLE,
     ];
 
     /// ffuf is required for a selected stateless bulk attack but is unavailable.
-    pub const PROXY_INTRUDER_FFUF_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.intruder-ffuf-unavailable",
+    pub const PROXY_FUZZER_FFUF_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-ffuf-unavailable",
         category: DiagnosticCategory::ExternalTool,
         severity: DiagnosticSeverity::Error,
-        what: "The stateless intruder engine is unavailable.",
+        what: "The stateless fuzzer engine is unavailable.",
         why: "The configured ffuf executable is missing, incompatible, or failed its version probe.",
         fix: "Install a supported ffuf release or configure its executable path; choose a stateful/native attack only when the attack actually needs that tier.",
     };
 
     /// ffuf exited unsuccessfully or emitted invalid structured output.
-    pub const PROXY_INTRUDER_FFUF_FAILED: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.intruder-ffuf-failed",
+    pub const PROXY_FUZZER_FFUF_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-ffuf-failed",
         category: DiagnosticCategory::ExternalTool,
         severity: DiagnosticSeverity::Error,
-        what: "The stateless intruder process failed.",
+        what: "The stateless fuzzer process failed.",
         why: "ffuf did not complete successfully or its JSON result could not be decoded.",
         fix: "Inspect the structured process diagnostic, verify the wordlist and target request, then retry or use a native stateful job.",
     };
 
-    /// Observed request rate reported after a stateless discovery/intruder run,
+    /// Observed request rate reported after a stateless discovery/fuzzer run,
     /// so the pre-run estimate can be judged honestly against reality.
     pub const WEB_DISCOVERY_RATE_OBSERVED: DiagnosticDefinition = DiagnosticDefinition {
         id: "web.discovery-rate-observed",
@@ -1338,52 +1399,52 @@ pub mod catalogue {
         fix: "If the actual rate differs materially from the estimate, set APIAXESS_DISCOVERY_RATE to the observed value for future estimates.",
     };
 
-    /// An intruder payload set or position configuration is malformed.
-    pub const PROXY_INTRUDER_CONFIG_INVALID: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.intruder-config-invalid",
+    /// A fuzzer payload set or position configuration is malformed.
+    pub const PROXY_FUZZER_CONFIG_INVALID: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-config-invalid",
         category: DiagnosticCategory::Session,
         severity: DiagnosticSeverity::Error,
-        what: "The intruder attack configuration is invalid.",
+        what: "The fuzzer attack configuration is invalid.",
         why: "Payload sets, positions, attack mode, limits, or sequence steps do not form a usable request attack.",
         fix: "Correct the marked positions and payload sets, then retry configuration validation.",
     };
 
-    /// A native intruder sequence failed at a specific step.
-    pub const PROXY_INTRUDER_SEQUENCE_FAILED: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.intruder-sequence-failed",
+    /// A native fuzzer sequence failed at a specific step.
+    pub const PROXY_FUZZER_SEQUENCE_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-sequence-failed",
         category: DiagnosticCategory::Session,
         severity: DiagnosticSeverity::Error,
-        what: "The stateful intruder sequence stopped before completion.",
+        what: "The stateful fuzzer sequence stopped before completion.",
         why: "Authentication, a prior request, token extraction, or token injection failed at the named sequence step.",
         fix: "Inspect the step diagnostic and response, correct the extractor or pre-flight request, and retry from the failed sequence.",
     };
 
-    /// An intruder job was stopped or cancelled cleanly.
-    pub const PROXY_INTRUDER_CANCELLED: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.intruder-cancelled",
+    /// A fuzzer job was stopped or cancelled cleanly.
+    pub const PROXY_FUZZER_CANCELLED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-cancelled",
         category: DiagnosticCategory::Session,
         severity: DiagnosticSeverity::Info,
-        what: "The intruder job was stopped.",
+        what: "The fuzzer job was stopped.",
         why: "The user cancelled the job or the session closed while work was in progress.",
         fix: "Resume the job or start a new attack if more payloads are authorized.",
     };
 
-    /// An intruder attack target was outside the declared engagement scope.
-    pub const PROXY_INTRUDER_OUTSIDE_SCOPE: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.intruder-outside-scope",
+    /// A fuzzer attack target was outside the declared engagement scope.
+    pub const PROXY_FUZZER_OUTSIDE_SCOPE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-outside-scope",
         category: DiagnosticCategory::AuthorizationScope,
         severity: DiagnosticSeverity::Warning,
-        what: "The intruder attack targets outside the declared engagement scope.",
+        what: "The fuzzer attack targets outside the declared engagement scope.",
         why: "The attack host was classified outside the session declaration.",
         fix: "Confirm authorization before continuing; this warning is recorded and the honor-system model does not silently block it.",
     };
 
-    /// Intruder result or configuration persistence failed.
-    pub const PROXY_INTRUDER_PERSISTENCE_FAILED: DiagnosticDefinition = DiagnosticDefinition {
-        id: "proxy.intruder-persistence-failed",
+    /// Fuzzer result or configuration persistence failed.
+    pub const PROXY_FUZZER_PERSISTENCE_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-persistence-failed",
         category: DiagnosticCategory::Persistence,
         severity: DiagnosticSeverity::Error,
-        what: "The intruder job or result could not be saved.",
+        what: "The fuzzer job or result could not be saved.",
         why: "The durable workbench store rejected the attack configuration or result revision.",
         fix: "Repair session storage and retry; unsaved results are not reported as durable findings.",
     };
@@ -1991,6 +2052,359 @@ pub mod catalogue {
         SANDBOX_CAPTURE_ENDPOINT_UNREACHABLE,
         SANDBOX_GUEST_FETCH_PREFLIGHT_FAILED,
         SANDBOX_NO_DECRYPTABLE_TRAFFIC,
+    ];
+
+    /// No rooted adb device was detected for provisioning.
+    pub const DEVICE_NOT_DETECTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.not-detected",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Warning,
+        what: "No adb device is available to provision.",
+        why: "adb reported no attached device in the `device` state (a physical device or same-machine emulator).",
+        fix: "Connect a rooted device over USB with USB debugging enabled (or start the emulator), then retry setup.",
+    };
+
+    /// An adb device is attached but not authorized for control.
+    pub const DEVICE_UNAUTHORIZED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.unauthorized",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Warning,
+        what: "The attached adb device has not authorized this workbench.",
+        why: "adb reports the device as `unauthorized` or `offline`, so no control command can run on it.",
+        fix: "On the device, accept the 'Allow USB debugging' prompt for this host's key (revoke and reconnect if you missed it), then retry.",
+    };
+
+    /// A rooted adb device was detected and is ready to provision.
+    pub const DEVICE_DETECTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.detected",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Info,
+        what: "A device was detected and is ready to provision.",
+        why: "adb reports an attached device in the `device` state that the workbench can drive over the secured control channel.",
+        fix: "Continue setup to establish the reverse tunnel and install the session CA; no action is required.",
+    };
+
+    /// The adb-reverse tunnel from device loopback to the workbench could not be set.
+    pub const DEVICE_REVERSE_TUNNEL_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.reverse-tunnel-failed",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "The adb-reverse tunnel to the workbench proxy could not be established.",
+        why: "`adb reverse` did not map the device loopback port onto the workbench loopback proxy/control port.",
+        fix: "Confirm the device is still connected and the workbench proxy port is bound, then retry; no other transport is used.",
+    };
+
+    /// The adb-reverse tunnel is set and the device loopback reaches the workbench.
+    pub const DEVICE_TUNNEL_READY: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.tunnel-ready",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Info,
+        what: "The device now tunnels to the workbench over adb.",
+        why: "`adb reverse` mapped the device loopback port onto the workbench loopback proxy/control port, so no LAN exposure is required.",
+        fix: "Continue setup; no action is required.",
+    };
+
+    /// The device's Android version could not be determined or is unsupported.
+    pub const DEVICE_ANDROID_VERSION_UNSUPPORTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.android-version-unsupported",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Error,
+        what: "The device's Android version could not be used for auto CA install.",
+        why: "`getprop ro.build.version.sdk` returned no parseable API level, or the level is below the minimum the CA-install paths support.",
+        fix: "Use a device running a supported Android version (API 24+) with a readable build fingerprint, then retry.",
+    };
+
+    /// The version-appropriate system-CA install path was selected.
+    pub const DEVICE_TRUST_PATH_SELECTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.trust-path-selected",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Info,
+        what: "The correct system-trust install path was chosen for this Android version.",
+        why: "The device's API level was detected, so the workbench routes to the legacy cacerts path (<=13) or the Conscrypt APEX path (14+).",
+        fix: "Continue setup; no action is required.",
+    };
+
+    /// The device refused `adb root`, so system trust cannot be modified.
+    pub const DEVICE_ROOT_REFUSED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.root-refused",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Error,
+        what: "The device did not grant root to the adb daemon.",
+        why: "`adb root` was refused or the shell did not become uid=0, so the read-only system/APEX trust store cannot be remounted.",
+        fix: "Use a userdebug/eng build or a root manager that permits `adb root` (or restarts adbd as root), then retry.",
+    };
+
+    /// The Android 14+ Conscrypt APEX trust bind-mount branch failed.
+    pub const DEVICE_APEX_TRUST_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.apex-trust-failed",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "The session CA could not be installed into the Conscrypt APEX trust store.",
+        why: "Staging the APEX cacerts, mounting the tmpfs over `/apex/com.android.conscrypt/cacerts`, or binding it into the zygote mount namespaces failed on this Android 14+ device.",
+        fix: "Confirm the device is rooted with a writable init mount namespace and that `mount`/`nsenter` are available, then retry.",
+    };
+
+    /// The session CA was installed and verified in the device system trust store.
+    pub const DEVICE_CA_INSTALLED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.ca-installed",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Info,
+        what: "The session CA is installed and verified in the device system trust store.",
+        why: "The version-appropriate install path placed and verified the hashed CA where Android's system trust anchors are read.",
+        fix: "The device now trusts the session CA for interception; no action is required.",
+    };
+
+    /// The optional device frida-server was started for later pinned-app bypass.
+    pub const DEVICE_FRIDA_SERVER_STARTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.frida-server-started",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Info,
+        what: "frida-server is running on the device.",
+        why: "Provisioning deployed and started the bundled frida-server so a later phase can bypass certificate pinning.",
+        fix: "No action is required; per-app Frida targeting is applied when a pinned app is analyzed.",
+    };
+
+    /// The optional device frida-server could not be started (non-fatal at C2).
+    pub const DEVICE_FRIDA_SERVER_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.frida-server-unavailable",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Warning,
+        what: "The optional device frida-server could not be started.",
+        why: "Deploying or launching the bundled frida-server failed, but CA-based interception was already provisioned.",
+        fix: "Retry provisioning if you need pinned-app bypass; unpinned HTTPS is already interceptable through the installed CA.",
+    };
+
+    /// The device chosen for a pinned-app Frida bypass is not connected.
+    pub const DEVICE_FRIDA_TARGET_NOT_FOUND: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.frida-target-not-found",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Error,
+        what: "The device selected for the pinning bypass is not connected.",
+        why: "The requested adb serial is not among the attached, authorized devices, so the workbench cannot forward to its frida-server.",
+        fix: "Reconnect the device (and re-run provisioning), then choose it again; when several devices are attached, the serial selects which one.",
+    };
+
+    /// Pinning was detected but is beyond the automated bypass (honest boundary).
+    pub const DEVICE_PINNING_UNBEATABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.pinning-unbeatable",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Warning,
+        what: "This app's certificate pinning is beyond the automated bypass.",
+        why: "The pinning is enforced in native code (Flutter/BoringSSL) that ignores the system store, or the app actively resists instrumentation, so the OkHttp/Java bypass lanes cannot unpin it.",
+        fix: "Capture is limited to this app's unpinned endpoints; native/anti-instrumentation cases need target-specific reverse-engineering and may not be beatable — this is disclosed, not a defect.",
+    };
+
+    /// Every phase C4 (per-device Frida targeting) definition, for conformance tests.
+    pub const PHASE_C4: &[DiagnosticDefinition] =
+        &[DEVICE_FRIDA_TARGET_NOT_FOUND, DEVICE_PINNING_UNBEATABLE];
+
+    /// The operator declined the device's request to connect (the human gate).
+    pub const DEVICE_PAIRING_DECLINED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.pairing-declined",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Warning,
+        what: "The workbench operator declined this device's connection.",
+        why: "A person at the workbench chose Decline on the accept/decline prompt, so no session token was issued and the device was not provisioned.",
+        fix: "Ask the operator to accept the connection, or re-scan a fresh pairing QR and try again.",
+    };
+
+    /// The pending pairing request is unknown or expired before a decision.
+    pub const DEVICE_PAIRING_REQUEST_EXPIRED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.pairing-request-expired",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Warning,
+        what: "The pairing request expired before it was accepted.",
+        why: "The operator did not accept or decline within the pairing window, or the workbench was restarted, so the pending request is no longer valid.",
+        fix: "Scan a fresh pairing QR (or re-enter the token) to start a new request; each request and its token are short-lived.",
+    };
+
+    /// Every phase C5 (accept/decline + QR pairing) definition, for conformance tests.
+    pub const PHASE_C5: &[DiagnosticDefinition] =
+        &[DEVICE_PAIRING_DECLINED, DEVICE_PAIRING_REQUEST_EXPIRED];
+
+    /// Every phase C2 (device provisioning) definition, used by conformance tests.
+    pub const PHASE_C2: &[DiagnosticDefinition] = &[
+        DEVICE_NOT_DETECTED,
+        DEVICE_UNAUTHORIZED,
+        DEVICE_DETECTED,
+        DEVICE_REVERSE_TUNNEL_FAILED,
+        DEVICE_TUNNEL_READY,
+        DEVICE_ANDROID_VERSION_UNSUPPORTED,
+        DEVICE_TRUST_PATH_SELECTED,
+        DEVICE_ROOT_REFUSED,
+        DEVICE_APEX_TRUST_FAILED,
+        DEVICE_CA_INSTALLED,
+        DEVICE_FRIDA_SERVER_STARTED,
+        DEVICE_FRIDA_SERVER_UNAVAILABLE,
+    ];
+
+    /// The GUI Android target add-on (slim AOSP emulator payload) is not installed.
+    ///
+    /// The GUI target is a separate, optional download, not part of the base
+    /// install. This reports that a GUI Android target was requested but the
+    /// add-on payload is absent — an actionable prompt, not a crash.
+    pub const ANDROID_TARGET_MISSING: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-missing",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Error,
+        what: "The GUI Android target add-on is not installed.",
+        why: "A GUI-drivable Android target runs a slim no-GApps AOSP emulator shipped as a separate, optional download that is not part of the base application.",
+        fix: "Install the GUI Android target add-on (install-android-target.ps1 / .sh) to enable a GUI-drivable target; static, web, and autonomous-dynamic workflows do not require it.",
+    };
+
+    /// The GUI Android target add-on manifest is missing or malformed.
+    pub const ANDROID_TARGET_MANIFEST_INVALID: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-manifest-invalid",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "The GUI Android target add-on manifest could not be read.",
+        why: "android-target-manifest.json is missing, unreadable, or does not match the schema the engine resolver expects.",
+        fix: "Re-run the add-on installer to regenerate the manifest; if it persists, the payload is corrupt and should be reinstalled.",
+    };
+
+    /// The GUI Android target's first-party client APK was not staged in the payload.
+    pub const ANDROID_TARGET_CLIENT_APK_MISSING: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-client-apk-missing",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Warning,
+        what: "The GUI Android target add-on does not include the APIaxess client APK.",
+        why: "The add-on was assembled without the first-party client APK, so first-boot provisioning cannot install the client the target uses to relay traffic.",
+        fix: "Build apps/android and re-run the add-on installer (or pass -ClientApk) so the client APK is staged; the target still boots but cannot pair until it is present.",
+    };
+
+    /// The GUI Android target booted headless and is provisioning on first boot.
+    pub const ANDROID_TARGET_BOOTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-booted",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Info,
+        what: "The GUI Android target booted headless and is ready for provisioning.",
+        why: "The add-on AVD reached sys.boot_completed and registered with the bundled adb, so first-boot C2/C5 provisioning can proceed.",
+        fix: "No action needed; provisioning (client APK, live session CA, frida-server, pairing) follows automatically.",
+    };
+
+    /// First-boot provisioning of the GUI Android target completed.
+    pub const ANDROID_TARGET_READY: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-ready",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Info,
+        what: "The GUI Android target is provisioned and ready to drive.",
+        why: "First-boot C2/C5 provisioning installed the client APK, the live session CA, and the device-side frida-server, and armed pairing over the adb tunnel.",
+        fix: "No action needed; install your target APK and drive it — traffic flows to the workbench.",
+    };
+
+    /// The GUI Android target's client APK could not be installed on first boot.
+    pub const ANDROID_TARGET_CLIENT_INSTALL_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-client-install-failed",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "First-boot provisioning could not install the GUI Android target's client APK.",
+        why: "adb install of the staged client APK failed on the booted target (an incompatible ABI, a full data partition, or an adb transport error).",
+        fix: "Confirm the target booted (sandbox.android-target-booted) with a x86_64 image and free space, then relaunch; the underlying adb error is attached.",
+    };
+
+    /// Every Phase D1 (GUI Android target add-on) definition.
+    pub const PHASE_D1: &[DiagnosticDefinition] = &[
+        ANDROID_TARGET_MISSING,
+        ANDROID_TARGET_MANIFEST_INVALID,
+        ANDROID_TARGET_CLIENT_APK_MISSING,
+        ANDROID_TARGET_BOOTED,
+        ANDROID_TARGET_READY,
+        ANDROID_TARGET_CLIENT_INSTALL_FAILED,
+    ];
+
+    /// The GUI Android target's screen-streaming components are not in the add-on.
+    ///
+    /// ws-scrcpy + its bundled Node runtime are shipped inside the GUI Android
+    /// target add-on. This reports that streaming was requested but those pieces
+    /// were not staged — the target still boots and provisions, but its screen
+    /// cannot be streamed until the add-on is (re)installed.
+    pub const ANDROID_STREAM_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-stream-unavailable",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Warning,
+        what: "The GUI Android target add-on does not include the screen-streaming components.",
+        why: "ws-scrcpy and its bundled Node runtime were not staged in the add-on, so the target's screen cannot be streamed.",
+        fix: "Reinstall the GUI Android target add-on so ws-scrcpy and the Node runtime are staged; the target still boots and captures traffic without streaming.",
+    };
+
+    /// The GUI Android target's screen stream (ws-scrcpy) started on loopback.
+    pub const ANDROID_STREAM_STARTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-stream-started",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Info,
+        what: "The GUI Android target screen stream is running on loopback.",
+        why: "ws-scrcpy started bound to 127.0.0.1 and relays the target's screen over adb; it is reachable only through the authenticated engine reverse-proxy, never directly.",
+        fix: "No action needed; open the Android view through the workbench.",
+    };
+
+    /// A stream request was made but no GUI Android target stream is running.
+    pub const ANDROID_STREAM_NOT_ACTIVE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-stream-not-active",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "No GUI Android target stream is currently running.",
+        why: "The Android view was requested through the engine reverse-proxy, but no GUI Android target has been launched with streaming this session.",
+        fix: "Launch the GUI Android target first; the stream starts with it.",
+    };
+
+    /// The engine reverse-proxy rejected an unauthenticated Android-view request.
+    ///
+    /// ws-scrcpy has no built-in auth, so the engine is the only reachable listener
+    /// and applies the workbench gate (loopback `Origin` + a valid session/device
+    /// token) to every Android-view request, including the WebSocket upgrade that
+    /// carries the control channel.
+    pub const ANDROID_STREAM_AUTH_REJECTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-stream-auth-rejected",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Warning,
+        what: "An Android-view request was rejected by the engine reverse-proxy gate.",
+        why: "The request did not present the loopback Origin and a valid workbench session or device pairing token, which the engine requires on every Android-view request and WebSocket upgrade.",
+        fix: "Open the Android view from the authenticated workbench UI; a random network client cannot reach the stream.",
+    };
+
+    /// The engine reverse-proxy could not reach the loopback ws-scrcpy upstream.
+    pub const ANDROID_STREAM_UPSTREAM_UNREACHABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-stream-upstream-unreachable",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "The engine could not reach the loopback ws-scrcpy stream.",
+        why: "The authenticated request passed the gate, but the bundled ws-scrcpy process on 127.0.0.1 did not accept the forwarded HTTP/WebSocket connection.",
+        fix: "Confirm the GUI Android target stream is still running (it may have exited); relaunch the target to restart it.",
+    };
+
+    /// Every Phase D2 (ws-scrcpy streaming + authenticated reverse-proxy) definition.
+    pub const PHASE_D2: &[DiagnosticDefinition] = &[
+        ANDROID_STREAM_UNAVAILABLE,
+        ANDROID_STREAM_STARTED,
+        ANDROID_STREAM_NOT_ACTIVE,
+        ANDROID_STREAM_AUTH_REJECTED,
+        ANDROID_STREAM_UPSTREAM_UNREACHABLE,
+    ];
+
+    /// An action needing a running GUI Android target was requested with none up.
+    pub const ANDROID_TARGET_NOT_RUNNING: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-not-running",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "No GUI Android target is running.",
+        why: "The requested action (such as installing your target APK) needs a launched Android target, but none is up this session.",
+        fix: "Launch the Android target from the workbench panel first, then retry.",
+    };
+
+    /// Installing the user's target APK onto the running GUI Android target failed.
+    pub const ANDROID_TARGET_APK_INSTALL_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-apk-install-failed",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "Your target APK could not be installed on the Android target.",
+        why: "adb rejected the install (an incompatible ABI or minSdk, a malformed APK, or a full data partition).",
+        fix: "Confirm the APK is a valid x86_64-compatible build and the target has free space, then retry; the underlying adb error is attached.",
+    };
+
+    /// Every Phase D3 (workbench Android target panel) definition.
+    pub const PHASE_D3: &[DiagnosticDefinition] = &[
+        ANDROID_TARGET_NOT_RUNNING,
+        ANDROID_TARGET_APK_INSTALL_FAILED,
     ];
 
     /// The Frida server could not be deployed to the session runtime.
@@ -3143,16 +3557,16 @@ pub mod catalogue {
         DYNAMIC_NO_OBSERVATIONS,
     ];
 
-    /// Every Phase 2.5 intruder definition.
+    /// Every Phase 2.5 fuzzer definition.
     pub const PHASE_2_5: &[DiagnosticDefinition] = &[
-        PROXY_INTRUDER_FFUF_UNAVAILABLE,
-        PROXY_INTRUDER_FFUF_FAILED,
+        PROXY_FUZZER_FFUF_UNAVAILABLE,
+        PROXY_FUZZER_FFUF_FAILED,
         WEB_DISCOVERY_RATE_OBSERVED,
-        PROXY_INTRUDER_CONFIG_INVALID,
-        PROXY_INTRUDER_SEQUENCE_FAILED,
-        PROXY_INTRUDER_CANCELLED,
-        PROXY_INTRUDER_OUTSIDE_SCOPE,
-        PROXY_INTRUDER_PERSISTENCE_FAILED,
+        PROXY_FUZZER_CONFIG_INVALID,
+        PROXY_FUZZER_SEQUENCE_FAILED,
+        PROXY_FUZZER_CANCELLED,
+        PROXY_FUZZER_OUTSIDE_SCOPE,
+        PROXY_FUZZER_PERSISTENCE_FAILED,
     ];
 
     /// Every Phase 9.2 bundled-browser definition.
@@ -3206,6 +3620,13 @@ mod tests {
             .chain(catalogue::PHASE_6_1)
             .chain(catalogue::PHASE_6_2)
             .chain(catalogue::PHASE_6_3)
+            .chain(catalogue::PHASE_C1)
+            .chain(catalogue::PHASE_C2)
+            .chain(catalogue::PHASE_C4)
+            .chain(catalogue::PHASE_C5)
+            .chain(catalogue::PHASE_D1)
+            .chain(catalogue::PHASE_D2)
+            .chain(catalogue::PHASE_D3)
         {
             let diagnostic = definition.instantiate(DiagnosticContext::new());
             diagnostic.validate().expect("catalogue entry is valid");

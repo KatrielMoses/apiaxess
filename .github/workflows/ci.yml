@@ -36,6 +36,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm ui:lint-tokens
+      - run: pnpm ui:lint-marks
       - run: pnpm ui:check
       - run: pnpm ui:build
       - run: cargo fmt --all --check

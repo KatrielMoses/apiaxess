@@ -57,6 +57,9 @@ pub struct CrawlConfig {
     pub settle_delay: Duration,
     /// Pre-grant the app's runtime permissions before crawling.
     pub pre_grant_permissions: bool,
+    /// Prepare device location state (services on + a seeded GPS fix) before
+    /// crawling, so location-gated screens make their backend calls.
+    pub seed_location: bool,
 }
 
 impl CrawlConfig {
@@ -73,6 +76,7 @@ impl CrawlConfig {
             state_revisit_cap: 12,
             settle_delay: Duration::from_millis(900),
             pre_grant_permissions: true,
+            seed_location: true,
         }
     }
 }
@@ -94,7 +98,9 @@ impl ScreenState {
         if self.fired >= budget {
             return None;
         }
-        self.actions.iter().find(|action| !self.tried.contains(&action.key()))
+        self.actions
+            .iter()
+            .find(|action| !self.tried.contains(&action.key()))
     }
 
     fn has_untried(&self, budget: usize) -> bool {
@@ -123,6 +129,10 @@ pub struct AppCrawler<'a> {
     activity_actions: HashMap<String, usize>,
     login_gates: usize,
     otp_prompts: usize,
+    /// Runtime permissions pre-granted before the crawl (state-prep telemetry).
+    permissions_granted: usize,
+    /// Whether device location state was prepared for location-gated screens.
+    location_prepared: bool,
     /// Login activities credentials have already been typed into. A login screen
     /// is injected at most once, so revisiting it (a stalled sign-in, or a BACK to
     /// it after auth) never re-submits the login form.
@@ -166,6 +176,8 @@ impl<'a> AppCrawler<'a> {
             activity_actions: HashMap::new(),
             login_gates: 0,
             otp_prompts: 0,
+            permissions_granted: 0,
+            location_prepared: false,
             login_injected: HashSet::new(),
             otp_injected: HashSet::new(),
             walls: HashSet::new(),
@@ -189,11 +201,13 @@ impl<'a> AppCrawler<'a> {
         self.started = Instant::now();
         match self.provider.pre_run(&self.config.package) {
             PreRunDecision::Skip => {
-                self.notes.push("Dynamic crawl skipped by operator (app requires sign-in).".to_owned());
+                self.notes
+                    .push("Dynamic crawl skipped by operator (app requires sign-in).".to_owned());
                 return self.build_report("skipped by operator");
             }
             PreRunDecision::FeedNow(answer) => {
-                self.notes.push("Operator supplied credentials before the run.".to_owned());
+                self.notes
+                    .push("Operator supplied credentials before the run.".to_owned());
                 self.staged_credentials = Some(answer);
             }
             PreRunDecision::TryAnyway => {}
@@ -201,7 +215,21 @@ impl<'a> AppCrawler<'a> {
 
         if self.config.pre_grant_permissions {
             let granted = device::grant_runtime_permissions(self.control, &self.config.package);
-            self.notes.push(format!("Pre-granted {} runtime permission(s).", granted.len()));
+            self.permissions_granted = granted.len();
+            self.notes.push(format!(
+                "Pre-granted {} runtime permission(s).",
+                granted.len()
+            ));
+        }
+
+        // Prepare device state (location) before launch so a location-gated app
+        // has a fix ready on its first screen rather than stalling on an empty map.
+        if self.config.seed_location {
+            let notes = device::prepare_location(self.control);
+            self.location_prepared = notes.iter().any(|note| note.starts_with("Enabled"));
+            for note in notes {
+                self.notes.push(note);
+            }
         }
 
         if let Err(error) = device::launch(self.control, &self.config.package) {
@@ -230,7 +258,10 @@ impl<'a> AppCrawler<'a> {
         let Some(mut fallback) = self.fallback.take() else {
             return;
         };
-        let remaining = self.config.time_budget.saturating_sub(self.started.elapsed());
+        let remaining = self
+            .config
+            .time_budget
+            .saturating_sub(self.started.elapsed());
         match fallback.run(self.control, &self.config.package, remaining) {
             Ok(extra) => self.notes.push(format!(
                 "Primary engine stalled early; fallback '{}' performed {extra} extra interactions.",
@@ -244,6 +275,7 @@ impl<'a> AppCrawler<'a> {
     }
 
     /// The main traversal loop. Returns the termination reason.
+    #[allow(clippy::too_many_lines)] // One cohesive traversal state machine; splitting obscures it.
     fn traverse(&mut self) -> String {
         let mut consecutive_backs = 0_usize;
         let mut consecutive_failures = 0_usize;
@@ -279,7 +311,10 @@ impl<'a> AppCrawler<'a> {
 
             // Foreground guard: if we've left the target package, come back.
             let activity = device::current_activity(self.control).unwrap_or_else(|_| {
-                hierarchy.package.clone().unwrap_or_else(|| self.config.package.clone())
+                hierarchy
+                    .package
+                    .clone()
+                    .unwrap_or_else(|| self.config.package.clone())
             });
             if let Some(package) = &hierarchy.package {
                 if !package.starts_with(&self.config.package) && !package.contains("permission") {
@@ -307,7 +342,9 @@ impl<'a> AppCrawler<'a> {
 
             // 2. OTP gate.
             if !self.walls_contains(&activity) && !self.otp_injected.contains(&activity) {
-                if let Some(request) = heuristics::detect_otp(&hierarchy, &self.config.package, &activity) {
+                if let Some(request) =
+                    heuristics::detect_otp(&hierarchy, &self.config.package, &activity)
+                {
                     if self.handle_otp(&hierarchy, &request) {
                         consecutive_backs = 0;
                         consecutive_failures = 0;
@@ -323,7 +360,9 @@ impl<'a> AppCrawler<'a> {
                 && !self.walls.contains(&activity)
                 && !self.login_injected.contains(&activity)
             {
-                if let Some(request) = heuristics::detect_login(&hierarchy, &self.config.package, &activity) {
+                if let Some(request) =
+                    heuristics::detect_login(&hierarchy, &self.config.package, &activity)
+                {
                     if self.handle_login(&hierarchy, &request) {
                         consecutive_backs = 0;
                         consecutive_failures = 0;
@@ -392,14 +431,17 @@ impl<'a> AppCrawler<'a> {
             None => match self.provider.on_login_gate(request) {
                 CredentialDecision::Provide(answer) => answer,
                 CredentialDecision::Continue => {
-                    self.walls.insert(request_activity(&request.screen_summary, hierarchy));
-                    self.notes.push("Login gate left uncrossed (no credentials).".to_owned());
+                    self.walls
+                        .insert(request_activity(&request.screen_summary, hierarchy));
+                    self.notes
+                        .push("Login gate left uncrossed (no credentials).".to_owned());
                     return false;
                 }
             },
         };
         if !answer.has_values() {
-            self.walls.insert(request_activity(&request.screen_summary, hierarchy));
+            self.walls
+                .insert(request_activity(&request.screen_summary, hierarchy));
             return false;
         }
         // Record the injection before submitting so a stalled sign-in (which is
@@ -425,9 +467,12 @@ impl<'a> AppCrawler<'a> {
             // stuck login screen — otherwise the broadened "Get OTP"/"Verify"
             // affordances would make the OTP screen look like an un-crossed gate
             // and discard the staged OTP.
-            let reached_otp =
-                heuristics::detect_otp(&advanced_hierarchy, &self.config.package, &advanced_activity)
-                    .is_some();
+            let reached_otp = heuristics::detect_otp(
+                &advanced_hierarchy,
+                &self.config.package,
+                &advanced_activity,
+            )
+            .is_some();
             let still_login = !reached_otp
                 && heuristics::detect_login(
                     &advanced_hierarchy,
@@ -445,7 +490,9 @@ impl<'a> AppCrawler<'a> {
             }
         }
         self.authenticated = true;
-        self.notes.push("Credentials injected and redacted from capture; post-auth crawl begins.".to_owned());
+        self.notes.push(
+            "Credentials injected and redacted from capture; post-auth crawl begins.".to_owned(),
+        );
         true
     }
 
@@ -465,7 +512,8 @@ impl<'a> AppCrawler<'a> {
             })
             .or_else(|| self.provider.on_otp(request));
         let Some(code) = code else {
-            self.walls.insert(request_activity(&request.screen_summary, hierarchy));
+            self.walls
+                .insert(request_activity(&request.screen_summary, hierarchy));
             self.notes.push("OTP gate left uncrossed.".to_owned());
             return false;
         };
@@ -503,12 +551,40 @@ impl<'a> AppCrawler<'a> {
             let _ = device::clear_focused(self.control);
             let _ = device::input_text(self.control, &plain);
         }
-        self.tap_submit(hierarchy, &["verify", "submit", "continue", "confirm", "next", "ok"]);
+        self.tap_submit(
+            hierarchy,
+            &["verify", "submit", "continue", "confirm", "next", "ok"],
+        );
         self.settle();
+        // A verified OTP is the final sign-in step of a phone→OTP flow. If we
+        // advanced off the OTP (and login) screen, mark post-auth reached — without
+        // this the crawl would keep attributing the whole post-sign-in surface to
+        // the pre-auth phase and report the gate as never crossed.
+        if !self.authenticated {
+            if let Some(xml) = self.dump() {
+                let advanced = Hierarchy::parse(&xml);
+                let activity = device::current_activity(self.control)
+                    .unwrap_or_else(|_| self.config.package.clone());
+                let still_otp =
+                    heuristics::detect_otp(&advanced, &self.config.package, &activity).is_some();
+                let still_login =
+                    heuristics::detect_login(&advanced, &self.config.package, &activity).is_some();
+                if !still_otp && !still_login {
+                    self.authenticated = true;
+                    self.notes
+                        .push("OTP verified and redacted; post-auth crawl begins.".to_owned());
+                }
+            }
+        }
         true
     }
 
-    fn inject_fields(&mut self, hierarchy: &Hierarchy, fields: &[CredentialField], answer: &CredentialAnswer) {
+    fn inject_fields(
+        &mut self,
+        hierarchy: &Hierarchy,
+        fields: &[CredentialField],
+        answer: &CredentialAnswer,
+    ) {
         for field in fields {
             let Some(secret) = resolve_value(answer, field) else {
                 continue;
@@ -537,8 +613,14 @@ impl<'a> AppCrawler<'a> {
     fn tap_submit(&self, hierarchy: &Hierarchy, labels: &[&str]) {
         if let Some(node) = hierarchy.actionable().iter().find(|node| {
             node.clickable && {
-                let text = if node.text.is_empty() { node.content_desc.to_ascii_lowercase() } else { node.text.to_ascii_lowercase() };
-                labels.iter().any(|label| text.trim() == *label || text.contains(label))
+                let text = if node.text.is_empty() {
+                    node.content_desc.to_ascii_lowercase()
+                } else {
+                    node.text.to_ascii_lowercase()
+                };
+                labels
+                    .iter()
+                    .any(|label| text.trim() == *label || text.contains(label))
             }
         }) {
             let (x, y) = node.bounds.center();
@@ -592,10 +674,14 @@ impl<'a> AppCrawler<'a> {
             return None;
         }
         let state = self.states.get(hash)?;
-        if state.visits > self.config.state_revisit_cap && !state.has_untried(self.config.per_state_action_budget) {
+        if state.visits > self.config.state_revisit_cap
+            && !state.has_untried(self.config.per_state_action_budget)
+        {
             return None;
         }
-        state.untried_action(self.config.per_state_action_budget).cloned()
+        state
+            .untried_action(self.config.per_state_action_budget)
+            .cloned()
     }
 
     fn perform(&self, action: &Action) {
@@ -639,7 +725,10 @@ impl<'a> AppCrawler<'a> {
 
     fn record_fired(&mut self, activity: &str) {
         self.actions_fired += 1;
-        *self.activity_actions.entry(activity.to_owned()).or_insert(0) += 1;
+        *self
+            .activity_actions
+            .entry(activity.to_owned())
+            .or_insert(0) += 1;
         if self.authenticated {
             self.post_actions += 1;
         } else {
@@ -677,7 +766,12 @@ impl<'a> AppCrawler<'a> {
             let Some(state) = self.states.get(&signature.hash) else {
                 break;
             };
-            let Some(action) = state.actions.iter().find(|candidate| candidate.key() == action_key).cloned() else {
+            let Some(action) = state
+                .actions
+                .iter()
+                .find(|candidate| candidate.key() == action_key)
+                .cloned()
+            else {
                 break;
             };
             self.perform(&action);
@@ -753,12 +847,9 @@ impl<'a> AppCrawler<'a> {
         while Instant::now() < deadline {
             if let Some(xml) = self.dump() {
                 let hierarchy = Hierarchy::parse(&xml);
-                let in_package = hierarchy
-                    .package
-                    .as_deref()
-                    .is_none_or(|package| {
-                        package.starts_with(&self.config.package) || package.contains("permission")
-                    });
+                let in_package = hierarchy.package.as_deref().is_none_or(|package| {
+                    package.starts_with(&self.config.package) || package.contains("permission")
+                });
                 if in_package && !hierarchy.actionable().is_empty() {
                     return;
                 }
@@ -792,9 +883,16 @@ impl<'a> AppCrawler<'a> {
                 || activity_lc.contains("walkthrough")
                 || hierarchy.nodes.iter().any(|node| {
                     let text = format!("{} {}", node.text, node.content_desc).to_ascii_lowercase();
-                    ["next", "skip", "get started", "continue", "let's go", "swipe"]
-                        .iter()
-                        .any(|needle| text.contains(needle))
+                    [
+                        "next",
+                        "skip",
+                        "get started",
+                        "continue",
+                        "let's go",
+                        "swipe",
+                    ]
+                    .iter()
+                    .any(|needle| text.contains(needle))
                 });
             if !looks_like_intro {
                 break;
@@ -871,6 +969,8 @@ impl<'a> AppCrawler<'a> {
             actions_fired: self.actions_fired,
             unreached_behind_wall: self.walls.len(),
             skipped_actions,
+            permissions_granted: self.permissions_granted,
+            location_prepared: self.location_prepared,
             credentials: CredentialTelemetry {
                 login_gates_encountered: self.login_gates,
                 credential_values_injected: self.redactor.registered_count(),
@@ -884,7 +984,10 @@ impl<'a> AppCrawler<'a> {
     }
 }
 
-fn resolve_value<'answer>(answer: &'answer CredentialAnswer, field: &CredentialField) -> Option<&'answer Secret> {
+fn resolve_value<'answer>(
+    answer: &'answer CredentialAnswer,
+    field: &CredentialField,
+) -> Option<&'answer Secret> {
     answer
         .get(&field.name)
         .or_else(|| answer.get(kind_key(field.kind)))

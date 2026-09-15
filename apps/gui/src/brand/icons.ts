@@ -17,6 +17,7 @@ const PATHS = {
   traffic: '<path d="M3 5.5h18"/><path d="M3 12h12"/><path d="M3 18.5h15"/><circle cx="18.5" cy="12" r="1.6"/>',
   surface: '<path d="m12 3 8.5 4.5L12 12 3.5 7.5Z"/><path d="m3.5 12 8.5 4.5 8.5-4.5"/><path d="m3.5 16.5 8.5 4.5 8.5-4.5"/>',
   discovery: '<circle cx="11" cy="11" r="6.75"/><path d="M11 4.25v13.5M4.25 11h13.5"/><path d="m16.2 16.2 4.3 4.3"/>',
+  search: '<circle cx="11" cy="11" r="6.75"/><path d="m16.2 16.2 4.3 4.3"/>',
   session: '<path d="M4.75 4.75h10.5L19.25 8.75v10.5H4.75Z"/><path d="M8.5 4.75v5h6v-5"/><path d="M8 19.25v-5.5h8v5.5"/>',
   export: '<path d="M12 3.5v11"/><path d="m7.75 10.25 4.25 4.25 4.25-4.25"/><path d="M4.5 16.5v2.25a1.75 1.75 0 0 0 1.75 1.75h11.5a1.75 1.75 0 0 0 1.75-1.75V16.5"/>',
   settings:

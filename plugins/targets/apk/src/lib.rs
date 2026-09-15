@@ -24,10 +24,10 @@ use apiaxess_diagnostics::{
     Diagnostic, DiagnosticContext, DiagnosticSeverity, DiagnosticValue,
     catalogue::{
         ARTIFACT_BUNDLE_RESOLUTION_FAILED, ARTIFACT_DECOMPILATION_FAILED,
-        ARTIFACT_DECOMPILATION_PARTIAL, ARTIFACT_DEX_ACCESS_UNAVAILABLE, ARTIFACT_MALFORMED_ARCHIVE,
-        ARTIFACT_PROTECTION_DETECTOR_UNAVAILABLE, ARTIFACT_UNPACK_FAILED,
-        ARTIFACT_UNSUPPORTED_FORMAT, EXTERNAL_TOOL_INVOCATION_FAILED, EXTERNAL_TOOL_MISSING,
-        EXTERNAL_TOOL_VERSION_INCOMPATIBLE, INSTALL_COMPONENT_MISSING,
+        ARTIFACT_DECOMPILATION_PARTIAL, ARTIFACT_DEX_ACCESS_UNAVAILABLE,
+        ARTIFACT_MALFORMED_ARCHIVE, ARTIFACT_PROTECTION_DETECTOR_UNAVAILABLE,
+        ARTIFACT_UNPACK_FAILED, ARTIFACT_UNSUPPORTED_FORMAT, EXTERNAL_TOOL_INVOCATION_FAILED,
+        EXTERNAL_TOOL_MISSING, EXTERNAL_TOOL_VERSION_INCOMPATIBLE, INSTALL_COMPONENT_MISSING,
     },
 };
 use apiaxess_external_tools::{
@@ -449,8 +449,7 @@ impl ApkTarget {
                     // the analysis (apktool is authoritative), so downgrade to a
                     // warning and continue rather than aborting a run whose
                     // structural model is complete.
-                    let mut diagnostic =
-                        with_definition(diagnostic, ARTIFACT_DECOMPILATION_FAILED);
+                    let mut diagnostic = with_definition(diagnostic, ARTIFACT_DECOMPILATION_FAILED);
                     diagnostic.severity = DiagnosticSeverity::Warning;
                     diagnostics.push(diagnostic);
                 }
@@ -1402,16 +1401,39 @@ fn ensure_success(tool: &str, invocation: &ToolInvocation) -> Result<(), Diagnos
     if invocation.exit_code == Some(0) {
         Ok(())
     } else {
-        let output = if invocation.stderr.trim().is_empty() {
+        let raw = if invocation.stderr.trim().is_empty() {
             invocation.stdout.trim()
         } else {
             invocation.stderr.trim()
         };
+        // Report the tool's own final message, not its entire progress log. Tools
+        // like jadx stream progress with a carriage-return bar (`\r`, no newline)
+        // and end on the real signal (e.g. "finished with errors, count: 51"), so
+        // split on both `\r` and `\n` and keep only the last non-empty segment.
+        // Splitting on `\n` alone treats the whole `\r` bar as one line and leaks
+        // the firehose.
+        let summary: String = raw
+            .split(['\n', '\r'])
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .unwrap_or("no output")
+            .chars()
+            .take(200)
+            .collect();
         Err(failure(
             EXTERNAL_TOOL_INVOCATION_FAILED,
-            format!("{tool} exited with {:?}: {}", invocation.exit_code, output),
+            format!("{tool} exited with {}: {summary}", format_exit_code(invocation.exit_code)),
         )
         .diagnostic)
+    }
+}
+
+/// Renders a process exit status for humans — never the `Option` debug form.
+fn format_exit_code(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("code {code}"),
+        None => "no exit code (process terminated by signal)".to_owned(),
     }
 }
 
@@ -1589,8 +1611,14 @@ mod tests {
         // A 60 MB APK (feeder: apktool alone needs ~5 min) gets a scaled deadline
         // above the old fixed 300s that used to fail it mid-unpack.
         let sixty = size_scaled_timeout_secs(60 * mb);
-        assert_eq!(sixty, TOOL_TIMEOUT_BASE_SECS + 60 * TOOL_TIMEOUT_PER_MB_SECS);
-        assert!(sixty > DEFAULT_TOOL_TIMEOUT_SECS, "60 MB must scale past the floor");
+        assert_eq!(
+            sixty,
+            TOOL_TIMEOUT_BASE_SECS + 60 * TOOL_TIMEOUT_PER_MB_SECS
+        );
+        assert!(
+            sixty > DEFAULT_TOOL_TIMEOUT_SECS,
+            "60 MB must scale past the floor"
+        );
         // A 249 MB APK (Openly, ~44 min observed) scales into the tens of minutes
         // so it is not failed by a fixed deadline.
         let large = size_scaled_timeout_secs(249 * mb);
@@ -1641,8 +1669,7 @@ mod tests {
         ));
         fs::create_dir_all(&outside).expect("create outside dir");
 
-        let result =
-            super::cleanup_intake_workspace(&output_root, &outside.display().to_string());
+        let result = super::cleanup_intake_workspace(&output_root, &outside.display().to_string());
 
         assert!(result.is_err(), "cleanup outside the output root must fail");
         assert!(outside.exists(), "the outside directory must be untouched");
@@ -1696,7 +1723,10 @@ mod tests {
         super::reap_stale_workspaces(&root, Duration::ZERO);
         assert!(fresh.exists(), "zero retention must disable reaping");
         // Non-`intake-` siblings are never touched.
-        assert!(unrelated.exists(), "unrelated directories must be untouched");
+        assert!(
+            unrelated.exists(),
+            "unrelated directories must be untouched"
+        );
 
         fs::remove_dir_all(&root).expect("remove reap fixture");
     }

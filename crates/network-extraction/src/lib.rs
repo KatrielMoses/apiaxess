@@ -501,6 +501,19 @@ impl ModelBuilder {
             );
             return;
         }
+        // Reject filesystem/kernel paths misread as HTTP endpoints. A bundled SDK
+        // reads sysfs/procfs and app-storage paths (device fingerprinting, file
+        // I/O); those string literals are not HTTP paths, and gluing one onto a
+        // base URL (`assets.juspay.in/sys/devices/system/cpu/`) is pure extraction
+        // noise. Real API paths never live under these roots, so this is safe.
+        if is_non_http_path(&path) {
+            self.partial(
+                &detection.library_id,
+                evidence_path,
+                "path was a filesystem/kernel path, not an HTTP endpoint",
+            );
+            return;
+        }
         let Ok(method) = apiaxess_api_model::HttpMethod::new(method) else {
             return;
         };
@@ -569,7 +582,14 @@ impl ModelBuilder {
                 schema: self.schema(extractor_id, evidence.clone(), expected),
             })
             .collect();
-        let base_url = base_url.or_else(|| self.base_urls().into_iter().next());
+        // Only associate a discovered base URL when there is a single unambiguous
+        // one. In a multi-SDK app the string pool holds several base URLs (Juspay,
+        // Razorpay, Firebase, …); gluing an arbitrary one onto a path that had no
+        // base of its own fabricates a wrong endpoint (the classic
+        // `assets.juspay.in/.well-known/oauth/...` mis-pairing). When ambiguous,
+        // leave the base unresolved — an honest "path known, host unknown" — rather
+        // than assert a host the path was never seen with.
+        let base_url = base_url.or_else(|| self.sole_discovered_base_url());
         let base_url_fact = base_url.map(|value| {
             self.bound_values.insert(value.clone());
             self.fact(
@@ -722,18 +742,33 @@ impl ModelBuilder {
         retained
     }
 
-    fn base_urls(&self) -> Vec<String> {
-        // Rank genuine API hosts ahead of documentation/attribution hosts so the
-        // endpoint's selected base_url is a real API base, not e.g. github.com.
-        let (api, doc): (Vec<String>, Vec<String>) = self
-            .string_candidates
-            .iter()
-            .filter(|candidate| candidate.kind == LooseFindingKind::BaseUrl)
-            .map(|candidate| candidate.value.clone())
-            .partition(|value| {
-                !finding_host(value).is_some_and(|host| is_documentation_host(&host))
-            });
-        api.into_iter().chain(doc).collect()
+    /// The single unambiguous discovered base URL, or `None` when there are zero
+    /// or several distinct API hosts. Used as an endpoint's base only when there
+    /// is exactly one candidate, so a multi-SDK app never mis-glues a path to an
+    /// unrelated SDK host. Documentation/attribution hosts are excluded.
+    fn sole_discovered_base_url(&self) -> Option<String> {
+        let mut distinct: Vec<String> = Vec::new();
+        for candidate in &self.string_candidates {
+            if candidate.kind != LooseFindingKind::BaseUrl {
+                continue;
+            }
+            let Some(host) = finding_host(&candidate.value) else {
+                continue;
+            };
+            if is_documentation_host(&host) {
+                continue;
+            }
+            if !distinct
+                .iter()
+                .any(|value| finding_host(value).as_deref() == Some(host.as_str()))
+            {
+                distinct.push(candidate.value.clone());
+            }
+        }
+        match distinct.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
     }
 
     fn finish(
@@ -1045,6 +1080,102 @@ fn loose_noise_reason(candidate: &StaticStringCandidate) -> Option<&'static str>
 
     let _ = candidate.kind;
     None
+}
+
+/// Whether a path is a filesystem/kernel path misread as an HTTP endpoint rather
+/// than a real API route.
+///
+/// High precision, so real API routes are never dropped (requirement: preserve
+/// real static signal):
+/// - The kernel pseudo-filesystems `/sys`, `/proc`, `/dev` are never HTTP roots.
+/// - Deeper Android/Unix filesystem signatures (`/data/data/`, `/system/bin`,
+///   `/storage/emulated`, `/sdcard/`, …) confirm a real path, not an API resource
+///   that merely shares a first word (so `/data/users` — a plausible API — stays).
+/// - The JVM class-descriptor form is not an HTTP path.
+fn is_non_http_path(path: &str) -> bool {
+    let raw = path.trim();
+    // JVM descriptor form (`Lcom/foo/Bar;`) — check before lowercasing, its `L`
+    // prefix and `;` suffix are case-significant.
+    if is_jvm_descriptor_path(raw) {
+        return true;
+    }
+    // Decompiler string-literal artifacts that are not real request paths: log
+    // lines and code comments (contain whitespace), HTML/markup fragments, format
+    // strings, and `toString()` shrapnel. A real HTTP path template never contains
+    // whitespace or these structural characters. `{`/`}` are intentionally allowed
+    // so genuine Retrofit templates like `/users/{id}` survive.
+    if raw
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '=' | '"' | '\\'))
+    {
+        return true;
+    }
+    // printf/format specifiers (`%s`, `%d`, `%1$s`, `%@`): a real percent-escape is
+    // `%` followed by two hex digits, so a `%` followed by anything else is a
+    // format string, not a path.
+    if let Some(rest) = raw.split_once('%').map(|(_, rest)| rest) {
+        let is_hex_escape = rest.as_bytes().first().is_some_and(u8::is_ascii_hexdigit)
+            && rest.as_bytes().get(1).is_some_and(u8::is_ascii_hexdigit);
+        if !is_hex_escape {
+            return true;
+        }
+    }
+    let lower = raw.to_ascii_lowercase();
+    // A lone segment that is exactly an HTTP header name or protocol keyword is a
+    // string-constant artifact, not an endpoint. Kept deliberately narrow so common
+    // single-segment API roots (`/videos`, `/login`) are never caught.
+    let single = lower.trim_start_matches('/').trim_end_matches('/');
+    if !single.contains('/')
+        && matches!(
+            single,
+            "authorization"
+                | "host"
+                | "location"
+                | "accept"
+                | "accept-type"
+                | "accept-encoding"
+                | "content-type"
+                | "content-length"
+                | "user-agent"
+                | "cookie"
+                | "set-cookie"
+                | "www-authenticate"
+                | "cache-control"
+                | "connection"
+                | "http"
+                | "https"
+                | "websocket"
+        )
+    {
+        return true;
+    }
+    let segments: Vec<&str> = lower
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let first = segments.first().copied().unwrap_or("");
+    // Kernel pseudo-filesystems and single-root mounts: never HTTP roots.
+    if matches!(
+        first,
+        "sys" | "proc" | "dev" | "sdcard" | "mnt" | "acct" | "apex" | "dalvik-cache"
+    ) {
+        return true;
+    }
+    // Two-segment filesystem prefixes matched by *segment equality* so a real API
+    // that merely shares a first word is not caught (e.g. `/data/users` and
+    // `/system/status` stay, while `/data/user/0` and `/system/bin/sh` are cut).
+    let second = segments.get(1).copied().unwrap_or("");
+    matches!(
+        (first, second),
+        ("data", "data" | "app" | "user" | "local" | "dalvik-cache")
+            | (
+                "system",
+                "bin" | "xbin" | "lib" | "lib64" | "framework" | "app" | "priv-app" | "etc"
+            )
+            | ("vendor", "lib" | "bin" | "etc")
+            | ("storage", "emulated")
+    )
 }
 
 /// A slash-prefixed class descriptor cannot be an HTTP path. Ordinary short
@@ -1442,9 +1573,9 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
         // annotated application methods cannot become invented endpoints.
         for document in corpus.documents().iter().filter(|document| {
             matches!(document.source_kind, SourceKind::DecompiledSource)
-                && corpus.text_for(document).is_some_and(|text| {
-                    text.contains("api/v") || text.contains("oauth/")
-                })
+                && corpus
+                    .text_for(document)
+                    .is_some_and(|text| text.contains("api/v") || text.contains("oauth/"))
         }) {
             let Some(text) = corpus.text_for(document) else {
                 continue;
@@ -1480,7 +1611,9 @@ fn obfuscated_retrofit_routes(text: &str) -> Vec<(String, String)> {
             let name = annotation
                 .split_once('(')
                 .map_or(annotation, |(name, _)| name)
-                .rsplit('.').next().unwrap_or_default();
+                .rsplit('.')
+                .next()
+                .unwrap_or_default();
             let route = match name {
                 // Tusky's R8 mappings for Retrofit GET/DELETE/PUT/PATCH/POST.
                 "f" => first_quoted(annotation).map(|path| ("GET".to_owned(), path)),
@@ -1493,14 +1626,15 @@ fn obfuscated_retrofit_routes(text: &str) -> Vec<(String, String)> {
                 _ => None,
             };
             if let Some((method, path)) = route
-                && (path.starts_with("api/") || path.starts_with("/api/") || path.starts_with("oauth/"))
+                && (path.starts_with("api/")
+                    || path.starts_with("/api/")
+                    || path.starts_with("oauth/"))
             {
                 pending.push((method, path));
             }
             continue;
         }
-        if (trimmed.starts_with("Object ") || trimmed.starts_with("fun "))
-            && trimmed.contains('(')
+        if (trimmed.starts_with("Object ") || trimmed.starts_with("fun ")) && trimmed.contains('(')
         {
             routes.append(&mut pending);
         } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
@@ -1575,15 +1709,21 @@ impl ProtocolDecoderExtractor for GrpcExtractor {
             for line in text.lines() {
                 let strings = document_string_literals(document, line);
                 if line.contains("generateFullMethodName") && strings.len() >= 2 {
-                    builder.add_operation(
-                        "grpc-java",
-                        detection,
-                        ProtocolOperationIdentity::Grpc {
-                            service: strings[0].clone(),
-                            method: strings[1].clone(),
-                        },
-                        &document.path,
-                    );
+                    // `generateFullMethodName(service, method)` — but decompiled token
+                    // order is unreliable and the surrounding line often yields
+                    // non-literal tokens (Kotlin `$lambda$0` synthetics, member names).
+                    // Only emit when the pair validates as a real gRPC service+method,
+                    // orienting by shape (the service is package-qualified, the method
+                    // is a bare proto identifier) so swapped captures are corrected and
+                    // synthetic-name garbage is dropped.
+                    if let Some((service, method)) = orient_grpc_pair(&strings[0], &strings[1]) {
+                        builder.add_operation(
+                            "grpc-java",
+                            detection,
+                            ProtocolOperationIdentity::Grpc { service, method },
+                            &document.path,
+                        );
+                    }
                 } else if let Some((service, method)) = grpc_path(line) {
                     builder.add_operation(
                         "grpc-java",
@@ -1636,25 +1776,35 @@ impl ProtocolDecoderExtractor for ApolloExtractor {
                     .file_stem()
                     .and_then(|value| value.to_str())
                     .unwrap_or_default();
-                let (kind, suffix) = if stem.ends_with("Mutation") {
-                    (GraphQlOperationType::Mutation, "Mutation")
+                // Only Apollo-codegen operation classes follow the `*Query` /
+                // `*Mutation` / `*Subscription` naming convention. A bare class name
+                // (`R`, `ChuckerDatabase_Impl`, `HttpTransaction`, `di`) is NOT a
+                // GraphQL operation — fabricating a `query <ClassName>` from every
+                // matched document is the source of the garbage-operation noise, so
+                // the catch-all is removed: no suffix match ⇒ no operation.
+                let matched = if stem.ends_with("Mutation") {
+                    Some((GraphQlOperationType::Mutation, "Mutation"))
                 } else if stem.ends_with("Subscription") {
-                    (GraphQlOperationType::Subscription, "Subscription")
+                    Some((GraphQlOperationType::Subscription, "Subscription"))
+                } else if stem.ends_with("Query") {
+                    Some((GraphQlOperationType::Query, "Query"))
                 } else {
-                    (GraphQlOperationType::Query, "Query")
+                    None
                 };
-                let name = stem.strip_suffix(suffix).unwrap_or(stem);
-                if !name.is_empty() {
-                    builder.add_operation(
-                        "graphql-apollo",
-                        detection,
-                        ProtocolOperationIdentity::GraphQl {
-                            endpoint_url: absolute_urls(&text).into_iter().next(),
-                            operation_type: kind,
-                            operation_name: name.to_owned(),
-                        },
-                        &document.path,
-                    );
+                if let Some((kind, suffix)) = matched {
+                    let name = stem.strip_suffix(suffix).unwrap_or(stem);
+                    if !name.is_empty() {
+                        builder.add_operation(
+                            "graphql-apollo",
+                            detection,
+                            ProtocolOperationIdentity::GraphQl {
+                                endpoint_url: absolute_urls(&text).into_iter().next(),
+                                operation_type: kind,
+                                operation_name: name.to_owned(),
+                            },
+                            &document.path,
+                        );
+                    }
                 }
             }
         }
@@ -2204,6 +2354,25 @@ fn is_dotted_proto_identifier(value: &str) -> bool {
     !value.is_empty() && value.split('.').all(is_proto_identifier)
 }
 
+/// Validates and orients a candidate gRPC (service, method) pair captured from a
+/// `generateFullMethodName` call. A real gRPC service is package-qualified
+/// (`pkg.Service`) and the method is a bare proto identifier (`SendEvent`). Returns
+/// the correctly-ordered pair when exactly one side is dotted-qualified and the
+/// other is a bare identifier — fixing swapped captures — and `None` for anything
+/// else (Kotlin synthetics like `$lambda$0`, member names, whitespace tokens), so
+/// decompiler noise never becomes a phantom gRPC operation.
+fn orient_grpc_pair(a: &str, b: &str) -> Option<(String, String)> {
+    let a = a.trim();
+    let b = b.trim();
+    let a_service = is_dotted_proto_identifier(a) && a.contains('.');
+    let b_service = is_dotted_proto_identifier(b) && b.contains('.');
+    match (a_service, b_service) {
+        (true, false) if is_proto_identifier(b) => Some((a.to_owned(), b.to_owned())),
+        (false, true) if is_proto_identifier(a) => Some((b.to_owned(), a.to_owned())),
+        _ => None,
+    }
+}
+
 fn graphql_operation(value: &str) -> Option<(GraphQlOperationType, String)> {
     let mut words = value.split_whitespace();
     let operation_type = match words.next()?.to_ascii_lowercase().as_str() {
@@ -2390,8 +2559,9 @@ fn deferred_diagnostic(detection: &LibraryDetection) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::{
-        StaticStringCandidate, classify_string, extract, is_documentation_host,
+        StaticStringCandidate, classify_string, extract, is_documentation_host, is_non_http_path,
         is_url_extraction_artifact, loose_noise_reason, obfuscated_retrofit_routes,
+        orient_grpc_pair,
     };
     use apiaxess_api_model::LooseFindingKind;
     use apiaxess_artifact_intake::{
@@ -2404,6 +2574,90 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn filesystem_paths_are_rejected_as_endpoints() {
+        // The Openly garbage: sysfs/procfs and app-storage paths misread as HTTP.
+        assert!(is_non_http_path("/sys/devices/system/cpu/"));
+        assert!(is_non_http_path("/proc/self/status"));
+        assert!(is_non_http_path("/dev/urandom"));
+        assert!(is_non_http_path("/data/data/com.example/files"));
+        assert!(is_non_http_path("/system/bin/sh"));
+        assert!(is_non_http_path("/storage/emulated/0/Download"));
+        assert!(is_non_http_path("/sdcard/DCIM"));
+        assert!(is_non_http_path("Lcom/example/Foo;"));
+    }
+
+    #[test]
+    fn real_api_paths_are_not_mistaken_for_filesystem() {
+        // Requirement: preserve real signal. API routes that merely share a first
+        // word with a filesystem root must survive.
+        assert!(!is_non_http_path("/v1/matches"));
+        assert!(!is_non_http_path("/data/users")); // an app resource, not /data/data/
+        assert!(!is_non_http_path("/system/status")); // an app resource, not /system/bin
+        assert!(!is_non_http_path("/api/v2/devices"));
+        assert!(!is_non_http_path("/.well-known/openid-configuration"));
+        assert!(!is_non_http_path("/users/{id}/profile"));
+    }
+
+    #[test]
+    fn string_literal_artifacts_are_rejected_as_endpoints() {
+        // The Openly-debug garbage: header names, format strings, log lines, code
+        // comments, and toString() shrapnel misread as endpoints.
+        assert!(is_non_http_path("/Authorization"));
+        assert!(is_non_http_path("/Host"));
+        assert!(is_non_http_path("/Accept-Type"));
+        assert!(is_non_http_path("/WebSocket"));
+        assert!(is_non_http_path("/https"));
+        assert!(is_non_http_path("https://%s/%s/%s"));
+        assert!(is_non_http_path("/%s"));
+        assert!(is_non_http_path("/A connection to"));
+        assert!(is_non_http_path("/Use LinkAnnotatation.Url(url) instead"));
+        assert!(is_non_http_path("/-->"));
+        assert!(is_non_http_path("/Response{protocol="));
+    }
+
+    #[test]
+    fn grpc_pair_validates_orients_and_rejects_garbage() {
+        // Correctly ordered.
+        assert_eq!(
+            orient_grpc_pair("gpt.EventService", "SendEvent"),
+            Some(("gpt.EventService".to_owned(), "SendEvent".to_owned()))
+        );
+        // Swapped capture is corrected.
+        assert_eq!(
+            orient_grpc_pair("SendEvent", "gpt.EventService"),
+            Some(("gpt.EventService".to_owned(), "SendEvent".to_owned()))
+        );
+        // Kotlin synthetics / member names / whitespace tokens are rejected.
+        assert_eq!(
+            orient_grpc_pair(
+                " gameRepository_delegate$lambda$0",
+                " gameRepository_delegate$lambda$1"
+            ),
+            None
+        );
+        assert_eq!(
+            orient_grpc_pair(
+                " generatePendingIntentRequestCode",
+                "$getALPHANUMERIC_ALPHABET$annotations"
+            ),
+            None
+        );
+        // Two dotted or two bare ⇒ ambiguous ⇒ rejected.
+        assert_eq!(orient_grpc_pair("a.B", "c.D"), None);
+        assert_eq!(orient_grpc_pair("Send", "Event"), None);
+    }
+
+    #[test]
+    fn real_paths_survive_the_artifact_filter() {
+        // Percent-encoding, templates, and ordinary single-segment roots must stay.
+        assert!(!is_non_http_path("/search/%20results")); // real %XX escape
+        assert!(!is_non_http_path("/users/{id}")); // Retrofit template
+        assert!(!is_non_http_path("/videos")); // common noun root, not a header
+        assert!(!is_non_http_path("/login"));
+        assert!(!is_non_http_path("/auth/otp/send"));
+    }
 
     #[test]
     fn linkannotation_url_artifact_is_rejected() {
@@ -2831,13 +3085,13 @@ mod tests {
         );
         // Ordinary REST path literals must NOT be misread as gRPC operations.
         for rest in [
-            "/api/v1/users",   // multiple segments
-            "/health/check",   // no package dot
-            "/users/{id}",     // non-identifier method
+            "/api/v1/users",         // multiple segments
+            "/health/check",         // no package dot
+            "/users/{id}",           // non-identifier method
             "/demo.Users/Get/extra", // trailing segment
             "/demo.Users/Get User",  // whitespace in method
-            "demo.Users/Get",  // no leading slash
-            "/.Users/Get",     // empty service segment
+            "demo.Users/Get",        // no leading slash
+            "/.Users/Get",           // empty service segment
         ] {
             assert_eq!(
                 super::parse_grpc_full_method_name(rest),

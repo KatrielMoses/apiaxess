@@ -18,8 +18,8 @@ statically-linked Go binary with no runtime — a pure drop-in.
 
 ## Invocation model
 
-Discovery routes through the intruder's ffuf tier (`crates/workbench-proxy/src/
-intruder.rs::run_ffuf`), which now resolves ffuf via
+Discovery routes through the fuzzer's ffuf tier (`crates/workbench-proxy/src/
+fuzzer.rs::run_ffuf`), which now resolves ffuf via
 `crate::bundled::resolve_ffuf()`:
 
 - Default: `<resource_base>/tools/ffuf/ffuf[.exe]`, absolute, from `current_exe`

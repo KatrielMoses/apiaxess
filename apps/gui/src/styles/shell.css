@@ -1,0 +1,1195 @@
+/*
+ * Desktop shell — the production-spec application chrome.
+ *
+ * This layer turns the page-shaped app into a fixed desktop shell: nine regions
+ * (title bar, workspace rail, module sidebar, document tabs, surface toolbar,
+ * content pane, inspector, bottom dock, status bar), all built to the geometry
+ * and tokens of `assets/brand/production-spec`. It is imported last so its
+ * overrides settle over the legacy component layer during the migration.
+ *
+ * Sections
+ *   A  Token bridge — map the legacy --color-* vocabulary onto the spec --s-*
+ *      tokens and flatten every radius, so not-yet-rebuilt surfaces already
+ *      wear the spec palette and 0-radius geometry.
+ *   B  Shell frame and the nine regions.
+ *   C  Content-pane density — legacy surfaces re-cast as flat application panels.
+ *   D  Command palette overlay.
+ */
+
+/* ================================================================== *
+ * A · Token bridge
+ *
+ * Every value here is var-to-var: the CI hex check stays green, and because the
+ * --s-* tokens flip by theme, one assignment covers both grounds. The selector
+ * list carries the specificity to outrank tokens.css under [data-theme=light].
+ * ================================================================== */
+
+:root,
+:root[data-theme="light"] {
+  --color-surface: var(--s-surface);
+  --color-surface-sunken: var(--s-bg);
+  --color-surface-raised: var(--s-surface);
+  --color-surface-inverse: var(--s-ink);
+  --color-surface-accent-wash: var(--s-sel);
+  --color-surface-danger-wash: var(--s-redbg);
+
+  --color-text: var(--s-ink);
+  --color-text-muted: var(--s-ink2);
+  --color-text-subtle: var(--s-ink3);
+  --color-text-hint: var(--s-ink2);
+  --color-text-disabled: var(--s-ink3);
+  --color-text-inverse: var(--s-onblue);
+  --color-text-accent: var(--s-blue2);
+
+  --color-rule: var(--s-line);
+  --color-rule-strong: var(--s-line);
+  --color-rule-ink: var(--s-rule);
+  --color-brand-mark: var(--s-ink);
+
+  --color-accent: var(--s-blue);
+  --color-accent-fill: var(--s-blue);
+  --color-accent-on: var(--s-onblue);
+  --color-accent-strong: var(--s-blue2);
+  --color-danger: var(--s-red);
+  --color-danger-ink: var(--s-red);
+
+  --color-focus-ring: var(--s-blue);
+  --color-selection: var(--s-sel);
+
+  --color-method-get: var(--s-blue2);
+  --color-method-other: var(--s-ink2);
+  --color-skeleton-highlight: var(--s-line);
+
+  /* Radius 0 everywhere, no exceptions (spec 01 · 02). Brand-only pill/plate
+     radii are left untouched for the marks that use them. */
+  --radius-xs: 0;
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+
+  /* The title bar is a fixed 32px region now, so any legacy full-height calc
+     resolves against it rather than the old 68px web header. */
+  --shell-header-height: 32px;
+
+  /* Pane geometry, resizable at runtime and stored per session. */
+  --sidebar-w: 192px;
+  --inspector-w: 340px;
+  --dock-h: 132px;
+  --row-h: 25px;
+}
+
+/* ================================================================== *
+ * B · Shell frame
+ * ================================================================== */
+
+.shell {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-rows: 32px 1fr 24px;
+  min-width: 860px;
+  min-height: 640px;
+  background: var(--s-bg);
+  color: var(--s-ink);
+  font-family: var(--s-ui);
+  overflow: hidden;
+}
+
+.shell__body {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+.shell__content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 420px;
+  min-height: 0;
+}
+
+.app-main {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+}
+
+/* Splitters — 6px hit area with a 2px visible rule, the spec's structural
+   region boundary. */
+.splitter {
+  position: relative;
+  flex: none;
+  background: transparent;
+  z-index: 4;
+}
+.splitter::before {
+  content: "";
+  position: absolute;
+  background: var(--s-rule);
+}
+.splitter--sidebar {
+  width: 6px;
+  margin: 0 -2px 0 0;
+  cursor: col-resize;
+}
+.splitter--sidebar::before {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+}
+.splitter--dock {
+  height: 6px;
+  cursor: row-resize;
+}
+.splitter--dock::before {
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 2px;
+}
+.splitter:focus-visible {
+  outline: var(--border-thick) solid var(--s-blue);
+  outline-offset: -2px;
+}
+
+/* --- Region 1 · Title bar ---------------------------------------- */
+.titlebar {
+  grid-row: 1;
+  display: flex;
+  align-items: stretch;
+  height: 32px;
+  background: var(--s-surface);
+  border-bottom: 2px solid var(--s-rule);
+  min-width: 0;
+}
+.titlebar__brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  flex: none;
+}
+.titlebar__lockup {
+  display: flex;
+  align-items: center;
+}
+.titlebar__divider {
+  width: 1px;
+  background: var(--s-line);
+  flex: none;
+}
+.menubar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 9px;
+  flex: none;
+}
+.menubar__item {
+  background: none;
+  border: 0;
+  padding: 2px 5px;
+  font-family: var(--s-ui);
+  font-size: 11px;
+  color: var(--s-ink2);
+  transition: var(--transition-control);
+}
+.menubar__item:hover,
+.menubar__item[aria-expanded="true"] {
+  color: var(--s-ink);
+  background: var(--s-line2);
+}
+.menu-dropdown {
+  position: fixed;
+  z-index: 200;
+  min-width: 210px;
+  padding: 4px 0;
+  background: var(--s-surface);
+  border: 1px solid var(--s-ink);
+  box-shadow: 0 10px 28px var(--s-shadow);
+}
+.menu-dropdown__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 28px;
+  width: 100%;
+  padding: 5px 12px;
+  background: none;
+  border: 0;
+  font-family: var(--s-ui);
+  font-size: 12px;
+  color: var(--s-ink);
+  text-align: left;
+  cursor: pointer;
+}
+.menu-dropdown__item:hover {
+  background: var(--s-sel);
+}
+.menu-dropdown__hint {
+  font-family: var(--s-mono);
+  font-size: 11px;
+  color: var(--s-ink3);
+}
+.menu-dropdown__sep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--s-line);
+}
+.titlebar__omni {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding: 0 8px;
+}
+.omnibox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 21px;
+  padding: 0 9px;
+  width: clamp(280px, 34vw, 420px);
+  background: var(--s-bg);
+  border: 1px solid var(--s-line);
+  color: var(--s-ink3);
+  transition: var(--transition-control);
+}
+.omnibox:hover {
+  border-color: var(--s-ink3);
+}
+.omnibox__icon {
+  display: flex;
+  color: var(--s-ink3);
+  flex: none;
+}
+.omnibox__text {
+  flex: 1;
+  text-align: left;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.omnibox__key {
+  font-family: var(--s-mono);
+  font-size: 10px;
+  color: var(--s-ink3);
+  flex: none;
+}
+.titlebar__scope {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 12px;
+  flex: none;
+  min-width: 0;
+}
+.scope-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--s-ink);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+}
+.scope-pill__dot {
+  width: 5px;
+  height: 5px;
+  background: var(--s-blue);
+  flex: none;
+}
+.scope-pill.is-unscoped {
+  border-color: var(--s-line2);
+}
+.scope-pill.is-unscoped .scope-pill__dot {
+  background: var(--s-ink3);
+}
+.scope-pill.is-unscoped .scope-pill__label {
+  color: var(--s-ink2);
+}
+.scope-host {
+  font-family: var(--s-mono);
+  font-size: 11px;
+  color: var(--s-ink2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.titlebar__aside {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  flex: none;
+}
+.titlebar__btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 22px;
+  background: none;
+  border: 0;
+  color: var(--s-ink2);
+  transition: var(--transition-control);
+}
+.titlebar__btn:hover {
+  color: var(--s-ink);
+  background: var(--s-line2);
+}
+.wincontrols {
+  display: flex;
+  align-items: stretch;
+  flex: none;
+}
+.wincontrol {
+  width: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 0;
+  color: var(--s-ink2);
+  transition: var(--transition-control);
+}
+.wincontrol:hover {
+  background: var(--s-line2);
+  color: var(--s-ink);
+}
+.wincontrol--close:hover {
+  background: var(--s-red);
+  color: var(--s-onblue);
+}
+.wincontrol__glyph--min {
+  width: 9px;
+  height: 1px;
+  background: currentColor;
+}
+.wincontrol__glyph--max {
+  width: 8px;
+  height: 8px;
+  border: 1px solid currentColor;
+}
+.wincontrol__glyph--close {
+  width: 9px;
+  height: 9px;
+  position: relative;
+}
+.wincontrol__glyph--close::before,
+.wincontrol__glyph--close::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 1.4px;
+  background: currentColor;
+}
+.wincontrol__glyph--close::before {
+  transform: rotate(45deg);
+}
+.wincontrol__glyph--close::after {
+  transform: rotate(-45deg);
+}
+
+/* --- Region 2 · Workspace rail ----------------------------------- */
+.rail {
+  grid-row: 2;
+  width: 48px;
+  flex: none;
+  background: var(--s-surface);
+  border-right: 1px solid var(--s-line);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.rail__cell {
+  position: relative;
+  height: 52px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--s-line2);
+  color: var(--s-ink3);
+  transition: var(--transition-control);
+}
+.rail__cell:hover {
+  background: var(--s-line2);
+  color: var(--s-ink2);
+}
+.rail__cell.is-active {
+  background: var(--s-sel);
+  color: var(--s-blue);
+}
+.rail__cell.is-active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--s-blue);
+}
+.rail__glyph {
+  display: flex;
+}
+.rail__label {
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+.rail__spacer {
+  flex: 1;
+}
+.rail__cell--foot {
+  border-top: 1px solid var(--s-line2);
+  border-bottom: 0;
+  height: 44px;
+}
+
+/* --- Region 3 · Module sidebar ----------------------------------- */
+.sidebar {
+  grid-row: 2;
+  width: var(--sidebar-w);
+  flex: none;
+  background: var(--s-surface);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.shell[data-sidebar="collapsed"] .sidebar,
+.shell[data-sidebar="collapsed"] .splitter--sidebar {
+  display: none;
+}
+.sidebar__session {
+  padding: 9px 12px 8px;
+  border-bottom: 1px solid var(--s-line);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: none;
+}
+.sidebar__kicker {
+  font-size: 9.5px;
+  letter-spacing: 0.2em;
+  color: var(--s-ink3);
+}
+.sidebar__session-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.sidebar__session-id {
+  font-family: var(--s-mono);
+  font-size: 12px;
+  font-weight: 500;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sidebar__session-state {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--s-blue);
+}
+.sidebar__modules {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 6px;
+}
+.sidebar__group {
+  padding: 11px 12px 5px;
+  font-size: 9.5px;
+  letter-spacing: 0.2em;
+  color: var(--s-ink3);
+}
+.modrow {
+  width: 100%;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 12px;
+  background: none;
+  border: 0;
+  border-left: 3px solid transparent;
+  color: var(--s-ink2);
+  text-align: left;
+  transition: var(--transition-control);
+}
+.modrow:hover {
+  background: var(--s-line2);
+  color: var(--s-ink);
+}
+.modrow.is-active {
+  background: var(--s-sel);
+  border-left-color: var(--s-blue);
+  color: var(--s-ink);
+}
+.modrow.is-active .modrow__label {
+  font-weight: 600;
+}
+.modrow__label {
+  flex: 1;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.modrow__count {
+  font-size: 10px;
+  color: var(--s-ink3);
+}
+.modrow__count:empty {
+  display: none;
+}
+.modrow--accent .modrow__count {
+  color: var(--s-blue);
+}
+.sidebar__health {
+  border-top: 1px solid var(--s-line);
+  padding: 9px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: none;
+}
+.sidebar__health-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.health-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.health-row__dot {
+  width: 5px;
+  height: 5px;
+  flex: none;
+  background: var(--s-ink);
+}
+.health-row__dot--up {
+  background: var(--s-ink);
+}
+.health-row__dot--accent {
+  background: var(--s-blue);
+}
+.health-row__dot--down {
+  background: var(--s-red);
+}
+.health-row__label {
+  flex: 1;
+  font-size: 11px;
+  color: var(--s-ink2);
+}
+.health-row__val {
+  font-family: var(--s-mono);
+  font-size: 10px;
+}
+
+/* --- Region 8 · Bottom dock -------------------------------------- */
+.dock {
+  height: var(--dock-h);
+  flex: none;
+  background: var(--s-surface);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.shell[data-dock="collapsed"] .dock,
+.shell[data-dock="collapsed"] .splitter--dock {
+  display: none;
+}
+.dock__tabs {
+  height: 26px;
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--s-line);
+}
+.dock__tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  background: none;
+  border: 0;
+  border-top: 2px solid transparent;
+  font-family: var(--s-ui);
+  font-size: 11px;
+  color: var(--s-ink2);
+  transition: var(--transition-control);
+}
+.dock__tab:hover {
+  color: var(--s-ink);
+}
+.dock__tab.is-active {
+  color: var(--s-ink);
+  font-weight: 500;
+  border-top-color: var(--s-blue);
+}
+.dock__badge {
+  min-width: 14px;
+  height: 14px;
+  padding: 0 2px;
+  background: var(--s-blue);
+  color: var(--s-onblue);
+  font-family: var(--s-mono);
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dock__diag {
+  font-family: var(--s-mono);
+  font-size: 10px;
+  color: var(--s-red);
+}
+.dock__spacer {
+  flex: 1;
+}
+.dock__transport {
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  color: var(--s-ink3);
+}
+.dock__body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+.dock__panel {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+}
+.dock__panel:not(.is-active) {
+  /* Kept mounted so streaming containers never lose their socket; only hidden
+     from view (visibility, not display, to preserve layout of live nodes). */
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* --- Region 9 · Status bar --------------------------------------- */
+.statusbar {
+  grid-row: 3;
+  display: flex;
+  align-items: stretch;
+  height: 24px;
+  background: var(--s-surface);
+  border-top: 2px solid var(--s-rule);
+  font-family: var(--s-mono);
+  font-size: 10px;
+  color: var(--s-ink2);
+  overflow: hidden;
+}
+.statusbar__cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  white-space: nowrap;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--s-ink2);
+}
+.statusbar__cell--surface {
+  background: var(--s-blue);
+  color: var(--s-onblue);
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+.statusbar__cell:not(.statusbar__cell--surface):not(:last-child) {
+  border-right: 1px solid var(--s-line);
+}
+.statusbar__cell--action {
+  border-left: 1px solid var(--s-line);
+  transition: var(--transition-control);
+}
+.statusbar__cell--action:hover {
+  background: var(--s-line2);
+  color: var(--s-ink);
+}
+.statusbar__cell--diag {
+  color: var(--s-red);
+}
+.statusbar__dot {
+  width: 5px;
+  height: 5px;
+  flex: none;
+}
+.statusbar__dot--control {
+  background: var(--s-ink);
+}
+.statusbar__dot--telemetry {
+  background: var(--s-blue);
+}
+.statusbar__spacer {
+  flex: 1;
+}
+
+/* ================================================================== *
+ * C · Content-pane density
+ *
+ * The legacy surfaces (view-head + workflow/panels) are re-cast as flat
+ * application panels inside the content pane. Structure and IDs are untouched;
+ * this is presentation only until each surface is rebuilt to its sheet.
+ * ================================================================== */
+
+.app-main .view {
+  height: 100%;
+  width: 100%;
+  overflow-y: auto;
+  padding: 0;
+  background: var(--s-bg);
+}
+.app-main .view.view--full {
+  overflow: hidden;
+}
+
+/* Surface header strip — the spec's 25/600 title flush left, kicker above,
+   single primary action top right. */
+.view-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  margin: 0;
+  background: var(--s-surface);
+  border-bottom: 2px solid var(--s-rule);
+}
+.view-head__text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.view-head__text .t-label {
+  font-size: 9.5px;
+  letter-spacing: 0.2em;
+  color: var(--s-ink3);
+}
+.view-head__text h1.t-display,
+.view-head__text .t-display {
+  font-family: var(--s-ui);
+  font-size: 25px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+  color: var(--s-ink);
+}
+.view-head__text > p:not(.t-label) {
+  font-size: 12.5px;
+  color: var(--s-ink2);
+  max-width: 70ch;
+  margin-top: 2px;
+}
+.view-head__actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+  align-items: center;
+}
+
+/* Body region below the header — a scroll region with panels. */
+.workflow,
+.settings,
+.about,
+.landing {
+  padding: 16px;
+  gap: 16px;
+}
+.workflow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  align-items: start;
+}
+.workflow__col {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+/* Panels — flat, bordered, square, no shadow. */
+.panel {
+  background: var(--s-surface);
+  border: 1px solid var(--s-line);
+  border-radius: 0;
+  box-shadow: none;
+}
+.panel__header {
+  min-height: 32px;
+  padding: 0 12px;
+  border-bottom: 2px solid var(--s-rule);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.panel__heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.panel__heading h2 {
+  font-family: var(--s-ui);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.panel__heading .icon {
+  color: var(--s-ink2);
+  width: 15px;
+  height: 15px;
+}
+.panel__hint {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--s-ink3);
+}
+.panel__body {
+  padding: 12px;
+}
+.panel__body--flush {
+  padding: 0;
+}
+.panel__footer {
+  padding: 12px;
+  border-top: 1px solid var(--s-line);
+}
+
+/* Section label used in several surfaces. */
+.section-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.section-label .icon {
+  color: var(--s-ink2);
+}
+
+/* Buttons — spec sizing: 24 default, accent-filled primary, ink secondary. */
+.btn {
+  border-radius: 0;
+  height: 24px;
+  padding: 0 11px;
+  font-family: var(--s-ui);
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--s-ink);
+  background: transparent;
+  color: var(--s-ink);
+  box-shadow: none;
+  gap: 6px;
+}
+.btn:hover {
+  background: var(--s-line2);
+}
+.btn .icon {
+  width: 14px;
+  height: 14px;
+}
+.btn--lg {
+  height: 30px;
+  padding: 0 14px;
+}
+.btn--sm {
+  height: 22px;
+  padding: 0 9px;
+}
+.btn--primary {
+  background: var(--s-blue);
+  border-color: var(--s-blue);
+  color: var(--s-onblue);
+}
+.btn--primary:hover {
+  background: var(--s-blue2);
+  border-color: var(--s-blue2);
+}
+.btn--danger {
+  background: transparent;
+  border-color: var(--s-red);
+  color: var(--s-red);
+}
+.btn--danger:hover {
+  background: var(--s-redbg);
+}
+.btn--quiet {
+  border-color: transparent;
+  color: var(--s-ink2);
+}
+.btn--quiet:hover {
+  color: var(--s-ink);
+  background: var(--s-line2);
+}
+.btn:disabled {
+  opacity: 0.45;
+  background: transparent;
+  border-color: var(--s-line);
+  color: var(--s-ink3);
+}
+
+/* Inputs — square, 1px line, accent focus border. */
+.input,
+.select,
+.textarea {
+  border-radius: 0;
+  border: 1px solid var(--s-line);
+  background: var(--s-surface);
+  color: var(--s-ink);
+  font-family: var(--s-ui);
+}
+.input--mono,
+.textarea {
+  font-family: var(--s-mono);
+  font-size: 11px;
+}
+.input:focus,
+.select:focus,
+.textarea:focus {
+  outline: none;
+  border-color: var(--s-blue);
+}
+.field__label {
+  font-size: 9.5px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--s-ink3);
+}
+.field__hint {
+  font-size: 11px;
+  color: var(--s-ink2);
+}
+
+/* Notices / states — flat, left-edged. */
+.notice {
+  border-radius: 0;
+  border: 1px solid var(--s-line);
+  border-left: 3px solid var(--s-ink3);
+  background: var(--s-surface2);
+}
+.notice--accent {
+  border-left-color: var(--s-blue);
+  background: var(--s-sel);
+}
+.notice--success {
+  border-left-color: var(--s-blue);
+}
+.state__title {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.state__body {
+  font-size: 11.5px;
+  color: var(--s-ink3);
+}
+
+/* ================================================================== *
+ * D · Command palette
+ * ================================================================== */
+.palette__scrim {
+  position: fixed;
+  inset: 0;
+  background: var(--s-scrim);
+  z-index: var(--z-overlay);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+}
+.palette {
+  width: min(560px, 92vw);
+  background: var(--s-surface);
+  border: 2px solid var(--s-rule);
+  box-shadow: var(--shadow-overlay);
+  display: flex;
+  flex-direction: column;
+  max-height: 60vh;
+}
+.palette__input {
+  height: 40px;
+  border: 0;
+  border-bottom: 1px solid var(--s-line);
+  background: var(--s-surface);
+  color: var(--s-ink);
+  font-family: var(--s-ui);
+  font-size: 14px;
+  padding: 0 14px;
+}
+.palette__input:focus {
+  outline: none;
+}
+.palette__list {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.palette__item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  height: 32px;
+  background: none;
+  border: 0;
+  border-left: 3px solid transparent;
+  color: var(--s-ink2);
+  text-align: left;
+  font-size: 12.5px;
+}
+.palette__item .icon {
+  width: 15px;
+  height: 15px;
+  color: var(--s-ink3);
+}
+.palette__item.is-active,
+.palette__item:hover {
+  background: var(--s-sel);
+  border-left-color: var(--s-blue);
+  color: var(--s-ink);
+}
+.palette__item-group {
+  margin-left: auto;
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  color: var(--s-ink3);
+}
+
+/* ================================================================== *
+ * E · Workbench in the shell
+ *
+ * The queue and the resend/fuzzer drawers have moved to the shared dock, so
+ * the workbench content is the traffic table (region 6) beside the flow-detail
+ * inspector (region 7), resizable by the injected inspector splitter.
+ * ================================================================== */
+.app-main .workbench__bar {
+  gap: 10px;
+  flex-wrap: nowrap;
+  padding: 0 12px;
+  min-height: 32px;
+  border-bottom: 2px solid var(--s-rule);
+  overflow: hidden;
+}
+.app-main .workbench__grid {
+  display: flex;
+  gap: 0;
+  background: transparent;
+  min-height: 0;
+}
+.workbench__pane--flows {
+  flex: 1;
+  min-width: 0;
+  border-right: 0;
+}
+.workbench__pane--queue {
+  /* Relocated to the shared dock. */
+  display: none;
+}
+.workbench__pane--detail {
+  flex: none;
+  width: var(--inspector-w);
+  min-width: 0;
+}
+.splitter--inspector {
+  width: 6px;
+  cursor: col-resize;
+  align-self: stretch;
+}
+.splitter--inspector::before {
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+}
+.shell[data-inspector="collapsed"] .workbench__pane--detail,
+.shell[data-inspector="collapsed"] .splitter--inspector {
+  display: none;
+}
+.app-main .workbench__drawer {
+  /* Resend and fuzzer are dock tabs now. */
+  display: none;
+}
+
+/* ================================================================== *
+ * F · Responsive collapse (spec sheet 04)
+ * ================================================================== */
+
+/* 900–1119 · sidebar collapses (handled in JS), rows compact, the scope pill
+   and menu bar drop; the status bar keeps the affordance. */
+@media (max-width: 1119px) {
+  :root,
+  :root[data-theme="light"] {
+    --row-h: 22px;
+  }
+  .titlebar__scope,
+  .menubar {
+    display: none;
+  }
+}
+
+/* Under 900 · rail labels drop (icons stay), the inspector becomes a bottom
+   pane and the dock hides (handled in JS + below). */
+@media (max-width: 899px) {
+  .rail__label {
+    display: none;
+  }
+  .rail__cell {
+    height: 44px;
+  }
+  .shell.is-narrow .workbench__grid {
+    flex-direction: column;
+  }
+  .shell.is-narrow .workbench__pane--detail {
+    width: auto;
+    height: 44%;
+    border-top: 2px solid var(--s-rule);
+  }
+  .shell.is-narrow .splitter--inspector {
+    width: auto;
+    height: 6px;
+    cursor: row-resize;
+    align-self: auto;
+  }
+  .shell.is-narrow .splitter--inspector::before {
+    left: 0;
+    right: 0;
+    top: 2px;
+    height: 2px;
+    width: auto;
+    bottom: auto;
+  }
+}

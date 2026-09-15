@@ -167,25 +167,25 @@ async function main() {
     return `${label?.trim()} (${response.status()})`;
   });
 
-  await check("send-to-repeater creates a durable context", async () => {
+  await check("send-to-resend creates a durable context", async () => {
     const [response] = await Promise.all([
       page.waitForResponse(
-        (r) => r.url().includes("/api/v1/workbench/repeater") && r.request().method() === "POST",
+        (r) => r.url().includes("/api/v1/workbench/resend") && r.request().method() === "POST",
         { timeout: 8000 },
       ),
-      page.getByRole("button", { name: "Repeater", exact: true }).click(),
+      page.getByRole("button", { name: "Resend", exact: true }).click(),
     ]);
-    await page.waitForSelector("#repeater-panel:not([hidden])");
-    expect(response.status() === 200, `repeater create responded ${response.status()}`);
-    const heading = await page.locator("#repeater-panel h2").textContent();
+    await page.waitForSelector("#resend-panel:not([hidden])");
+    expect(response.status() === 200, `resend create responded ${response.status()}`);
+    const heading = await page.locator("#resend-panel h2").textContent();
     return `${heading?.trim()} (${response.status()})`;
   });
 
-  await check("send-to-intruder opens a configurable draft", async () => {
-    await page.getByRole("button", { name: "Intruder", exact: true }).click();
-    await page.waitForSelector("#intruder-panel:not([hidden])");
-    const fields = await page.locator("#intruder-panel .field").count();
-    expect(fields > 4, `only ${fields} fields in the intruder draft`);
+  await check("send-to-fuzzer opens a configurable draft", async () => {
+    await page.getByRole("button", { name: "Fuzzer", exact: true }).click();
+    await page.waitForSelector("#fuzzer-panel:not([hidden])");
+    const fields = await page.locator("#fuzzer-panel .field").count();
+    expect(fields > 4, `only ${fields} fields in the fuzzer draft`);
     return `${fields} configurable fields`;
   });
 

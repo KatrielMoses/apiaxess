@@ -20,41 +20,41 @@ use apiaxess_session::{
     ScopeDisposition, Session,
 };
 use apiaxess_workbench_store::{
-    IntruderAttackType, IntruderConfig, IntruderJob, IntruderJobState, IntruderPositionLocation,
-    IntruderResponseDiff, IntruderResult, IntruderTier, IntruderTokenExtractor, PayloadPosition,
-    RepeaterRequest, RepeaterResponse, TrafficStore,
+    FuzzerAttackType, FuzzerConfig, FuzzerJob, FuzzerJobState, FuzzerPositionLocation,
+    FuzzerResponseDiff, FuzzerResult, FuzzerTier, FuzzerTokenExtractor, PayloadPosition,
+    ResendRequest, ResendResponse, TrafficStore,
 };
 use regex::Regex;
 
-use crate::{RepeaterSender, repeater::url_target};
+use crate::{ResendSender, resend::url_target};
 
-/// Session-scoped intruder job manager.
-pub struct IntruderWorkbench {
+/// Session-scoped fuzzer job manager.
+pub struct FuzzerWorkbench {
     store: RwLock<Option<Arc<TrafficStore>>>,
-    sender: RwLock<Option<Arc<dyn RepeaterSender>>>,
+    sender: RwLock<Option<Arc<dyn ResendSender>>>,
     scope: RwLock<Option<EngagementScope>>,
-    jobs: Mutex<BTreeMap<String, IntruderJob>>,
+    jobs: Mutex<BTreeMap<String, FuzzerJob>>,
     controls: Mutex<BTreeMap<String, Arc<JobControl>>>,
     ffuf_proxy: RwLock<Option<std::net::SocketAddr>>,
 }
 
-impl std::fmt::Debug for IntruderWorkbench {
+impl std::fmt::Debug for FuzzerWorkbench {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("IntruderWorkbench")
+            .debug_struct("FuzzerWorkbench")
             .field("job_count", &self.list().len())
             .finish_non_exhaustive()
     }
 }
 
-impl Default for IntruderWorkbench {
+impl Default for FuzzerWorkbench {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl IntruderWorkbench {
-    /// Creates an empty intruder surface.
+impl FuzzerWorkbench {
+    /// Creates an empty fuzzer surface.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -73,7 +73,7 @@ impl IntruderWorkbench {
     ///
     /// Returns the stable persistence diagnostic when saved jobs cannot load.
     pub fn attach_store(&self, store: Arc<TrafficStore>) -> Result<(), Diagnostic> {
-        let jobs = store.intruder_jobs()?;
+        let jobs = store.fuzzer_jobs()?;
         if let Ok(mut current) = self.store.write() {
             *current = Some(store);
         }
@@ -84,8 +84,8 @@ impl IntruderWorkbench {
         Ok(())
     }
 
-    /// Attaches the same routed sender used by the repeater.
-    pub fn attach_sender(&self, sender: Arc<dyn RepeaterSender>) {
+    /// Attaches the same routed sender used by the resend.
+    pub fn attach_sender(&self, sender: Arc<dyn ResendSender>) {
         if let Ok(mut current) = self.sender.write() {
             *current = Some(sender);
         }
@@ -105,9 +105,9 @@ impl IntruderWorkbench {
         }
     }
 
-    /// Records one completed intruder result in the active session audit trail.
+    /// Records one completed fuzzer result in the active session audit trail.
     ///
-    /// The result itself remains in the durable intruder job; this method adds
+    /// The result itself remains in the durable fuzzer job; this method adds
     /// the canonical session action record when the host application owns the
     /// mutable session aggregate.
     ///
@@ -123,24 +123,24 @@ impl IntruderWorkbench {
     ) -> Result<(), Diagnostic> {
         let job = self
             .get(job_id)
-            .ok_or_else(|| intruder_config_diagnostic("audit", "job not found"))?;
+            .ok_or_else(|| fuzzer_config_diagnostic("audit", "job not found"))?;
         let result = job
             .results
             .iter()
             .find(|result| result.ordinal == ordinal)
-            .ok_or_else(|| intruder_config_diagnostic("audit", "result not found"))?;
+            .ok_or_else(|| fuzzer_config_diagnostic("audit", "result not found"))?;
         let outcome = if result.diagnostic.is_some() {
             ActionOutcome::Failed
         } else {
             ActionOutcome::Completed
         };
         session.record_action(ActionRecordInput {
-            id: format!("intruder:{job_id}:{}", result.ordinal),
+            id: format!("fuzzer:{job_id}:{}", result.ordinal),
             occurred_at: chrono::Utc::now(),
             actor: AuditActor::User,
             action: ActionDescriptor {
-                kind: "workbench.intruder.send".to_owned(),
-                summary: format!("Sent intruder result {}", result.ordinal),
+                kind: "workbench.fuzzer.send".to_owned(),
+                summary: format!("Sent fuzzer result {}", result.ordinal),
             },
             target: ActionTarget::Network {
                 host: url_target(&result.request.url)
@@ -155,7 +155,7 @@ impl IntruderWorkbench {
 
     /// Lists jobs ordered by their stable ID.
     #[must_use]
-    pub fn list(&self) -> Vec<IntruderJob> {
+    pub fn list(&self) -> Vec<FuzzerJob> {
         self.jobs
             .lock()
             .map(|jobs| jobs.values().cloned().collect())
@@ -164,7 +164,7 @@ impl IntruderWorkbench {
 
     /// Reads one job.
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<IntruderJob> {
+    pub fn get(&self, id: &str) -> Option<FuzzerJob> {
         self.jobs.lock().ok().and_then(|jobs| jobs.get(id).cloned())
     }
 
@@ -173,7 +173,7 @@ impl IntruderWorkbench {
     /// # Errors
     ///
     /// Returns a stable configuration or persistence diagnostic.
-    pub fn create(&self, config: IntruderConfig) -> Result<IntruderJob, Diagnostic> {
+    pub fn create(&self, config: FuzzerConfig) -> Result<FuzzerJob, Diagnostic> {
         validate_config(&config)?;
         // ffuf can only faithfully execute a single URL-position Sniper sweep
         // with one payload set and a status-only match filter (passed via -mc).
@@ -185,23 +185,23 @@ impl IntruderWorkbench {
         let ffuf_capable = config.sequence.is_empty()
             && config.auth_preflight.is_none()
             && config.positions.len() == 1
-            && config.positions[0].location == IntruderPositionLocation::Url
+            && config.positions[0].location == FuzzerPositionLocation::Url
             && config.payload_sets.len() == 1
-            && config.attack_type == IntruderAttackType::Sniper
+            && config.attack_type == FuzzerAttackType::Sniper
             && filter.min_size.is_none()
             && filter.max_size.is_none()
             && filter.contains.is_none()
             && filter.regex.is_none();
         let tier = if ffuf_capable {
-            IntruderTier::Ffuf
+            FuzzerTier::Ffuf
         } else {
-            IntruderTier::Native
+            FuzzerTier::Native
         };
-        let job = IntruderJob {
+        let job = FuzzerJob {
             id: new_job_id(),
             created_at: chrono::Utc::now(),
             tier,
-            state: IntruderJobState::Pending,
+            state: FuzzerJobState::Pending,
             config,
             results: Vec::new(),
             diagnostics: Vec::new(),
@@ -218,17 +218,17 @@ impl IntruderWorkbench {
     /// # Errors
     ///
     /// Returns a configuration, persistence, or lifecycle diagnostic.
-    pub fn launch(self: &Arc<Self>, id: &str) -> Result<IntruderJob, Diagnostic> {
+    pub fn launch(self: &Arc<Self>, id: &str) -> Result<FuzzerJob, Diagnostic> {
         let mut job = self
             .get(id)
-            .ok_or_else(|| intruder_config_diagnostic("launch", "job not found"))?;
-        if matches!(job.state, IntruderJobState::Running) {
-            return Err(intruder_config_diagnostic(
+            .ok_or_else(|| fuzzer_config_diagnostic("launch", "job not found"))?;
+        if matches!(job.state, FuzzerJobState::Running) {
+            return Err(fuzzer_config_diagnostic(
                 "launch",
                 "job is already running",
             ));
         }
-        job.state = IntruderJobState::Running;
+        job.state = FuzzerJobState::Running;
         self.persist(&job)?;
         self.replace(job.clone());
         let control = Arc::new(JobControl::default());
@@ -258,15 +258,15 @@ impl IntruderWorkbench {
         self: &Arc<Self>,
         id: &str,
         session: &mut Session,
-    ) -> Result<IntruderJob, Diagnostic> {
+    ) -> Result<FuzzerJob, Diagnostic> {
         let job = self.launch(id)?;
         session.record_action(ActionRecordInput {
-            id: format!("intruder:{id}:launch"),
+            id: format!("fuzzer:{id}:launch"),
             occurred_at: chrono::Utc::now(),
             actor: AuditActor::User,
             action: ActionDescriptor {
-                kind: "workbench.intruder.launch".to_owned(),
-                summary: format!("Launched intruder job {id}"),
+                kind: "workbench.fuzzer.launch".to_owned(),
+                summary: format!("Launched fuzzer job {id}"),
             },
             target: ActionTarget::Network {
                 host: url_target(&job.config.base_request.url).map_or_else(
@@ -286,14 +286,14 @@ impl IntruderWorkbench {
     /// # Errors
     ///
     /// Returns a lifecycle diagnostic when the job does not exist or run.
-    pub fn pause(&self, id: &str) -> Result<IntruderJob, Diagnostic> {
+    pub fn pause(&self, id: &str) -> Result<FuzzerJob, Diagnostic> {
         let job = self
             .get(id)
-            .ok_or_else(|| intruder_config_diagnostic("pause", "job not found"))?;
+            .ok_or_else(|| fuzzer_config_diagnostic("pause", "job not found"))?;
         let control = self.control(id)?;
         control.paused.store(true, Ordering::Release);
         let mut paused = job;
-        paused.state = IntruderJobState::Paused;
+        paused.state = FuzzerJobState::Paused;
         self.persist(&paused)?;
         self.replace(paused.clone());
         Ok(paused)
@@ -304,15 +304,15 @@ impl IntruderWorkbench {
     /// # Errors
     ///
     /// Returns a lifecycle diagnostic when no running control exists.
-    pub fn resume(&self, id: &str) -> Result<IntruderJob, Diagnostic> {
+    pub fn resume(&self, id: &str) -> Result<FuzzerJob, Diagnostic> {
         let job = self
             .get(id)
-            .ok_or_else(|| intruder_config_diagnostic("resume", "job not found"))?;
+            .ok_or_else(|| fuzzer_config_diagnostic("resume", "job not found"))?;
         let control = self.control(id)?;
         control.paused.store(false, Ordering::Release);
         control.notify.notify_waiters();
         let mut running = job;
-        running.state = IntruderJobState::Running;
+        running.state = FuzzerJobState::Running;
         self.persist(&running)?;
         self.replace(running.clone());
         Ok(running)
@@ -323,18 +323,18 @@ impl IntruderWorkbench {
     /// # Errors
     ///
     /// Returns a lifecycle or persistence diagnostic.
-    pub fn stop(&self, id: &str) -> Result<IntruderJob, Diagnostic> {
+    pub fn stop(&self, id: &str) -> Result<FuzzerJob, Diagnostic> {
         let job = self
             .get(id)
-            .ok_or_else(|| intruder_config_diagnostic("stop", "job not found"))?;
+            .ok_or_else(|| fuzzer_config_diagnostic("stop", "job not found"))?;
         let control = self.control(id)?;
         control.cancelled.store(true, Ordering::Release);
         control.notify.notify_waiters();
         let mut stopped = job;
-        stopped.state = IntruderJobState::Stopped;
+        stopped.state = FuzzerJobState::Stopped;
         stopped
             .diagnostics
-            .push(catalogue::PROXY_INTRUDER_CANCELLED.instantiate(DiagnosticContext::new()));
+            .push(catalogue::PROXY_FUZZER_CANCELLED.instantiate(DiagnosticContext::new()));
         self.persist(&stopped)?;
         self.replace(stopped.clone());
         Ok(stopped)
@@ -343,8 +343,8 @@ impl IntruderWorkbench {
     async fn run_job(&self, id: &str, control: Arc<JobControl>) -> Result<(), Diagnostic> {
         let job = self
             .get(id)
-            .ok_or_else(|| intruder_config_diagnostic("run", "job disappeared"))?;
-        if job.tier == IntruderTier::Ffuf {
+            .ok_or_else(|| fuzzer_config_diagnostic("run", "job disappeared"))?;
+        if job.tier == FuzzerTier::Ffuf {
             self.run_ffuf(job, control).await
         } else {
             self.run_native(job, control).await
@@ -353,7 +353,7 @@ impl IntruderWorkbench {
 
     async fn run_native(
         &self,
-        mut job: IntruderJob,
+        mut job: FuzzerJob,
         control: Arc<JobControl>,
     ) -> Result<(), Diagnostic> {
         let requests = expand_attack(&job.config)?;
@@ -361,7 +361,7 @@ impl IntruderWorkbench {
         let Some(sender) = sender else {
             return self.finish_failed(
                 &job,
-                catalogue::PROXY_REPEATER_TRANSPORT_UNAVAILABLE
+                catalogue::PROXY_RESEND_TRANSPORT_UNAVAILABLE
                     .instantiate(DiagnosticContext::new()),
             );
         };
@@ -374,7 +374,7 @@ impl IntruderWorkbench {
             job.config.concurrency.max(1)
         };
         let rate = job.config.rate_per_second;
-        let planned: Vec<(Vec<String>, RepeaterRequest)> =
+        let planned: Vec<(Vec<String>, ResendRequest)> =
             requests.into_iter().take(job.config.max_results).collect();
         let mut prior = None;
         let mut index = 0usize;
@@ -397,9 +397,9 @@ impl IntruderWorkbench {
             index = end;
         }
         job.state = if control.cancelled.load(Ordering::Acquire) {
-            IntruderJobState::Stopped
+            FuzzerJobState::Stopped
         } else {
-            IntruderJobState::Completed
+            FuzzerJobState::Completed
         };
         self.persist(&job)?;
         self.replace(job);
@@ -411,12 +411,12 @@ impl IntruderWorkbench {
     /// fans them out concurrently. Rate limiting paces each dispatch.
     async fn dispatch_batch(
         &self,
-        config: &IntruderConfig,
-        batch: &[(Vec<String>, RepeaterRequest)],
+        config: &FuzzerConfig,
+        batch: &[(Vec<String>, ResendRequest)],
         stateful: bool,
         rate: u32,
-        sender: &Arc<dyn RepeaterSender>,
-    ) -> Vec<Result<RepeaterResponse, Diagnostic>> {
+        sender: &Arc<dyn ResendSender>,
+    ) -> Vec<Result<ResendResponse, Diagnostic>> {
         let mut responses = Vec::with_capacity(batch.len());
         if stateful {
             for (_, request) in batch {
@@ -439,7 +439,7 @@ impl IntruderWorkbench {
                 responses.push(
                     handle
                         .await
-                        .unwrap_or_else(|error| Err(intruder_task_diagnostic(&error.to_string()))),
+                        .unwrap_or_else(|error| Err(fuzzer_task_diagnostic(&error.to_string()))),
                 );
             }
         }
@@ -451,10 +451,10 @@ impl IntruderWorkbench {
     /// applying the match filter, and persisting after each result.
     fn record_batch(
         &self,
-        job: &mut IntruderJob,
-        batch: &[(Vec<String>, RepeaterRequest)],
-        responses: Vec<Result<RepeaterResponse, Diagnostic>>,
-        prior: &mut Option<RepeaterResponse>,
+        job: &mut FuzzerJob,
+        batch: &[(Vec<String>, ResendRequest)],
+        responses: Vec<Result<ResendResponse, Diagnostic>>,
+        prior: &mut Option<ResendResponse>,
     ) -> Result<(), Diagnostic> {
         for ((payloads, request), response) in batch.iter().zip(responses) {
             let (response, diagnostic) = match response {
@@ -474,7 +474,7 @@ impl IntruderWorkbench {
                 diagnostics.push(diagnostic.clone());
             }
             let ordinal = job.results.len() + 1;
-            job.results.push(IntruderResult {
+            job.results.push(FuzzerResult {
                 ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
                 payloads: payloads.clone(),
                 request: request.clone(),
@@ -495,10 +495,10 @@ impl IntruderWorkbench {
 
     async fn send_sequence(
         &self,
-        config: &IntruderConfig,
-        first_request: &RepeaterRequest,
-        sender: &dyn RepeaterSender,
-    ) -> Result<RepeaterResponse, Diagnostic> {
+        config: &FuzzerConfig,
+        first_request: &ResendRequest,
+        sender: &dyn ResendSender,
+    ) -> Result<ResendResponse, Diagnostic> {
         let mut variables = BTreeMap::new();
         if let Some(preflight) = &config.auth_preflight {
             let response = sender
@@ -525,14 +525,14 @@ impl IntruderWorkbench {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run_ffuf(&self, job: IntruderJob, control: Arc<JobControl>) -> Result<(), Diagnostic> {
+    async fn run_ffuf(&self, job: FuzzerJob, control: Arc<JobControl>) -> Result<(), Diagnostic> {
         let proxy = self
             .ffuf_proxy
             .read()
             .ok()
             .and_then(|proxy| *proxy)
             .ok_or_else(|| {
-                catalogue::PROXY_INTRUDER_FFUF_UNAVAILABLE.instantiate(DiagnosticContext::new())
+                catalogue::PROXY_FUZZER_FFUF_UNAVAILABLE.instantiate(DiagnosticContext::new())
             })?;
         // The bundled ffuf is invoked by absolute path from the install layout;
         // nothing on the host is required. An operator may still point
@@ -648,12 +648,12 @@ impl IntruderWorkbench {
                 process
                     .stop()
                     .map_err(|error| ffuf_failed("stop", &error.to_string()))?;
-                completed.state = IntruderJobState::Stopped;
+                completed.state = FuzzerJobState::Stopped;
                 if completed.diagnostics.iter().all(|diagnostic| {
-                    diagnostic.id.as_ref() != catalogue::PROXY_INTRUDER_CANCELLED.id
+                    diagnostic.id.as_ref() != catalogue::PROXY_FUZZER_CANCELLED.id
                 }) {
                     completed.diagnostics.push(
-                        catalogue::PROXY_INTRUDER_CANCELLED.instantiate(DiagnosticContext::new()),
+                        catalogue::PROXY_FUZZER_CANCELLED.instantiate(DiagnosticContext::new()),
                     );
                 }
                 self.persist(&completed)?;
@@ -677,7 +677,7 @@ impl IntruderWorkbench {
         let parsed =
             read_ffuf_json(&output).map_err(|error| ffuf_failed("json", &error.to_string()))?;
         self.append_ffuf_results(&mut completed, &parsed, &mut seen)?;
-        completed.state = IntruderJobState::Completed;
+        completed.state = FuzzerJobState::Completed;
         // Report the actual achieved request rate so the pre-run estimate can be
         // judged honestly against reality (the estimate is latency-bound and
         // often lower than an unrouted ffuf; this closes that gap).
@@ -703,7 +703,7 @@ impl IntruderWorkbench {
 
     fn append_ffuf_results(
         &self,
-        job: &mut IntruderJob,
+        job: &mut FuzzerJob,
         json: &serde_json::Value,
         seen: &mut usize,
     ) -> Result<(), Diagnostic> {
@@ -736,7 +736,7 @@ impl IntruderWorkbench {
                 .get("status")
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|status| u16::try_from(status).ok())
-                .map(|status| RepeaterResponse {
+                .map(|status| ResendResponse {
                     status,
                     headers: Vec::new(),
                     body: entry
@@ -759,7 +759,7 @@ impl IntruderWorkbench {
                 .results
                 .last()
                 .and_then(|result| result.response.as_ref());
-            job.results.push(IntruderResult {
+            job.results.push(FuzzerResult {
                 ordinal: u64::try_from(job.results.len() + 1).unwrap_or(u64::MAX),
                 payloads: vec![payload],
                 request,
@@ -782,9 +782,9 @@ impl IntruderWorkbench {
         Ok(())
     }
 
-    fn finish_failed(&self, job: &IntruderJob, diagnostic: Diagnostic) -> Result<(), Diagnostic> {
+    fn finish_failed(&self, job: &FuzzerJob, diagnostic: Diagnostic) -> Result<(), Diagnostic> {
         let mut failed = job.clone();
-        failed.state = IntruderJobState::Failed;
+        failed.state = FuzzerJobState::Failed;
         failed.diagnostics.push(diagnostic);
         self.persist(&failed)?;
         self.replace(failed);
@@ -793,7 +793,7 @@ impl IntruderWorkbench {
 
     fn append_job_diagnostic(&self, id: &str, diagnostic: Diagnostic) {
         if let Some(mut job) = self.get(id) {
-            job.state = IntruderJobState::Failed;
+            job.state = FuzzerJobState::Failed;
             job.diagnostics.push(diagnostic);
             if self.persist(&job).is_ok() {
                 self.replace(job);
@@ -801,16 +801,16 @@ impl IntruderWorkbench {
         }
     }
 
-    fn persist(&self, job: &IntruderJob) -> Result<(), Diagnostic> {
+    fn persist(&self, job: &FuzzerJob) -> Result<(), Diagnostic> {
         let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
             return Err(
-                catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED.instantiate(DiagnosticContext::new())
+                catalogue::PROXY_FUZZER_PERSISTENCE_FAILED.instantiate(DiagnosticContext::new())
             );
         };
-        store.upsert_intruder(job)
+        store.upsert_fuzzer(job)
     }
 
-    fn replace(&self, job: IntruderJob) {
+    fn replace(&self, job: FuzzerJob) {
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.insert(job.id.clone(), job);
         }
@@ -821,7 +821,7 @@ impl IntruderWorkbench {
             .lock()
             .ok()
             .and_then(|controls| controls.get(id).cloned())
-            .ok_or_else(|| intruder_config_diagnostic("control", "job is not running"))
+            .ok_or_else(|| fuzzer_config_diagnostic("control", "job is not running"))
     }
 
     fn classify_scope(&self, url: &str) -> ScopeDisposition {
@@ -858,14 +858,14 @@ impl JobControl {
 }
 
 fn expand_attack(
-    config: &IntruderConfig,
-) -> Result<Vec<(Vec<String>, RepeaterRequest)>, Diagnostic> {
+    config: &FuzzerConfig,
+) -> Result<Vec<(Vec<String>, ResendRequest)>, Diagnostic> {
     let mut results = Vec::new();
     match config.attack_type {
-        IntruderAttackType::Sniper => {
+        FuzzerAttackType::Sniper => {
             for position in &config.positions {
                 let set = config.payload_sets.get(position.set_index).ok_or_else(|| {
-                    intruder_config_diagnostic("payload", "position payload set not found")
+                    fuzzer_config_diagnostic("payload", "position payload set not found")
                 })?;
                 for value in &set.values {
                     let mut request = config.base_request.clone();
@@ -874,7 +874,7 @@ fn expand_attack(
                 }
             }
         }
-        IntruderAttackType::Clusterbomb => {
+        FuzzerAttackType::Clusterbomb => {
             let indexes = config
                 .positions
                 .iter()
@@ -885,7 +885,7 @@ fn expand_attack(
             let mut combinations = vec![Vec::<String>::new()];
             for index in indexes.iter().copied() {
                 let set = config.payload_sets.get(index).ok_or_else(|| {
-                    intruder_config_diagnostic("payload", "position payload set not found")
+                    fuzzer_config_diagnostic("payload", "position payload set not found")
                 })?;
                 combinations = combinations
                     .into_iter()
@@ -908,7 +908,7 @@ fn expand_attack(
                 let mut applied: Vec<(&PayloadPosition, &str)> = Vec::new();
                 for position in &config.positions {
                     let value = values_by_set.get(&position.set_index).ok_or_else(|| {
-                        intruder_config_diagnostic("payload", "position payload set not found")
+                        fuzzer_config_diagnostic("payload", "position payload set not found")
                     })?;
                     applied.push((position, value.as_str()));
                 }
@@ -916,7 +916,7 @@ fn expand_attack(
                 results.push((values, request));
             }
         }
-        IntruderAttackType::Pitchfork => {
+        FuzzerAttackType::Pitchfork => {
             let length = config
                 .positions
                 .iter()
@@ -955,7 +955,7 @@ fn expand_attack(
 /// been applied yet. Cross-field positions are independent, so a single global
 /// descending sort is correct for all of them.
 fn apply_positions(
-    request: &mut RepeaterRequest,
+    request: &mut ResendRequest,
     positions: &[(&PayloadPosition, &str)],
 ) -> Result<(), Diagnostic> {
     let mut ordered: Vec<&(&PayloadPosition, &str)> = positions.iter().collect();
@@ -967,34 +967,34 @@ fn apply_positions(
 }
 
 fn apply_position(
-    request: &mut RepeaterRequest,
+    request: &mut ResendRequest,
     position: &PayloadPosition,
     value: &str,
 ) -> Result<(), Diagnostic> {
     match position.location {
-        IntruderPositionLocation::Url => {
+        FuzzerPositionLocation::Url => {
             replace_range(&mut request.url, position.start, position.end, value)
         }
-        IntruderPositionLocation::Body => {
+        FuzzerPositionLocation::Body => {
             let body =
                 String::from_utf8(request.body.clone().unwrap_or_default()).map_err(|_| {
-                    intruder_config_diagnostic("body", "body payload position is not UTF-8")
+                    fuzzer_config_diagnostic("body", "body payload position is not UTF-8")
                 })?;
             let mut body = body;
             replace_range(&mut body, position.start, position.end, value)?;
             request.body = Some(body.into_bytes());
             Ok(())
         }
-        IntruderPositionLocation::Header => {
+        FuzzerPositionLocation::Header => {
             let name = position.header_name.as_deref().ok_or_else(|| {
-                intruder_config_diagnostic("header", "header payload position has no header name")
+                fuzzer_config_diagnostic("header", "header payload position has no header name")
             })?;
             let header = request
                 .headers
                 .iter_mut()
                 .find(|(header, _)| header.eq_ignore_ascii_case(name))
                 .ok_or_else(|| {
-                    intruder_config_diagnostic(
+                    fuzzer_config_diagnostic(
                         "header",
                         "header payload position names an absent header",
                     )
@@ -1015,7 +1015,7 @@ fn replace_range(
         || !value.is_char_boundary(start)
         || !value.is_char_boundary(end)
     {
-        return Err(intruder_config_diagnostic(
+        return Err(fuzzer_config_diagnostic(
             "position",
             "payload position is outside the selected field",
         ));
@@ -1025,8 +1025,8 @@ fn replace_range(
 }
 
 fn matches_filter(
-    filter: &apiaxess_workbench_store::IntruderMatchFilter,
-    response: &RepeaterResponse,
+    filter: &apiaxess_workbench_store::FuzzerMatchFilter,
+    response: &ResendResponse,
 ) -> bool {
     let size = response.body.as_ref().map_or(0, |body| body.len() as u64);
     let body = response
@@ -1048,14 +1048,14 @@ fn matches_filter(
 }
 
 fn response_diff(
-    previous: Option<&RepeaterResponse>,
-    current: Option<&RepeaterResponse>,
-) -> IntruderResponseDiff {
+    previous: Option<&ResendResponse>,
+    current: Option<&ResendResponse>,
+) -> FuzzerResponseDiff {
     let Some(current) = current else {
-        return IntruderResponseDiff::default();
+        return FuzzerResponseDiff::default();
     };
     let Some(previous) = previous else {
-        return IntruderResponseDiff {
+        return FuzzerResponseDiff {
             status_changed: false,
             size_changed: false,
             size_delta: 0,
@@ -1065,7 +1065,7 @@ fn response_diff(
     let previous_size =
         i64::try_from(previous.body.as_ref().map_or(0, Vec::len)).unwrap_or(i64::MAX);
     let current_size = i64::try_from(current.body.as_ref().map_or(0, Vec::len)).unwrap_or(i64::MAX);
-    IntruderResponseDiff {
+    FuzzerResponseDiff {
         status_changed: previous.status != current.status,
         size_changed: previous_size != current_size,
         size_delta: current_size - previous_size,
@@ -1075,8 +1075,8 @@ fn response_diff(
 
 fn extract_tokens(
     step: &str,
-    response: &RepeaterResponse,
-    extractors: &[IntruderTokenExtractor],
+    response: &ResendResponse,
+    extractors: &[FuzzerTokenExtractor],
     variables: &mut BTreeMap<String, String>,
 ) -> Result<(), Diagnostic> {
     let body = response
@@ -1087,7 +1087,7 @@ fn extract_tokens(
         .to_string();
     for extractor in extractors {
         let (variable, value) = match extractor {
-            IntruderTokenExtractor::Header { variable, name } => (
+            FuzzerTokenExtractor::Header { variable, name } => (
                 variable,
                 response
                     .headers
@@ -1095,7 +1095,7 @@ fn extract_tokens(
                     .find(|(key, _)| key.eq_ignore_ascii_case(name))
                     .map(|(_, value)| value.clone()),
             ),
-            IntruderTokenExtractor::Regex { variable, pattern } => (
+            FuzzerTokenExtractor::Regex { variable, pattern } => (
                 variable,
                 Regex::new(pattern).ok().and_then(|regex| {
                     regex.captures(&body).and_then(|captures| {
@@ -1106,7 +1106,7 @@ fn extract_tokens(
                     })
                 }),
             ),
-            IntruderTokenExtractor::JsonPath { variable, path } => (
+            FuzzerTokenExtractor::JsonPath { variable, path } => (
                 variable,
                 serde_json::from_str::<serde_json::Value>(&body)
                     .ok()
@@ -1127,9 +1127,9 @@ fn extract_tokens(
 }
 
 fn inject_request(
-    request: &RepeaterRequest,
+    request: &ResendRequest,
     variables: &BTreeMap<String, String>,
-) -> RepeaterRequest {
+) -> ResendRequest {
     let replace = |value: &str| {
         variables
             .iter()
@@ -1137,7 +1137,7 @@ fn inject_request(
                 value.replace(&format!("{{{{{key}}}}}"), token)
             })
     };
-    RepeaterRequest {
+    ResendRequest {
         method: replace(&request.method),
         url: replace(&request.url),
         headers: request
@@ -1153,23 +1153,23 @@ fn inject_request(
 }
 
 fn ffuf_url(
-    request: &RepeaterRequest,
+    request: &ResendRequest,
     positions: &[PayloadPosition],
 ) -> Result<String, Diagnostic> {
     let url_position = positions
         .iter()
-        .find(|position| position.location == IntruderPositionLocation::Url)
+        .find(|position| position.location == FuzzerPositionLocation::Url)
         .ok_or_else(|| {
-            intruder_config_diagnostic("ffuf", "ffuf requires a URL payload position")
+            fuzzer_config_diagnostic("ffuf", "ffuf requires a URL payload position")
         })?;
     let mut url = request.url.clone();
     replace_range(&mut url, url_position.start, url_position.end, "FUZZ")?;
     Ok(url)
 }
 
-fn request_with_ffuf_payload(request: &RepeaterRequest, payload: &str) -> RepeaterRequest {
+fn request_with_ffuf_payload(request: &ResendRequest, payload: &str) -> ResendRequest {
     let replace = |value: &str| value.replace("FUZZ", payload);
-    RepeaterRequest {
+    ResendRequest {
         method: request.method.clone(),
         url: replace(&request.url),
         headers: request
@@ -1237,7 +1237,7 @@ impl Drop for FfufTempFiles {
     }
 }
 
-fn validate_config(config: &IntruderConfig) -> Result<(), Diagnostic> {
+fn validate_config(config: &FuzzerConfig) -> Result<(), Diagnostic> {
     if config.positions.is_empty()
         || config.payload_sets.is_empty()
         || config.max_results == 0
@@ -1245,14 +1245,14 @@ fn validate_config(config: &IntruderConfig) -> Result<(), Diagnostic> {
         || config.base_request.method.is_empty()
         || config.base_request.url.is_empty()
     {
-        return Err(intruder_config_diagnostic(
+        return Err(fuzzer_config_diagnostic(
             "config",
             "request, positions, payload sets, concurrency, and max_results are required",
         ));
     }
     for position in &config.positions {
         if config.payload_sets.get(position.set_index).is_none() || position.start > position.end {
-            return Err(intruder_config_diagnostic(
+            return Err(fuzzer_config_diagnostic(
                 "position",
                 "position range or payload set is invalid",
             ));
@@ -1263,12 +1263,12 @@ fn validate_config(config: &IntruderConfig) -> Result<(), Diagnostic> {
 
 fn new_job_id() -> String {
     format!(
-        "intruder-{}",
+        "fuzzer-{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     )
 }
 
-fn intruder_config_diagnostic(operation: &str, detail: &str) -> Diagnostic {
+fn fuzzer_config_diagnostic(operation: &str, detail: &str) -> Diagnostic {
     let mut context = DiagnosticContext::new();
     context.insert(
         "operation".to_owned(),
@@ -1278,7 +1278,7 @@ fn intruder_config_diagnostic(operation: &str, detail: &str) -> Diagnostic {
         "error".to_owned(),
         DiagnosticValue::String(detail.to_owned()),
     );
-    catalogue::PROXY_INTRUDER_CONFIG_INVALID.instantiate(context)
+    catalogue::PROXY_FUZZER_CONFIG_INVALID.instantiate(context)
 }
 
 /// Builds the honest observed-rate diagnostic comparing estimate vs. reality.
@@ -1303,13 +1303,13 @@ fn discovery_rate_diagnostic(
 
 /// Wraps a rare send-task join failure (a panicked send future) as a stable
 /// per-result diagnostic so one bad request cannot abort the whole attack.
-fn intruder_task_diagnostic(detail: &str) -> Diagnostic {
+fn fuzzer_task_diagnostic(detail: &str) -> Diagnostic {
     let mut context = DiagnosticContext::new();
     context.insert(
         "error".to_owned(),
         DiagnosticValue::String(detail.to_owned()),
     );
-    catalogue::PROXY_REPEATER_TRANSPORT_UNAVAILABLE.instantiate(context)
+    catalogue::PROXY_RESEND_TRANSPORT_UNAVAILABLE.instantiate(context)
 }
 
 fn sequence_diagnostic(step: &str, detail: &str) -> Diagnostic {
@@ -1319,13 +1319,13 @@ fn sequence_diagnostic(step: &str, detail: &str) -> Diagnostic {
         "error".to_owned(),
         DiagnosticValue::String(detail.to_owned()),
     );
-    catalogue::PROXY_INTRUDER_SEQUENCE_FAILED.instantiate(context)
+    catalogue::PROXY_FUZZER_SEQUENCE_FAILED.instantiate(context)
 }
 
 fn outside_scope(url: &str) -> Diagnostic {
     let mut context = DiagnosticContext::new();
     context.insert("url".to_owned(), DiagnosticValue::String(url.to_owned()));
-    catalogue::PROXY_INTRUDER_OUTSIDE_SCOPE.instantiate(context)
+    catalogue::PROXY_FUZZER_OUTSIDE_SCOPE.instantiate(context)
 }
 
 fn ffuf_unavailable(detail: &str) -> Diagnostic {
@@ -1334,7 +1334,7 @@ fn ffuf_unavailable(detail: &str) -> Diagnostic {
         "error".to_owned(),
         DiagnosticValue::String(detail.to_owned()),
     );
-    catalogue::PROXY_INTRUDER_FFUF_UNAVAILABLE.instantiate(context)
+    catalogue::PROXY_FUZZER_FFUF_UNAVAILABLE.instantiate(context)
 }
 
 /// A bundled ffuf binary is missing from a correct install. This is an
@@ -1365,17 +1365,17 @@ fn ffuf_failed(operation: &str, detail: &str) -> Diagnostic {
         "error".to_owned(),
         DiagnosticValue::String(detail.to_owned()),
     );
-    catalogue::PROXY_INTRUDER_FFUF_FAILED.instantiate(context)
+    catalogue::PROXY_FUZZER_FFUF_FAILED.instantiate(context)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apiaxess_workbench_store::{IntruderPositionLocation, PayloadSet};
+    use apiaxess_workbench_store::{FuzzerPositionLocation, PayloadSet};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn request() -> RepeaterRequest {
-        RepeaterRequest {
+    fn request() -> ResendRequest {
+        ResendRequest {
             method: "GET".to_owned(),
             url: "https://api.example.test/items?id=FUZZ".to_owned(),
             headers: Vec::new(),
@@ -1383,11 +1383,11 @@ mod tests {
         }
     }
 
-    fn config(attack_type: IntruderAttackType) -> IntruderConfig {
-        IntruderConfig {
+    fn config(attack_type: FuzzerAttackType) -> FuzzerConfig {
+        FuzzerConfig {
             base_request: request(),
             positions: vec![PayloadPosition {
-                location: IntruderPositionLocation::Url,
+                location: FuzzerPositionLocation::Url,
                 header_name: None,
                 start: 34,
                 end: 38,
@@ -1398,7 +1398,7 @@ mod tests {
                 values: vec!["one".to_owned(), "two".to_owned()],
             }],
             attack_type,
-            match_filter: apiaxess_workbench_store::IntruderMatchFilter::default(),
+            match_filter: apiaxess_workbench_store::FuzzerMatchFilter::default(),
             concurrency: 1,
             rate_per_second: 0,
             max_results: 100,
@@ -1410,9 +1410,9 @@ mod tests {
 
     #[test]
     fn payload_expansion_applies_clusterbomb_values_by_set() {
-        let mut attack = config(IntruderAttackType::Clusterbomb);
+        let mut attack = config(FuzzerAttackType::Clusterbomb);
         attack.positions.push(PayloadPosition {
-            location: IntruderPositionLocation::Url,
+            location: FuzzerPositionLocation::Url,
             header_name: None,
             start: 27,
             end: 31,
@@ -1442,28 +1442,28 @@ mod tests {
     #[test]
     fn stateless_and_stateful_jobs_select_the_expected_tier() {
         let path = std::env::temp_dir().join(format!(
-            "apiaxess-intruder-{}",
+            "apiaxess-fuzzer-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
         ));
         let store = Arc::new(TrafficStore::open(&path, "session:test").expect("store"));
-        let manager = IntruderWorkbench::new();
+        let manager = FuzzerWorkbench::new();
         manager.attach_store(Arc::clone(&store)).expect("attach");
         let stateless = manager
-            .create(config(IntruderAttackType::Sniper))
+            .create(config(FuzzerAttackType::Sniper))
             .expect("create");
-        assert_eq!(stateless.tier, IntruderTier::Ffuf);
-        let mut stateful_config = config(IntruderAttackType::Sniper);
+        assert_eq!(stateless.tier, FuzzerTier::Ffuf);
+        let mut stateful_config = config(FuzzerAttackType::Sniper);
         stateful_config.auth_preflight = Some(request());
         let stateful = manager.create(stateful_config).expect("create");
-        assert_eq!(stateful.tier, IntruderTier::Native);
+        assert_eq!(stateful.tier, FuzzerTier::Native);
     }
 
     fn temp_store() -> Arc<TrafficStore> {
         let path = std::env::temp_dir().join(format!(
-            "apiaxess-intruder-{}",
+            "apiaxess-fuzzer-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -1474,19 +1474,19 @@ mod tests {
 
     #[test]
     fn richer_configs_route_to_native_so_their_controls_take_effect() {
-        let manager = IntruderWorkbench::new();
+        let manager = FuzzerWorkbench::new();
         manager.attach_store(temp_store()).expect("attach");
         // A content match rule cannot be expressed to ffuf faithfully.
-        let mut contains = config(IntruderAttackType::Sniper);
+        let mut contains = config(FuzzerAttackType::Sniper);
         contains.match_filter.contains = Some("token".to_owned());
         assert_eq!(
             manager.create(contains).expect("create").tier,
-            IntruderTier::Native
+            FuzzerTier::Native
         );
         // Multiple positions/sets (Clusterbomb) exceed ffuf's single-FUZZ model.
-        let mut multi = config(IntruderAttackType::Clusterbomb);
+        let mut multi = config(FuzzerAttackType::Clusterbomb);
         multi.positions.push(PayloadPosition {
-            location: IntruderPositionLocation::Url,
+            location: FuzzerPositionLocation::Url,
             header_name: None,
             start: 27,
             end: 31,
@@ -1498,14 +1498,14 @@ mod tests {
         });
         assert_eq!(
             manager.create(multi).expect("create").tier,
-            IntruderTier::Native
+            FuzzerTier::Native
         );
         // A status-only filter still rides the fast ffuf path (passed via -mc).
-        let mut status_only = config(IntruderAttackType::Sniper);
+        let mut status_only = config(FuzzerAttackType::Sniper);
         status_only.match_filter.statuses = vec![200, 301];
         assert_eq!(
             manager.create(status_only).expect("create").tier,
-            IntruderTier::Ffuf
+            FuzzerTier::Ffuf
         );
     }
 
@@ -1516,15 +1516,15 @@ mod tests {
         struct CountingSender {
             count: Arc<AtomicUsize>,
         }
-        impl RepeaterSender for CountingSender {
+        impl ResendSender for CountingSender {
             fn send(
                 &self,
-                _request: RepeaterRequest,
-            ) -> crate::backend::BackendFuture<Result<RepeaterResponse, Diagnostic>> {
+                _request: ResendRequest,
+            ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>> {
                 let count = Arc::clone(&self.count);
                 Box::pin(async move {
                     count.fetch_add(1, Ordering::SeqCst);
-                    Ok(RepeaterResponse {
+                    Ok(ResendResponse {
                         status: 200,
                         headers: Vec::new(),
                         body: Some(b"ok".to_vec()),
@@ -1534,7 +1534,7 @@ mod tests {
             }
         }
 
-        let manager = Arc::new(IntruderWorkbench::new());
+        let manager = Arc::new(FuzzerWorkbench::new());
         manager.attach_store(temp_store()).expect("attach");
         let count = Arc::new(AtomicUsize::new(0));
         manager.attach_sender(Arc::new(CountingSender {
@@ -1542,18 +1542,18 @@ mod tests {
         }));
 
         // A content match rule forces the native tier; five payloads, width 3.
-        let mut attack = config(IntruderAttackType::Sniper);
+        let mut attack = config(FuzzerAttackType::Sniper);
         attack.match_filter.contains = Some("ok".to_owned());
         attack.concurrency = 3;
         attack.payload_sets[0].values = (0..5).map(|index| format!("p{index}")).collect();
         let job = manager.create(attack).expect("create");
-        assert_eq!(job.tier, IntruderTier::Native);
+        assert_eq!(job.tier, FuzzerTier::Native);
 
         let launched = manager.launch(&job.id).expect("launch");
         let mut finished = None;
         for _ in 0..200 {
             let current = manager.get(&launched.id).expect("job present");
-            if matches!(current.state, IntruderJobState::Completed) {
+            if matches!(current.state, FuzzerJobState::Completed) {
                 finished = Some(current);
                 break;
             }

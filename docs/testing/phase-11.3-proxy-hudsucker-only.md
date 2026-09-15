@@ -50,7 +50,7 @@ raw TLS + h2 clients/servers across the public listener, no external tool):
   hudsucker MITM pipeline.
 - **Capture into the durable store** — an h2 flow lands in `TrafficStore`
   summaries via the `LiveWorkbench` observer (the same path the web-capture and
-  workbench/repeater/intruder flows use).
+  workbench/resend/fuzzer flows use).
 
 Existing hudsucker unit tests continue to cover HTTP/1.1 capture into the store
 (`origin_form_is_normalized_…`) and per-flow intercept (forward/modify/drop +

@@ -4,8 +4,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use apiaxess_external_tools::{
-    ExternalToolRunner, ToolInvocationRequest, ToolProbeRequest, ToolProcess, ToolProcessRequest,
-    ToolRequirement, ToolVersion,
+    ExternalToolRunner, ToolProbeRequest, ToolProcess, ToolProcessRequest, ToolRequirement,
+    ToolVersion,
 };
 use apiaxess_session::Session;
 use apiaxess_workbench_proxy::{FlowObserver, ProxyCore, SessionCa, TransparentFrontend};
@@ -291,9 +291,17 @@ fn nftables_rules(config: &L3RoutingConfig) -> (Vec<Vec<String>>, Vec<Vec<String
 #[serde(rename_all = "snake_case")]
 pub enum TrustMechanism {
     /// `adb root`/`adb remount` and hashed system cacerts path.
+    ///
+    /// The correct path for Android <= 13, where the platform trust anchors live
+    /// in `/system/etc/security/cacerts`.
     AvdWritableSystem,
     /// Disposable overlay mount over redroid's system cacerts directory.
     RedroidOverlay,
+    /// Android 14+ Conscrypt APEX trust store: a tmpfs copy of the immutable
+    /// `/apex/com.android.conscrypt/cacerts` merged with the session CA, bind-mounted
+    /// over the APEX path in the zygote mount namespaces (the NCC "Conscrypt Trust
+    /// User Certs" approach), done programmatically with no Magisk module.
+    ConscryptApex,
 }
 
 /// Trust provisioning configuration.
@@ -301,8 +309,6 @@ pub enum TrustMechanism {
 pub struct CaTrustConfig {
     /// Mechanism appropriate for the selected runtime.
     pub mechanism: TrustMechanism,
-    /// Host `openssl` executable used for `subject_hash_old`.
-    pub openssl_executable: String,
     /// Session-safe path suffix.
     pub lease_id: String,
 }
@@ -310,11 +316,7 @@ pub struct CaTrustConfig {
 impl CaTrustConfig {
     /// Selects the disposable trust path from the sandbox tier.
     #[must_use]
-    pub fn for_tier(
-        tier: SandboxTier,
-        openssl_executable: impl Into<String>,
-        lease_id: impl Into<String>,
-    ) -> Self {
+    pub fn for_tier(tier: SandboxTier, lease_id: impl Into<String>) -> Self {
         let mechanism = match tier {
             // The bundled AOSP emulator uses the same writable-system + adb root
             // CA-install path as the legacy AVD.
@@ -323,7 +325,6 @@ impl CaTrustConfig {
         };
         Self {
             mechanism,
-            openssl_executable: openssl_executable.into(),
             lease_id: lease_id.into(),
         }
     }
@@ -371,6 +372,23 @@ impl CaTrustReceipt {
                     "trust overlay unmount failed",
                 ));
             }
+            if self.mechanism == TrustMechanism::ConscryptApex {
+                // The APEX mechanism also mounts a tmpfs over the Conscrypt APEX
+                // trust dir and binds it into the zygote namespaces; revert both so
+                // the device returns to its pristine boot-time trust store.
+                let apex = "/apex/com.android.conscrypt/cacerts".to_owned();
+                unbind_apex_from_zygote_namespaces(&self.control, &apex);
+                if !successful(
+                    &self
+                        .control
+                        .shell(&["umount".to_owned(), apex], Duration::from_secs(15)),
+                ) {
+                    diagnostics.push(ca_teardown_diagnostic(
+                        self.control.transport_id(),
+                        "Conscrypt APEX trust unmount failed",
+                    ));
+                }
+            }
         } else if !successful(
             &self
                 .control
@@ -414,11 +432,13 @@ impl CaTrustReceipt {
 #[allow(clippy::too_many_lines)]
 pub fn provision_system_ca(
     control: Arc<dyn SandboxControl>,
-    runner: &Arc<dyn ExternalToolRunner>,
     ca: &SessionCa,
     config: &CaTrustConfig,
 ) -> Result<CaTrustReceipt, Vec<Diagnostic>> {
-    let hash = subject_hash_old(runner, &config.openssl_executable, ca)?;
+    // The `<hash>.0` cacerts filename is OpenSSL's legacy `subject_hash_old`,
+    // computed in-process from the CA so provisioning has no host `openssl`
+    // dependency (a bundled install has none on PATH).
+    let hash = ca.android_subject_hash_old().map_err(|error| vec![error])?;
     let temporary_path = format!(
         "/data/local/tmp/apiaxess-{}.pem",
         safe_suffix(&config.lease_id)
@@ -513,7 +533,11 @@ pub fn provision_system_ca(
             )?;
             ensure_shell(
                 &control,
-                &["chmod".to_owned(), "644".to_owned(), format!("{directory}/*")],
+                &[
+                    "chmod".to_owned(),
+                    "644".to_owned(),
+                    format!("{directory}/*"),
+                ],
                 "trust anchor permissions",
             )?;
             ensure_shell(
@@ -565,12 +589,89 @@ pub fn provision_system_ca(
             )?;
             (format!("/system/etc/security/cacerts/{hash}.0"), Some(root))
         }
+        TrustMechanism::ConscryptApex => {
+            // Android 14+ moved the platform trust anchors into the immutable
+            // Conscrypt APEX at `/apex/com.android.conscrypt/cacerts`. A plain copy
+            // there fails, and a tmpfs over it in the init namespace is invisible to
+            // apps (which run in the zygote's separate mount namespace, set up at
+            // boot). The NCC "Conscrypt Trust User Certs" approach, done here purely
+            // over the control channel with no Magisk module:
+            //   1. `adb root` so we can mount over read-only paths.
+            //   2. Stage the current APEX anchors plus our session CA.
+            //   3. tmpfs over BOTH the APEX dir (the real 14+ store) and the legacy
+            //      `/system/etc/security/cacerts` dir (still read by some components),
+            //      repopulated from the stage — preserving platform trust.
+            //   4. Bind the repopulated store into every live zygote mount namespace
+            //      so already-running apps observe it; newly-spawned apps inherit the
+            //      init-namespace tmpfs.
+            control
+                .command(&["root".to_owned()], Duration::from_secs(30))
+                .map_err(|error| {
+                    vec![catalogue::DEVICE_ROOT_REFUSED.instantiate(context(
+                        control.transport_id(),
+                        "error",
+                        error.to_string(),
+                    ))]
+                })?;
+            let apex = "/apex/com.android.conscrypt/cacerts".to_owned();
+            let legacy = "/system/etc/security/cacerts".to_owned();
+            let stage = format!(
+                "/data/local/tmp/apiaxess-apex-cacerts-{}",
+                safe_suffix(&config.lease_id)
+            );
+            ensure_apex_shell(
+                &control,
+                &[
+                    "mkdir".to_owned(),
+                    "-p".to_owned(),
+                    "-m".to_owned(),
+                    "700".to_owned(),
+                    stage.clone(),
+                ],
+                "APEX cacerts staging directory",
+            )?;
+            // Preserve the existing APEX anchors so all other TLS keeps validating,
+            // then add the session CA under its subject hash.
+            ensure_apex_shell(
+                &control,
+                &[
+                    "cp".to_owned(),
+                    "-f".to_owned(),
+                    format!("{apex}/*"),
+                    format!("{stage}/"),
+                ],
+                "stage existing APEX trust anchors",
+            )?;
+            ensure_apex_shell(
+                &control,
+                &[
+                    "cp".to_owned(),
+                    "-f".to_owned(),
+                    temporary_path.clone(),
+                    format!("{stage}/{hash}.0"),
+                ],
+                "stage session CA",
+            )?;
+            // Mount tmpfs over both the legacy and APEX trust dirs and repopulate.
+            for directory in [&legacy, &apex] {
+                mount_tmpfs_trust_dir(&control, &stage, directory)?;
+            }
+            // Re-expose the freshly-populated APEX store inside every live zygote
+            // mount namespace. Best-effort per pid: a namespace we cannot enter
+            // simply keeps the boot-time store, and newly-forked apps still inherit
+            // the init-namespace tmpfs.
+            bind_apex_into_zygote_namespaces(&control, &legacy, &apex);
+            (format!("{apex}/{hash}.0"), Some(stage))
+        }
     };
     verify_installed_ca(
         &control,
         &temporary_path,
         &installed_path,
-        config.mechanism == TrustMechanism::AvdWritableSystem,
+        matches!(
+            config.mechanism,
+            TrustMechanism::AvdWritableSystem | TrustMechanism::ConscryptApex
+        ),
     )?;
     Ok(CaTrustReceipt {
         control,
@@ -712,84 +813,218 @@ fn ensure_shell(
     }
 }
 
-fn subject_hash_old(
-    runner: &Arc<dyn ExternalToolRunner>,
-    executable: &str,
-    ca: &SessionCa,
-) -> Result<String, Vec<Diagnostic>> {
-    let path = std::env::temp_dir().join(format!(
-        "apiaxess-ca-hash-{}.pem",
-        crate::generated_lease_id()
-    ));
-    std::fs::write(&path, ca.root_certificate_pem()).map_err(|error| {
-        vec![catalogue::SANDBOX_CA_INJECTION_FAILED.instantiate(context(
-            "sandbox.ca",
-            "error",
-            error.to_string(),
-        ))]
-    })?;
-    let probe = runner
-        .probe(&ToolProbeRequest {
-            tool_id: "crypto.openssl".to_owned(),
-            executable: executable.to_owned(),
-            version_arguments: vec!["version".to_owned()],
-            requirement: ToolRequirement {
-                minimum: ToolVersion {
-                    major: 0,
-                    minor: 0,
-                    patch: 0,
-                },
-            },
-        })
+/// Minimum Android API level the auto CA-install paths support.
+pub const MIN_SUPPORTED_SDK: u32 = 24;
+
+/// First Android API level whose trust store lives in the Conscrypt APEX.
+pub const CONSCRYPT_APEX_MIN_SDK: u32 = 34;
+
+/// Reads the device's Android API level from `ro.build.version.sdk`.
+///
+/// # Errors
+///
+/// Returns the unsupported-version diagnostic when the property is missing or
+/// does not parse as an API level.
+pub fn detect_android_sdk(control: &Arc<dyn SandboxControl>) -> Result<u32, Vec<Diagnostic>> {
+    let output = control
+        .shell(
+            &["getprop".to_owned(), "ro.build.version.sdk".to_owned()],
+            Duration::from_secs(15),
+        )
         .map_err(|error| {
-            vec![
-                catalogue::SANDBOX_CA_SYSTEM_STORE_UNAVAILABLE.instantiate(context(
-                    "sandbox.ca",
-                    "error",
-                    error.to_string(),
-                )),
-            ]
+            vec![android_version_diagnostic(
+                control.transport_id(),
+                error.to_string(),
+            )]
         })?;
-    let output = runner.invoke(&ToolInvocationRequest {
-        probe,
-        arguments: vec![
-            "x509".to_owned(),
-            "-subject_hash_old".to_owned(),
-            "-in".to_owned(),
-            path.display().to_string(),
-            "-noout".to_owned(),
-        ],
-        working_directory: None,
-        environment: Vec::new(),
-        timeout: Duration::from_secs(30),
-    });
-    let _ = std::fs::remove_file(&path);
-    let output = output.map_err(|error| {
-        vec![catalogue::SANDBOX_CA_INJECTION_FAILED.instantiate(context(
-            "sandbox.ca",
-            "error",
-            error.to_string(),
-        ))]
-    })?;
-    let hash = output
-        .stdout
-        .lines()
-        .find(|line| {
-            line.trim().len() == 8
-                && line
-                    .trim()
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit())
-        })
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_owned();
-    if hash.is_empty() {
-        return Err(vec![catalogue::SANDBOX_CA_INJECTION_FAILED.instantiate(
-            context("sandbox.ca", "openssl_output", output.stdout),
-        )]);
+    output.stdout.trim().parse::<u32>().map_err(|_| {
+        vec![android_version_diagnostic(
+            control.transport_id(),
+            format!(
+                "getprop ro.build.version.sdk returned {:?}",
+                output.stdout.trim()
+            ),
+        )]
+    })
+}
+
+/// Selects the system-trust install mechanism for a detected Android API level.
+///
+/// Android <= 13 uses the legacy writable-system cacerts path; Android 14+ uses
+/// the Conscrypt APEX bind-mount path. Levels below [`MIN_SUPPORTED_SDK`] are
+/// rejected with a legible diagnostic.
+///
+/// # Errors
+///
+/// Returns the unsupported-version diagnostic when `sdk` is below the minimum.
+pub fn select_trust_mechanism(sdk: u32) -> Result<TrustMechanism, Vec<Diagnostic>> {
+    if sdk < MIN_SUPPORTED_SDK {
+        return Err(vec![
+            catalogue::DEVICE_ANDROID_VERSION_UNSUPPORTED.instantiate(context(
+                "device.provision",
+                "sdk",
+                format!("API level {sdk} is below the supported minimum {MIN_SUPPORTED_SDK}"),
+            )),
+        ]);
     }
-    Ok(hash)
+    if sdk >= CONSCRYPT_APEX_MIN_SDK {
+        Ok(TrustMechanism::ConscryptApex)
+    } else {
+        Ok(TrustMechanism::AvdWritableSystem)
+    }
+}
+
+/// Mounts a tmpfs over one trust directory and repopulates it from the stage,
+/// preserving the platform anchors staged there plus the session CA.
+fn mount_tmpfs_trust_dir(
+    control: &Arc<dyn SandboxControl>,
+    stage: &str,
+    directory: &str,
+) -> Result<(), Vec<Diagnostic>> {
+    ensure_apex_shell(
+        control,
+        &[
+            "mount".to_owned(),
+            "-t".to_owned(),
+            "tmpfs".to_owned(),
+            "tmpfs".to_owned(),
+            directory.to_owned(),
+        ],
+        "trust tmpfs mount",
+    )?;
+    ensure_apex_shell(
+        control,
+        &[
+            "cp".to_owned(),
+            "-f".to_owned(),
+            format!("{stage}/*"),
+            format!("{directory}/"),
+        ],
+        "repopulate trust anchors",
+    )?;
+    ensure_apex_shell(
+        control,
+        &[
+            "chmod".to_owned(),
+            "644".to_owned(),
+            format!("{directory}/*"),
+        ],
+        "trust anchor permissions",
+    )?;
+    ensure_apex_shell(
+        control,
+        &[
+            "chown".to_owned(),
+            "root:root".to_owned(),
+            format!("{directory}/*"),
+        ],
+        "trust anchor ownership",
+    )?;
+    // Best-effort SELinux relabel so the anchors carry the type Android expects
+    // (`system_security_cacerts_file`); `verify_installed_ca` enforces the label.
+    let _ = control.shell(
+        &[
+            "restorecon".to_owned(),
+            "-R".to_owned(),
+            directory.to_owned(),
+        ],
+        Duration::from_secs(30),
+    );
+    let _ = control.shell(
+        &[
+            "chcon".to_owned(),
+            "u:object_r:system_security_cacerts_file:s0".to_owned(),
+            format!("{directory}/*"),
+        ],
+        Duration::from_secs(30),
+    );
+    Ok(())
+}
+
+/// Binds the repopulated trust dir into every live zygote mount namespace so
+/// already-running apps observe the session CA. Best-effort per pid.
+fn bind_apex_into_zygote_namespaces(control: &Arc<dyn SandboxControl>, source: &str, apex: &str) {
+    for pid in zygote_pids(control) {
+        let _ = control.shell(
+            &[
+                "nsenter".to_owned(),
+                format!("--mount=/proc/{pid}/ns/mnt"),
+                "--".to_owned(),
+                "mount".to_owned(),
+                "--bind".to_owned(),
+                source.to_owned(),
+                apex.to_owned(),
+            ],
+            Duration::from_secs(20),
+        );
+    }
+}
+
+/// Reverts the per-namespace APEX bind mounts installed during provisioning.
+fn unbind_apex_from_zygote_namespaces(control: &Arc<dyn SandboxControl>, apex: &str) {
+    for pid in zygote_pids(control) {
+        let _ = control.shell(
+            &[
+                "nsenter".to_owned(),
+                format!("--mount=/proc/{pid}/ns/mnt"),
+                "--".to_owned(),
+                "umount".to_owned(),
+                apex.to_owned(),
+            ],
+            Duration::from_secs(20),
+        );
+    }
+}
+
+/// Lists live `zygote`/`zygote64` PIDs; empty when `pidof` is unavailable.
+fn zygote_pids(control: &Arc<dyn SandboxControl>) -> Vec<String> {
+    let Ok(output) = control.shell(
+        &[
+            "pidof".to_owned(),
+            "zygote".to_owned(),
+            "zygote64".to_owned(),
+        ],
+        Duration::from_secs(15),
+    ) else {
+        return Vec::new();
+    };
+    output
+        .stdout
+        .split_whitespace()
+        .filter(|pid| !pid.is_empty() && pid.chars().all(|character| character.is_ascii_digit()))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn ensure_apex_shell(
+    control: &Arc<dyn SandboxControl>,
+    command: &[String],
+    operation: &str,
+) -> Result<(), Vec<Diagnostic>> {
+    let output = control
+        .shell(command, Duration::from_secs(30))
+        .map_err(|error| {
+            vec![catalogue::DEVICE_APEX_TRUST_FAILED.instantiate(context(
+                control.transport_id(),
+                "operation",
+                format!("{operation}: {error}"),
+            ))]
+        })?;
+    if output.exit_code == Some(0) {
+        Ok(())
+    } else {
+        Err(vec![catalogue::DEVICE_APEX_TRUST_FAILED.instantiate(
+            context(
+                control.transport_id(),
+                "operation",
+                format!("{operation}: {}", output.stderr),
+            ),
+        )])
+    }
+}
+
+fn android_version_diagnostic(backend: &str, error: String) -> Diagnostic {
+    catalogue::DEVICE_ANDROID_VERSION_UNSUPPORTED.instantiate(context(backend, "error", error))
 }
 
 /// A secured SSH local forward for remote captured traffic.
@@ -1020,13 +1255,13 @@ impl SandboxTrafficSession {
             Ok(frontend) => frontend,
             Err(error) => {
                 let _ = proxy.shutdown().await;
-                return Err(vec![catalogue::SANDBOX_L3_REDIRECTION_SETUP_FAILED.instantiate(
-                    context(
+                return Err(vec![
+                    catalogue::SANDBOX_L3_REDIRECTION_SETUP_FAILED.instantiate(context(
                         "sandbox.traffic",
                         "transparent_frontend",
                         error.to_string(),
-                    ),
-                )]);
+                    )),
+                ]);
             }
         };
         let proxy_addr = frontend.local_addr();
@@ -1047,7 +1282,7 @@ impl SandboxTrafficSession {
             },
         };
         let control = lease.control();
-        let trust_receipt = match provision_system_ca(control.clone(), &runner, &ca, &trust) {
+        let trust_receipt = match provision_system_ca(control.clone(), &ca, &trust) {
             Ok(receipt) => receipt,
             Err(mut errors) => {
                 if let Some(mut bridge) = bridge.take() {
@@ -1207,8 +1442,110 @@ impl SandboxTrafficSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaTrustConfig, L3Mechanism, L3RoutingConfig, TrustMechanism, iptables_rules};
-    use crate::SandboxTier;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use apiaxess_workbench_proxy::SessionCa;
+
+    use super::{
+        CaTrustConfig, L3Mechanism, L3RoutingConfig, TrustMechanism, detect_android_sdk,
+        iptables_rules, provision_system_ca, select_trust_mechanism,
+    };
+    use crate::{SandboxCommandOutput, SandboxControl, SandboxTier};
+
+    /// A `SandboxControl` that records every call and returns canned output so the
+    /// exact device command sequence can be asserted without a live device.
+    #[derive(Default)]
+    struct RecordingControl {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingControl {
+        fn record(&self, kind: &str, args: &[String]) {
+            let mut entry = vec![kind.to_owned()];
+            entry.extend(args.iter().cloned());
+            self.calls.lock().expect("calls lock").push(entry);
+        }
+
+        fn shell_lines(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .iter()
+                .map(|call| call.join(" "))
+                .collect()
+        }
+
+        fn ok(stdout: &str) -> SandboxCommandOutput {
+            SandboxCommandOutput {
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                exit_code: Some(0),
+            }
+        }
+    }
+
+    impl SandboxControl for RecordingControl {
+        fn command(
+            &self,
+            arguments: &[String],
+            _timeout: Duration,
+        ) -> Result<SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> {
+            self.record("command", arguments);
+            Ok(Self::ok(""))
+        }
+
+        fn shell(
+            &self,
+            arguments: &[String],
+            _timeout: Duration,
+        ) -> Result<SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> {
+            self.record("shell", arguments);
+            let stdout = match arguments.first().map(String::as_str) {
+                // Trust verification probes.
+                Some("stat") => "644:root:root",
+                Some("ls") => "u:object_r:system_security_cacerts_file:s0 target",
+                // Version + root probes.
+                Some("getprop") => "34",
+                Some("id") => "uid=0(root)",
+                // Live zygote namespaces for the bind-mount step.
+                Some("pidof") => "1200 1201",
+                _ => "",
+            };
+            Ok(Self::ok(stdout))
+        }
+
+        fn put(
+            &self,
+            _bytes: &[u8],
+            remote_path: &str,
+            _timeout: Duration,
+        ) -> Result<SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> {
+            self.record("put", &[remote_path.to_owned()]);
+            Ok(Self::ok(""))
+        }
+
+        fn remove(
+            &self,
+            remote_path: &str,
+            _timeout: Duration,
+        ) -> Result<SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> {
+            self.record("remove", &[remote_path.to_owned()]);
+            Ok(Self::ok(""))
+        }
+
+        fn install_apks(
+            &self,
+            _apk_paths: &[std::path::PathBuf],
+            _timeout: Duration,
+        ) -> Result<SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> {
+            Ok(Self::ok(""))
+        }
+
+        fn transport_id(&self) -> &str {
+            "test-device"
+        }
+    }
 
     #[test]
     fn iptables_plan_always_drops_udp_443_and_bypasses_proxy_endpoint() {
@@ -1236,12 +1573,89 @@ mod tests {
     #[test]
     fn trust_path_is_selected_from_runtime_tier() {
         assert_eq!(
-            CaTrustConfig::for_tier(SandboxTier::Avd, "openssl", "lease-test").mechanism,
+            CaTrustConfig::for_tier(SandboxTier::Avd, "lease-test").mechanism,
             TrustMechanism::AvdWritableSystem
         );
         assert_eq!(
-            CaTrustConfig::for_tier(SandboxTier::Redroid, "openssl", "lease-test").mechanism,
+            CaTrustConfig::for_tier(SandboxTier::Redroid, "lease-test").mechanism,
             TrustMechanism::RedroidOverlay
         );
+    }
+
+    #[test]
+    fn version_routing_selects_apex_for_14_plus_and_legacy_below() {
+        assert_eq!(
+            select_trust_mechanism(30).expect("api 30"),
+            TrustMechanism::AvdWritableSystem
+        );
+        assert_eq!(
+            select_trust_mechanism(33).expect("api 33"),
+            TrustMechanism::AvdWritableSystem
+        );
+        assert_eq!(
+            select_trust_mechanism(34).expect("api 34"),
+            TrustMechanism::ConscryptApex
+        );
+        assert_eq!(
+            select_trust_mechanism(35).expect("api 35"),
+            TrustMechanism::ConscryptApex
+        );
+        assert!(select_trust_mechanism(21).is_err());
+    }
+
+    #[test]
+    fn detect_android_sdk_reads_build_property() {
+        let control: Arc<dyn SandboxControl> = Arc::new(RecordingControl::default());
+        assert_eq!(detect_android_sdk(&control).expect("sdk"), 34);
+    }
+
+    #[test]
+    fn conscrypt_apex_branch_merges_stores_and_binds_zygote_namespaces() {
+        let recorder = Arc::new(RecordingControl::default());
+        let control: Arc<dyn SandboxControl> = recorder.clone();
+        let ca = SessionCa::generate().expect("session CA");
+        let config = CaTrustConfig {
+            mechanism: TrustMechanism::ConscryptApex,
+            lease_id: "lease-c2".to_owned(),
+        };
+        // The cacerts filename is the in-process subject hash — no host openssl.
+        let hash = ca.android_subject_hash_old().expect("subject hash");
+        let anchor = format!("{hash}.0");
+
+        let receipt = provision_system_ca(Arc::clone(&control), &ca, &config)
+            .expect("APEX install succeeds against the recording control");
+
+        let lines = recorder.shell_lines();
+        let has = |needle: &str| lines.iter().any(|line| line.contains(needle));
+        // Root elevation before touching read-only trust stores.
+        assert!(has("command root"), "expected adb root: {lines:?}");
+        // The immutable APEX anchors are preserved into a staging dir with our CA.
+        assert!(has("cp -f /apex/com.android.conscrypt/cacerts/*"));
+        assert!(has("cp -f /data/local/tmp/apiaxess-") && has(&anchor));
+        // tmpfs is mounted over BOTH the legacy and the APEX trust dirs.
+        assert!(has("mount -t tmpfs tmpfs /system/etc/security/cacerts"));
+        assert!(has(
+            "mount -t tmpfs tmpfs /apex/com.android.conscrypt/cacerts"
+        ));
+        // The store is bound into each live zygote mount namespace.
+        assert!(has("pidof zygote zygote64"));
+        assert!(
+            has("nsenter --mount=/proc/1200/ns/mnt -- mount --bind"),
+            "expected per-namespace bind: {lines:?}"
+        );
+        // Verification targets the APEX path, where 14+ apps read trust.
+        assert!(has(&format!(
+            "ls -Zd /apex/com.android.conscrypt/cacerts/{anchor}"
+        )));
+
+        // Teardown reverts both tmpfs mounts and the namespace binds.
+        receipt.teardown().expect("APEX teardown succeeds");
+        let after = recorder.shell_lines();
+        let reverted = |needle: &str| after.iter().any(|line| line.contains(needle));
+        assert!(reverted("umount /system/etc/security/cacerts"));
+        assert!(reverted("umount /apex/com.android.conscrypt/cacerts"));
+        assert!(reverted(
+            "nsenter --mount=/proc/1200/ns/mnt -- umount /apex/com.android.conscrypt/cacerts"
+        ));
     }
 }

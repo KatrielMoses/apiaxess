@@ -3,7 +3,7 @@
  *
  * `ui-shots.mjs` walks the routed surfaces; this walks the states inside them
  * that only exist once there is data or once something is open — a selected
- * flow, the repeater and intruder drawers, the diagnostics drawer, a confirm
+ * flow, the resend and fuzzer drawers, the diagnostics drawer, a confirm
  * dialog, a toast. Those are the states most likely to break responsively and
  * the ones a route-level sweep never reaches.
  *
@@ -68,23 +68,23 @@ const STATES = [
     },
   },
   {
-    name: "workbench-repeater",
+    name: "workbench-resend",
     view: "workbench",
     async open(page) {
       await page.locator("#flow-list .list-row").nth(1).click();
       await page.waitForSelector("#detail-actions .btn");
-      await page.getByRole("button", { name: "Repeater", exact: true }).click();
-      await page.waitForSelector("#repeater-panel:not([hidden])");
+      await page.getByRole("button", { name: "Resend", exact: true }).click();
+      await page.waitForSelector("#resend-panel:not([hidden])");
     },
   },
   {
-    name: "workbench-intruder",
+    name: "workbench-fuzzer",
     view: "workbench",
     async open(page) {
       await page.locator("#flow-list .list-row").nth(1).click();
       await page.waitForSelector("#detail-actions .btn");
-      await page.getByRole("button", { name: "Intruder", exact: true }).click();
-      await page.waitForSelector("#intruder-panel:not([hidden])");
+      await page.getByRole("button", { name: "Fuzzer", exact: true }).click();
+      await page.waitForSelector("#fuzzer-panel:not([hidden])");
     },
   },
   {

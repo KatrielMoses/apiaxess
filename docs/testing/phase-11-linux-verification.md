@@ -53,11 +53,11 @@ mitmdump removal did not break Linux capture.
 The gate had a **chain** of pre-existing issues (from the earlier hardening pass)
 that a first-error-abort had hidden — not just the one flagged:
 
-1. `crates/workbench-proxy/src/intruder.rs::run_native` — `too_many_lines`
+1. `crates/workbench-proxy/src/fuzzer.rs::run_native` — `too_many_lines`
    (102/100). Refactored under the limit by extracting `dispatch_batch`
    (batch dispatch: stateful in-order vs. stateless fan-out + rate limiting) and
    `record_batch` (ordinal recording, scope/diff/filter, persistence). Pure
-   refactor — the intruder native-tier tests still pass (5/5).
+   refactor — the fuzzer native-tier tests still pass (5/5).
 2. `crates/engine-shell/src/lib.rs::launch_bundled_chromium` — `missing_errors_doc`.
    Added the `# Errors` section.
 3. `apps/engine/src/main.rs` — `print_literal` (a `println!` with a `"Bundled

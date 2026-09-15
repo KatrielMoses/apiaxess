@@ -1,8 +1,16 @@
 /*
  * Style entry point. Order matters: tokens define the vocabulary, base sets
  * the typographic ground, components style the parts, surfaces lay them out.
+ *
+ * `shell-tokens.css` is the production-spec `--s-*` vocabulary the desktop
+ * shell rebuild is being coded against; `tokens.css` is the legacy `--color-*`
+ * vocabulary the not-yet-rebuilt surfaces still consume. The legacy file is
+ * retired as each surface is migrated to the shell tokens.
  */
+@import "./shell-tokens.css";
 @import "./tokens.css";
 @import "./base.css";
 @import "./components.css";
 @import "./surfaces.css";
+/* The desktop shell overlays the legacy component layer during the migration. */
+@import "./shell.css";

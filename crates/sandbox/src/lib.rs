@@ -9,6 +9,8 @@
 // that contract. Concrete backend IDs remain dynamically typed for plugins.
 #![allow(clippy::missing_errors_doc, clippy::unnecessary_literal_bound)]
 
+pub mod android_target;
+pub mod device_provision;
 #[cfg(feature = "frida-embedded")]
 pub mod frida_embedded;
 pub mod instrumentation;
@@ -139,7 +141,7 @@ pub enum RuntimeEnvironment {
     WindowsHome,
     /// Windows-on-`ARM`, outside the supported local `AVD` matrix.
     WindowsArm,
-    /// `APIxess` is running inside a `VM` or nested virtualization boundary.
+    /// `APIaxess` is running inside a `VM` or nested virtualization boundary.
     InsideVm,
     /// `WSL2` exposed a usable nested `KVM` path for `HQarroum` `Docker`.
     Wsl2NestedKvm,
@@ -874,6 +876,23 @@ struct AdbControl {
 }
 
 impl AdbControl {
+    /// Builds a control channel for an externally-attached adb device (physical
+    /// USB device or same-machine emulator) targeted by serial. Used by device
+    /// provisioning, which drives devices the sandbox did not itself boot.
+    pub(crate) fn for_device(
+        runner: Arc<dyn ExternalToolRunner>,
+        adb: ToolProbe,
+        serial: String,
+    ) -> Self {
+        Self {
+            runner,
+            adb,
+            serial,
+            environment: Vec::new(),
+            transport: "device-adb",
+        }
+    }
+
     fn invoke(
         &self,
         arguments: &[String],
@@ -3383,9 +3402,7 @@ fn backend_diagnostic(capability: &str, reason: &str) -> Diagnostic {
 /// Removes stale AVD lock files/dirs left by a previously killed emulator so a
 /// crashed run does not block every subsequent boot. Best-effort and idempotent.
 fn clear_stale_avd_locks(runtime_root: &std::path::Path, avd_name: &str) {
-    let avd_dir = runtime_root
-        .join("avd")
-        .join(format!("{avd_name}.avd"));
+    let avd_dir = runtime_root.join("avd").join(format!("{avd_name}.avd"));
     for lock in [
         "hardware-qemu.ini.lock",
         "multiinstance.lock",
@@ -3929,7 +3946,10 @@ mod tests {
     fn available_space_measures_an_existing_volume() {
         let free = available_space(&std::env::temp_dir())
             .expect("free space on the temp volume must be measurable");
-        assert!(free > 0, "an existing writable volume reports non-zero free space");
+        assert!(
+            free > 0,
+            "an existing writable volume reports non-zero free space"
+        );
     }
 
     #[test]
@@ -3956,7 +3976,10 @@ mod tests {
         let default = EMULATOR_MIN_FREE_MB_DEFAULT * 1024 * 1024;
         assert_eq!(resolve_min_free_bytes(None), default);
         assert_eq!(resolve_min_free_bytes(Some("0".to_owned())), default);
-        assert_eq!(resolve_min_free_bytes(Some("not-a-number".to_owned())), default);
+        assert_eq!(
+            resolve_min_free_bytes(Some("not-a-number".to_owned())),
+            default
+        );
     }
 
     #[test]

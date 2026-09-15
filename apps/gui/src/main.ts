@@ -1,5 +1,7 @@
 import "./styles/index.css";
 
+import { toDataURL as qrToDataUrl } from "qrcode";
+
 import { icon } from "./brand/icons";
 import { lockupHtml, stackedLockupHtml } from "./brand/logo";
 import {
@@ -16,6 +18,7 @@ import {
   stateBlock,
 } from "./ui/dom";
 import { initNavigation, onViewChange, showView, trackNavOverflow } from "./ui/nav";
+import { initShell } from "./ui/shell";
 import { initTheme } from "./ui/theme";
 import { type CredentialDialogField, choiceDialog, confirmDialog, credentialDialog, promptDialog } from "./ui/overlay";
 import { toast } from "./ui/toast";
@@ -30,28 +33,60 @@ interface WorkbenchSession { readonly authToken: string; readonly interceptEnabl
 interface WorkbenchHealth { readonly proxyRunning: boolean; readonly backend?: { readonly hudsuckerAvailable: boolean }; }
 interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; }
 interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; }
-interface RepeaterRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
-interface RepeaterResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; }
-interface RepeaterRevision { revision: number; sentAt: string; request: RepeaterRequest; response?: RepeaterResponse | null; diagnostic?: Diagnostic | null; scope: string; }
-interface RepeaterContext { id: string; sourceFlowId?: number; createdAt: string; current: RepeaterRequest; history: RepeaterRevision[]; }
-interface RepeaterSendResult { context: RepeaterContext; revision: RepeaterRevision; diagnostics: (Diagnostic | null)[]; }
-interface IntruderResult { ordinal: number; payloads: string[]; response?: { status: number; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: Diagnostic | null; }
-type IntruderLocation = "url" | "header" | "body";
-interface IntruderPosition { location: IntruderLocation; headerName?: string | null; start: number; end: number; setIndex: number; }
-interface IntruderPayloadSet { name: string; values: string[]; }
-interface IntruderMatchFilter { statuses: number[]; minSize?: number | null; maxSize?: number | null; contains?: string | null; regex?: string | null; }
-interface IntruderConfig { baseRequest: RepeaterRequest; positions: IntruderPosition[]; payloadSets: IntruderPayloadSet[]; attackType: string; matchFilter: IntruderMatchFilter; concurrency: number; ratePerSecond: number; maxResults: number; authPreflight?: RepeaterRequest | null; sequence?: unknown[]; }
-interface IntruderJob { id: string; tier: "ffuf" | "native"; state: string; config: IntruderConfig; results: IntruderResult[]; diagnostics: (Diagnostic | null)[]; }
+interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
+interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; }
+interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: Diagnostic | null; scope: string; }
+interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; }
+interface ResendSendResult { context: ResendContext; revision: ResendRevision; diagnostics: (Diagnostic | null)[]; }
+interface FuzzerResult { ordinal: number; payloads: string[]; response?: { status: number; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: Diagnostic | null; }
+type FuzzerLocation = "url" | "header" | "body";
+interface FuzzerPosition { location: FuzzerLocation; headerName?: string | null; start: number; end: number; setIndex: number; }
+interface FuzzerPayloadSet { name: string; values: string[]; }
+interface FuzzerMatchFilter { statuses: number[]; minSize?: number | null; maxSize?: number | null; contains?: string | null; regex?: string | null; }
+interface FuzzerConfig { baseRequest: ResendRequest; positions: FuzzerPosition[]; payloadSets: FuzzerPayloadSet[]; attackType: string; matchFilter: FuzzerMatchFilter; concurrency: number; ratePerSecond: number; maxResults: number; authPreflight?: ResendRequest | null; sequence?: unknown[]; }
+interface FuzzerJob { id: string; tier: "ffuf" | "native"; state: string; config: FuzzerConfig; results: FuzzerResult[]; diagnostics: (Diagnostic | null)[]; }
 interface CredentialPromptMsg { readonly id: number; readonly package: string; readonly screenSummary: string; readonly reason: string; readonly fields: readonly CredentialDialogField[]; }
 interface LiveUpdate { readonly flows: readonly FlowSummary[]; readonly diagnostics: readonly Diagnostic[]; readonly prompts?: readonly CredentialPromptMsg[]; }
 interface PipelineRun { readonly runId: string; readonly artifactPath: string; readonly stage: string; readonly status: "running" | "completed" | "failed"; readonly progressBasisPoints: number; readonly message: string; readonly diagnostics: (Diagnostic | null)[]; readonly dynamicRan: boolean; readonly updatedAt: string; readonly surfaceAvailable: boolean; }
-interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunId: string; readonly endpoints: readonly { readonly method: string; readonly pathTemplate: string; readonly minimumFactConfidence?: number | null; readonly signerCount: number }[]; readonly coverage: { readonly endpointCount: number; readonly confirmedEndpointCount: number; readonly inferredEndpointCount: number; readonly staticOnlyEndpointCount: number; readonly openHandoffCount: number; readonly resolvedHandoffCount: number }; readonly signerCount: number; readonly diagnostics: (Diagnostic | null)[]; }
+/** Request/response essentials extracted from a fused endpoint for the expandable
+ * detail and the send-to-resend/fuzzer actions. The surface is a normalized
+ * model (header names and observed statuses, not raw bodies), so this is the
+ * endpoint's shape, not a captured exchange. */
+interface EndpointDetail {
+  readonly baseUrl: string | null;
+  readonly requestHeaders: readonly string[];
+  readonly queryParams: readonly string[];
+  readonly pathParams: readonly string[];
+  readonly responses: readonly { readonly status: string; readonly headers: readonly string[] }[];
+}
+interface SurfaceEndpoint { readonly method: string; readonly pathTemplate: string; readonly baseUrl?: string | null; readonly evidenceSource?: string | null; readonly minimumFactConfidence?: number | null; readonly signerCount: number; readonly detail?: EndpointDetail }
+interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunId: string; readonly endpoints: readonly SurfaceEndpoint[]; readonly coverage: { readonly endpointCount: number; readonly confirmedEndpointCount: number; readonly inferredEndpointCount: number; readonly staticOnlyEndpointCount: number; readonly openHandoffCount: number; readonly resolvedHandoffCount: number }; readonly signerCount: number; readonly diagnostics: (Diagnostic | null)[]; }
 interface DiscoveryEstimate { target: string; requestCount: number; ratePerSecond: number; estimatedLabel: string; }
 interface BrowserLaunchStatus { running: boolean; browser?: string | null; target?: string | null; pid?: number | null; cdpConnected?: boolean; debugPort?: number | null; }
 interface TargetIdentifier { readonly kind: string; readonly value: string; }
-interface SessionStatus { readonly sessionId: string; readonly lifecycle: string; readonly artifactPath: string; readonly storePath: string; readonly flowCount: number; readonly repeaterCount: number; readonly intruderCount: number; readonly scopeConfigured: boolean; readonly recoveredFromCheckpoint: boolean; readonly lastCheckpointAt?: string | null; readonly scope?: { readonly declared_at?: string; readonly target?: { readonly target_type?: string; readonly primary?: TargetIdentifier } }; readonly analysisPipeline?: { readonly run_id?: string; readonly artifact_path?: string } | null; }
+interface SessionStatus { readonly sessionId: string; readonly lifecycle: string; readonly artifactPath: string; readonly storePath: string; readonly flowCount: number; readonly resendCount: number; readonly fuzzerCount: number; readonly scopeConfigured: boolean; readonly recoveredFromCheckpoint: boolean; readonly lastCheckpointAt?: string | null; readonly scope?: { readonly declared_at?: string; readonly target?: { readonly target_type?: string; readonly primary?: TargetIdentifier } }; readonly analysisPipeline?: { readonly run_id?: string; readonly artifact_path?: string } | null; }
 interface AuditActionDescriptor { readonly kind: string; readonly summary: string; }
 interface AuditRecord { readonly id: string; readonly occurred_at: string; readonly action: AuditActionDescriptor; readonly outcome: string; readonly diagnostics: (Diagnostic | null)[]; }
+
+/* Device pairing (Phase C5). These mirror the local API's pairing shapes. */
+interface PairingDevice { readonly serial: string; readonly state: string; readonly description: string; }
+interface PairingQrPayload { readonly host: string; readonly controlPort: number; readonly proxyPort: number; readonly pairingToken: string; readonly caFingerprintSha256: string; readonly expiresAtMs: number; }
+interface PendingPairing { readonly id: string; readonly deviceName: string; readonly serial?: string | null; readonly requestedAgoMs: number; }
+
+/* Android target panel (Phase D3). Mirrors engine-shell's AndroidTargetStatus. */
+type AndroidPhase = "idle" | "booting" | "provisioning" | "streaming" | "ready" | "error";
+interface AndroidTargetStatus {
+  readonly phase: AndroidPhase;
+  readonly message: string;
+  readonly addonPresent: boolean;
+  readonly serial: string | null;
+  readonly wsScrcpyPort: number | null;
+  readonly streaming: boolean;
+  readonly clientApkInstalled: boolean;
+  readonly fridaServerStarted: boolean;
+  readonly androidSdk: number | null;
+  readonly diagnostics: readonly Diagnostic[];
+}
 
 class ApiRequestError extends Error {}
 
@@ -72,8 +107,8 @@ const methodInput = document.querySelector<HTMLInputElement>("#edit-method");
 const headersInput = document.querySelector<HTMLTextAreaElement>("#edit-headers");
 const bodyInput = document.querySelector<HTMLTextAreaElement>("#edit-body");
 const selectedLabel = document.querySelector<HTMLElement>("#selected-label");
-const repeaterPanel = document.querySelector<HTMLElement>("#repeater-panel");
-const intruderPanel = document.querySelector<HTMLElement>("#intruder-panel");
+const resendPanel = document.querySelector<HTMLElement>("#resend-panel");
+const fuzzerPanel = document.querySelector<HTMLElement>("#fuzzer-panel");
 const pipelineStatus = document.querySelector<HTMLElement>("#pipeline-status");
 const pipelineProgress = document.querySelector<HTMLElement>("#pipeline-progress");
 const pipelineDiagnostics = document.querySelector<HTMLElement>("#pipeline-diagnostics");
@@ -113,6 +148,23 @@ const captureHealth = document.querySelector<HTMLElement>("#capture-health");
 const harImport = document.querySelector<HTMLButtonElement>("#har-import");
 const harExport = document.querySelector<HTMLButtonElement>("#har-export");
 const harFile = document.querySelector<HTMLInputElement>("#har-file");
+const devicesList = document.querySelector<HTMLElement>("#devices-list");
+const devicesCount = document.querySelector<HTMLElement>("#devices-count");
+const pairingArmResult = document.querySelector<HTMLElement>("#pairing-arm-result");
+const pairingArmBadge = document.querySelector<HTMLElement>("#pairing-arm-badge");
+const pairingPending = document.querySelector<HTMLElement>("#pairing-pending");
+const pairingPendingCount = document.querySelector<HTMLElement>("#pairing-pending-count");
+const pairingCa = document.querySelector<HTMLElement>("#pairing-ca");
+const androidLaunch = document.querySelector<HTMLButtonElement>("#android-launch");
+const androidStop = document.querySelector<HTMLButtonElement>("#android-stop");
+const androidPhaseBadge = document.querySelector<HTMLElement>("#android-phase-badge");
+const androidStatus = document.querySelector<HTMLElement>("#android-status");
+const androidInstallPanel = document.querySelector<HTMLElement>("#android-install-panel");
+const androidApkPath = document.querySelector<HTMLInputElement>("#android-apk-path");
+const androidApkBrowse = document.querySelector<HTMLButtonElement>("#android-apk-browse");
+const androidApkFile = document.querySelector<HTMLInputElement>("#android-apk-file");
+const androidApkInstall = document.querySelector<HTMLButtonElement>("#android-apk-install");
+const androidScreen = document.querySelector<HTMLElement>("#android-screen");
 
 /* ==================================================================== *
  * State
@@ -123,11 +175,17 @@ const pending = new Set<number>();
 const diagnostics = new DiagnosticsLog();
 let selectedFlow: FlowDetail | null = null;
 let control: WebSocket | null = null;
-let selectedRepeater: RepeaterContext | null = null;
-let selectedIntruder: IntruderJob | null = null;
-let discoveryJob: IntruderJob | null = null;
+let telemetry: WebSocket | null = null;
+let reconnectTimer: number | undefined;
+let reconnectDelay = 1000;
+let selectedResend: ResendContext | null = null;
+let selectedFuzzer: FuzzerJob | null = null;
+let discoveryJob: FuzzerJob | null = null;
+/** Endpoints of the currently rendered surface, so row expand and the
+ * send-to-resend/fuzzer actions can resolve a clicked row by index. */
+let lastSurfaceEndpoints: readonly SurfaceEndpoint[] = [];
 let lastDiscoveryEstimate: DiscoveryEstimate | null = null;
-let intruderPoll: number | undefined;
+let fuzzerPoll: number | undefined;
 let pipelinePoll: number | undefined;
 let discoveryPoll: number | undefined;
 let browserPoll: number | undefined;
@@ -140,6 +198,19 @@ const heldSince = new Map<number, number>();
 let queueTicker: number | undefined;
 /** Auto-forward timeout the intercept toggle installs on the backend. */
 const INTERCEPT_TIMEOUT_MS = 30_000;
+/** Operator bearer token, shared with the control channel; gates pairing calls. */
+let operatorToken = "";
+/** The most recently armed pairing payload, kept so its QR survives re-renders. */
+let armedPairing: PairingQrPayload | null = null;
+/** Verbatim JSON bytes of the armed payload; the QR must encode these unchanged. */
+let armedPairingRaw: string | null = null;
+/** Poll handle for the pending-pairing list; live only while the Devices view is shown. */
+let pairingPoll: number | undefined;
+/** Poll handle for the Android target status; live only while that view is shown. */
+let androidPoll: number | undefined;
+/** Whether the embedded ws-scrcpy screen is currently mounted, so a status poll
+ * never reloads (and resets) a live stream by re-rendering the iframe. */
+let androidScreenMounted = false;
 
 /* ==================================================================== *
  * Status and diagnostics
@@ -342,24 +413,24 @@ async function selectFlow(flowId: number): Promise<void> {
   }
 }
 
-/** The send-to-repeater / send-to-intruder affordances for the selected flow. */
+/** The send-to-resend / send-to-fuzzer affordances for the selected flow. */
 function renderDetailActions(flowId: number): void {
   if (detailActions === null) return;
   detailActions.replaceChildren();
 
-  const repeater = document.createElement("button");
-  repeater.type = "button";
-  repeater.className = "btn btn--sm";
-  repeater.innerHTML = `${icon("send", { size: 14 })}<span>Repeater</span>`;
-  repeater.addEventListener("click", () => void createRepeater(flowId));
+  const resend = document.createElement("button");
+  resend.type = "button";
+  resend.className = "btn btn--sm";
+  resend.innerHTML = `${icon("send", { size: 14 })}<span>Resend</span>`;
+  resend.addEventListener("click", () => void createResend(flowId));
 
-  const intruder = document.createElement("button");
-  intruder.type = "button";
-  intruder.className = "btn btn--sm";
-  intruder.innerHTML = `${icon("discovery", { size: 14 })}<span>Intruder</span>`;
-  intruder.addEventListener("click", () => void openIntruder(flowId));
+  const fuzzer = document.createElement("button");
+  fuzzer.type = "button";
+  fuzzer.className = "btn btn--sm";
+  fuzzer.innerHTML = `${icon("discovery", { size: 14 })}<span>Fuzz</span>`;
+  fuzzer.addEventListener("click", () => void openFuzzer(flowId));
 
-  detailActions.append(repeater, intruder);
+  detailActions.append(resend, fuzzer);
 }
 
 function renderDetailEmpty(): void {
@@ -367,7 +438,7 @@ function renderDetailEmpty(): void {
   detail.innerHTML = stateBlock({
     icon: "chevronRight",
     title: "No flow selected",
-    body: "Choose a row from live traffic to load its request and response metadata, then send it to the repeater or the intruder.",
+    body: "Choose a row from live traffic to inspect its request and response, then resend it or send it to the Fuzzer.",
   });
 }
 
@@ -426,12 +497,12 @@ function revealDrawer(panel: HTMLElement | null): void {
 }
 
 /* ==================================================================== *
- * 7. Workbench — intruder
+ * 7. Workbench — fuzzer
  * ==================================================================== */
 
-async function openIntruder(flowId: number): Promise<void> {
+async function openFuzzer(flowId: number): Promise<void> {
   if (selectedFlow === null || selectedFlow.summary.id !== flowId) return;
-  selectedIntruder = {
+  selectedFuzzer = {
     id: "", tier: "ffuf", state: "draft",
     config: {
       baseRequest: { method: selectedFlow.summary.method ?? "GET", url: selectedFlow.summary.url ?? "", headers: [...selectedFlow.requestHeaders], body: selectedFlow.requestBody ?? null },
@@ -446,17 +517,17 @@ async function openIntruder(flowId: number): Promise<void> {
     },
     results: [], diagnostics: [],
   };
-  renderIntruder();
-  revealDrawer(intruderPanel);
+  renderFuzzer();
+  revealDrawer(fuzzerPanel);
 }
 
 /** Config is only editable before the job is created; the backend snapshots it. */
-function intruderConfigLocked(): boolean {
-  return selectedIntruder !== null && selectedIntruder.id !== "";
+function fuzzerConfigLocked(): boolean {
+  return selectedFuzzer !== null && selectedFuzzer.id !== "";
 }
 
 /** Text of the field a payload position substitutes into, for live preview. */
-function positionFieldText(config: IntruderConfig, position: IntruderPosition): string {
+function positionFieldText(config: FuzzerConfig, position: FuzzerPosition): string {
   if (position.location === "url") return config.baseRequest.url;
   if (position.location === "body") return bytesToText(config.baseRequest.body);
   const name = (position.headerName ?? "").toLowerCase();
@@ -464,54 +535,54 @@ function positionFieldText(config: IntruderConfig, position: IntruderPosition): 
 }
 
 /** Snapshots the current form inputs back into the draft config. */
-function readIntruderForm(): void {
-  if (selectedIntruder === null || intruderConfigLocked() || intruderPanel === null) return;
-  const config = selectedIntruder.config;
+function readFuzzerForm(): void {
+  if (selectedFuzzer === null || fuzzerConfigLocked() || fuzzerPanel === null) return;
+  const config = selectedFuzzer.config;
 
-  const sets: IntruderPayloadSet[] = [];
-  intruderPanel.querySelectorAll<HTMLElement>("[data-set-row]").forEach((row) => {
+  const sets: FuzzerPayloadSet[] = [];
+  fuzzerPanel.querySelectorAll<HTMLElement>("[data-set-row]").forEach((row) => {
     const j = row.dataset.setRow ?? "0";
-    const name = valueOfIntruder(`#set-name-${j}`).trim() || `set ${Number(j) + 1}`;
-    const values = valueOfIntruder(`#set-values-${j}`).split("\n").map((value) => value.trim()).filter(Boolean);
+    const name = valueOfFuzzer(`#set-name-${j}`).trim() || `set ${Number(j) + 1}`;
+    const values = valueOfFuzzer(`#set-values-${j}`).split("\n").map((value) => value.trim()).filter(Boolean);
     sets.push({ name, values });
   });
   if (sets.length > 0) config.payloadSets = sets;
 
-  const positions: IntruderPosition[] = [];
-  intruderPanel.querySelectorAll<HTMLElement>("[data-position-row]").forEach((row) => {
+  const positions: FuzzerPosition[] = [];
+  fuzzerPanel.querySelectorAll<HTMLElement>("[data-position-row]").forEach((row) => {
     const i = row.dataset.positionRow ?? "0";
-    const location = (valueOfIntruder(`#pos-location-${i}`) || "url") as IntruderLocation;
-    const headerName = location === "header" ? (valueOfIntruder(`#pos-header-${i}`).trim() || null) : null;
-    const start = Math.max(0, Math.floor(Number(valueOfIntruder(`#pos-start-${i}`)) || 0));
-    const end = Math.max(start, Math.floor(Number(valueOfIntruder(`#pos-end-${i}`)) || 0));
-    let setIndex = Math.floor(Number(valueOfIntruder(`#pos-set-${i}`)) || 0);
+    const location = (valueOfFuzzer(`#pos-location-${i}`) || "url") as FuzzerLocation;
+    const headerName = location === "header" ? (valueOfFuzzer(`#pos-header-${i}`).trim() || null) : null;
+    const start = Math.max(0, Math.floor(Number(valueOfFuzzer(`#pos-start-${i}`)) || 0));
+    const end = Math.max(start, Math.floor(Number(valueOfFuzzer(`#pos-end-${i}`)) || 0));
+    let setIndex = Math.floor(Number(valueOfFuzzer(`#pos-set-${i}`)) || 0);
     if (setIndex >= config.payloadSets.length) setIndex = Math.max(0, config.payloadSets.length - 1);
     positions.push({ location, headerName, start, end, setIndex });
   });
   if (positions.length > 0) config.positions = positions;
 
-  config.attackType = valueOfIntruder("#intruder-type") || "sniper";
-  config.maxResults = Math.max(1, Math.floor(Number(valueOfIntruder("#intruder-max")) || 100));
-  config.concurrency = Math.max(1, Math.floor(Number(valueOfIntruder("#intruder-concurrency")) || 1));
-  config.ratePerSecond = Math.max(0, Math.floor(Number(valueOfIntruder("#intruder-rate")) || 0));
+  config.attackType = valueOfFuzzer("#fuzzer-type") || "sniper";
+  config.maxResults = Math.max(1, Math.floor(Number(valueOfFuzzer("#fuzzer-max")) || 100));
+  config.concurrency = Math.max(1, Math.floor(Number(valueOfFuzzer("#fuzzer-concurrency")) || 1));
+  config.ratePerSecond = Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-rate")) || 0));
 
-  const statuses = valueOfIntruder("#match-statuses").split(",").map((value) => Number(value.trim())).filter((value) => Number.isFinite(value) && value > 0);
+  const statuses = valueOfFuzzer("#match-statuses").split(",").map((value) => Number(value.trim())).filter((value) => Number.isFinite(value) && value > 0);
   const parseSize = (raw: string): number | null => { const trimmed = raw.trim(); if (trimmed === "") return null; const n = Number(trimmed); return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null; };
-  const contains = valueOfIntruder("#match-contains");
-  const regex = valueOfIntruder("#match-regex").trim();
-  config.matchFilter = { statuses, minSize: parseSize(valueOfIntruder("#match-min")), maxSize: parseSize(valueOfIntruder("#match-max")), contains: contains === "" ? null : contains, regex: regex === "" ? null : regex };
+  const contains = valueOfFuzzer("#match-contains");
+  const regex = valueOfFuzzer("#match-regex").trim();
+  config.matchFilter = { statuses, minSize: parseSize(valueOfFuzzer("#match-min")), maxSize: parseSize(valueOfFuzzer("#match-max")), contains: contains === "" ? null : contains, regex: regex === "" ? null : regex };
 
-  const seqRaw = valueOfIntruder("#intruder-sequence").trim();
+  const seqRaw = valueOfFuzzer("#fuzzer-sequence").trim();
   if (seqRaw === "") { config.sequence = []; }
   else { try { const parsed: unknown = JSON.parse(seqRaw); if (Array.isArray(parsed)) config.sequence = parsed; } catch { /* validated on launch */ } }
 }
 
-function addIntruderPosition(): void { if (selectedIntruder === null) return; readIntruderForm(); selectedIntruder.config.positions.push({ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }); renderIntruder(); }
-function removeIntruderPosition(index: number): void { if (selectedIntruder === null) return; readIntruderForm(); selectedIntruder.config.positions.splice(index, 1); if (selectedIntruder.config.positions.length === 0) selectedIntruder.config.positions.push({ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }); renderIntruder(); }
-function addIntruderSet(): void { if (selectedIntruder === null) return; readIntruderForm(); selectedIntruder.config.payloadSets.push({ name: `set ${selectedIntruder.config.payloadSets.length + 1}`, values: [] }); renderIntruder(); }
-function removeIntruderSet(index: number): void { if (selectedIntruder === null) return; readIntruderForm(); const config = selectedIntruder.config; config.payloadSets.splice(index, 1); if (config.payloadSets.length === 0) config.payloadSets.push({ name: "set 1", values: [] }); config.positions.forEach((position) => { if (position.setIndex >= config.payloadSets.length) position.setIndex = config.payloadSets.length - 1; }); renderIntruder(); }
+function addFuzzerPosition(): void { if (selectedFuzzer === null) return; readFuzzerForm(); selectedFuzzer.config.positions.push({ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }); renderFuzzer(); }
+function removeFuzzerPosition(index: number): void { if (selectedFuzzer === null) return; readFuzzerForm(); selectedFuzzer.config.positions.splice(index, 1); if (selectedFuzzer.config.positions.length === 0) selectedFuzzer.config.positions.push({ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }); renderFuzzer(); }
+function addFuzzerSet(): void { if (selectedFuzzer === null) return; readFuzzerForm(); selectedFuzzer.config.payloadSets.push({ name: `set ${selectedFuzzer.config.payloadSets.length + 1}`, values: [] }); renderFuzzer(); }
+function removeFuzzerSet(index: number): void { if (selectedFuzzer === null) return; readFuzzerForm(); const config = selectedFuzzer.config; config.payloadSets.splice(index, 1); if (config.payloadSets.length === 0) config.payloadSets.push({ name: "set 1", values: [] }); config.positions.forEach((position) => { if (position.setIndex >= config.payloadSets.length) position.setIndex = config.payloadSets.length - 1; }); renderFuzzer(); }
 
-function renderIntruderPositionRow(config: IntruderConfig, position: IntruderPosition, index: number, locked: boolean): string {
+function renderFuzzerPositionRow(config: FuzzerConfig, position: FuzzerPosition, index: number, locked: boolean): string {
   const disabled = locked ? "disabled" : "";
   const opt = (value: string, label: string, selected: boolean): string => `<option value="${value}"${selected ? " selected" : ""}>${label}</option>`;
   const setOptions = config.payloadSets.map((set, j) => opt(String(j), escapeHtml(`${j + 1} · ${set.name}`), j === position.setIndex)).join("");
@@ -535,7 +606,7 @@ function renderIntruderPositionRow(config: IntruderConfig, position: IntruderPos
 </div>`;
 }
 
-function renderIntruderSetRow(set: IntruderPayloadSet, index: number, locked: boolean): string {
+function renderFuzzerSetRow(set: FuzzerPayloadSet, index: number, locked: boolean): string {
   const disabled = locked ? "disabled" : "";
   return `<div class="stack stack--tight" data-set-row="${index}">
   <div class="row">
@@ -547,15 +618,39 @@ function renderIntruderSetRow(set: IntruderPayloadSet, index: number, locked: bo
 </div>`;
 }
 
-function renderIntruder(): void {
-  if (intruderPanel === null || selectedIntruder === null) return;
-  intruderPanel.hidden = false;
-  const config = selectedIntruder.config;
-  const locked = intruderConfigLocked();
+/** Resting state for the shared dock's Resend tab when no request is loaded. */
+function seedResendEmpty(): void {
+  if (resendPanel === null) return;
+  resendPanel.hidden = false;
+  resendPanel.innerHTML = stateBlock({
+    icon: "refresh",
+    title: "No request loaded",
+    body: "Send a flow here from the traffic table or the API surface, then edit and resend it.",
+    compact: true,
+  });
+}
+
+/** Resting state for the shared dock's Fuzzer tab when no attack is loaded. */
+function seedFuzzerEmpty(): void {
+  if (fuzzerPanel === null) return;
+  fuzzerPanel.hidden = false;
+  fuzzerPanel.innerHTML = stateBlock({
+    icon: "discovery",
+    title: "No attack loaded",
+    body: "Send a flow here from the traffic table or the API surface to mark positions and fuzz it.",
+    compact: true,
+  });
+}
+
+function renderFuzzer(): void {
+  if (fuzzerPanel === null || selectedFuzzer === null) return;
+  fuzzerPanel.hidden = false;
+  const config = selectedFuzzer.config;
+  const locked = fuzzerConfigLocked();
   const disabled = locked ? "disabled" : "";
   const filter = config.matchFilter;
   const sequence = Array.isArray(config.sequence) ? config.sequence : [];
-  const launchLabel = locked && selectedIntruder.state === "paused" ? "Resume" : locked ? "Start" : "Create attack";
+  const launchLabel = locked && selectedFuzzer.state === "paused" ? "Resume" : locked ? "Start" : "Create attack";
   const sequencePlaceholder = escapeHtml('[{"name":"login","request":{"method":"POST","url":"https://target/login","headers":[]},"extractors":[]}]');
   const opt = (value: string, label: string, selected: boolean): string => `<option value="${value}"${selected ? " selected" : ""}>${label}</option>`;
   const attackHint = config.positions.length <= 1 || config.payloadSets.length <= 1
@@ -564,12 +659,12 @@ function renderIntruder(): void {
     : config.attackType === "pitchfork" ? "Pitchfork: values paired by row across sets (shortest set wins)."
     : "Sniper: one position at a time using its set.";
 
-  intruderPanel.innerHTML = `<div class="panel__header">
-  <div class="panel__heading">${icon("discovery", { size: 16 })}<h2>Intruder · ${escapeHtml(selectedIntruder.id === "" ? "new attack" : selectedIntruder.id.slice(-8))}</h2></div>
+  fuzzerPanel.innerHTML = `<div class="panel__header">
+  <div class="panel__heading">${icon("discovery", { size: 16 })}<h2>Fuzzer · ${escapeHtml(selectedFuzzer.id === "" ? "new attack" : selectedFuzzer.id.slice(-8))}</h2></div>
   <div class="row">
-    <span class="badge">${escapeHtml(selectedIntruder.tier)}</span>
-    <span class="badge ${selectedIntruder.state === "running" ? "badge--accent" : selectedIntruder.state === "failed" ? "badge--danger" : ""}">${escapeHtml(selectedIntruder.state)}</span>
-    <button class="btn btn--quiet btn--icon" type="button" data-close-intruder><span class="visually-hidden">Close intruder</span>${icon("close", { size: 16 })}</button>
+    <span class="badge">${escapeHtml(selectedFuzzer.tier)}</span>
+    <span class="badge ${selectedFuzzer.state === "running" ? "badge--accent" : selectedFuzzer.state === "failed" ? "badge--danger" : ""}">${escapeHtml(selectedFuzzer.state)}</span>
+    <button class="btn btn--quiet btn--icon" type="button" data-close-fuzzer><span class="visually-hidden">Close Fuzzer</span>${icon("close", { size: 16 })}</button>
   </div>
 </div>
 <div class="panel__body stack">
@@ -581,25 +676,25 @@ function renderIntruder(): void {
 
   <div class="split-2">
     <div class="field">
-      <label class="field__label" for="intruder-type">Attack type</label>
-      <select class="select" id="intruder-type" ${disabled}>${opt("sniper", "Sniper", config.attackType === "sniper")}${opt("clusterbomb", "Clusterbomb", config.attackType === "clusterbomb")}${opt("pitchfork", "Pitchfork", config.attackType === "pitchfork")}</select>
+      <label class="field__label" for="fuzzer-type">Attack type</label>
+      <select class="select" id="fuzzer-type" ${disabled}>${opt("sniper", "Sniper", config.attackType === "sniper")}${opt("clusterbomb", "Clusterbomb", config.attackType === "clusterbomb")}${opt("pitchfork", "Pitchfork", config.attackType === "pitchfork")}</select>
       <p class="field__hint">${escapeHtml(attackHint)}</p>
     </div>
     <div class="split-3">
-      <div class="field"><label class="field__label" for="intruder-concurrency">Concurrency</label><input class="input input--mono" id="intruder-concurrency" type="number" min="1" value="${config.concurrency}" ${disabled} /></div>
-      <div class="field"><label class="field__label" for="intruder-rate">Rate/s</label><input class="input input--mono" id="intruder-rate" type="number" min="0" value="${config.ratePerSecond}" ${disabled} /><p class="field__hint">0 = unlimited</p></div>
-      <div class="field"><label class="field__label" for="intruder-max">Max results</label><input class="input input--mono" id="intruder-max" type="number" min="1" value="${config.maxResults}" ${disabled} /></div>
+      <div class="field"><label class="field__label" for="fuzzer-concurrency">Concurrency</label><input class="input input--mono" id="fuzzer-concurrency" type="number" min="1" value="${config.concurrency}" ${disabled} /></div>
+      <div class="field"><label class="field__label" for="fuzzer-rate">Rate/s</label><input class="input input--mono" id="fuzzer-rate" type="number" min="0" value="${config.ratePerSecond}" ${disabled} /><p class="field__hint">0 = unlimited</p></div>
+      <div class="field"><label class="field__label" for="fuzzer-max">Max results</label><input class="input input--mono" id="fuzzer-max" type="number" min="1" value="${config.maxResults}" ${disabled} /></div>
     </div>
   </div>
 
   <div class="stack stack--tight">
     <div class="row"><p class="section-label">Payload positions</p><span class="spacer"></span>${locked ? "" : `<button class="btn btn--sm" type="button" data-add-pos>${icon("plus", { size: 12 })}<span>Add position</span></button>`}</div>
-    ${config.positions.map((position, index) => renderIntruderPositionRow(config, position, index, locked)).join("")}
+    ${config.positions.map((position, index) => renderFuzzerPositionRow(config, position, index, locked)).join("")}
   </div>
 
   <div class="stack stack--tight">
     <div class="row"><p class="section-label">Payload sets</p><span class="spacer"></span>${locked ? "" : `<button class="btn btn--sm" type="button" data-add-set>${icon("plus", { size: 12 })}<span>Add set</span></button>`}</div>
-    ${config.payloadSets.map((set, index) => renderIntruderSetRow(set, index, locked)).join("")}
+    ${config.payloadSets.map((set, index) => renderFuzzerSetRow(set, index, locked)).join("")}
   </div>
 
   <div class="stack stack--tight">
@@ -619,38 +714,39 @@ function renderIntruder(): void {
   </div>
 
   <div class="field">
-    <label class="field__label" for="intruder-sequence">Native token-chain sequence (JSON, optional)</label>
-    <textarea class="textarea" id="intruder-sequence" spellcheck="false" placeholder="${sequencePlaceholder}" ${disabled}>${escapeHtml(sequence.length === 0 ? "" : JSON.stringify(sequence, null, 2))}</textarea>
+    <label class="field__label" for="fuzzer-sequence">Native token-chain sequence (JSON, optional)</label>
+    <textarea class="textarea" id="fuzzer-sequence" spellcheck="false" placeholder="${sequencePlaceholder}" ${disabled}>${escapeHtml(sequence.length === 0 ? "" : JSON.stringify(sequence, null, 2))}</textarea>
     <p class="field__hint">Stateful native attacks: each step may extract <code class="t-mono">{{variable}}</code> values for later requests.</p>
   </div>
 
   <div class="row">
-    ${selectedIntruder.state === "running" ? "" : `<button class="btn btn--primary" id="intruder-launch" type="button">${icon("play", { size: 14 })}<span>${escapeHtml(launchLabel)}</span></button>`}
-    <button class="btn" id="intruder-pause" type="button">${icon("pause", { size: 14 })}<span>Pause</span></button>
-    <button class="btn btn--danger" id="intruder-stop" type="button">${icon("stop", { size: 14 })}<span>Stop</span></button>
+    ${selectedFuzzer.state === "running" ? "" : `<button class="btn btn--primary" id="fuzzer-launch" type="button">${icon("play", { size: 14 })}<span>${escapeHtml(launchLabel)}</span></button>`}
+    <button class="btn" id="fuzzer-pause" type="button">${icon("pause", { size: 14 })}<span>Pause</span></button>
+    <button class="btn btn--danger" id="fuzzer-stop" type="button">${icon("stop", { size: 14 })}<span>Stop</span></button>
   </div>
 
-  <div id="intruder-results">${renderIntruderResults(selectedIntruder.results)}</div>
+  <div id="fuzzer-results">${renderFuzzerResults(selectedFuzzer.results)}</div>
 </div>`;
 
-  intruderPanel.querySelector("#intruder-launch")?.addEventListener("click", () => void launchIntruder());
-  intruderPanel.querySelector("#intruder-pause")?.addEventListener("click", () => void pauseIntruder());
-  intruderPanel.querySelector("#intruder-stop")?.addEventListener("click", () => void stopIntruder());
-  intruderPanel.querySelector("[data-add-pos]")?.addEventListener("click", () => addIntruderPosition());
-  intruderPanel.querySelector("[data-add-set]")?.addEventListener("click", () => addIntruderSet());
-  intruderPanel.querySelectorAll<HTMLButtonElement>("[data-remove-pos]").forEach((button) => button.addEventListener("click", () => removeIntruderPosition(Number(button.dataset.removePos))));
-  intruderPanel.querySelectorAll<HTMLButtonElement>("[data-remove-set]").forEach((button) => button.addEventListener("click", () => removeIntruderSet(Number(button.dataset.removeSet))));
+  fuzzerPanel.querySelector("#fuzzer-launch")?.addEventListener("click", () => void launchFuzzer());
+  fuzzerPanel.querySelector("#fuzzer-pause")?.addEventListener("click", () => void pauseFuzzer());
+  fuzzerPanel.querySelector("#fuzzer-stop")?.addEventListener("click", () => void stopFuzzer());
+  fuzzerPanel.querySelector("[data-add-pos]")?.addEventListener("click", () => addFuzzerPosition());
+  fuzzerPanel.querySelector("[data-add-set]")?.addEventListener("click", () => addFuzzerSet());
+  fuzzerPanel.querySelectorAll<HTMLButtonElement>("[data-remove-pos]").forEach((button) => button.addEventListener("click", () => removeFuzzerPosition(Number(button.dataset.removePos))));
+  fuzzerPanel.querySelectorAll<HTMLButtonElement>("[data-remove-set]").forEach((button) => button.addEventListener("click", () => removeFuzzerSet(Number(button.dataset.removeSet))));
   // A location change toggles the header-name field and refreshes the preview.
-  intruderPanel.querySelectorAll<HTMLSelectElement>('[id^="pos-location-"]').forEach((select) => select.addEventListener("change", () => { readIntruderForm(); renderIntruder(); }));
+  fuzzerPanel.querySelectorAll<HTMLSelectElement>('[id^="pos-location-"]').forEach((select) => select.addEventListener("change", () => { readFuzzerForm(); renderFuzzer(); }));
   // Offset edits refresh their row's live preview without a full rebuild.
-  intruderPanel.querySelectorAll<HTMLInputElement>('[id^="pos-start-"], [id^="pos-end-"]').forEach((input) => input.addEventListener("change", () => { readIntruderForm(); renderIntruder(); }));
-  intruderPanel.querySelector("[data-close-intruder]")?.addEventListener("click", () => {
-    intruderPanel.hidden = true;
-    if (intruderPoll !== undefined) { window.clearInterval(intruderPoll); intruderPoll = undefined; }
+  fuzzerPanel.querySelectorAll<HTMLInputElement>('[id^="pos-start-"], [id^="pos-end-"]').forEach((input) => input.addEventListener("change", () => { readFuzzerForm(); renderFuzzer(); }));
+  fuzzerPanel.querySelector("[data-close-fuzzer]")?.addEventListener("click", () => {
+    if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
+    selectedFuzzer = null;
+    seedFuzzerEmpty();
   });
 }
 
-function renderIntruderResults(results: readonly IntruderResult[]): string {
+function renderFuzzerResults(results: readonly FuzzerResult[]): string {
   if (results.length === 0) {
     return stateBlock({
       icon: "discovery",
@@ -670,130 +766,130 @@ function renderIntruderResults(results: readonly IntruderResult[]): string {
   return `<div class="stack stack--tight"><p class="section-label">Results · ${results.length} · ${matchedCount} matched</p><div class="discovery-results"><table class="data-table"><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Time</th><th>Match</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
 }
 
-async function launchIntruder(): Promise<void> {
-  if (selectedIntruder === null) return;
+async function launchFuzzer(): Promise<void> {
+  if (selectedFuzzer === null) return;
   try {
-    if (selectedIntruder.id === "") {
-      readIntruderForm();
-      const config = selectedIntruder.config;
+    if (selectedFuzzer.id === "") {
+      readFuzzerForm();
+      const config = selectedFuzzer.config;
       // Validate the token-chain sequence JSON before committing the job.
-      const seqRaw = valueOfIntruder("#intruder-sequence").trim();
-      if (seqRaw !== "") { try { const parsed: unknown = JSON.parse(seqRaw); if (!Array.isArray(parsed)) throw new Error("sequence must be a JSON array"); config.sequence = parsed; } catch (error) { showDiagnostic({ id: "proxy.intruder-config-invalid", what: "The token-chain sequence is invalid JSON.", why: String(error), fix: "Enter a JSON array of named request steps and retry." }); return; } }
-      if (config.positions.length === 0) { showDiagnostic({ id: "proxy.intruder-config-invalid", what: "The attack has no payload positions.", why: "At least one marked position is required to substitute payloads.", fix: "Add a position and mark the bytes to replace, then start the attack." }); return; }
-      if (config.payloadSets.every((set) => set.values.length === 0) && config.sequence?.length === 0) { showDiagnostic({ id: "proxy.intruder-config-invalid", what: "No payloads were supplied.", why: "Every payload set is empty, so there is nothing to send.", fix: "Enter at least one payload value, one per line." }); return; }
-      const created = await fetch("/api/v1/workbench/intruder", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(config) });
-      await requireOk(created, "intruder configuration failed");
-      selectedIntruder = (await created.json()) as IntruderJob;
+      const seqRaw = valueOfFuzzer("#fuzzer-sequence").trim();
+      if (seqRaw !== "") { try { const parsed: unknown = JSON.parse(seqRaw); if (!Array.isArray(parsed)) throw new Error("sequence must be a JSON array"); config.sequence = parsed; } catch (error) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "The token-chain sequence is invalid JSON.", why: String(error), fix: "Enter a JSON array of named request steps and retry." }); return; } }
+      if (config.positions.length === 0) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "The attack has no payload positions.", why: "At least one marked position is required to substitute payloads.", fix: "Add a position and mark the bytes to replace, then start the attack." }); return; }
+      if (config.payloadSets.every((set) => set.values.length === 0) && config.sequence?.length === 0) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "No payloads were supplied.", why: "Every payload set is empty, so there is nothing to send.", fix: "Enter at least one payload value, one per line." }); return; }
+      const created = await fetch("/api/v1/workbench/fuzzer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(config) });
+      await requireOk(created, "fuzzer configuration failed");
+      selectedFuzzer = (await created.json()) as FuzzerJob;
     }
-    const action = selectedIntruder.state === "paused" ? "resume" : "start";
-    const started = await fetch("/api/v1/workbench/intruder/" + encodeURIComponent(selectedIntruder.id) + "/" + action, { method: "POST" });
-    await requireOk(started, "intruder " + action + " failed");
-    selectedIntruder = (await started.json()) as IntruderJob;
-    renderIntruder();
-    if (intruderPoll !== undefined) window.clearInterval(intruderPoll);
-    intruderPoll = window.setInterval(() => void refreshIntruder(), 500);
+    const action = selectedFuzzer.state === "paused" ? "resume" : "start";
+    const started = await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(selectedFuzzer.id) + "/" + action, { method: "POST" });
+    await requireOk(started, "fuzzer " + action + " failed");
+    selectedFuzzer = (await started.json()) as FuzzerJob;
+    renderFuzzer();
+    if (fuzzerPoll !== undefined) window.clearInterval(fuzzerPoll);
+    fuzzerPoll = window.setInterval(() => void refreshFuzzer(), 500);
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.intruder-config-invalid", what: "The intruder job could not start.", why: "", fix: "Check payload positions, payloads, and the session proxy/tool configuration." });
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer job could not start.", why: "", fix: "Check payload positions, payloads, and the session proxy/tool configuration." });
   }
 }
 
-async function refreshIntruder(): Promise<void> {
-  if (selectedIntruder === null || selectedIntruder.id === "") return;
+async function refreshFuzzer(): Promise<void> {
+  if (selectedFuzzer === null || selectedFuzzer.id === "") return;
   try {
-    const response = await fetch("/api/v1/workbench/intruder/" + encodeURIComponent(selectedIntruder.id));
-    await requireOk(response, "intruder status unavailable");
-    selectedIntruder = (await response.json()) as IntruderJob;
-    selectedIntruder.diagnostics.forEach(showDiagnostic);
-    renderIntruder();
-    if (["completed", "failed", "stopped"].includes(selectedIntruder.state) && intruderPoll !== undefined) { window.clearInterval(intruderPoll); intruderPoll = undefined; }
+    const response = await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(selectedFuzzer.id));
+    await requireOk(response, "fuzzer status unavailable");
+    selectedFuzzer = (await response.json()) as FuzzerJob;
+    selectedFuzzer.diagnostics.forEach(showDiagnostic);
+    renderFuzzer();
+    if (["completed", "failed", "stopped"].includes(selectedFuzzer.state) && fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
   } catch (error) {
-    if (intruderPoll !== undefined) { window.clearInterval(intruderPoll); intruderPoll = undefined; }
-    reportUnexpected(error, { id: "proxy.intruder-config-invalid", what: "The intruder status could not be loaded.", why: "", fix: "Check the active session and retry." });
+    if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer status could not be loaded.", why: "", fix: "Check the active session and retry." });
   }
 }
 
-async function stopIntruder(): Promise<void> {
-  if (selectedIntruder === null || selectedIntruder.id === "") return;
+async function stopFuzzer(): Promise<void> {
+  if (selectedFuzzer === null || selectedFuzzer.id === "") return;
   try {
-    await requireOk(await fetch("/api/v1/workbench/intruder/" + encodeURIComponent(selectedIntruder.id) + "/stop", { method: "POST" }), "intruder stop failed");
-    await refreshIntruder();
+    await requireOk(await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(selectedFuzzer.id) + "/stop", { method: "POST" }), "fuzzer stop failed");
+    await refreshFuzzer();
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.intruder-config-invalid", what: "The intruder job could not stop.", why: "", fix: "Check the active session and retry." });
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer job could not stop.", why: "", fix: "Check the active session and retry." });
   }
 }
 
-async function pauseIntruder(): Promise<void> {
-  if (selectedIntruder === null || selectedIntruder.id === "") return;
+async function pauseFuzzer(): Promise<void> {
+  if (selectedFuzzer === null || selectedFuzzer.id === "") return;
   try {
-    const response = await fetch("/api/v1/workbench/intruder/" + encodeURIComponent(selectedIntruder.id) + "/pause", { method: "POST" });
-    await requireOk(response, "intruder pause failed");
-    selectedIntruder = (await response.json()) as IntruderJob;
-    renderIntruder();
+    const response = await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(selectedFuzzer.id) + "/pause", { method: "POST" });
+    await requireOk(response, "fuzzer pause failed");
+    selectedFuzzer = (await response.json()) as FuzzerJob;
+    renderFuzzer();
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.intruder-config-invalid", what: "The intruder job could not pause.", why: "", fix: "Pause only at a request boundary while the job is running." });
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer job could not pause.", why: "", fix: "Pause only at a request boundary while the job is running." });
   }
 }
 
-function valueOfIntruder(selector: string): string { return intruderPanel?.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(selector)?.value ?? ""; }
+function valueOfFuzzer(selector: string): string { return fuzzerPanel?.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(selector)?.value ?? ""; }
 
 /* ==================================================================== *
- * 7. Workbench — repeater
+ * 7. Workbench — resend
  * ==================================================================== */
 
-async function createRepeater(flowId: number): Promise<void> {
+async function createResend(flowId: number): Promise<void> {
   try {
-    const response = await fetch("/api/v1/workbench/repeater", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ flowId }) });
-    await requireOk(response, "repeater context unavailable");
-    selectedRepeater = (await response.json()) as RepeaterContext;
-    renderRepeater();
-    revealDrawer(repeaterPanel);
+    const response = await fetch("/api/v1/workbench/resend", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ flowId }) });
+    await requireOk(response, "resend context unavailable");
+    selectedResend = (await response.json()) as ResendContext;
+    renderResend();
+    revealDrawer(resendPanel);
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.repeater-history-failed", what: "The repeater context could not be created.", why: "", fix: "Check the selected flow and session store, then retry." });
+    reportUnexpected(error, { id: "proxy.resend-history-failed", what: "The Resend context could not be created.", why: "", fix: "Check the selected flow and session store, then retry." });
   }
 }
 
-function renderRepeater(): void {
-  if (repeaterPanel === null || selectedRepeater === null) return;
-  repeaterPanel.hidden = false;
-  repeaterPanel.innerHTML = `<div class="panel__header">
-  <div class="panel__heading">${icon("send", { size: 16 })}<h2>Repeater · ${escapeHtml(selectedRepeater.id.slice(-8))}</h2></div>
+function renderResend(): void {
+  if (resendPanel === null || selectedResend === null) return;
+  resendPanel.hidden = false;
+  resendPanel.innerHTML = `<div class="panel__header">
+  <div class="panel__heading">${icon("send", { size: 16 })}<h2>Resend · ${escapeHtml(selectedResend.id.slice(-8))}</h2></div>
   <div class="row">
     <span class="panel__hint">append-only history</span>
-    <button class="btn btn--quiet btn--icon" type="button" data-close-repeater><span class="visually-hidden">Close repeater</span>${icon("close", { size: 16 })}</button>
+    <button class="btn btn--quiet btn--icon" type="button" data-close-resend><span class="visually-hidden">Close Resend</span>${icon("close", { size: 16 })}</button>
   </div>
 </div>
 <div class="panel__body stack">
   <div class="split-2">
     <div class="field">
-      <label class="field__label" for="repeater-method">Method</label>
-      <input class="input input--mono" id="repeater-method" value="${escapeHtml(selectedRepeater.current.method)}" />
+      <label class="field__label" for="resend-method">Method</label>
+      <input class="input input--mono" id="resend-method" value="${escapeHtml(selectedResend.current.method)}" />
     </div>
     <div class="field">
-      <label class="field__label" for="repeater-url">URL</label>
-      <input class="input input--mono" id="repeater-url" value="${escapeHtml(selectedRepeater.current.url)}" />
+      <label class="field__label" for="resend-url">URL</label>
+      <input class="input input--mono" id="resend-url" value="${escapeHtml(selectedResend.current.url)}" />
     </div>
   </div>
   <div class="split-2">
     <div class="field">
-      <label class="field__label" for="repeater-headers">Headers</label>
-      <textarea class="textarea" id="repeater-headers" spellcheck="false">${escapeHtml(formatHeaders(selectedRepeater.current.headers))}</textarea>
+      <label class="field__label" for="resend-headers">Headers</label>
+      <textarea class="textarea" id="resend-headers" spellcheck="false">${escapeHtml(formatHeaders(selectedResend.current.headers))}</textarea>
     </div>
     <div class="field">
-      <label class="field__label" for="repeater-body">Body</label>
-      <textarea class="textarea textarea--wrap" id="repeater-body" spellcheck="false">${escapeHtml(bytesToText(selectedRepeater.current.body))}</textarea>
+      <label class="field__label" for="resend-body">Body</label>
+      <textarea class="textarea textarea--wrap" id="resend-body" spellcheck="false">${escapeHtml(bytesToText(selectedResend.current.body))}</textarea>
     </div>
   </div>
   <div class="row">
-    <button class="btn btn--primary" id="repeater-send" type="button">${icon("send", { size: 14 })}<span>Send request</span></button>
+    <button class="btn btn--primary" id="resend-send" type="button">${icon("send", { size: 14 })}<span>Send request</span></button>
   </div>
-  <div id="repeater-response">${renderRepeaterHistory(selectedRepeater.history)}</div>
+  <div id="resend-response">${renderResendHistory(selectedResend.history)}</div>
 </div>`;
-  repeaterPanel.querySelector("#repeater-send")?.addEventListener("click", () => void sendRepeater());
-  repeaterPanel.querySelectorAll<HTMLButtonElement>("[data-derive]").forEach((button) => button.addEventListener("click", () => void deriveRepeater(Number(button.dataset.derive))));
-  repeaterPanel.querySelector("[data-close-repeater]")?.addEventListener("click", () => { repeaterPanel.hidden = true; });
+  resendPanel.querySelector("#resend-send")?.addEventListener("click", () => void sendResend());
+  resendPanel.querySelectorAll<HTMLButtonElement>("[data-derive]").forEach((button) => button.addEventListener("click", () => void deriveResend(Number(button.dataset.derive))));
+  resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); });
 }
 
-function renderRepeaterHistory(history: readonly RepeaterRevision[]): string {
+function renderResendHistory(history: readonly ResendRevision[]): string {
   if (history.length === 0) {
     return stateBlock({
       icon: "clock",
@@ -824,46 +920,46 @@ function renderRepeaterHistory(history: readonly RepeaterRevision[]): string {
   return `<div class="stack stack--tight"><p class="section-label">History · ${history.length}</p><div class="history">${entries}</div></div>`;
 }
 
-async function sendRepeater(): Promise<void> {
-  const repeater = selectedRepeater;
-  if (repeater === null) return;
-  const repeaterId = repeater.id;
-  const request: RepeaterRequest = { method: valueOf("#repeater-method"), url: valueOf("#repeater-url"), headers: parseHeaders(valueOf("#repeater-headers")), body: [...new TextEncoder().encode(valueOf("#repeater-body"))] };
+async function sendResend(): Promise<void> {
+  const resend = selectedResend;
+  if (resend === null) return;
+  const resendId = resend.id;
+  const request: ResendRequest = { method: valueOf("#resend-method"), url: valueOf("#resend-url"), headers: parseHeaders(valueOf("#resend-headers")), body: [...new TextEncoder().encode(valueOf("#resend-body"))] };
   try {
-    const update = await fetch("/api/v1/workbench/repeater/" + encodeURIComponent(repeaterId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
-    await requireOk(update, "repeater edit failed");
-    const sent = await fetch("/api/v1/workbench/repeater/" + encodeURIComponent(repeaterId) + "/send", { method: "POST" });
-    await requireOk(sent, "repeater send failed");
-    const result = (await sent.json()) as Partial<RepeaterSendResult>;
+    const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
+    await requireOk(update, "resend edit failed");
+    const sent = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId) + "/send", { method: "POST" });
+    await requireOk(sent, "resend send failed");
+    const result = (await sent.json()) as Partial<ResendSendResult>;
     let context = result.context;
     if (context === null || context === undefined || typeof context.id !== "string") {
-      const refreshed = await fetch("/api/v1/workbench/repeater/" + encodeURIComponent(repeaterId));
-      await requireOk(refreshed, "repeater history refresh failed");
-      context = (await refreshed.json()) as RepeaterContext;
+      const refreshed = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId));
+      await requireOk(refreshed, "resend history refresh failed");
+      context = (await refreshed.json()) as ResendContext;
     }
-    if (context === null || typeof context.id !== "string") throw new Error("repeater response did not include a valid context");
-    selectedRepeater = context;
+    if (context === null || typeof context.id !== "string") throw new Error("resend response did not include a valid context");
+    selectedResend = context;
     (result.diagnostics ?? []).forEach(showDiagnostic);
     showDiagnostic(result.revision?.diagnostic);
-    renderRepeater();
+    renderResend();
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.repeater-request-failed", what: "The repeater send failed.", why: "", fix: "Review the request and confirm the session proxy is running." });
+    reportUnexpected(error, { id: "proxy.resend-request-failed", what: "The resend send failed.", why: "", fix: "Review the request and confirm the session proxy is running." });
   }
 }
 
-async function deriveRepeater(revision: number): Promise<void> {
-  if (selectedRepeater === null) return;
+async function deriveResend(revision: number): Promise<void> {
+  if (selectedResend === null) return;
   try {
-    const response = await fetch("/api/v1/workbench/repeater/" + encodeURIComponent(selectedRepeater.id) + "/derive/" + revision, { method: "POST" });
-    await requireOk(response, "repeater derivation failed");
-    selectedRepeater = (await response.json()) as RepeaterContext;
-    renderRepeater();
+    const response = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(selectedResend.id) + "/derive/" + revision, { method: "POST" });
+    await requireOk(response, "resend derivation failed");
+    selectedResend = (await response.json()) as ResendContext;
+    renderResend();
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.repeater-request-failed", what: "The repeater request could not be derived.", why: "", fix: "Check the selected revision and session store, then retry." });
+    reportUnexpected(error, { id: "proxy.resend-request-failed", what: "The resend request could not be derived.", why: "", fix: "Check the selected revision and session store, then retry." });
   }
 }
 
-function valueOf(selector: string): string { return repeaterPanel?.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)?.value ?? ""; }
+function valueOf(selector: string): string { return resendPanel?.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)?.value ?? ""; }
 
 /* ==================================================================== *
  * 4. Analysis pipeline
@@ -887,10 +983,18 @@ function renderPipeline(run: PipelineRun): void {
   const percent = Math.min(100, Math.max(0, run.progressBasisPoints / 100));
   const stageIndex = pipelineStages.indexOf(run.stage);
   const tone = run.status === "completed" ? " progress--success" : run.status === "failed" ? " progress--failed" : " progress--running";
+  // A static-only run skips the dynamic and signing-recovery stages entirely, so
+  // those stages must read "skipped" — never the same "done" as a stage that
+  // actually ran. Marking them done would contradict the "not incorporated" fact
+  // shown just below and overstate what the analysis did.
+  const skipped = new Set<string>(run.dynamicRan ? [] : ["dynamic", "signing"]);
   const stages = pipelineStages.slice(0, -1).map((stage, index) => {
-    const done = index < stageIndex || run.status === "completed";
-    const active = stage === run.stage && run.status === "running";
-    return `<span class="stage ${done ? "is-done" : ""} ${active ? "is-active" : ""}"><span class="stage__marker"></span>${escapeHtml(STAGE_LABELS[stage] ?? stage)}</span>`;
+    const isSkipped = skipped.has(stage);
+    const done = !isSkipped && (index < stageIndex || run.status === "completed");
+    const active = !isSkipped && stage === run.stage && run.status === "running";
+    const cls = isSkipped ? "is-skipped" : done ? "is-done" : active ? "is-active" : "";
+    const label = escapeHtml(STAGE_LABELS[stage] ?? stage) + (isSkipped ? " · skipped" : "");
+    return `<span class="stage ${cls}"><span class="stage__marker"></span>${label}</span>`;
   }).join("");
 
   pipelineProgress.innerHTML = `<div class="stack">
@@ -1024,7 +1128,16 @@ async function startPipeline(): Promise<void> {
 function renderSurface(surface: SurfaceSummary): void {
   if (surfaceView === null) return;
   const coverage = surface.coverage;
-  const endpointRows = surface.endpoints.map((entry) => {
+  // Demote static-inferred candidates below dynamic-confirmed endpoints so the
+  // tester reads the real (observed) surface first; a stable sort preserves the
+  // original order within each group. Row indices are taken from this sorted
+  // array so expand / send-to-resend stay aligned.
+  const rank = (endpoint: SurfaceEndpoint): number => (endpoint.evidenceSource === "static_inferred" ? 1 : 0);
+  lastSurfaceEndpoints = [...surface.endpoints]
+    .map((endpoint, index) => ({ endpoint, index }))
+    .sort((a, b) => rank(a.endpoint) - rank(b.endpoint) || a.index - b.index)
+    .map((entry) => entry.endpoint);
+  const endpointRows = lastSurfaceEndpoints.map((entry, index) => {
     const confidence = entry.minimumFactConfidence;
     const percent = confidence === null || confidence === undefined ? null : Math.round(confidence * 100);
     const band = percent === null ? "" : percent >= 80 ? " confidence--high" : percent < 50 ? " confidence--low" : "";
@@ -1032,10 +1145,17 @@ function renderSurface(surface: SurfaceSummary): void {
       ? '<span class="t-subtle">unscored</span>'
       : `<span class="confidence${band}" title="Minimum supporting fact confidence"><span class="confidence__track"><span class="confidence__fill" style="width:${percent}%"></span></span>${percent}%</span>`;
     const method = entry.method.toUpperCase();
-    return `<div class="endpoint-row">
+    // The row is a real button so it is keyboard-focusable and expands on
+    // click/Enter; a right-click (contextmenu) offers send-to-resend/fuzzer,
+    // matching Burp/Caido. The detail region fills lazily on first expand.
+    return `<div class="endpoint-item" data-ep="${index}">
+<button class="endpoint-row" type="button" data-ep-toggle="${index}" aria-expanded="false" title="Click to expand · right-click to send to resend or fuzzer">
+<span class="endpoint-row__caret" data-icon="chevronRight" aria-hidden="true"></span>
 <span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method)}</span>
 <span class="endpoint-row__path" title="${escapeHtml(entry.pathTemplate)}">${escapeHtml(entry.pathTemplate)}</span>
-<span class="endpoint-row__meta">${confidenceHtml}<span class="badge">${entry.signerCount} signer${entry.signerCount === 1 ? "" : "s"}</span></span>
+<span class="endpoint-row__meta">${evidenceChipHtml(entry)}${partyChipHtml(entry)}${confidenceHtml}<span class="badge">${entry.signerCount} signer${entry.signerCount === 1 ? "" : "s"}</span></span>
+</button>
+<div class="endpoint-detail" data-ep-detail="${index}" hidden></div>
 </div>`;
   }).join("");
 
@@ -1086,7 +1206,139 @@ function renderSurface(surface: SurfaceSummary): void {
   <div class="panel__body panel__body--flush scroll-region">${diagnosticListHtml(surface.diagnostics, "The assembled surface reported no boundaries or warnings.")}</div>
 </article>
 </div>`;
+  hydrateIcons(surfaceView);
+  wireSurfaceEndpoints();
   surface.diagnostics.forEach(showDiagnostic);
+}
+
+/** Wires each surface endpoint row: click/Enter expands its request/response
+ * detail; right-click opens the send-to-resend/fuzzer menu. */
+function wireSurfaceEndpoints(): void {
+  if (surfaceView === null) return;
+  surfaceView.querySelectorAll<HTMLButtonElement>("[data-ep-toggle]").forEach((button) => {
+    const index = Number(button.dataset.epToggle);
+    button.addEventListener("click", () => toggleEndpointDetail(index, button));
+    button.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      showEndpointMenu(event.clientX, event.clientY, index);
+    });
+  });
+}
+
+/** Expands or collapses an endpoint's request/response detail. */
+function toggleEndpointDetail(index: number, button: HTMLButtonElement): void {
+  const detailRegion = surfaceView?.querySelector<HTMLElement>(`[data-ep-detail="${index}"]`);
+  const endpoint = lastSurfaceEndpoints[index];
+  if (detailRegion === null || detailRegion === undefined || endpoint === undefined) return;
+  const open = detailRegion.hidden;
+  if (open && detailRegion.childElementCount === 0) detailRegion.innerHTML = endpointDetailHtml(endpoint, index);
+  detailRegion.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
+  button.closest(".endpoint-item")?.classList.toggle("is-open", open);
+  if (open) {
+    detailRegion.querySelector("[data-ep-resend]")?.addEventListener("click", () => void sendEndpointToResend(index));
+    detailRegion.querySelector("[data-ep-fuzzer]")?.addEventListener("click", () => sendEndpointToFuzzer(index));
+  }
+}
+
+/** The expanded request/response essentials, side by side. */
+function endpointDetailHtml(endpoint: SurfaceEndpoint, _index: number): string {
+  const detail = endpoint.detail;
+  const url = endpointUrl(endpoint);
+  const headerList = (names: readonly string[]): string =>
+    names.length === 0
+      ? '<li class="t-subtle">none observed</li>'
+      : names.map((name) => `<li class="t-mono">${escapeHtml(name)}</li>`).join("");
+  const params = detail === undefined ? [] : [...detail.pathParams, ...detail.queryParams];
+  const requestSide = `<section class="endpoint-detail__col">
+  <p class="section-label">Request</p>
+  <dl class="kv kv--tight"><dt>Method</dt><dd class="t-mono">${escapeHtml(endpoint.method.toUpperCase())}</dd><dt>URL</dt><dd class="t-mono" style="word-break:break-all">${escapeHtml(url)}</dd></dl>
+  <p class="t-label t-small">Headers</p><ul class="endpoint-detail__headers">${headerList(detail?.requestHeaders ?? [])}</ul>
+  ${params.length === 0 ? "" : `<p class="t-label t-small">Parameters</p><ul class="endpoint-detail__headers">${params.map((name) => `<li class="t-mono">${escapeHtml(name)}</li>`).join("")}</ul>`}
+</section>`;
+  const responses = detail?.responses ?? [];
+  const responseSide = `<section class="endpoint-detail__col">
+  <p class="section-label">Response</p>
+  ${responses.length === 0
+    ? '<p class="t-subtle t-small">No response observed for this endpoint.</p>'
+    : responses.map((response) => `<div class="stack stack--tight"><div class="row"><span class="list-row__status" data-class="${statusClass(Number(response.status))}">${escapeHtml(response.status)}</span></div><p class="t-label t-small">Headers</p><ul class="endpoint-detail__headers">${headerList(response.headers)}</ul></div>`).join('<hr class="rule" />')}
+</section>`;
+  return `<div class="endpoint-detail__grid">${requestSide}${responseSide}</div>
+<div class="row endpoint-detail__actions">
+  <button class="btn btn--sm" type="button" data-ep-resend>${icon("send", { size: 14 })}<span>Resend</span></button>
+  <button class="btn btn--sm" type="button" data-ep-fuzzer>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>
+</div>`;
+}
+
+/** Floating right-click menu: resend the endpoint or open it in the Fuzzer. */
+function showEndpointMenu(x: number, y: number, index: number): void {
+  document.querySelector(".context-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.className = "context-menu";
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.innerHTML = `<button class="context-menu__item" type="button" data-ep-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" data-ep-fuzzer>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>`;
+  const close = (): void => {
+    menu.remove();
+    document.removeEventListener("click", close);
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (event: KeyboardEvent): void => { if (event.key === "Escape") close(); };
+  menu.querySelector("[data-ep-resend]")?.addEventListener("click", () => { close(); void sendEndpointToResend(index); });
+  menu.querySelector("[data-ep-fuzzer]")?.addEventListener("click", () => { close(); sendEndpointToFuzzer(index); });
+  document.body.append(menu);
+  // Keep the menu inside the viewport if opened near an edge.
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${Math.max(4, window.innerWidth - rect.width - 4)}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${Math.max(4, window.innerHeight - rect.height - 4)}px`;
+  setTimeout(() => { document.addEventListener("click", close); document.addEventListener("keydown", onKey); }, 0);
+}
+
+/** Skeleton request built from an endpoint's shape: the operator fills header
+ * values and body in Resend or the Fuzzer. */
+function endpointRequest(endpoint: SurfaceEndpoint): ResendRequest {
+  const headers: [string, string][] = (endpoint.detail?.requestHeaders ?? []).map((name) => [name, ""]);
+  return { method: endpoint.method.toUpperCase() || "GET", url: endpointUrl(endpoint), headers, body: null };
+}
+
+/** Creates a Resend context from a surface endpoint and opens it in the workbench. */
+async function sendEndpointToResend(index: number): Promise<void> {
+  const endpoint = lastSurfaceEndpoints[index];
+  if (endpoint === undefined) return;
+  try {
+    const response = await fetch("/api/v1/workbench/resend", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ request: endpointRequest(endpoint) }) });
+    await requireOk(response, "resend context unavailable");
+    selectedResend = (await response.json()) as ResendContext;
+    renderResend();
+    showView("workbench");
+    revealDrawer(resendPanel);
+    toast(`Sent ${endpoint.method.toUpperCase()} ${endpoint.pathTemplate} to Resend`, "success");
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.resend-history-failed", what: "The endpoint could not be sent to Resend.", why: "", fix: "Confirm a session is active, then retry." });
+  }
+}
+
+/** Opens the Fuzzer in the workbench seeded from a surface endpoint. */
+function sendEndpointToFuzzer(index: number): void {
+  const endpoint = lastSurfaceEndpoints[index];
+  if (endpoint === undefined) return;
+  const request = endpointRequest(endpoint);
+  selectedFuzzer = {
+    id: "", tier: "ffuf", state: "draft",
+    config: {
+      baseRequest: request,
+      positions: [{ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }],
+      payloadSets: [{ name: "set 1", values: [] }],
+      attackType: "sniper",
+      matchFilter: { statuses: [], minSize: null, maxSize: null, contains: null, regex: null },
+      concurrency: 5, ratePerSecond: 10, maxResults: 100, authPreflight: null, sequence: [],
+    },
+    results: [], diagnostics: [],
+  };
+  renderFuzzer();
+  showView("workbench");
+  revealDrawer(fuzzerPanel);
+  toast(`Loaded ${endpoint.method.toUpperCase()} ${endpoint.pathTemplate} into the Fuzzer`, "success");
 }
 
 function renderSurfaceEmpty(): void {
@@ -1098,6 +1350,129 @@ function renderSurfaceEmpty(): void {
   });
 }
 
+/** Header names that are transport/CDN/date noise, not part of the API's own
+ * contract — hidden from the endpoint detail so only meaningful headers
+ * (content-type, authorization, api keys, cookies, …) show, per the "no
+ * x-powered-by bs" ask. */
+const NOISE_HEADERS = new Set([
+  "date", "server", "connection", "keep-alive", "content-length", "content-encoding",
+  "transfer-encoding", "vary", "via", "age", "x-powered-by", "x-aspnet-version",
+  "x-cache", "x-served-by", "x-timer", "cf-ray", "cf-cache-status", "alt-svc",
+  "strict-transport-security", "report-to", "nel", "x-amzn-requestid", "x-amz-cf-id",
+  "x-amz-cf-pop", "expect-ct", "accept-ranges", "etag", "last-modified", "x-frame-options",
+]);
+
+function meaningfulHeaders(names: readonly string[]): string[] {
+  return names.filter((name) => !NOISE_HEADERS.has(name.toLowerCase()));
+}
+
+/** Resolves a fused field object to its selected candidate value. */
+function resolveFieldValue(field: unknown): string | null {
+  const record = field as Record<string, unknown> | null | undefined;
+  if (record === null || record === undefined) return null;
+  const candidates = Array.isArray(record.candidates) ? (record.candidates as Record<string, unknown>[]) : [];
+  const selected = (record.resolution as Record<string, unknown> | undefined)?.selected;
+  const chosen = candidates.find((candidate) => candidate.id === selected) ?? candidates[0];
+  const raw = chosen?.value;
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "object") {
+    const template = (raw as Record<string, unknown>).template;
+    return typeof template === "string" ? template : null;
+  }
+  return String(raw);
+}
+
+function fieldNames(list: unknown): string[] {
+  return Array.isArray(list)
+    ? list.map((item) => String((item as Record<string, unknown>).name ?? "")).filter((name) => name !== "")
+    : [];
+}
+
+function extractEndpointDetail(endpoint: Record<string, unknown>): EndpointDetail {
+  const responses = Array.isArray(endpoint.responses) ? (endpoint.responses as Record<string, unknown>[]) : [];
+  return {
+    baseUrl: resolveFieldValue(endpoint.base_url),
+    requestHeaders: meaningfulHeaders(fieldNames(endpoint.headers)),
+    queryParams: fieldNames(endpoint.query_parameters),
+    pathParams: fieldNames(endpoint.path_parameters),
+    responses: responses.map((response) => {
+      const selector = response.selector as Record<string, unknown> | undefined;
+      return {
+        status: String(selector?.value ?? selector?.kind ?? "?"),
+        headers: meaningfulHeaders(fieldNames(response.headers)),
+      };
+    }),
+  };
+}
+
+/** Builds an absolute URL for an endpoint from its resolved base host + template. */
+function endpointUrl(endpoint: SurfaceEndpoint): string {
+  const base = endpoint.detail?.baseUrl ?? endpoint.baseUrl ?? "";
+  const path = endpoint.pathTemplate.startsWith("/") ? endpoint.pathTemplate : `/${endpoint.pathTemplate}`;
+  if (base === "") return path;
+  if (base.startsWith("http://") || base.startsWith("https://")) return `${base.replace(/\/$/, "")}${path}`;
+  return `https://${base}${path}`;
+}
+
+/** Well-known third-party SDK / analytics / tracker / payment host suffixes.
+ * Mirrors the workbench's server-side list (engine-shell pipeline). A host ending
+ * in one of these is external to the app's own backend — a labeling aid the tester
+ * uses to tell the app's own API apart from the SDKs and trackers it also calls.
+ * Every endpoint is still shown regardless; this only sets the chip. */
+const THIRD_PARTY_HOST_SUFFIXES = [
+  "facebook.com", "fbcdn.net", "google.com", "googleapis.com", "google-analytics.com",
+  "googletagmanager.com", "gstatic.com", "doubleclick.net", "crashlytics.com",
+  "app-measurement.com", "firebaseio.com", "clarity.ms", "appsflyer.com", "adjust.com",
+  "branch.io", "sentry.io", "bugsnag.com", "mixpanel.com", "amplitude.com", "segment.io",
+  "segment.com", "onesignal.com", "cloudflareinsights.com", "razorpay.com", "juspay.in",
+  "cashfree.com", "phonepe.com", "paytm.in",
+];
+
+/** Extracts the bare host from an endpoint's base URL (scheme/port/path stripped). */
+function endpointHost(endpoint: SurfaceEndpoint): string {
+  const base = (endpoint.detail?.baseUrl ?? endpoint.baseUrl ?? "").trim();
+  if (base === "") return "";
+  const afterScheme = base.includes("://") ? base.slice(base.indexOf("://") + 3) : base;
+  const authority = afterScheme.split(/[/?#]/)[0] ?? "";
+  const hostPort = authority.includes("@") ? authority.slice(authority.indexOf("@") + 1) : authority;
+  return hostPort.replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
+}
+
+/** First- vs third-party label for an endpoint's host. Third-party when the host
+ * matches a known SDK/tracker suffix; otherwise treated as the app's own surface.
+ * Returns null when there is no host to classify (nothing to show). */
+function endpointParty(endpoint: SurfaceEndpoint): "first" | "third" | null {
+  const host = endpointHost(endpoint);
+  if (host === "") return null;
+  const isThird = THIRD_PARTY_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+  return isThird ? "third" : "first";
+}
+
+/** Renders the confirmed/inferred evidence chip: "confirmed" when the app was
+ * observed hitting the endpoint dynamically, "inferred" when it is a static-only
+ * candidate (e.g. a bundled SDK base not observed being hit) — so an unconfirmed
+ * candidate is never presented as confirmed surface. */
+function evidenceChipHtml(endpoint: SurfaceEndpoint): string {
+  const source = endpoint.evidenceSource;
+  if (source === "confirmed") {
+    return `<span class="party-chip party-chip--confirmed" title="Observed being hit in dynamic capture">confirmed</span>`;
+  }
+  if (source === "static_inferred") {
+    return `<span class="party-chip party-chip--inferred" title="Static-inferred candidate — recovered from the app's code but not observed being hit. Treat as a lead, not a confirmed endpoint.">inferred</span>`;
+  }
+  return "";
+}
+
+/** Renders the first/third-party chip for an endpoint row, or "" when unknown. */
+function partyChipHtml(endpoint: SurfaceEndpoint): string {
+  const party = endpointParty(endpoint);
+  if (party === null) return "";
+  const host = escapeHtml(endpointHost(endpoint));
+  return party === "third"
+    ? `<span class="party-chip party-chip--third" title="Third-party SDK / analytics / tracker host the app calls (${host}) — real surface, but not the app's own backend">3rd party</span>`
+    : `<span class="party-chip party-chip--first" title="The app's own backend host (${host})">1st party</span>`;
+}
+
 function normalizeFusedSurface(raw: unknown): SurfaceSummary {
   const value = raw as Record<string, unknown>;
   if (value.coverage !== null && value.coverage !== undefined && Array.isArray(value.endpoints)) return value as unknown as SurfaceSummary;
@@ -1107,11 +1482,21 @@ function normalizeFusedSurface(raw: unknown): SurfaceSummary {
     const identity = (endpoint.identity ?? endpoint) as Record<string, unknown>;
     const facts = Array.isArray(entry.fact_confidence) ? entry.fact_confidence : [];
     const scores = facts.map((fact) => Number((fact as Record<string, unknown>).score)).filter(Number.isFinite);
+    // Observed = at least one fact traces to dynamic capture (the app was seen
+    // hitting it); otherwise it is a static-only inferred candidate.
+    const observed = facts.some((fact) => {
+      const sources = (fact as Record<string, unknown>).sources;
+      return Array.isArray(sources) && sources.includes("dynamic_capture");
+    });
+    const detail = extractEndpointDetail(endpoint);
     return {
       method: String(identity.method ?? ""),
       pathTemplate: String(identity.path_template ?? identity.pathTemplate ?? ""),
+      baseUrl: detail.baseUrl,
+      evidenceSource: observed ? "confirmed" : "static_inferred",
       minimumFactConfidence: scores.length === 0 ? undefined : Math.min(...scores),
       signerCount: Array.isArray(entry.signers) ? entry.signers.length : 0,
+      detail,
     };
   }) : [];
   const confidence = (value.confidence ?? {}) as Record<string, unknown>;
@@ -1137,6 +1522,18 @@ function normalizeFusedSurface(raw: unknown): SurfaceSummary {
 async function refreshPipeline(): Promise<void> {
   try {
     const response = await fetch("/api/v1/pipeline");
+    if (response.status === 404) {
+      // No analysis run exists in this session yet. That is the normal empty
+      // state — not an error the operator can act on — so render it plainly and
+      // stop polling rather than surfacing a "run not found" diagnostic on every
+      // clean boot. A real run installs its own poll when it starts.
+      renderPipelineEmpty();
+      if (pipelinePoll !== undefined) {
+        window.clearInterval(pipelinePoll);
+        pipelinePoll = undefined;
+      }
+      return;
+    }
     if (!response.ok) {
       await requireOk(response, "pipeline status unavailable");
       return;
@@ -1151,6 +1548,11 @@ async function refreshPipeline(): Promise<void> {
     if (run.status !== "running" && pipelinePoll !== undefined) {
       window.clearInterval(pipelinePoll);
       pipelinePoll = undefined;
+      // A finished run commits the session's scope and counts (a completed APK
+      // analysis declares its scope at fusion). Refresh the session once so the
+      // title-bar scope pill and the session metrics reflect it without waiting
+      // for the operator to visit the Session surface.
+      void refreshSession();
     }
   } catch (error) {
     if (!(error instanceof ApiRequestError) && !String(error).includes("pipeline.run-not-found")) showDiagnostic({ id: "pipeline.status-unavailable", what: "Analysis status could not be loaded.", why: String(error), fix: "Check the local API and active session, then refresh the workbench." });
@@ -1170,12 +1572,66 @@ async function refreshStoredSurface(): Promise<void> {
  * Live transport
  * ==================================================================== */
 
+/**
+ * Fetches a currently-valid operator token. On a reconnect the previous token
+ * may be stale (the engine was restarted, so its per-run token changed), so the
+ * token is re-read rather than reused.
+ */
+async function currentToken(): Promise<string | null> {
+  try {
+    const response = await fetch("/api/v1/workbench/session");
+    if (!response.ok) return null;
+    return ((await response.json()) as WorkbenchSession).authToken;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Re-establishes the live channels after a drop, with capped exponential
+ * backoff. A desktop app must survive an engine restart, a machine sleep, or a
+ * transient socket blip without the operator reloading — the channels come back
+ * on their own and the status bar narrates the wait honestly.
+ */
+function scheduleReconnect(): void {
+  if (reconnectTimer !== undefined) return;
+  setStatus("Reconnecting to the local engine…", "working");
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = undefined;
+    void currentToken().then((token) => {
+      if (token === null) {
+        reconnectDelay = Math.min(reconnectDelay * 2, 15_000);
+        scheduleReconnect();
+        return;
+      }
+      connect({ authToken: token, interceptEnabled: false });
+    });
+  }, reconnectDelay);
+}
+
 function connect(session: WorkbenchSession): void {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
+  // Drop any prior sockets so a reconnect never leaks a half-open channel.
+  try {
+    control?.close();
+  } catch {
+    /* already closed */
+  }
+  try {
+    telemetry?.close();
+  } catch {
+    /* already closed */
+  }
   control = new WebSocket(`${scheme}://${location.host}/api/v1/workbench/ws/control?token=${encodeURIComponent(session.authToken)}`);
-  const telemetry = new WebSocket(`${scheme}://${location.host}/api/v1/workbench/ws/telemetry?token=${encodeURIComponent(session.authToken)}`);
-  control.onopen = () => setStatus("Live control connected", "ready");
-  control.onclose = () => setStatus("Control channel closed", "unavailable");
+  telemetry = new WebSocket(`${scheme}://${location.host}/api/v1/workbench/ws/telemetry?token=${encodeURIComponent(session.authToken)}`);
+  control.onopen = () => {
+    reconnectDelay = 1000;
+    setStatus("Live control connected", "ready");
+  };
+  control.onclose = () => {
+    setStatus("Control channel closed", "unavailable");
+    scheduleReconnect();
+  };
   control.onmessage = (event) => {
     const message = JSON.parse(event.data) as { type?: string; diagnostic?: Diagnostic };
     if (message.diagnostic !== undefined) showDiagnostic(message.diagnostic);
@@ -1187,7 +1643,7 @@ function connect(session: WorkbenchSession): void {
     (update.prompts ?? []).forEach((prompt) => void handleCredentialPrompt(prompt));
     renderFlows();
   };
-  telemetry.onclose = () => setStatus("Telemetry channel closed", "unavailable");
+  telemetry.onclose = () => scheduleReconnect();
 }
 
 const handledPrompts = new Set<number>();
@@ -1251,7 +1707,7 @@ async function startWebSession(): Promise<void> {
   // current one to its artifact first, but the operator should know the active
   // context (and its captured work) is being switched out.
   const current = lastSessionStatus;
-  const hasWork = current !== null && (current.flowCount > 0 || current.repeaterCount > 0 || current.intruderCount > 0 || current.scopeConfigured);
+  const hasWork = current !== null && (current.flowCount > 0 || current.resendCount > 0 || current.fuzzerCount > 0 || current.scopeConfigured);
   if (hasWork && current !== null) {
     const confirmed = await confirmDialog({
       eyebrow: "Replace active session",
@@ -1491,7 +1947,7 @@ async function runDiscovery(): Promise<void> {
   try {
     const response = await fetch("/api/v1/discovery/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: discoveryKind?.value ?? "directory", wordlist: discoveryWordlist?.value ?? "small", confirmed: true }) });
     await requireOk(response, "discovery could not start");
-    discoveryJob = await response.json() as IntruderJob;
+    discoveryJob = await response.json() as FuzzerJob;
     renderDiscovery();
     if (discoveryPoll !== undefined) window.clearInterval(discoveryPoll);
     discoveryPoll = window.setInterval(() => void refreshDiscovery(), 500);
@@ -1570,9 +2026,9 @@ function renderDiscoveryIdle(): void {
 
 async function refreshDiscovery(): Promise<void> {
   if (discoveryJob === null) return;
-  const response = await fetch("/api/v1/workbench/intruder/" + encodeURIComponent(discoveryJob.id));
+  const response = await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(discoveryJob.id));
   if (!response.ok) return;
-  discoveryJob = await response.json() as IntruderJob;
+  discoveryJob = await response.json() as FuzzerJob;
   renderDiscovery();
   if (["completed", "failed", "stopped"].includes(discoveryJob.state) && discoveryPoll !== undefined) {
     window.clearInterval(discoveryPoll);
@@ -1582,7 +2038,7 @@ async function refreshDiscovery(): Promise<void> {
 
 async function stopDiscovery(): Promise<void> {
   if (discoveryJob === null) return;
-  await fetch("/api/v1/workbench/intruder/" + encodeURIComponent(discoveryJob.id) + "/stop", { method: "POST" });
+  await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(discoveryJob.id) + "/stop", { method: "POST" });
   await refreshDiscovery();
   toast("Discovery cancelled");
 }
@@ -1674,12 +2130,13 @@ function renderSession(status: SessionStatus): void {
     headerSession.title = status.artifactPath;
   }
   if (sessionBadge !== null) sessionBadge.textContent = status.lifecycle;
+  updateScopePill(status);
   if (sessionDetail === null) return;
   sessionDetail.innerHTML = `<div class="stack">
 <div class="metric-grid">
   <div class="metric"><span class="metric__value">${status.flowCount}</span><span class="metric__label">flows</span></div>
-  <div class="metric"><span class="metric__value">${status.repeaterCount}</span><span class="metric__label">repeaters</span></div>
-  <div class="metric"><span class="metric__value">${status.intruderCount}</span><span class="metric__label">intruder jobs</span></div>
+  <div class="metric"><span class="metric__value">${status.resendCount}</span><span class="metric__label">resends</span></div>
+  <div class="metric"><span class="metric__value">${status.fuzzerCount}</span><span class="metric__label">fuzzer jobs</span></div>
 </div>
 <dl class="kv">
   <dt>Session</dt><dd class="t-mono">${escapeHtml(status.sessionId)}</dd>
@@ -1692,6 +2149,40 @@ function renderSession(status: SessionStatus): void {
 ${status.scopeConfigured ? "" : `<div class="notice notice--caution"><span class="notice__icon">${icon("shield", { size: 18 })}</span><div class="notice__body"><p class="notice__title">No network allow rules declared</p><p>Active work is gated on a declared scope. Start a web session, or run an APK analysis, to establish one.</p></div></div>`}
 ${status.recoveredFromCheckpoint ? `<div class="notice notice--accent"><span class="notice__icon">${icon("info", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Recovered from a checkpoint</p><p>Compact metadata newer than the full artifact was found and used. Save the session to write a full artifact again.</p></div></div>` : ""}
 </div>`;
+}
+
+/**
+ * Keeps the title-bar scope pill honest. The pill is the operator's at-a-glance
+ * answer to "is active work authorized, and against what?" — so it reflects the
+ * real declared scope, never a decorative constant. Unscoped sessions say so
+ * plainly rather than implying authorization that has not been affirmed.
+ */
+function updateScopePill(status: SessionStatus): void {
+  const pill = document.querySelector<HTMLElement>("#scope-pill");
+  const host = document.querySelector<HTMLElement>("#scope-host");
+  if (pill === null) return;
+  const label = pill.querySelector<HTMLElement>(".scope-pill__label");
+  pill.hidden = false;
+  if (status.scopeConfigured) {
+    pill.classList.remove("is-unscoped");
+    if (label !== null) label.textContent = "AUTHORIZED";
+    const primary = status.scope?.target?.primary?.value ?? "";
+    let shown = "";
+    if (primary !== "") {
+      try {
+        shown = new URL(primary).host;
+      } catch {
+        shown = primary;
+      }
+    }
+    if (host !== null) host.textContent = shown;
+    pill.title = shown === "" ? "Active scope is authorized" : `Authorized scope: ${shown}`;
+  } else {
+    pill.classList.add("is-unscoped");
+    if (label !== null) label.textContent = "NO SCOPE";
+    if (host !== null) host.textContent = "";
+    pill.title = "No scope declared — start a web session or run an APK analysis to authorize active work";
+  }
 }
 
 /**
@@ -1784,7 +2275,7 @@ async function openSession(): Promise<void> {
   const path = await promptDialog({
     eyebrow: "Session",
     title: "Open a saved session",
-    message: "Enter the path to a session artifact on this machine. Captured traffic, repeater history, intruder jobs, and the audit trail are restored with it.",
+    message: "Enter the path to a session artifact on this machine. Captured traffic, resend history, fuzzer jobs, and the audit trail are restored with it.",
     label: "Session artifact path",
     value: "",
     placeholder: "artifacts/session.json",
@@ -1855,16 +2346,53 @@ document.querySelector("#web-fuse")?.addEventListener("click", () => void fuseWe
 document.querySelector("#web-export")?.addEventListener("click", () => showView("export"));
 document.querySelector("#apk-run")?.addEventListener("click", () => void startPipeline());
 document.querySelector("#apk-refresh")?.addEventListener("click", () => void refreshPipeline());
-document.querySelector("#apk-browse")?.addEventListener("click", () => apkFile?.click());
+// "Static only" and the dynamic pass are opposite ends of one axis: static-only
+// skips dynamic entirely. Keep the two checkboxes coherent so the form can never
+// show both passes selected at once (the run logic already makes static-only win;
+// this makes the displayed state match what will actually happen).
+function syncApkPasses(): void {
+  if (apkStaticOnly === null || apkDynamic === null) return;
+  apkDynamic.disabled = apkStaticOnly.checked;
+  apkDynamic.checked = !apkStaticOnly.checked;
+}
+apkStaticOnly?.addEventListener("change", syncApkPasses);
+document.querySelector("#apk-browse")?.addEventListener("click", () => void browseForApk());
 apkFile?.addEventListener("change", () => {
   const file = apkFile.files?.[0];
   if (file === undefined || apkPath === null) return;
-  // Browsers expose only the file name, never the full path. Fill what is
-  // available and say so, rather than silently producing an unreadable path.
+  // Fallback path only (no native picker): browsers expose only the file name,
+  // never the full path. Fill what is available and say so.
   apkPath.value = file.name;
   apkPath.focus();
   toast("Prefix the file name with its full directory path so the engine can read it.");
 });
+
+/**
+ * Browse for an APK. On the desktop the engine opens the platform's native file
+ * dialog, which returns the artifact's full disk path — so the field is filled
+ * with a path the engine can actually read. Where no native picker is available
+ * (a remote browser), fall back to the plain file input.
+ */
+async function browseForApk(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/pick-file", { method: "POST" });
+    if (response.ok) {
+      const result = (await response.json()) as { available: boolean; path: string | null };
+      if (result.available) {
+        // Native dialog handled it. A null path means the operator cancelled —
+        // leave the field untouched rather than clearing a prior value.
+        if (result.path !== null && result.path !== "" && apkPath !== null) {
+          apkPath.value = result.path;
+          apkPath.focus();
+        }
+        return;
+      }
+    }
+  } catch {
+    // Fall through to the browser file input below.
+  }
+  apkFile?.click();
+}
 document.querySelector("#export-run")?.addEventListener("click", () => void runExport());
 document.querySelector("#session-new")?.addEventListener("click", () => void newSession());
 document.querySelector("#session-open")?.addEventListener("click", () => void openSession());
@@ -2076,7 +2604,7 @@ async function saveSettings(): Promise<void> {
 
 function paintShell(): void {
   const lockup = document.querySelector<HTMLElement>("#header-lockup");
-  if (lockup !== null) lockup.innerHTML = lockupHtml(22);
+  if (lockup !== null) lockup.innerHTML = lockupHtml(13);
   const aboutLockup = document.querySelector<HTMLElement>("#about-lockup");
   if (aboutLockup !== null) aboutLockup.innerHTML = stackedLockupHtml(34);
   hydrateIcons();
@@ -2092,11 +2620,34 @@ function paintShell(): void {
     if (view === "session") void refreshSession();
     if (view === "surface") void refreshStoredSurface();
     if (view === "settings") void refreshSettings();
+    if (view === "devices") enterDevicesView();
+    else leaveDevicesView();
+    if (view === "android") enterAndroidView();
+    else leaveAndroidView();
+  });
+  androidLaunch?.addEventListener("click", () => void launchAndroidTarget());
+  androidStop?.addEventListener("click", () => void stopAndroidTarget());
+  androidApkInstall?.addEventListener("click", () => void installTargetApk());
+  androidApkBrowse?.addEventListener("click", () => void browseForAndroidApk());
+  androidApkFile?.addEventListener("change", () => {
+    const file = androidApkFile.files?.[0];
+    if (file === undefined || androidApkPath === null) return;
+    androidApkPath.value = file.name;
+    androidApkPath.focus();
+    toast("Prefix the file name with its full directory path so the engine can read it.");
   });
   document
     .querySelector<HTMLButtonElement>("#settings-save")
     ?.addEventListener("click", () => void saveSettings());
+  document
+    .querySelector<HTMLButtonElement>("#devices-refresh")
+    ?.addEventListener("click", () => void refreshDevices());
 
+  initShell();
+  // The dock now owns the Resend/Fuzzer panels (relocated by initShell); give
+  // each a resting empty state so its tab is never a blank void.
+  seedResendEmpty();
+  seedFuzzerEmpty();
   initNavigation();
   initDiagnosticsDrawer(diagnostics);
   diagnostics.render();
@@ -2119,31 +2670,31 @@ function dismissSplash(): void {
 }
 
 /**
- * Reopens durable repeater and intruder state after a reload. These jobs are
+ * Reopens durable resend and fuzzer state after a reload. These jobs are
  * persisted with the session, so a resumed session should surface them rather
  * than leaving reachable state stranded. The most recent of each is restored
- * into its drawer; a live intruder job resumes polling.
+ * into its drawer; a live fuzzer job resumes polling.
  */
 async function restoreWorkbench(): Promise<void> {
   try {
-    const response = await fetch("/api/v1/workbench/repeater");
+    const response = await fetch("/api/v1/workbench/resend");
     if (response.ok) {
-      const contexts = (await response.json()) as RepeaterContext[];
+      const contexts = (await response.json()) as ResendContext[];
       const latest = contexts.at(-1);
-      if (latest !== undefined) { selectedRepeater = latest; renderRepeater(); }
+      if (latest !== undefined) { selectedResend = latest; renderResend(); }
     }
   } catch { /* durable state; a transient read failure is not fatal */ }
   try {
-    const response = await fetch("/api/v1/workbench/intruder");
+    const response = await fetch("/api/v1/workbench/fuzzer");
     if (response.ok) {
-      const jobs = (await response.json()) as IntruderJob[];
+      const jobs = (await response.json()) as FuzzerJob[];
       const latest = jobs.at(-1);
       if (latest !== undefined) {
-        selectedIntruder = latest;
-        renderIntruder();
+        selectedFuzzer = latest;
+        renderFuzzer();
         if (latest.state === "running") {
-          if (intruderPoll !== undefined) window.clearInterval(intruderPoll);
-          intruderPoll = window.setInterval(() => void refreshIntruder(), 500);
+          if (fuzzerPoll !== undefined) window.clearInterval(fuzzerPoll);
+          fuzzerPoll = window.setInterval(() => void refreshFuzzer(), 500);
         }
       }
     }
@@ -2161,6 +2712,16 @@ async function boot(): Promise<void> {
     const status = (await statusResponse.json()) as SystemStatus;
     const session = (await sessionResponse.json()) as WorkbenchSession;
     const health = (await healthResponse.json()) as WorkbenchHealth;
+    operatorToken = session.authToken;
+    // A deep link straight to #devices renders before the token is known; now
+    // that it is, reload that view's operator-gated data.
+    if (document.querySelector<HTMLElement>('[data-view="devices"]')?.hidden === false) {
+      enterDevicesView();
+    }
+    // Same for a deep link straight to #android before the token was known.
+    if (document.querySelector<HTMLElement>('[data-view="android"]')?.hidden === false) {
+      enterAndroidView();
+    }
     latestHealth = health;
     setStatus(`${status.service} ${status.apiVersion} · ready`, "ready");
     renderAbout(status);
@@ -2189,6 +2750,442 @@ async function boot(): Promise<void> {
   } finally {
     dismissSplash();
   }
+}
+
+/* ==================================================================== *
+ * 7b. Device pairing (Phase C5)
+ *
+ * The operator arms an attached device (transport + a one-time token), the
+ * client scans the QR, and the operator accepts the ensuing request to
+ * provision trust. The pairing endpoints are operator-gated, so every call
+ * carries the workbench bearer token the control channel also uses.
+ * ==================================================================== */
+
+/** Header set for operator-gated pairing calls; `json` adds the request body type. */
+function pairingHeaders(json = false): Record<string, string> {
+  const headers: Record<string, string> = { authorization: `Bearer ${operatorToken}` };
+  if (json) headers["content-type"] = "application/json";
+  return headers;
+}
+
+/** Shown when the operator session token is not yet available. */
+function renderDevicesUnavailable(): void {
+  if (devicesCount !== null) devicesCount.textContent = "—";
+  if (devicesList !== null) {
+    devicesList.innerHTML = stateBlock({
+      icon: "alert",
+      title: "Operator session not ready",
+      body: "The workbench session token is required to manage devices. It becomes available once the local engine is connected — reload if this persists.",
+    });
+  }
+}
+
+function renderDevices(devices: readonly PairingDevice[]): void {
+  if (devicesList === null) return;
+  if (devicesCount !== null) devicesCount.textContent = `${devices.length} attached`;
+  if (devices.length === 0) {
+    devicesList.innerHTML = stateBlock({
+      icon: "apk",
+      title: "No devices attached",
+      body: "Connect a rooted Android device over adb, then refresh. Attached devices appear here to arm for pairing.",
+    });
+    return;
+  }
+  devicesList.replaceChildren();
+  const list = document.createElement("div");
+  list.className = "list";
+  devices.forEach((device) => {
+    const row = document.createElement("div");
+    row.className = "list-row";
+    row.style.gridTemplateColumns = "minmax(0, 1fr) auto";
+    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(device.serial)}</b> <span class="badge">${escapeHtml(device.state)}</span><br><span class="t-small t-subtle">${escapeHtml(device.description)}</span></span>`;
+    const arm = document.createElement("button");
+    arm.type = "button";
+    arm.className = "btn btn--sm btn--primary";
+    arm.innerHTML = `${icon("shield", { size: 14 })}<span>Arm pairing</span>`;
+    arm.addEventListener("click", () => void armDevice(device.serial, arm));
+    row.append(arm);
+    list.append(row);
+  });
+  devicesList.append(list);
+}
+
+async function refreshDevices(): Promise<void> {
+  if (operatorToken === "") { renderDevicesUnavailable(); return; }
+  try {
+    const response = await fetch("/api/v1/pairing/devices", { headers: pairingHeaders() });
+    await requireOk(response, "attached devices unavailable");
+    renderDevices((await response.json()) as PairingDevice[]);
+  } catch (error) {
+    // A failed listing on entering this view is, most often, simply that no adb
+    // device is attached yet — the expected state before pairing, not a hard
+    // failure worth a danger toast. Show the calm guidance state in the panel;
+    // the underlying diagnostic (recorded by requireOk when the engine returned
+    // one) stays in the drawer for a genuine adb/transport fault.
+    if (devicesCount !== null) devicesCount.textContent = "0 attached";
+    if (devicesList !== null) {
+      devicesList.innerHTML = stateBlock({
+        icon: "apk",
+        title: "No devices attached",
+        body: "Connect a rooted Android device over adb, then refresh. If a device is connected but not listed, confirm adb is on PATH and the device is authorized.",
+      });
+    }
+    if (!(error instanceof ApiRequestError)) {
+      showDiagnostic({ id: "pairing.devices-unavailable", what: "Attached devices could not be listed.", why: String(error), fix: "Confirm adb is on PATH and a device is connected and authorized, then refresh." });
+    }
+  }
+}
+
+/**
+ * Arms a device and captures the QR payload. The QR encodes the server's
+ * response bytes verbatim — the Android client JSON-parses exactly this string,
+ * so the raw text is kept and never re-serialized.
+ */
+async function armDevice(serial: string, button: HTMLButtonElement): Promise<void> {
+  await withBusy(button, "Arming…", async () => {
+    try {
+      const response = await fetch("/api/v1/pairing/arm", { method: "POST", headers: pairingHeaders(true), body: JSON.stringify({ serial }) });
+      await requireOk(response, "device arm failed");
+      armedPairingRaw = await response.text();
+      armedPairing = JSON.parse(armedPairingRaw) as PairingQrPayload;
+      await renderArmed();
+      revealDrawer(pairingArmResult);
+      toast(`Armed ${serial}. Scan the pairing code on the device.`, "success");
+    } catch (error) {
+      reportUnexpected(error, { id: "pairing.arm-failed", what: "The device could not be armed for pairing.", why: "", fix: "Confirm the device is authorized over adb and that the reverse tunnel can be established, then retry." });
+    }
+  });
+}
+
+/** Renders the armed payload as a scannable QR plus a manual-entry fallback. */
+async function renderArmed(): Promise<void> {
+  if (pairingArmResult === null) return;
+  const payload = armedPairing;
+  const raw = armedPairingRaw;
+  if (payload === null || raw === null) {
+    if (pairingArmBadge !== null) pairingArmBadge.textContent = "not armed";
+    pairingArmResult.innerHTML = stateBlock({
+      icon: "shield",
+      title: "No device armed",
+      body: "Arm an attached device to generate a one-time pairing code. The client scans the QR to request pairing, then you accept it below.",
+    });
+    return;
+  }
+  if (pairingArmBadge !== null) pairingArmBadge.textContent = "armed";
+  const expires = new Date(payload.expiresAtMs);
+  const expiresText = Number.isNaN(expires.getTime()) ? String(payload.expiresAtMs) : expires.toLocaleTimeString();
+  pairingArmResult.innerHTML = `<div class="stack">
+  <div style="align-self:center;background:#ffffff;padding:12px;border-radius:var(--radius-2);line-height:0">
+    <img id="pairing-qr" width="232" height="232" alt="Pairing QR code" />
+  </div>
+  <p class="t-small t-subtle">Scan with the APIaxess Android client. The client reads this exact payload — use the values below only if scanning is unavailable.</p>
+  <dl class="kv">
+    <dt>Host</dt><dd class="t-mono">${escapeHtml(payload.host)}:${payload.controlPort}</dd>
+    <dt>Proxy port</dt><dd class="t-mono">${payload.proxyPort}</dd>
+    <dt>Pairing token</dt><dd class="t-mono" style="word-break:break-all">${escapeHtml(payload.pairingToken)}</dd>
+    <dt>CA fingerprint</dt><dd class="t-mono" style="word-break:break-all">${escapeHtml(payload.caFingerprintSha256)}</dd>
+    <dt>Expires</dt><dd>${escapeHtml(expiresText)}</dd>
+  </dl>
+</div>`;
+  try {
+    // High-contrast, quiet-zoned, and error-corrected so a phone camera reads it
+    // reliably against the dark UI. margin keeps the mandatory white quiet zone.
+    const dataUrl = await qrToDataUrl(raw, { errorCorrectionLevel: "M", margin: 2, width: 232 });
+    const img = pairingArmResult.querySelector<HTMLImageElement>("#pairing-qr");
+    if (img !== null) img.src = dataUrl;
+  } catch (error) {
+    reportUnexpected(error, { id: "pairing.qr-render-failed", what: "The pairing QR code could not be rendered.", why: "", fix: "Enter the pairing token and CA fingerprint on the device manually instead." });
+  }
+}
+
+function renderPendingPairing(list: readonly PendingPairing[]): void {
+  if (pairingPending === null) return;
+  if (pairingPendingCount !== null) pairingPendingCount.textContent = `${list.length} pending`;
+  if (list.length === 0) {
+    pairingPending.innerHTML = stateBlock({
+      icon: "check",
+      title: "No devices awaiting",
+      body: "When an armed device scans its pairing code, its request appears here to accept or decline.",
+      compact: true,
+    });
+    return;
+  }
+  pairingPending.replaceChildren();
+  const container = document.createElement("div");
+  container.className = "list";
+  list.forEach((entry) => {
+    const row = document.createElement("div");
+    row.className = "list-row";
+    row.style.gridTemplateColumns = "minmax(0, 1fr) auto";
+    const ago = Math.max(0, Math.round(entry.requestedAgoMs / 1000));
+    const serialNote = entry.serial === null || entry.serial === undefined || entry.serial === "" ? "" : ` · ${escapeHtml(entry.serial)}`;
+    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(entry.deviceName)}</b>${serialNote}<br><span class="t-small t-subtle">requested ${ago}s ago</span></span>`;
+    const actions = document.createElement("div");
+    actions.className = "row";
+    const accept = document.createElement("button");
+    accept.type = "button";
+    accept.className = "btn btn--sm btn--primary";
+    accept.innerHTML = `${icon("check", { size: 14 })}<span>Accept</span>`;
+    accept.addEventListener("click", () => void acceptPairing(entry.id, accept));
+    const decline = document.createElement("button");
+    decline.type = "button";
+    decline.className = "btn btn--sm btn--danger";
+    decline.innerHTML = `${icon("close", { size: 14 })}<span>Decline</span>`;
+    decline.addEventListener("click", () => void declinePairing(entry.id, decline));
+    actions.append(accept, decline);
+    row.append(actions);
+    container.append(row);
+  });
+  pairingPending.append(container);
+}
+
+async function refreshPendingPairing(): Promise<void> {
+  if (operatorToken === "") return;
+  try {
+    const response = await fetch("/api/v1/pairing/pending", { headers: pairingHeaders() });
+    if (!response.ok) return;
+    renderPendingPairing((await response.json()) as PendingPairing[]);
+  } catch {
+    // Transient; the next poll retries. The diagnostics register stays quiet
+    // so a brief blip does not flood it every two seconds.
+  }
+}
+
+/** Accepts a pending device: provisions it (can take several seconds) and issues its token. */
+async function acceptPairing(id: string, button: HTMLButtonElement): Promise<void> {
+  await withBusy(button, "Provisioning…", async () => {
+    try {
+      const response = await fetch(`/api/v1/pairing/pending/${encodeURIComponent(id)}/accept`, { method: "POST", headers: pairingHeaders() });
+      await requireOk(response, "device accept failed");
+      toast("Device accepted and provisioned.", "success");
+      await refreshPendingPairing();
+    } catch (error) {
+      reportUnexpected(error, { id: "pairing.accept-failed", what: "The device could not be accepted.", why: "", fix: "Provisioning failed or the request expired. Check the device over adb and pair again from the device." });
+    }
+  });
+}
+
+async function declinePairing(id: string, button: HTMLButtonElement): Promise<void> {
+  await withBusy(button, "Declining…", async () => {
+    try {
+      const response = await fetch(`/api/v1/pairing/pending/${encodeURIComponent(id)}/decline`, { method: "POST", headers: pairingHeaders() });
+      await requireOk(response, "device decline failed");
+      toast("Device declined.", "info");
+      await refreshPendingPairing();
+    } catch (error) {
+      reportUnexpected(error, { id: "pairing.decline-failed", what: "The device could not be declined.", why: "", fix: "The request may have already expired. Refresh the pending list." });
+    }
+  });
+}
+
+/** Reads the public CA endpoint and shows the fingerprint the client pins. */
+async function refreshPairingCa(): Promise<void> {
+  if (pairingCa === null) return;
+  try {
+    const response = await fetch("/api/v1/pairing/ca");
+    await requireOk(response, "workbench CA unavailable");
+    const fingerprint = response.headers.get("x-apiaxess-ca-fingerprint") ?? "unavailable";
+    pairingCa.innerHTML = `<div class="stack stack--tight">
+  <p class="t-small t-subtle">The client pins this certificate authority. Confirm the fingerprint the device displays matches this value before accepting.</p>
+  <p class="t-mono" style="word-break:break-all">${escapeHtml(fingerprint)}</p>
+</div>`;
+  } catch (error) {
+    reportUnexpected(error, { id: "pairing.ca-unavailable", what: "The workbench CA fingerprint could not be read.", why: "", fix: "The session CA is available only while a session is active. Start a session and retry." });
+  }
+}
+
+/** Starts the Devices view: loads everything and polls the pending list. */
+function enterDevicesView(): void {
+  void refreshPairingCa();
+  void refreshDevices();
+  void renderArmed();
+  void refreshPendingPairing();
+  if (pairingPoll === undefined) {
+    pairingPoll = window.setInterval(() => void refreshPendingPairing(), 2000);
+  }
+}
+
+/** Stops the pending-pairing poll when the Devices view is left. */
+function leaveDevicesView(): void {
+  if (pairingPoll !== undefined) {
+    window.clearInterval(pairingPoll);
+    pairingPoll = undefined;
+  }
+}
+
+/* ==================================================================== *
+ * 7c. Android target panel (Phase D3)
+ *
+ * One authenticated workbench surface to launch the GUI Android target
+ * (boot → C2/C5 provision → D2 stream), install the app to capture, and
+ * drive it on the embedded ws-scrcpy screen — all on the engine origin, so
+ * desktop (loopback) and VM (ip:port / SSH-tunnel) are one identical panel.
+ * ==================================================================== */
+
+const ANDROID_STEPS: readonly { readonly phase: AndroidPhase; readonly label: string }[] = [
+  { phase: "booting", label: "Boot AVD (headless)" },
+  { phase: "provisioning", label: "Provision · client app, session CA, instrumentation" },
+  { phase: "streaming", label: "Start screen stream" },
+];
+/** Monotonic order of the launch phases, so the step list can mark done/active. */
+const ANDROID_ORDER: Record<AndroidPhase, number> = { idle: 0, booting: 1, provisioning: 2, streaming: 3, ready: 4, error: 1 };
+
+function androidStepsMarkup(status: AndroidTargetStatus): string {
+  const current = ANDROID_ORDER[status.phase];
+  const rows = ANDROID_STEPS.map((step) => {
+    const order = ANDROID_ORDER[step.phase];
+    let mark: string;
+    let cls: string;
+    if (status.phase === "error" && order >= current) { mark = icon("alert", { size: 14 }); cls = "is-error"; }
+    else if (status.phase === "ready" || order < current) { mark = icon("check", { size: 14 }); cls = "is-done"; }
+    else if (order === current) { mark = icon("refresh", { size: 14, className: "spinner" }); cls = "is-active"; }
+    else { mark = icon("clock", { size: 14 }); cls = ""; }
+    return `<li class="steps__item ${cls}">${mark}<span>${escapeHtml(step.label)}</span></li>`;
+  }).join("");
+  return `<ol class="steps">${rows}</ol>`;
+}
+
+/** Renders the actionable non-info diagnostics inline in the panel (right message,
+ * right place) rather than only in the global drawer. */
+function androidDiagnosticNotices(status: AndroidTargetStatus): string {
+  const notable = status.diagnostics.filter((d) => /unavailable|failed|missing|not-active|not-running|degraded|software-mode/.test(d.id));
+  return notable
+    .map((d) => `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(d.what)}</p><p>${escapeHtml(d.why)}</p><p class="t-small t-subtle">${escapeHtml(d.fix)}</p></div></div>`)
+    .join("");
+}
+
+function androidStatusBody(status: AndroidTargetStatus): string {
+  if (!status.addonPresent) {
+    return stateBlock({ icon: "apk", title: "Android target add-on not installed", body: "The GUI Android target is a separate, optional download. Install it with install-android-target.ps1 (Windows) or .sh (Linux), then launch it here." });
+  }
+  if (status.phase === "idle") {
+    return stateBlock({ icon: "play", title: "No Android target running", body: "Launch to boot the AVD, provision it (client app, session CA, instrumentation), and start the screen stream — one click." });
+  }
+  if (status.phase === "error") {
+    const first = status.diagnostics[0];
+    const detail = first === undefined ? "" : `<div class="notice notice--danger"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(first.what)}</p><p>${escapeHtml(first.why)}</p><p class="t-small t-subtle">${escapeHtml(first.fix)}</p></div></div>`;
+    return `${androidStepsMarkup(status)}${detail}`;
+  }
+  if (status.phase === "ready") {
+    const facts = [
+      status.serial === null ? null : `serial ${escapeHtml(status.serial)}`,
+      status.androidSdk === null ? null : `Android API ${status.androidSdk}`,
+      status.clientApkInstalled ? "client installed" : "client not installed",
+      status.fridaServerStarted ? "instrumentation on" : "instrumentation off",
+      status.streaming ? "streaming" : "no stream",
+    ].filter((fact): fact is string => fact !== null).join(" · ");
+    const banner = `<div class="notice notice--success"><span class="notice__icon">${icon("check", { size: 18 })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(status.message)}</p><p class="t-small t-subtle">${facts}</p></div></div>`;
+    return `${banner}${androidDiagnosticNotices(status)}`;
+  }
+  const progress = `<div class="notice"><span class="notice__icon">${icon("refresh", { size: 18, className: "spinner" })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(status.message)}</p><p class="t-small t-subtle">This can take a few minutes, especially in software mode.</p></div></div>`;
+  return `${progress}${androidStepsMarkup(status)}${androidDiagnosticNotices(status)}`;
+}
+
+/**
+ * Mounts or unmounts the embedded ws-scrcpy screen. It is mounted exactly once
+ * per live stream: re-rendering the iframe on a status poll would reload and reset
+ * the stream, so a mounted screen is left untouched until the stream ends.
+ */
+function updateAndroidScreen(status: AndroidTargetStatus): void {
+  if (androidScreen === null) return;
+  const canStream = status.phase === "ready" && status.streaming;
+  if (canStream) {
+    if (androidScreenMounted) return;
+    const src = `/android-stream/?token=${encodeURIComponent(operatorToken)}`;
+    androidScreen.innerHTML = `<iframe class="android-screen__frame" title="Android target screen" src="${escapeHtml(src)}" allow="clipboard-read; clipboard-write"></iframe>`;
+    androidScreenMounted = true;
+    return;
+  }
+  androidScreenMounted = false;
+  let body: string;
+  if (!status.addonPresent) body = "Install the Android target add-on to stream a device screen.";
+  else if (status.phase === "ready") body = "The target is running, but its streaming components are not installed. Reinstall the add-on to enable the screen.";
+  else if (status.phase === "idle" || status.phase === "error") body = "Launch the Android target to see and drive its screen here.";
+  else body = "The screen appears here once the target finishes provisioning and the stream starts.";
+  androidScreen.innerHTML = stateBlock({ icon: "traffic", title: "Screen", body });
+}
+
+function renderAndroidStatus(status: AndroidTargetStatus): void {
+  if (androidPhaseBadge !== null) androidPhaseBadge.textContent = status.phase;
+  const inFlight = status.phase === "booting" || status.phase === "provisioning" || status.phase === "streaming";
+  if (androidLaunch !== null) {
+    androidLaunch.disabled = inFlight || !status.addonPresent;
+    androidLaunch.hidden = status.phase === "ready";
+  }
+  if (androidStop !== null) androidStop.hidden = !(inFlight || status.phase === "ready");
+  if (androidInstallPanel !== null) androidInstallPanel.hidden = status.phase !== "ready";
+  if (androidStatus !== null) { androidStatus.innerHTML = androidStatusBody(status); hydrateIcons(androidStatus); }
+  updateAndroidScreen(status);
+}
+
+function renderAndroidUnavailable(): void {
+  if (androidStatus !== null) {
+    androidStatus.innerHTML = stateBlock({ icon: "lock", title: "Workbench session not ready", body: "The operator token is not available yet. Reload once the local engine is up." });
+    hydrateIcons(androidStatus);
+  }
+  if (androidLaunch !== null) androidLaunch.disabled = true;
+}
+
+async function refreshAndroidStatus(): Promise<void> {
+  if (operatorToken === "") { renderAndroidUnavailable(); return; }
+  try {
+    const response = await fetch("/api/v1/android-target/status", { headers: pairingHeaders() });
+    if (!response.ok) return;
+    renderAndroidStatus((await response.json()) as AndroidTargetStatus);
+  } catch { /* transient; the next poll retries */ }
+}
+
+async function launchAndroidTarget(): Promise<void> {
+  if (operatorToken === "") return;
+  await withBusy(androidLaunch, "Launching…", async () => {
+    const response = await fetch("/api/v1/android-target/launch", { method: "POST", headers: pairingHeaders() });
+    if (response.ok) renderAndroidStatus((await response.json()) as AndroidTargetStatus);
+    else showDiagnostic((await response.json()) as Diagnostic);
+  });
+}
+
+async function stopAndroidTarget(): Promise<void> {
+  if (operatorToken === "") return;
+  await withBusy(androidStop, "Stopping…", async () => {
+    androidScreenMounted = false;
+    const response = await fetch("/api/v1/android-target/stop", { method: "POST", headers: pairingHeaders() });
+    if (response.ok) renderAndroidStatus((await response.json()) as AndroidTargetStatus);
+  });
+}
+
+async function installTargetApk(): Promise<void> {
+  const path = androidApkPath?.value.trim() ?? "";
+  if (path === "") { toast("Enter the full path to the APK you want to install."); androidApkPath?.focus(); return; }
+  await withBusy(androidApkInstall, "Installing…", async () => {
+    const response = await fetch("/api/v1/android-target/install-apk", { method: "POST", headers: pairingHeaders(true), body: JSON.stringify({ path }) });
+    if (response.status === 204) toast("Installed. Open the app on the screen and drive it — its traffic flows to the workbench.");
+    else showDiagnostic((await response.json()) as Diagnostic);
+  });
+}
+
+/** Native file picker for the target APK (same pattern as the APK analysis view). */
+async function browseForAndroidApk(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/pick-file", { method: "POST" });
+    if (response.ok) {
+      const result = (await response.json()) as { available: boolean; path: string | null };
+      if (result.available) {
+        if (result.path !== null && result.path !== "" && androidApkPath !== null) { androidApkPath.value = result.path; androidApkPath.focus(); }
+        return;
+      }
+    }
+  } catch { /* fall through to the browser file input */ }
+  androidApkFile?.click();
+}
+
+function enterAndroidView(): void {
+  void refreshAndroidStatus();
+  if (androidPoll === undefined) androidPoll = window.setInterval(() => void refreshAndroidStatus(), 1000);
+}
+
+/** Stops the status poll when the Android target view is left. */
+function leaveAndroidView(): void {
+  if (androidPoll !== undefined) { window.clearInterval(androidPoll); androidPoll = undefined; }
 }
 
 /* ==================================================================== *

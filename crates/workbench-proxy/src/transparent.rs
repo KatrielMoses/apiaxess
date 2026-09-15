@@ -302,11 +302,7 @@ mod tests {
         body.extend_from_slice(&extensions);
 
         let mut handshake = vec![0x01]; // ClientHello
-        handshake.extend_from_slice(&[
-            0,
-            (body.len() >> 8) as u8,
-            (body.len() & 0xff) as u8,
-        ]); // 24-bit length
+        handshake.extend_from_slice(&[0, (body.len() >> 8) as u8, (body.len() & 0xff) as u8]); // 24-bit length
         handshake.extend_from_slice(&body);
 
         let mut record = vec![0x16, 0x03, 0x01]; // handshake, TLS 1.0 record version

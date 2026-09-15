@@ -33,10 +33,10 @@ pub struct SessionStatus {
     pub store_path: String,
     /// Number of captured flows currently persisted.
     pub flow_count: usize,
-    /// Number of persisted repeater contexts.
-    pub repeater_count: usize,
-    /// Number of persisted intruder jobs.
-    pub intruder_count: usize,
+    /// Number of persisted resend contexts.
+    pub resend_count: usize,
+    /// Number of persisted fuzzer jobs.
+    pub fuzzer_count: usize,
     /// Canonical session engagement scope.
     pub scope: apiaxess_session::EngagementScope,
     /// Whether one or more network allow rules are declared.
@@ -198,8 +198,8 @@ impl SessionRuntime {
             artifact_path: self.artifact_path.display().to_string(),
             store_path: self.store.database_path().display().to_string(),
             flow_count: self.store.summaries()?.len(),
-            repeater_count: self.store.repeater_contexts()?.len(),
-            intruder_count: self.store.intruder_jobs()?.len(),
+            resend_count: self.store.resend_contexts()?.len(),
+            fuzzer_count: self.store.fuzzer_jobs()?.len(),
             scope: session.engagement_scope().clone(),
             scope_configured: !session.engagement_scope().allowed_targets.is_empty(),
             analysis_pipeline: session.analysis_pipeline_state().map(|state| {
@@ -452,8 +452,8 @@ fn remove_recovery_files(path: &Path) {
 
 fn store_is_empty(store: &TrafficStore) -> Result<bool, Diagnostic> {
     Ok(store.summaries()?.is_empty()
-        && store.repeater_contexts()?.is_empty()
-        && store.intruder_jobs()?.is_empty())
+        && store.resend_contexts()?.is_empty()
+        && store.fuzzer_jobs()?.is_empty())
 }
 
 fn save_diagnostic(path: &Path, error: &str) -> Diagnostic {

@@ -1,4 +1,4 @@
-//! Manual request repeater backed by the active session proxy and store.
+//! Manual request resend backed by the active session proxy and store.
 
 use std::{
     collections::BTreeMap,
@@ -12,44 +12,44 @@ use apiaxess_session::{
     ScopeDisposition, Session,
 };
 use apiaxess_workbench_store::{
-    RepeaterContext, RepeaterRequest, RepeaterResponse, RepeaterRevision, TrafficStore,
+    ResendContext, ResendRequest, ResendResponse, ResendRevision, TrafficStore,
 };
 use getrandom::fill;
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::{FlowDetail, SessionCa};
 
-/// Result returned after a repeater send, including any non-fatal warnings.
+/// Result returned after a resend send, including any non-fatal warnings.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RepeaterSendResult {
+pub struct ResendSendResult {
     /// Updated context containing the appended revision.
-    pub context: RepeaterContext,
+    pub context: ResendContext,
     /// The revision created by this send.
-    pub revision: RepeaterRevision,
+    pub revision: ResendRevision,
     /// Warnings or send diagnostics shown alongside the revision.
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Request transport used by the repeater. Implementations must send through
+/// Request transport used by the resend. Implementations must send through
 /// the session's routed proxy path rather than silently falling back to a
 /// direct connection.
-pub trait RepeaterSender: Send + Sync {
+pub trait ResendSender: Send + Sync {
     /// Sends one fully edited request.
     fn send(
         &self,
-        request: RepeaterRequest,
-    ) -> crate::backend::BackendFuture<Result<RepeaterResponse, Diagnostic>>;
+        request: ResendRequest,
+    ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>>;
 }
 
 /// HTTP client that sends through an already-running `ProxyHandle` listener.
 #[derive(Clone, Debug)]
-pub struct ProxyRepeaterSender {
+pub struct ProxyResendSender {
     proxy_addr: std::net::SocketAddr,
     ca: SessionCa,
 }
 
-impl ProxyRepeaterSender {
+impl ProxyResendSender {
     /// Creates a sender bound to the session proxy listener and CA.
     #[must_use]
     pub const fn new(proxy_addr: std::net::SocketAddr, ca: SessionCa) -> Self {
@@ -57,42 +57,42 @@ impl ProxyRepeaterSender {
     }
 }
 
-impl RepeaterSender for ProxyRepeaterSender {
+impl ResendSender for ProxyResendSender {
     fn send(
         &self,
-        request: RepeaterRequest,
-    ) -> crate::backend::BackendFuture<Result<RepeaterResponse, Diagnostic>> {
+        request: ResendRequest,
+    ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>> {
         let proxy_addr = self.proxy_addr;
         let ca = self.ca.clone();
         Box::pin(async move { send_through_proxy(proxy_addr, ca, request).await })
     }
 }
 
-/// Session-scoped repeater contexts and their persistence bridge.
-pub struct RepeaterWorkbench {
+/// Session-scoped resend contexts and their persistence bridge.
+pub struct ResendWorkbench {
     store: RwLock<Option<Arc<TrafficStore>>>,
-    sender: RwLock<Option<Arc<dyn RepeaterSender>>>,
+    sender: RwLock<Option<Arc<dyn ResendSender>>>,
     scope: RwLock<Option<EngagementScope>>,
-    contexts: Mutex<BTreeMap<String, RepeaterContext>>,
+    contexts: Mutex<BTreeMap<String, ResendContext>>,
 }
 
-impl std::fmt::Debug for RepeaterWorkbench {
+impl std::fmt::Debug for ResendWorkbench {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RepeaterWorkbench")
+            .debug_struct("ResendWorkbench")
             .field("context_count", &self.list().len())
             .finish_non_exhaustive()
     }
 }
 
-impl Default for RepeaterWorkbench {
+impl Default for ResendWorkbench {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RepeaterWorkbench {
-    /// Creates an empty repeater surface.
+impl ResendWorkbench {
+    /// Creates an empty resend surface.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -110,7 +110,7 @@ impl RepeaterWorkbench {
     /// Returns the stable history diagnostic if persisted contexts cannot be
     /// loaded.
     pub fn attach_store(&self, store: Arc<TrafficStore>) -> Result<(), Diagnostic> {
-        let contexts = store.repeater_contexts()?;
+        let contexts = store.resend_contexts()?;
         if let Ok(mut current) = self.store.write() {
             *current = Some(store);
         }
@@ -126,31 +126,31 @@ impl RepeaterWorkbench {
     }
 
     /// Attaches the sender for the active routed proxy listener.
-    pub fn attach_sender(&self, sender: Arc<dyn RepeaterSender>) {
+    pub fn attach_sender(&self, sender: Arc<dyn ResendSender>) {
         if let Ok(mut current) = self.sender.write() {
             *current = Some(sender);
         }
     }
 
-    /// Sets the engagement scope used for repeater warnings and records.
+    /// Sets the engagement scope used for resend warnings and records.
     pub fn set_engagement_scope(&self, scope: EngagementScope) {
         if let Ok(mut current) = self.scope.write() {
             *current = Some(scope);
         }
     }
 
-    /// Lists independent repeater contexts.
+    /// Lists independent resend contexts.
     #[must_use]
-    pub fn list(&self) -> Vec<RepeaterContext> {
+    pub fn list(&self) -> Vec<ResendContext> {
         self.contexts
             .lock()
             .map(|contexts| contexts.values().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Reads one repeater context.
+    /// Reads one resend context.
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<RepeaterContext> {
+    pub fn get(&self, id: &str) -> Option<ResendContext> {
         self.contexts
             .lock()
             .ok()
@@ -163,14 +163,14 @@ impl RepeaterWorkbench {
     ///
     /// Returns a history diagnostic when the initial request cannot be
     /// persisted.
-    pub fn create_from_flow(&self, flow: &FlowDetail) -> Result<RepeaterContext, Diagnostic> {
+    pub fn create_from_flow(&self, flow: &FlowDetail) -> Result<ResendContext, Diagnostic> {
         let url = flow.summary.url.clone().ok_or_else(|| {
             request_diagnostic(
                 "create",
                 "captured flow has no exact request URL; refresh the flow and retry",
             )
         })?;
-        let request = RepeaterRequest {
+        let request = ResendRequest {
             method: flow
                 .summary
                 .method
@@ -191,11 +191,11 @@ impl RepeaterWorkbench {
     /// be persisted.
     pub fn create(
         &self,
-        request: RepeaterRequest,
+        request: ResendRequest,
         source_flow_id: Option<u64>,
-    ) -> Result<RepeaterContext, Diagnostic> {
+    ) -> Result<ResendContext, Diagnostic> {
         validate_request(&request)?;
-        let context = RepeaterContext {
+        let context = ResendContext {
             id: new_context_id(),
             source_flow_id,
             created_at: chrono::Utc::now(),
@@ -218,8 +218,8 @@ impl RepeaterWorkbench {
     pub fn update_request(
         &self,
         id: &str,
-        request: RepeaterRequest,
-    ) -> Result<RepeaterContext, Diagnostic> {
+        request: ResendRequest,
+    ) -> Result<ResendContext, Diagnostic> {
         validate_request(&request)?;
         let mut context = self
             .get(id)
@@ -236,7 +236,7 @@ impl RepeaterWorkbench {
     ///
     /// Returns a request diagnostic when the context or revision is absent,
     /// or a history diagnostic when the re-derived state cannot be saved.
-    pub fn derive(&self, id: &str, revision: u64) -> Result<RepeaterContext, Diagnostic> {
+    pub fn derive(&self, id: &str, revision: u64) -> Result<ResendContext, Diagnostic> {
         let mut context = self
             .get(id)
             .ok_or_else(|| request_diagnostic("derive", "context not found"))?;
@@ -259,7 +259,7 @@ impl RepeaterWorkbench {
     /// Returns a history diagnostic when the revision cannot be persisted.
     /// Transport and malformed-request failures are retained in the returned
     /// revision and diagnostics so the failed attempt is never hidden.
-    pub async fn send(&self, id: &str) -> Result<RepeaterSendResult, Diagnostic> {
+    pub async fn send(&self, id: &str) -> Result<ResendSendResult, Diagnostic> {
         let mut context = self
             .get(id)
             .ok_or_else(|| request_diagnostic("send", "context not found"))?;
@@ -282,7 +282,7 @@ impl RepeaterWorkbench {
                 (None, Some(diagnostic))
             }
         };
-        let revision = RepeaterRevision {
+        let revision = ResendRevision {
             revision: u64::try_from(context.history.len() + 1).unwrap_or(u64::MAX),
             sent_at: chrono::Utc::now(),
             request,
@@ -298,7 +298,7 @@ impl RepeaterWorkbench {
         context.history.push(revision.clone());
         self.persist(&context)?;
         self.replace_context(context.clone());
-        Ok(RepeaterSendResult {
+        Ok(ResendSendResult {
             context,
             revision,
             diagnostics,
@@ -309,13 +309,13 @@ impl RepeaterWorkbench {
     ///
     /// # Errors
     ///
-    /// Returns a repeater diagnostic for persistence/transport failures or a
+    /// Returns a resend diagnostic for persistence/transport failures or a
     /// session diagnostic if the audit record cannot be appended.
     pub async fn send_in_session(
         &self,
         id: &str,
         session: &mut Session,
-    ) -> Result<RepeaterSendResult, Diagnostic> {
+    ) -> Result<ResendSendResult, Diagnostic> {
         let result = self.send(id).await?;
         let (host, port) = url_target(&result.revision.request.url)
             .unwrap_or_else(|| ("unknown".to_owned(), None));
@@ -326,12 +326,12 @@ impl RepeaterWorkbench {
             ActionOutcome::Completed
         };
         session.record_action(ActionRecordInput {
-            id: format!("repeater:{}:{}", id, result.revision.revision),
+            id: format!("resend:{}:{}", id, result.revision.revision),
             occurred_at: result.revision.sent_at,
             actor: AuditActor::User,
             action: ActionDescriptor {
-                kind: "workbench.repeater.send".to_owned(),
-                summary: format!("Sent repeater revision {}", result.revision.revision),
+                kind: "workbench.resend.send".to_owned(),
+                summary: format!("Sent resend revision {}", result.revision.revision),
             },
             target,
             outcome,
@@ -340,16 +340,16 @@ impl RepeaterWorkbench {
         Ok(result)
     }
 
-    fn persist(&self, context: &RepeaterContext) -> Result<(), Diagnostic> {
+    fn persist(&self, context: &ResendContext) -> Result<(), Diagnostic> {
         let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
             return Err(
-                catalogue::PROXY_REPEATER_HISTORY_FAILED.instantiate(DiagnosticContext::new())
+                catalogue::PROXY_RESEND_HISTORY_FAILED.instantiate(DiagnosticContext::new())
             );
         };
-        store.upsert_repeater(context)
+        store.upsert_resend(context)
     }
 
-    fn replace_context(&self, context: RepeaterContext) {
+    fn replace_context(&self, context: ResendContext) {
         if let Ok(mut contexts) = self.contexts.lock() {
             contexts.insert(context.id.clone(), context);
         }
@@ -375,8 +375,8 @@ impl RepeaterWorkbench {
 async fn send_through_proxy(
     proxy_addr: std::net::SocketAddr,
     ca: SessionCa,
-    request: RepeaterRequest,
-) -> Result<RepeaterResponse, Diagnostic> {
+    request: ResendRequest,
+) -> Result<ResendResponse, Diagnostic> {
     validate_request(&request)?;
     let proxy = reqwest::Proxy::all(format!("http://{proxy_addr}"))
         .map_err(|error| request_diagnostic("proxy", &error.to_string()))?;
@@ -425,7 +425,7 @@ async fn send_through_proxy(
         .await
         .map(|body| (!body.is_empty()).then(|| body.to_vec()))
         .map_err(|error| request_diagnostic("response-body", &error.to_string()))?;
-    Ok(RepeaterResponse {
+    Ok(ResendResponse {
         status,
         headers,
         body,
@@ -433,7 +433,7 @@ async fn send_through_proxy(
     })
 }
 
-fn validate_request(request: &RepeaterRequest) -> Result<(), Diagnostic> {
+fn validate_request(request: &ResendRequest) -> Result<(), Diagnostic> {
     if request.method.trim().is_empty() {
         return Err(request_diagnostic("method", "HTTP method is empty"));
     }
@@ -475,7 +475,7 @@ fn new_context_id() -> String {
                 .to_le_bytes(),
         );
     }
-    let mut id = String::from("repeater-");
+    let mut id = String::from("resend-");
     for byte in bytes {
         use std::fmt::Write as _;
         let _ = write!(id, "{byte:02x}");
@@ -493,17 +493,17 @@ fn request_diagnostic(operation: &str, error: &str) -> Diagnostic {
         "error".to_owned(),
         DiagnosticValue::String(error.to_owned()),
     );
-    catalogue::PROXY_REPEATER_REQUEST_FAILED.instantiate(context)
+    catalogue::PROXY_RESEND_REQUEST_FAILED.instantiate(context)
 }
 
 fn outside_scope_diagnostic(url: &str) -> Diagnostic {
     let mut context = DiagnosticContext::new();
     context.insert("url".to_owned(), DiagnosticValue::String(url.to_owned()));
-    catalogue::PROXY_REPEATER_OUTSIDE_SCOPE.instantiate(context)
+    catalogue::PROXY_RESEND_OUTSIDE_SCOPE.instantiate(context)
 }
 
 fn transport_unavailable() -> Diagnostic {
-    catalogue::PROXY_REPEATER_TRANSPORT_UNAVAILABLE.instantiate(DiagnosticContext::new())
+    catalogue::PROXY_RESEND_TRANSPORT_UNAVAILABLE.instantiate(DiagnosticContext::new())
 }
 
 #[cfg(test)]
@@ -518,13 +518,13 @@ mod tests {
     #[derive(Debug)]
     struct MockSender;
 
-    impl RepeaterSender for MockSender {
+    impl ResendSender for MockSender {
         fn send(
             &self,
-            _request: RepeaterRequest,
-        ) -> crate::backend::BackendFuture<Result<RepeaterResponse, Diagnostic>> {
+            _request: ResendRequest,
+        ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>> {
             Box::pin(async {
-                Ok(RepeaterResponse {
+                Ok(ResendResponse {
                     status: 200,
                     headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                     body: Some(b"{\"ok\":true}".to_vec()),
@@ -536,17 +536,17 @@ mod tests {
 
     fn store() -> Arc<TrafficStore> {
         let path = env::temp_dir().join(format!(
-            "apiaxess-repeater-{}",
+            "apiaxess-resend-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
         ));
-        Arc::new(TrafficStore::open(&path, "session:repeater-test").expect("store"))
+        Arc::new(TrafficStore::open(&path, "session:resend-test").expect("store"))
     }
 
-    fn request() -> RepeaterRequest {
-        RepeaterRequest {
+    fn request() -> ResendRequest {
+        ResendRequest {
             method: "POST".to_owned(),
             url: "https://api.example.test/items".to_owned(),
             headers: vec![("content-type".to_owned(), "application/json".to_owned())],
@@ -557,18 +557,18 @@ mod tests {
     #[tokio::test]
     async fn send_appends_history_and_hydrates_again() {
         let store = store();
-        let repeater = RepeaterWorkbench::new();
-        repeater.attach_store(Arc::clone(&store)).expect("attach");
-        repeater.attach_sender(Arc::new(MockSender));
-        let context = repeater.create(request(), None).expect("create");
-        let result = repeater.send(&context.id).await.expect("send");
+        let resend = ResendWorkbench::new();
+        resend.attach_store(Arc::clone(&store)).expect("attach");
+        resend.attach_sender(Arc::new(MockSender));
+        let context = resend.create(request(), None).expect("create");
+        let result = resend.send(&context.id).await.expect("send");
         assert_eq!(
             result.revision.response.as_ref().map(|r| r.status),
             Some(200)
         );
         assert_eq!(result.context.history.len(), 1);
 
-        let restored = RepeaterWorkbench::new();
+        let restored = ResendWorkbench::new();
         restored.attach_store(store).expect("restore");
         assert_eq!(restored.get(&context.id).expect("context").history.len(), 1);
         restored.derive(&context.id, 1).expect("derive");
@@ -576,21 +576,21 @@ mod tests {
 
     #[tokio::test]
     async fn missing_transport_is_a_recorded_diagnostic_not_a_direct_fallback() {
-        let repeater = RepeaterWorkbench::new();
-        repeater.attach_store(store()).expect("attach");
-        let context = repeater.create(request(), None).expect("create");
-        let result = repeater.send(&context.id).await.expect("record failure");
+        let resend = ResendWorkbench::new();
+        resend.attach_store(store()).expect("attach");
+        let context = resend.create(request(), None).expect("create");
+        let result = resend.send(&context.id).await.expect("record failure");
         assert_eq!(
             result.revision.diagnostic.as_ref().map(|d| d.id.as_ref()),
-            Some("proxy.repeater-transport-unavailable")
+            Some("proxy.resend-transport-unavailable")
         );
         assert_eq!(result.context.history.len(), 1);
     }
 
     #[test]
     fn create_from_flow_preserves_scheme_port_path_and_query() {
-        let repeater = RepeaterWorkbench::new();
-        repeater.attach_store(store()).expect("attach");
+        let resend = ResendWorkbench::new();
+        resend.attach_store(store()).expect("attach");
         let flow = FlowDetail {
             summary: FlowSummary {
                 id: 9,
@@ -609,9 +609,9 @@ mod tests {
             request_body: None,
             response_body: None,
         };
-        let context = repeater
+        let context = resend
             .create_from_flow(&flow)
-            .expect("flow enters repeater");
+            .expect("flow enters resend");
         assert_eq!(
             context.current.url,
             "http://api.example.test:8080/items?id=7"

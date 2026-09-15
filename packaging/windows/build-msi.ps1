@@ -173,6 +173,9 @@ function Write-WixPayloadFragment {
                 $Xml.WriteAttributeString("Name", "APIaxess")
                 $Xml.WriteAttributeString("Description", "Launch the APIaxess local workbench")
                 $Xml.WriteAttributeString("WorkingDirectory", "INSTALLFOLDER")
+                # The desktop shell embeds the app icon; the Start Menu shortcut
+                # uses the same mark (Icon element defined in Product.wxs).
+                $Xml.WriteAttributeString("Icon", "AppIcon.exe")
                 $Xml.WriteEndElement()
             }
             $Xml.WriteEndElement()
@@ -520,6 +523,10 @@ if ($LASTEXITCODE -ne 0 -or -not $reportedWixVersion.StartsWith($WixVersion, [Sy
     throw "Expected WiX $WixVersion at $wix; found '$reportedWixVersion'."
 }
 
+# The branded wizard (Product.wxs references WixUI_Minimal) needs the WiX UI
+# extension. Add it version-pinned so `wix build -ext` below resolves it.
+Invoke-Checked $wix "extension" "add" "WixToolset.UI.wixext/$WixVersion"
+
 $payloadFragment = Join-Path $targetRoot "Payload.wxs"
 Write-WixPayloadFragment -StageDirectory $stageRoot -Destination $payloadFragment
 $msiName = "APIaxess-$productVersion-windows-$Architecture.msi"
@@ -528,7 +535,21 @@ if (Test-Path -LiteralPath $msiPath) {
     Remove-Item -LiteralPath $msiPath -Force
 }
 
-Invoke-Checked $wix "build" (Join-Path $PSScriptRoot "Product.wxs") $payloadFragment "-arch" $Architecture "-d" "ProductVersion=$productVersion" "-d" "ProductCode=$productCode" "-bindpath" "Stage=$stageRoot" "-intermediateFolder" $intermediateRoot "-pdbtype" "none" "-out" $msiPath
+$licenseRtf = Join-Path $PSScriptRoot "License.rtf"
+if (-not (Test-Path -LiteralPath $licenseRtf -PathType Leaf)) {
+    throw "The installer license is missing at $licenseRtf."
+}
+# Branded wizard graphics (identity-kit mark) referenced by Product.wxs as the
+# WixUIBannerBmp / WixUIDialogBmp variables. Regenerate with
+# scratchpad gen-installer-bmps if the mark changes.
+$bannerBmp = Join-Path $PSScriptRoot "banner.bmp"
+$dialogBmp = Join-Path $PSScriptRoot "dialog.bmp"
+foreach ($brandBmp in @($bannerBmp, $dialogBmp)) {
+    if (-not (Test-Path -LiteralPath $brandBmp -PathType Leaf)) {
+        throw "The branded installer bitmap is missing at $brandBmp."
+    }
+}
+Invoke-Checked $wix "build" (Join-Path $PSScriptRoot "Product.wxs") $payloadFragment "-arch" $Architecture "-ext" "WixToolset.UI.wixext" "-d" "ProductVersion=$productVersion" "-d" "ProductCode=$productCode" "-d" "LicenseRtf=$licenseRtf" "-d" "BannerBmp=$bannerBmp" "-d" "DialogBmp=$dialogBmp" "-bindpath" "Stage=$stageRoot" "-intermediateFolder" $intermediateRoot "-pdbtype" "none" "-out" $msiPath
 
 $msiHash = (Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash.ToLowerInvariant()
 "$msiHash  $msiName" | Set-Content -LiteralPath "$msiPath.sha256" -Encoding ascii

@@ -130,6 +130,10 @@ fn main() {
                         // frame arrives; on the Ink ground that reads as a
                         // flash. Matching the window to the theme removes it.
                         .background_color(tauri::window::Color(0x0d, 0x0d, 0x0d, 0xff))
+                        // Set the window/taskbar/title-bar icon explicitly to the
+                        // identity-kit mark, so it never falls back to a generic
+                        // placeholder regardless of how the exe resource is built.
+                        .icon(app_window_icon()?)?
                         .build()?;
                 }
                 LaunchMode::Browser => {
@@ -144,6 +148,7 @@ fn main() {
                     .inner_size(540.0, 460.0)
                     .min_inner_size(380.0, 340.0)
                     .background_color(tauri::window::Color(0x0d, 0x0d, 0x0d, 0xff))
+                    .icon(app_window_icon()?)?
                     .initialization_script(format!("window.__APIAXESS_URL__ = {injected};"))
                     .build()?;
                 }
@@ -157,6 +162,13 @@ fn main() {
                 stop_engine(&exit_slot);
             }
         });
+}
+
+/// The app's window icon — the identity-kit mark, embedded from the same PNG the
+/// installer and bundle use, so the taskbar, title bar, and Alt-Tab all show the
+/// real mark at a crisp size rather than any generic default.
+fn app_window_icon() -> tauri::Result<tauri::image::Image<'static>> {
+    tauri::image::Image::from_bytes(include_bytes!("../icons/128x128@2x.png"))
 }
 
 /// Determines the launch mode: an explicit env override wins, then the remembered

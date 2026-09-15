@@ -1,0 +1,94 @@
+/*
+ * APIaxess shell tokens — the desktop-application design vocabulary.
+ *
+ * These are the `--s-*` variables from the production design spec
+ * (`assets/brand/production-spec/01 Shell tokens components`). The sheet is the
+ * source of truth: every colour, the row height, and the two font families are
+ * lifted verbatim from its `:root` blocks. Nothing else in the shell may
+ * hard-code a colour — a CI check (`pnpm --filter @apiaxess/gui lint:tokens`)
+ * fails the build on any hex literal outside this file.
+ *
+ * Two complete mappings, matching the two spec sheets:
+ *   :root                       DARK values (from the "- Dark" sheet). This is
+ *                               the app's pre-paint default, so it needs no
+ *                               attribute — `index.html` sets data-theme before
+ *                               first paint and dark is the fallback.
+ *   :root[data-theme="light"]   LIGHT values (from the "- Light" sheet),
+ *                               restated in full and selected by the theme
+ *                               toggle in `ui/theme.ts` with no restart.
+ *
+ * Because `[data-theme="light"]` outranks `:root`, dark stays correct whether
+ * the shell writes data-theme="dark" explicitly or leaves it unset.
+ *
+ * `--s-mono` / `--s-ui` name the families; the self-hosted @font-face rules
+ * that back them are delivered in the type step.
+ */
+
+:root {
+  /* Grounds and selection */
+  --s-bg: #1b1a19;
+  --s-surface: #232221;
+  --s-surface2: #282726;
+  --s-sel: #17293f;
+  --s-selrule: #4c93ff;
+
+  /* Ink */
+  --s-ink: #edebe9;
+  --s-ink2: #b3afab;
+  --s-ink3: #7b7773;
+
+  /* Lines, rules, tracks */
+  --s-line: #37342f;
+  --s-line2: #2c2b29;
+  --s-rule: #4a4642;
+  --s-track: #343130;
+
+  /* Accent */
+  --s-blue: #4c93ff;
+  --s-blue2: #7fb1ff;
+  --s-onblue: #0e1620;
+
+  /* Failure */
+  --s-red: #e8735c;
+  --s-redbg: #2c1815;
+
+  /* Elevation and scrim */
+  --s-shadow: rgba(0, 0, 0, 0.55);
+  --s-scrim: rgba(27, 26, 25, 0.62);
+
+  /* Metrics and type families */
+  --s-row: 25px;
+  --s-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --s-ui: "Archivo", sans-serif;
+}
+
+:root[data-theme="light"] {
+  --s-bg: #f3f2f2;
+  --s-surface: #ffffff;
+  --s-surface2: #fafaf9;
+  --s-sel: #ecf3fe;
+  --s-selrule: #2d7ff9;
+
+  --s-ink: #0d0d0d;
+  --s-ink2: #4a4948;
+  --s-ink3: #8a8a8a;
+
+  --s-line: #dcdbda;
+  --s-line2: #eae9e8;
+  --s-rule: #0d0d0d;
+  --s-track: #e3e2e1;
+
+  --s-blue: #2d7ff9;
+  --s-blue2: #1b5fc4;
+  --s-onblue: #ffffff;
+
+  --s-red: #b0230c;
+  --s-redbg: #fbeeeb;
+
+  --s-shadow: rgba(0, 0, 0, 0.16);
+  --s-scrim: rgba(243, 242, 242, 0.55);
+
+  --s-row: 25px;
+  --s-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --s-ui: "Archivo", sans-serif;
+}

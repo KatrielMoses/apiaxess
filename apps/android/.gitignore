@@ -1,0 +1,19 @@
+# Android / Gradle build outputs — never committed.
+.gradle/
+build/
+/app/build/
+/app/.cxx/
+/captures/
+/artifacts/
+
+# Local SDK location and secrets.
+local.properties
+*.keystore
+*.jks
+
+# IDE
+.idea/
+*.iml
+
+# The Gradle wrapper JAR is a binary; regenerate with `gradle wrapper` (see README).
+gradle/wrapper/gradle-wrapper.jar

@@ -66,9 +66,12 @@
   /* ---------------------------------------------------------------- *
    * 3. Typography
    * ---------------------------------------------------------------- */
-  --font-sans: "Outfit", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --font-mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", "SF Mono",
-    "Menlo", "Consolas", monospace;
+  /* The desktop shell's faces (production spec): Archivo for UI, IBM Plex Mono
+     for all data. Both are self-hosted in base.css. Outfit is retained only for
+     the brand wordmark, which pins it directly. */
+  --font-sans: "Archivo", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", "JetBrains Mono",
+    "SF Mono", "Menlo", "Consolas", monospace;
 
   --weight-regular: 400;
   --weight-medium: 500;

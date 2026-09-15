@@ -1,6 +1,8 @@
 //! Robustness heuristics: dialog handling and login/OTP detection.
 
-use crate::credentials::{CredentialField, CredentialKind, CredentialPromptReason, CredentialRequest};
+use crate::credentials::{
+    CredentialField, CredentialKind, CredentialPromptReason, CredentialRequest,
+};
 use crate::hierarchy::{Hierarchy, UiNode};
 
 /// A dialog button the crawler should press to keep making progress.
@@ -16,16 +18,42 @@ pub struct DialogAction {
 
 /// Buttons that advance permission/consent dialogs (press to proceed).
 const ALLOW_LABELS: &[&str] = &[
-    "allow", "allow all the time", "while using the app", "only this time",
-    "accept", "accept all", "agree", "i agree", "ok", "okay", "got it",
-    "continue", "grant", "yes", "enable", "turn on", "next", "done",
+    "allow",
+    "allow all the time",
+    "while using the app",
+    "only this time",
+    "accept",
+    "accept all",
+    "agree",
+    "i agree",
+    "ok",
+    "okay",
+    "got it",
+    "continue",
+    "grant",
+    "yes",
+    "enable",
+    "turn on",
+    "next",
+    "done",
 ];
 
 /// Buttons that dismiss onboarding/update/rate/crash dialogs.
 const DISMISS_LABELS: &[&str] = &[
-    "not now", "later", "maybe later", "no thanks", "no, thanks", "skip",
-    "skip for now", "dismiss", "close", "cancel", "deny", "don't allow",
-    "remind me later", "no",
+    "not now",
+    "later",
+    "maybe later",
+    "no thanks",
+    "no, thanks",
+    "skip",
+    "skip for now",
+    "dismiss",
+    "close",
+    "cancel",
+    "deny",
+    "don't allow",
+    "remind me later",
+    "no",
 ];
 
 /// Android system permission-dialog button resource-ids.
@@ -109,7 +137,11 @@ pub const SIGN_IN_AFFORDANCES: &[&str] = &[
 /// matches registration screens — the operator can still choose to supply
 /// values or continue without.
 #[must_use]
-pub fn detect_login(hierarchy: &Hierarchy, package: &str, activity: &str) -> Option<CredentialRequest> {
+pub fn detect_login(
+    hierarchy: &Hierarchy,
+    package: &str,
+    activity: &str,
+) -> Option<CredentialRequest> {
     let editables: Vec<&UiNode> = hierarchy
         .nodes
         .iter()
@@ -119,16 +151,19 @@ pub fn detect_login(hierarchy: &Hierarchy, package: &str, activity: &str) -> Opt
         return None;
     }
     let has_password = editables.iter().any(|node| node.password);
-    let has_signin_affordance = hierarchy.actionable().iter().any(|node| {
-        node.clickable && label_matches(node, SIGN_IN_AFFORDANCES)
-    });
+    let has_signin_affordance = hierarchy
+        .actionable()
+        .iter()
+        .any(|node| node.clickable && label_matches(node, SIGN_IN_AFFORDANCES));
     // A login/OTP/auth-named activity with an input field is a login gate even
     // when its submit button is disabled until valid input (so it isn't yet a
     // clickable affordance) — the common phone-number → "Get OTP" pattern.
     let activity_lc = activity.to_ascii_lowercase();
-    let activity_is_auth = ["login", "signin", "sign_in", "sign-in", "otp", "auth", "register"]
-        .iter()
-        .any(|needle| activity_lc.contains(needle));
+    let activity_is_auth = [
+        "login", "signin", "sign_in", "sign-in", "otp", "auth", "register",
+    ]
+    .iter()
+    .any(|needle| activity_lc.contains(needle));
     if !has_password && !has_signin_affordance && !activity_is_auth {
         return None;
     }
@@ -153,12 +188,23 @@ pub fn detect_login(hierarchy: &Hierarchy, package: &str, activity: &str) -> Opt
 /// Detects an OTP/verification-code gate: an enabled text field whose identity
 /// signals a one-time code, with no password field present.
 #[must_use]
-pub fn detect_otp(hierarchy: &Hierarchy, package: &str, activity: &str) -> Option<CredentialRequest> {
+pub fn detect_otp(
+    hierarchy: &Hierarchy,
+    package: &str,
+    activity: &str,
+) -> Option<CredentialRequest> {
     let otp_node = hierarchy.nodes.iter().find(|node| {
-        node.editable && node.enabled && node.bounds.is_tappable() && infer_kind(node) == CredentialKind::Otp
+        node.editable
+            && node.enabled
+            && node.bounds.is_tappable()
+            && infer_kind(node) == CredentialKind::Otp
     })?;
     // If a password field is present it is a login gate, not an OTP gate.
-    if hierarchy.nodes.iter().any(|node| node.editable && node.password) {
+    if hierarchy
+        .nodes
+        .iter()
+        .any(|node| node.editable && node.password)
+    {
         return None;
     }
     let field = field_from_node(otp_node, 0);
@@ -194,7 +240,11 @@ fn field_label(node: &UiNode) -> String {
     } else if !node.text.is_empty() && !node.password {
         node.text.clone()
     } else if !node.resource_id.is_empty() {
-        node.resource_id.rsplit('/').next().unwrap_or("field").to_owned()
+        node.resource_id
+            .rsplit('/')
+            .next()
+            .unwrap_or("field")
+            .to_owned()
     } else {
         "field".to_owned()
     };
@@ -216,7 +266,18 @@ pub fn infer_kind(node: &UiNode) -> CredentialKind {
         }
         return CredentialKind::Password;
     }
-    if identity_contains(node, &["otp", "one-time", "one time", "verification", "verify", "2fa", "code"]) {
+    if identity_contains(
+        node,
+        &[
+            "otp",
+            "one-time",
+            "one time",
+            "verification",
+            "verify",
+            "2fa",
+            "code",
+        ],
+    ) {
         return CredentialKind::Otp;
     }
     if identity_contains(node, &["email", "e-mail"]) {
@@ -251,7 +312,9 @@ fn identity_contains(node: &UiNode, needles: &[&str]) -> bool {
 fn label_matches(node: &UiNode, labels: &[&str]) -> bool {
     let text = node_text(node).to_ascii_lowercase();
     let text = text.trim();
-    labels.iter().any(|label| text == *label || text.starts_with(label))
+    labels
+        .iter()
+        .any(|label| text == *label || text.starts_with(label))
 }
 
 fn node_text(node: &UiNode) -> String {

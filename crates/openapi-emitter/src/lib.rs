@@ -40,7 +40,7 @@ pub struct OpenApiEmitter {
 impl Default for OpenApiEmitter {
     fn default() -> Self {
         Self {
-            title: "APIxess recovered API".to_owned(),
+            title: "APIaxess recovered API".to_owned(),
             version: "0.1.0".to_owned(),
             minimum_dynamic_samples: NonZeroU64::new(DEFAULT_MINIMUM_DYNAMIC_SAMPLES)
                 .expect("the default threshold is non-zero"),
@@ -1545,7 +1545,7 @@ mod tests {
             serde_json::to_vec(&second.document).expect("json")
         );
         assert_eq!(first.document["openapi"], OPENAPI_VERSION);
-        assert_eq!(first.document["info"]["title"], "APIxess recovered API");
+        assert_eq!(first.document["info"]["title"], "APIaxess recovered API");
         assert!(first.document["paths"].is_object());
         assert!(first.document["x-apiaxess-coverage"].is_object());
     }

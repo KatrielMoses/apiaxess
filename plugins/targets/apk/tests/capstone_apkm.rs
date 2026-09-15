@@ -809,7 +809,7 @@ fn real_apkm_capstone_evidence() {
             mechanism: L3Mechanism::Iptables,
             lease_id: request.lease_id.clone(),
         },
-        CaTrustConfig::for_tier(SandboxTier::Avd, "openssl", &request.lease_id),
+        CaTrustConfig::for_tier(SandboxTier::Avd, &request.lease_id),
         Arc::new(ProcessToolRunner),
         None,
     )) {

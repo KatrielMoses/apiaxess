@@ -1,8 +1,12 @@
 //! Loopback HTTP/WebSocket transport and static GUI asset serving.
 
+mod pairing;
 mod settings;
+mod stream_proxy;
 
 pub use settings::persisted_env_overrides;
+
+use pairing::{DevicePairingRegistry, PairingOutcome, PendingPairingRegistry};
 
 use std::{
     collections::BTreeMap,
@@ -18,13 +22,16 @@ use apiaxess_engine_shell::{
 };
 use apiaxess_session::EngagementScope;
 use apiaxess_workbench_proxy::{
-    FlowDetail, FlowSummary, InterceptDecision, LiveWorkbench, RepeaterRequest,
+    FlowDetail, FlowSummary, InterceptDecision, LiveWorkbench, ResendRequest,
 };
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path as AxumPath, Query, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode, header::ORIGIN},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN},
+    },
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -49,6 +56,7 @@ pub fn router(engine: Engine, gui_directory: &Path) -> io::Result<Router> {
 /// # Errors
 ///
 /// Returns an I/O error when the built GUI entry point is unavailable.
+#[allow(clippy::too_many_lines)] // A flat, auditable route table reads better than split builders.
 pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::Result<Router> {
     let index = gui_directory.join("index.html");
     index.metadata()?;
@@ -57,13 +65,45 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         engine,
         expected_origin: Arc::from(format!("http://127.0.0.1:{port}")),
         pipeline_runs: PipelineRegistry::default(),
+        pairing: DevicePairingRegistry::default(),
+        pending_pairing: PendingPairingRegistry::default(),
+        gui_port: port,
     };
 
     Ok(Router::new()
         .route("/api/v1/system/status", get(system_status))
+        .route("/api/v1/pick-file", axum::routing::post(pick_file))
         .route(
             "/api/v1/settings",
             get(get_settings).put(update_settings_handler),
+        )
+        .route("/api/v1/pairing/ca", get(pairing_ca))
+        .route(
+            "/api/v1/pairing/token",
+            axum::routing::post(mint_pairing_token),
+        )
+        .route(
+            "/api/v1/pairing/exchange",
+            axum::routing::post(exchange_pairing_token),
+        )
+        .route(
+            "/api/v1/pairing/exchange/{request_id}",
+            get(poll_pairing_exchange),
+        )
+        .route("/api/v1/pairing/devices", get(pairing_devices))
+        .route("/api/v1/pairing/arm", axum::routing::post(arm_pairing))
+        .route("/api/v1/pairing/pending", get(list_pending_pairing))
+        .route(
+            "/api/v1/pairing/pending/{request_id}/accept",
+            axum::routing::post(accept_pairing),
+        )
+        .route(
+            "/api/v1/pairing/pending/{request_id}/decline",
+            axum::routing::post(decline_pairing),
+        )
+        .route(
+            "/api/v1/pairing/devices/{serial}/bypass",
+            axum::routing::post(bypass_device),
         )
         .route("/api/v1/session", get(session_status))
         .route(
@@ -110,44 +150,81 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         .route("/api/v1/workbench/intercept/pending", get(pending_flows))
         .route("/api/v1/workbench/har", get(export_har).post(import_har))
         .route(
-            "/api/v1/workbench/repeater",
-            get(list_repeater).post(create_repeater),
+            "/api/v1/workbench/resend",
+            get(list_resend).post(create_resend),
         )
         .route(
-            "/api/v1/workbench/repeater/{context_id}",
-            get(get_repeater).put(update_repeater),
+            "/api/v1/workbench/resend/{context_id}",
+            get(get_resend).put(update_resend),
         )
         .route(
-            "/api/v1/workbench/repeater/{context_id}/send",
-            axum::routing::post(send_repeater),
+            "/api/v1/workbench/resend/{context_id}/send",
+            axum::routing::post(send_resend),
         )
         .route(
-            "/api/v1/workbench/repeater/{context_id}/derive/{revision}",
-            axum::routing::post(derive_repeater),
+            "/api/v1/workbench/resend/{context_id}/derive/{revision}",
+            axum::routing::post(derive_resend),
         )
         .route(
-            "/api/v1/workbench/intruder",
-            get(list_intruder).post(create_intruder),
+            "/api/v1/workbench/fuzzer",
+            get(list_fuzzer).post(create_fuzzer),
         )
-        .route("/api/v1/workbench/intruder/{job_id}", get(get_intruder))
+        .route("/api/v1/workbench/fuzzer/{job_id}", get(get_fuzzer))
         .route(
-            "/api/v1/workbench/intruder/{job_id}/start",
-            axum::routing::post(start_intruder),
-        )
-        .route(
-            "/api/v1/workbench/intruder/{job_id}/pause",
-            axum::routing::post(pause_intruder),
+            "/api/v1/workbench/fuzzer/{job_id}/start",
+            axum::routing::post(start_fuzzer),
         )
         .route(
-            "/api/v1/workbench/intruder/{job_id}/resume",
-            axum::routing::post(resume_intruder),
+            "/api/v1/workbench/fuzzer/{job_id}/pause",
+            axum::routing::post(pause_fuzzer),
         )
         .route(
-            "/api/v1/workbench/intruder/{job_id}/stop",
-            axum::routing::post(stop_intruder),
+            "/api/v1/workbench/fuzzer/{job_id}/resume",
+            axum::routing::post(resume_fuzzer),
+        )
+        .route(
+            "/api/v1/workbench/fuzzer/{job_id}/stop",
+            axum::routing::post(stop_fuzzer),
         )
         .route("/api/v1/workbench/ws/control", get(control_ws))
         .route("/api/v1/workbench/ws/telemetry", get(telemetry_ws))
+        .route(
+            "/api/v1/workbench/ws/device/control",
+            get(device_control_ws),
+        )
+        // Phase D3: the workbench Android target panel — one-click launch, status
+        // polling, install-your-APK, and stop. All operator-gated.
+        .route("/api/v1/android-target/status", get(android_target_status))
+        .route(
+            "/api/v1/android-target/launch",
+            axum::routing::post(launch_android_target),
+        )
+        .route(
+            "/api/v1/android-target/install-apk",
+            axum::routing::post(install_target_apk),
+        )
+        .route(
+            "/api/v1/android-target/stop",
+            axum::routing::post(stop_android_target),
+        )
+        // Phase D2: the authenticated reverse-proxy for the GUI Android target's
+        // ws-scrcpy screen stream (HTTP + WebSocket upgrade). ws-scrcpy is bound to
+        // loopback and never reachable directly; this is the only door to it.
+        // Three patterns: the bare base, the base with a trailing slash (the URL the
+        // embedded iframe loads and ws-scrcpy serves its app from — axum's `{*rest}`
+        // wildcard does not match an empty trailing segment), and everything below it.
+        .route(
+            "/android-stream",
+            axum::routing::any(stream_proxy::stream_proxy),
+        )
+        .route(
+            "/android-stream/",
+            axum::routing::any(stream_proxy::stream_proxy),
+        )
+        .route(
+            "/android-stream/{*rest}",
+            axum::routing::any(stream_proxy::stream_proxy),
+        )
         .fallback_service(gui_assets)
         .with_state(state))
 }
@@ -157,6 +234,12 @@ struct ApiState {
     engine: Engine,
     expected_origin: Arc<str>,
     pipeline_runs: PipelineRegistry,
+    pairing: DevicePairingRegistry,
+    /// Devices awaiting the operator accept/decline gate (Phase C5).
+    pending_pairing: PendingPairingRegistry,
+    /// The GUI/control loopback port this router is bound to; carried into the
+    /// pairing QR and used to arm a device's control-channel reverse tunnel.
+    gui_port: u16,
 }
 
 #[derive(Clone, Default)]
@@ -203,6 +286,17 @@ struct SurfaceSummaryResponse {
 struct SurfaceEndpointSummary {
     method: String,
     path_template: String,
+    /// Resolved base URL, when statically recovered — the host the GUI labels
+    /// first- vs third-party so the tester can tell the app's own API from the
+    /// SDK/tracker hosts it also talks to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    /// `confirmed` when at least one of the endpoint's facts was observed in
+    /// dynamic capture (the app was actually seen hitting it), else
+    /// `static_inferred` — a static candidate not observed being hit (e.g. a
+    /// bundled SDK's configured base URL). Lets the GUI mark inferred candidates
+    /// distinctly from confirmed surface so neither is presented as the other.
+    evidence_source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     minimum_fact_confidence: Option<f64>,
     signer_count: usize,
@@ -313,6 +407,91 @@ struct TokenQuery {
     token: String,
 }
 
+/// Response for `POST /api/v1/pairing/token`: the one-time pairing token the
+/// operator hands to a device (the C5 QR encodes this), the fingerprint of the
+/// CA the device must pin, and the pairing token's expiry.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingTokenResponse {
+    pairing_token: String,
+    expires_at_ms: u64,
+    ca_fingerprint_sha256: String,
+}
+
+/// Request body for `POST /api/v1/pairing/exchange`: the one-time pairing token a
+/// device presents, plus a friendly name for the operator's accept prompt.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingExchangeRequest {
+    pairing_token: String,
+    #[serde(default)]
+    device_name: Option<String>,
+}
+
+/// Response for `POST /api/v1/pairing/exchange`: the device is now awaiting the
+/// operator's accept/decline. It polls the request id for the outcome (Phase C5).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingExchangeAck {
+    request_id: String,
+    status: &'static str,
+}
+
+/// Response for `GET /api/v1/pairing/exchange/{request_id}`: the operator decision.
+/// On `accepted` it carries the per-session bearer token; nothing before that.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingPollResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<u64>,
+}
+
+/// Request body for `POST /api/v1/pairing/arm` (operator): the adb serial to arm
+/// pairing for. The minted token is bound to it so accepting provisions it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArmPairingRequest {
+    #[serde(default)]
+    serial: Option<String>,
+}
+
+/// Everything the QR encodes so a device can connect and pin the workbench —
+/// host/port, the one-time pairing token, and the CA SHA-256 fingerprint. Its JSON
+/// (camelCase) is exactly what the QR carries and what the client parses.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingQrPayload {
+    host: String,
+    control_port: u16,
+    proxy_port: u16,
+    pairing_token: String,
+    ca_fingerprint_sha256: String,
+    expires_at_ms: u64,
+}
+
+/// One attached device the operator can arm pairing for.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingDeviceView {
+    serial: String,
+    state: String,
+    description: String,
+}
+
+/// One device awaiting the operator's accept/decline decision.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingPairingView {
+    id: String,
+    device_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial: Option<String>,
+    requested_ago_ms: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlMessage {
@@ -361,6 +540,60 @@ async fn system_status(State(_state): State<ApiState>) -> Json<SystemStatus> {
         service: "APIaxess",
         state: "ready",
     })
+}
+
+/// Result of the native "Browse…" file picker.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickFileResponse {
+    /// Whether a native picker is available on this platform.
+    available: bool,
+    /// The full path the operator selected, or `null` if they cancelled.
+    path: Option<String>,
+}
+
+/// Opens a native OS file dialog and returns the selected artifact's full path.
+///
+/// The web GUI's `<input type="file">` exposes only a filename, never a path the
+/// engine can read from disk. On the desktop this endpoint opens the platform's
+/// own file dialog (which yields a real path) so "Browse…" fills the field
+/// directly. It is a local, single-operator, side-effectful action, so the modal
+/// runs on a blocking thread. Platforms without a bundled native picker report
+/// `available: false`, and the GUI falls back to the filename input.
+async fn pick_file(State(_state): State<ApiState>) -> Json<PickFileResponse> {
+    #[cfg(windows)]
+    {
+        let path = tokio::task::spawn_blocking(|| {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Select an Android package")
+                .add_filter("Android package", &["apk", "apks", "xapk", "aab"])
+                .add_filter("All files", &["*"]);
+            // Own the dialog to the current foreground window (the app the user
+            // just clicked "Browse" in) so it opens on top and focused, not behind
+            // the window where they'd have to hunt for it in the taskbar. Without
+            // an owner an unparented dialog from this server process can open
+            // behind the app. The Win32 handle is fetched via a tiny helper crate
+            // that isolates the required unsafe (this workspace forbids unsafe).
+            if let Some(parent) = apiaxess_native_dialog::foreground_window() {
+                dialog = dialog.set_parent(&parent);
+            }
+            dialog.pick_file()
+        })
+        .await
+        .ok()
+        .flatten();
+        Json(PickFileResponse {
+            available: true,
+            path: path.map(|path| path.display().to_string()),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        Json(PickFileResponse {
+            available: false,
+            path: None,
+        })
+    }
 }
 
 async fn get_settings(State(_state): State<ApiState>) -> Json<settings::SettingsView> {
@@ -509,7 +742,7 @@ async fn discovery_run(
     State(state): State<ApiState>,
     Json(input): Json<DiscoveryRequest>,
 ) -> Result<
-    Json<apiaxess_workbench_store::IntruderJob>,
+    Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
@@ -602,7 +835,10 @@ async fn start_pipeline(
             let staged = credentials
                 .into_iter()
                 .map(|credential| {
-                    (credential.key, apiaxess_engine_shell::Secret::from_text(&credential.value))
+                    (
+                        credential.key,
+                        apiaxess_engine_shell::Secret::from_text(&credential.value),
+                    )
                 })
                 .collect::<Vec<_>>();
             if !staged.is_empty() {
@@ -825,6 +1061,20 @@ fn surface_summary(surface: &apiaxess_api_model::UnifiedApiSurface) -> SurfaceSu
             .map(|endpoint| SurfaceEndpointSummary {
                 method: serialize_model_string(&endpoint.endpoint.identity.method),
                 path_template: serialize_model_string(&endpoint.endpoint.identity.path_template),
+                base_url: endpoint
+                    .endpoint
+                    .base_url
+                    .as_ref()
+                    .and_then(|fact| fact.selected_candidate())
+                    .map(|candidate| candidate.value.clone()),
+                evidence_source: if endpoint.fact_confidence.iter().any(|fact| {
+                    fact.sources
+                        .contains(&apiaxess_api_model::SourceType::DynamicCapture)
+                }) {
+                    "confirmed"
+                } else {
+                    "static_inferred"
+                },
                 minimum_fact_confidence: endpoint
                     .fact_confidence
                     .iter()
@@ -965,7 +1215,11 @@ impl PipelineRunResponse {
             status: entry.progress.status,
             progress_basis_points: entry.progress.progress_basis_points,
             message: entry.progress.message.clone(),
-            diagnostics: apiaxess_diagnostics::bounded_status_diagnostics(&entry.diagnostics, 8, 100),
+            diagnostics: apiaxess_diagnostics::bounded_status_diagnostics(
+                &entry.diagnostics,
+                8,
+                100,
+            ),
             dynamic_ran: entry.progress.dynamic_ran,
             updated_at: entry.progress.updated_at,
             surface_available: entry.surface.is_some(),
@@ -1171,25 +1425,25 @@ async fn import_har(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateRepeater {
+struct CreateResend {
     flow_id: Option<u64>,
-    request: Option<RepeaterRequest>,
+    request: Option<ResendRequest>,
 }
 
-async fn list_repeater(
+async fn list_resend(
     State(state): State<ApiState>,
-) -> Json<Vec<apiaxess_workbench_store::RepeaterContext>> {
-    Json(state.engine.repeater().list())
+) -> Json<Vec<apiaxess_workbench_store::ResendContext>> {
+    Json(state.engine.resend().list())
 }
 
-async fn create_repeater(
+async fn create_resend(
     State(state): State<ApiState>,
-    Json(input): Json<CreateRepeater>,
+    Json(input): Json<CreateResend>,
 ) -> Result<
-    Json<apiaxess_workbench_store::RepeaterContext>,
+    Json<apiaxess_workbench_store::ResendContext>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
-    let repeater = state.engine.repeater();
+    let resend = state.engine.resend();
     let context = if let Some(flow_id) = input.flow_id {
         let flow = state
             .engine
@@ -1203,28 +1457,28 @@ async fn create_repeater(
                     Json(catalogue::PROXY_LIVE_DESYNC.instantiate(DiagnosticContext::new())),
                 )
             })?;
-        repeater.create_from_flow(&flow)
+        resend.create_from_flow(&flow)
     } else if let Some(request) = input.request {
-        repeater.create(request, None)
+        resend.create(request, None)
     } else {
         return Err(storage_response(
-            catalogue::PROXY_REPEATER_REQUEST_FAILED.instantiate(DiagnosticContext::new()),
+            catalogue::PROXY_RESEND_REQUEST_FAILED.instantiate(DiagnosticContext::new()),
         ));
     }
     .map_err(storage_response)?;
     Ok(Json(context))
 }
 
-async fn get_repeater(
+async fn get_resend(
     State(state): State<ApiState>,
     AxumPath(context_id): AxumPath<String>,
 ) -> Result<
-    Json<apiaxess_workbench_store::RepeaterContext>,
+    Json<apiaxess_workbench_store::ResendContext>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .repeater()
+        .resend()
         .get(&context_id)
         .map(Json)
         .ok_or_else(|| {
@@ -1235,27 +1489,27 @@ async fn get_repeater(
         })
 }
 
-async fn update_repeater(
+async fn update_resend(
     State(state): State<ApiState>,
     AxumPath(context_id): AxumPath<String>,
-    Json(request): Json<RepeaterRequest>,
+    Json(request): Json<ResendRequest>,
 ) -> Result<
-    Json<apiaxess_workbench_store::RepeaterContext>,
+    Json<apiaxess_workbench_store::ResendContext>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .repeater()
+        .resend()
         .update_request(&context_id, request)
         .map(Json)
         .map_err(storage_response)
 }
 
-async fn send_repeater(
+async fn send_resend(
     State(state): State<ApiState>,
     AxumPath(context_id): AxumPath<String>,
 ) -> Result<
-    Json<apiaxess_workbench_proxy::RepeaterSendResult>,
+    Json<apiaxess_workbench_proxy::ResendSendResult>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     let runtime = state
@@ -1270,7 +1524,7 @@ async fn send_repeater(
     let mut session = runtime.session_snapshot().map_err(session_response)?;
     let result = state
         .engine
-        .repeater()
+        .resend()
         .send_in_session(&context_id, &mut session)
         .await
         .map_err(storage_response)?;
@@ -1278,52 +1532,52 @@ async fn send_repeater(
     Ok(Json(result))
 }
 
-async fn derive_repeater(
+async fn derive_resend(
     State(state): State<ApiState>,
     AxumPath((context_id, revision)): AxumPath<(String, u64)>,
 ) -> Result<
-    Json<apiaxess_workbench_store::RepeaterContext>,
+    Json<apiaxess_workbench_store::ResendContext>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .repeater()
+        .resend()
         .derive(&context_id, revision)
         .map(Json)
         .map_err(storage_response)
 }
 
-async fn list_intruder(
+async fn list_fuzzer(
     State(state): State<ApiState>,
-) -> Json<Vec<apiaxess_workbench_store::IntruderJob>> {
-    Json(state.engine.intruder().list())
+) -> Json<Vec<apiaxess_workbench_store::FuzzerJob>> {
+    Json(state.engine.fuzzer().list())
 }
 
-async fn create_intruder(
+async fn create_fuzzer(
     State(state): State<ApiState>,
-    Json(config): Json<apiaxess_workbench_store::IntruderConfig>,
+    Json(config): Json<apiaxess_workbench_store::FuzzerConfig>,
 ) -> Result<
-    Json<apiaxess_workbench_store::IntruderJob>,
+    Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .intruder()
+        .fuzzer()
         .create(config)
         .map(Json)
         .map_err(storage_response)
 }
 
-async fn get_intruder(
+async fn get_fuzzer(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<
-    Json<apiaxess_workbench_store::IntruderJob>,
+    Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .intruder()
+        .fuzzer()
         .get(&job_id)
         .map(Json)
         .ok_or_else(|| {
@@ -1334,11 +1588,11 @@ async fn get_intruder(
         })
 }
 
-async fn start_intruder(
+async fn start_fuzzer(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<
-    Json<apiaxess_workbench_store::IntruderJob>,
+    Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     let runtime = state
@@ -1351,19 +1605,19 @@ async fn start_intruder(
             )
         })?;
     let mut session = runtime.session_snapshot().map_err(session_response)?;
-    let intruder = state.engine.intruder();
-    let job = intruder
+    let fuzzer = state.engine.fuzzer();
+    let job = fuzzer
         .launch_in_session(&job_id, &mut session)
         .map_err(storage_response)?;
     runtime.replace_session(session).map_err(session_response)?;
 
     let watcher_runtime = runtime;
-    let watcher_intruder = intruder;
+    let watcher_fuzzer = fuzzer;
     let watcher_job_id = job_id.clone();
     let watcher_live = state.engine.live_workbench();
     tokio::spawn(async move {
         loop {
-            let Some(current) = watcher_intruder.get(&watcher_job_id) else {
+            let Some(current) = watcher_fuzzer.get(&watcher_job_id) else {
                 watcher_live.publish_diagnostic(
                     catalogue::PROXY_SESSION_AUDIT_FAILED.instantiate(DiagnosticContext::new()),
                 );
@@ -1371,9 +1625,9 @@ async fn start_intruder(
             };
             if matches!(
                 current.state,
-                apiaxess_workbench_store::IntruderJobState::Completed
-                    | apiaxess_workbench_store::IntruderJobState::Failed
-                    | apiaxess_workbench_store::IntruderJobState::Stopped
+                apiaxess_workbench_store::FuzzerJobState::Completed
+                    | apiaxess_workbench_store::FuzzerJobState::Failed
+                    | apiaxess_workbench_store::FuzzerJobState::Stopped
             ) {
                 let mut session = match watcher_runtime.session_snapshot() {
                     Ok(session) => session,
@@ -1383,7 +1637,7 @@ async fn start_intruder(
                     }
                 };
                 for result in current.results {
-                    let record_id = format!("intruder:{watcher_job_id}:{}", result.ordinal);
+                    let record_id = format!("fuzzer:{watcher_job_id}:{}", result.ordinal);
                     if session
                         .audit_trail()
                         .iter()
@@ -1391,7 +1645,7 @@ async fn start_intruder(
                     {
                         continue;
                     }
-                    if let Err(diagnostic) = watcher_intruder.record_result_in_session(
+                    if let Err(diagnostic) = watcher_fuzzer.record_result_in_session(
                         &watcher_job_id,
                         result.ordinal,
                         &mut session,
@@ -1413,49 +1667,529 @@ async fn start_intruder(
     Ok(Json(job))
 }
 
-async fn pause_intruder(
+async fn pause_fuzzer(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<
-    Json<apiaxess_workbench_store::IntruderJob>,
+    Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .intruder()
+        .fuzzer()
         .pause(&job_id)
         .map(Json)
         .map_err(storage_response)
 }
 
-async fn resume_intruder(
+async fn resume_fuzzer(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<
-    Json<apiaxess_workbench_store::IntruderJob>,
+    Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .intruder()
+        .fuzzer()
         .resume(&job_id)
         .map(Json)
         .map_err(storage_response)
 }
 
-async fn stop_intruder(
+async fn stop_fuzzer(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Result<
-    Json<apiaxess_workbench_store::IntruderJob>,
+    Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
     state
         .engine
-        .intruder()
+        .fuzzer()
         .stop(&job_id)
         .map(Json)
         .map_err(storage_response)
+}
+
+/// Serves the current session's root CA in PEM form.
+///
+/// This endpoint is intentionally public: it serves a public certificate, never
+/// a private key. A device pulls the live session CA here at pairing/connect
+/// time, so it never trusts a stale certificate. The trust anchor for the device
+/// is the CA SHA-256 fingerprint delivered out-of-band by the pairing token
+/// response (and, in C5, pinned in the QR); the device verifies the fetched PEM
+/// against that fingerprint, which is also echoed in the `x-apiaxess-ca-fingerprint`
+/// response header for convenience.
+async fn pairing_ca(State(state): State<ApiState>) -> Response {
+    let Some(ca) = state.engine.session_ca() else {
+        let diagnostic = catalogue::PAIRING_CA_UNAVAILABLE.instantiate(DiagnosticContext::new());
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(diagnostic)).into_response();
+    };
+    let pem = ca.root_certificate_pem().to_owned();
+    let fingerprint_header = HeaderValue::from_str(ca.fingerprint())
+        .unwrap_or_else(|_| HeaderValue::from_static("unavailable"));
+    (
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/x-pem-file"),
+            ),
+            (
+                HeaderName::from_static("x-apiaxess-ca-fingerprint"),
+                fingerprint_header,
+            ),
+        ],
+        pem,
+    )
+        .into_response()
+}
+
+/// Mints a one-time device pairing token (operator action).
+///
+/// This is the operator-side of pairing: only the trusted workbench UI may mint a
+/// token, so it is guarded by both the loopback `Origin` and the workbench session
+/// token — exactly the pair the browser control channel requires. A cross-origin
+/// device cannot reach this path, so it can never mint its own pairing token.
+async fn mint_pairing_token(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<PairingTokenResponse>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    let ca = state.engine.session_ca().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(catalogue::PAIRING_CA_UNAVAILABLE.instantiate(DiagnosticContext::new())),
+        )
+    })?;
+    let issued = state.pairing.issue_pairing_token(None).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(catalogue::PAIRING_TOKEN_REJECTED.instantiate(DiagnosticContext::new())),
+        )
+    })?;
+    Ok(Json(PairingTokenResponse {
+        pairing_token: issued.token,
+        expires_at_ms: issued.expires_at_ms,
+        ca_fingerprint_sha256: ca.fingerprint().to_owned(),
+    }))
+}
+
+/// Device-side of pairing (Phase C5): presents a one-time pairing token and enters
+/// the accept/decline gate.
+///
+/// Deliberately *not* origin-gated — a device is cross-origin. The pairing token
+/// (single-use, short-lived, and consumed here) proves the device holds a QR the
+/// operator showed. Consuming it does NOT issue a session token: the device is
+/// registered as a *pending* request and must wait for an explicit operator accept,
+/// which it learns by polling the returned `requestId`. A device without a valid
+/// token is rejected outright and never reaches the gate.
+async fn exchange_pairing_token(
+    State(state): State<ApiState>,
+    Json(request): Json<PairingExchangeRequest>,
+) -> Result<Json<PairingExchangeAck>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let claim = state
+        .pairing
+        .consume_pairing_token(&request.pairing_token)
+        .ok_or_else(|| {
+            let diagnostic =
+                catalogue::PAIRING_TOKEN_REJECTED.instantiate(DiagnosticContext::new());
+            state
+                .engine
+                .live_workbench()
+                .publish_diagnostic(diagnostic.clone());
+            (StatusCode::UNAUTHORIZED, Json(diagnostic))
+        })?;
+    let device_name = request
+        .device_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Unnamed device".to_owned());
+    let request_id = state
+        .pending_pairing
+        .register(device_name, claim.serial)
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(catalogue::PAIRING_TOKEN_REJECTED.instantiate(DiagnosticContext::new())),
+            )
+        })?;
+    Ok(Json(PairingExchangeAck {
+        request_id,
+        status: "pending",
+    }))
+}
+
+/// Device polls the operator's decision on its pending pairing request (Phase C5).
+async fn poll_pairing_exchange(
+    State(state): State<ApiState>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Result<Json<PairingPollResponse>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    match state.pending_pairing.poll(&request_id) {
+        PairingOutcome::Pending => Ok(Json(PairingPollResponse {
+            status: "pending",
+            session_token: None,
+            expires_at_ms: None,
+        })),
+        PairingOutcome::Accepted(token) => Ok(Json(PairingPollResponse {
+            status: "accepted",
+            session_token: Some(token.token),
+            expires_at_ms: Some(token.expires_at_ms),
+        })),
+        PairingOutcome::Declined => Err((
+            StatusCode::FORBIDDEN,
+            Json(catalogue::DEVICE_PAIRING_DECLINED.instantiate(DiagnosticContext::new())),
+        )),
+        PairingOutcome::Unknown => Err((
+            StatusCode::GONE,
+            Json(catalogue::DEVICE_PAIRING_REQUEST_EXPIRED.instantiate(DiagnosticContext::new())),
+        )),
+    }
+}
+
+/// Lists attached adb devices the operator can arm pairing for (operator-gated).
+async fn pairing_devices(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PairingDeviceView>>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    let devices = state
+        .engine
+        .detect_adb_devices()
+        .map_err(|diagnostic| (StatusCode::INTERNAL_SERVER_ERROR, Json(diagnostic)))?;
+    Ok(Json(
+        devices
+            .into_iter()
+            .map(|device| PairingDeviceView {
+                serial: device.serial,
+                state: format!("{:?}", device.state),
+                description: device.description,
+            })
+            .collect(),
+    ))
+}
+
+/// Arms pairing for a device (operator-gated): establishes the reverse tunnel so
+/// the device can reach the workbench, mints a one-time pairing token bound to the
+/// device serial, and returns the QR payload. This is transport + a token only — no
+/// trust is granted until the operator accepts the device's ensuing request.
+async fn arm_pairing(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ArmPairingRequest>,
+) -> Result<Json<PairingQrPayload>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    let ca = state.engine.session_ca().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(catalogue::PAIRING_CA_UNAVAILABLE.instantiate(DiagnosticContext::new())),
+        )
+    })?;
+    let proxy_port = state.engine.proxy_port().unwrap_or(8080);
+
+    // Arm the transport for a specific detected device so it can reach the
+    // workbench loopback to present its token. Skipped when no serial is given
+    // (e.g. an already-tunnelled device pairing manually).
+    if let Some(serial) = request.serial.as_deref() {
+        state
+            .engine
+            .arm_device_tunnel(serial, state.gui_port, proxy_port)
+            .map_err(|diagnostics| pairing_error(diagnostics, StatusCode::UNPROCESSABLE_ENTITY))?;
+    }
+
+    let issued = state
+        .pairing
+        .issue_pairing_token(request.serial)
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(catalogue::PAIRING_TOKEN_REJECTED.instantiate(DiagnosticContext::new())),
+            )
+        })?;
+    // The response body's JSON is exactly what the QR encodes and what the client
+    // parses — the GUI reads it verbatim and renders the QR from it, so it must
+    // stay the pure payload (no extra fields).
+    Ok(Json(PairingQrPayload {
+        host: "127.0.0.1".to_owned(),
+        control_port: state.gui_port,
+        proxy_port,
+        pairing_token: issued.token,
+        ca_fingerprint_sha256: ca.fingerprint().to_owned(),
+        expires_at_ms: issued.expires_at_ms,
+    }))
+}
+
+/// Lists devices awaiting the operator accept/decline decision (operator-gated).
+async fn list_pending_pairing(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PendingPairingView>>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    Ok(Json(
+        state
+            .pending_pairing
+            .list_pending()
+            .into_iter()
+            .map(|pending| PendingPairingView {
+                id: pending.id,
+                device_name: pending.device_name,
+                serial: pending.serial,
+                requested_ago_ms: pending.requested_ago_ms,
+            })
+            .collect(),
+    ))
+}
+
+/// Accepts a pending device (operator-gated) — THE gate that wraps C2 provisioning.
+///
+/// This is the only path that runs `provision_adb_device`: on accept the workbench
+/// provisions the armed device (system-CA install + optional frida) and issues the
+/// session token the device is polling for. Nothing here runs without the operator
+/// explicitly accepting, which closes the C2 "ungated provisioning" gap.
+async fn accept_pairing(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(request_id): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+
+    let serial = state
+        .pending_pairing
+        .serial_for_pending(&request_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(
+                    catalogue::DEVICE_PAIRING_REQUEST_EXPIRED.instantiate(DiagnosticContext::new()),
+                ),
+            )
+        })?;
+
+    // The gated trust-granting provisioning. Provision + start frida-server so a
+    // later pinned-app bypass (C4) can attach.
+    if let Some(serial) = serial.as_deref() {
+        state
+            .engine
+            .provision_device_retained(serial, true)
+            .map_err(|diagnostics| {
+                state.pending_pairing.decline(&request_id);
+                pairing_error(diagnostics, StatusCode::UNPROCESSABLE_ENTITY)
+            })?;
+    }
+
+    let session = state.pairing.issue_session_token().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(catalogue::PAIRING_TOKEN_REJECTED.instantiate(DiagnosticContext::new())),
+        )
+    })?;
+    if state.pending_pairing.accept(&request_id, session) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            Json(catalogue::DEVICE_PAIRING_REQUEST_EXPIRED.instantiate(DiagnosticContext::new())),
+        ))
+    }
+}
+
+/// Request body for `POST /api/v1/pairing/devices/{serial}/bypass`: the package of
+/// the pinned app the C3 client is capturing on that device.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BypassDeviceRequest {
+    package: String,
+}
+
+/// Response for the device pinning-bypass (Phase C4): the selected lane, the
+/// techniques actually applied, and whether the device's frida-server is up.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BypassDeviceResponse {
+    lane: String,
+    frida_server_started: bool,
+    applied_technique_ids: Vec<String>,
+    reason: String,
+}
+
+/// Runs the certificate-pinning bypass (Phase C4) against a captured pinned app on
+/// a paired device, by adb serial. Operator-gated. The device's C2 frida-server
+/// hosts instrumentation; the workbench attaches over the adb tunnel and applies
+/// the unpin techniques so the pinned app's HTTPS decrypts at the workbench.
+async fn bypass_device(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(serial): AxumPath<String>,
+    Json(body): Json<BypassDeviceRequest>,
+) -> Result<Json<BypassDeviceResponse>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+
+    let target = apiaxess_engine_shell::TargetInventory {
+        package_name: body.package.clone(),
+        apks: Vec::new(),
+        rooted_available: true,
+        frameworks: Vec::new(),
+        native_libraries: Vec::new(),
+        build_fingerprint: None,
+        escalation_boundaries: Vec::new(),
+        evidence: Vec::new(),
+    };
+    let mut request = apiaxess_engine_shell::DeviceBypassRequestSpec::new(
+        format!("device-bypass:{serial}"),
+        format!("device-bypass:{serial}:{}", body.package),
+        target,
+    );
+    // A paired physical/emulator device is instrumented in place, never patched.
+    request.install_patched_app = false;
+
+    match state.engine.bypass_pinning_on_device(&serial, &request) {
+        Ok((outcome, session)) => {
+            // The Frida session must outlive this request: dropping it unloads the
+            // injected script and removes the unpin hooks, so the pinned app would
+            // immediately pin again. Retain it for the workbench's lifetime so the
+            // bypass stays active while the C3 client captures the app. (Cleanup
+            // happens when the workbench process exits.)
+            std::mem::forget(session);
+            Ok(Json(BypassDeviceResponse {
+                lane: format!("{:?}", outcome.plan.lane),
+                frida_server_started: outcome.frida_server_started,
+                applied_technique_ids: outcome.applied_technique_ids,
+                reason: outcome.plan.reason,
+            }))
+        }
+        Err(diagnostics) => Err(pairing_error(diagnostics, StatusCode::UNPROCESSABLE_ENTITY)),
+    }
+}
+
+/// Declines a pending device (operator-gated). The device is told it was declined.
+async fn decline_pairing(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(request_id): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    if state.pending_pairing.decline(&request_id) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(catalogue::DEVICE_PAIRING_REQUEST_EXPIRED.instantiate(DiagnosticContext::new())),
+        ))
+    }
+}
+
+/// Collapses a device-provisioning/tunnel diagnostic vector into one HTTP error.
+fn pairing_error(
+    diagnostics: Vec<apiaxess_diagnostics::Diagnostic>,
+    status: StatusCode,
+) -> (StatusCode, Json<apiaxess_diagnostics::Diagnostic>) {
+    let diagnostic = diagnostics
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| catalogue::PAIRING_TOKEN_REJECTED.instantiate(DiagnosticContext::new()));
+    (status, Json(diagnostic))
+}
+
+/// The GUI Android target's current lifecycle (Phase D3), polled by the panel.
+async fn android_target_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<
+    Json<apiaxess_engine_shell::AndroidTargetStatus>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    Ok(Json(state.engine.android_target_status()))
+}
+
+/// Launches the GUI Android target (Phase D3). The blocking boot → provision →
+/// stream runs on a background thread; this returns immediately with the (booting)
+/// status the panel then polls. Idempotent while a launch is already in flight.
+async fn launch_android_target(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<
+    Json<apiaxess_engine_shell::AndroidTargetStatus>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    if state.engine.begin_android_launch() {
+        let engine = state.engine.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = engine.launch_android_target();
+        });
+    }
+    Ok(Json(state.engine.android_target_status()))
+}
+
+/// Body for installing the user's target APK onto the running Android target.
+#[derive(Deserialize)]
+struct AndroidInstallRequest {
+    /// Absolute path on this machine to the APK to install.
+    path: String,
+}
+
+/// Installs the user's target APK onto the running GUI Android target (Phase D3).
+async fn install_target_apk(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<AndroidInstallRequest>,
+) -> Result<StatusCode, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    state
+        .engine
+        .install_target_apk(std::path::Path::new(&request.path))
+        .map_err(|diagnostics| pairing_error(diagnostics, StatusCode::BAD_REQUEST))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stops the running GUI Android target and its stream (Phase D3).
+async fn stop_android_target(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<
+    Json<apiaxess_engine_shell::AndroidTargetStatus>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    let _ = state.engine.teardown_android_target();
+    Ok(Json(state.engine.android_target_status()))
+}
+
+/// Token-authenticated device control channel.
+///
+/// A device authenticates by the per-session bearer token it received from the
+/// pairing exchange, presented as the `token` query parameter — not by `Origin`,
+/// which a device cannot satisfy. This is the sole relaxation of the origin guard
+/// and applies only to this token-gated device path; the browser/GUI/emulator
+/// control paths (`/ws/control`) keep their exact origin+token behavior. Once
+/// authenticated, the device drives the same `ControlMessage` protocol and the
+/// same session-scoped [`control_loop`] the operator UI uses.
+async fn device_control_ws(
+    State(state): State<ApiState>,
+    Query(query): Query<TokenQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let live = state.engine.live_workbench();
+    if !state.pairing.validate_session_token(&query.token) {
+        let diagnostic =
+            catalogue::PAIRING_DEVICE_AUTH_REJECTED.instantiate(DiagnosticContext::new());
+        live.publish_diagnostic(diagnostic.clone());
+        return (StatusCode::UNAUTHORIZED, Json(diagnostic)).into_response();
+    }
+    upgrade
+        .on_upgrade(move |socket| control_loop(socket, live))
+        .into_response()
 }
 
 async fn control_ws(
@@ -1510,6 +2244,49 @@ fn authorize(
         return Err((StatusCode::UNAUTHORIZED, Json(diagnostic)));
     }
     Ok(())
+}
+
+/// Authorizes an operator-only HTTP action (minting a device pairing token).
+///
+/// Requires the same trust pair as the browser control channel: the loopback
+/// `Origin` and the workbench session token (here carried as an
+/// `Authorization: Bearer` header). This keeps pairing-token minting exclusive to
+/// the trusted local UI, so no cross-origin device or unrelated local caller can
+/// bootstrap a pairing.
+fn require_operator(
+    state: &ApiState,
+    headers: &HeaderMap,
+    live: &LiveWorkbench,
+) -> Result<(), (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    // Browsers omit `Origin` on same-origin GETs (the operator GUI's device and
+    // pending polls), so an absent Origin is legitimate same-origin traffic. Only
+    // reject a *present* Origin that does not match; the mandatory bearer token
+    // below is the real authenticator (a per-session token, not an ambient cookie,
+    // so cross-site request forgery does not apply).
+    if let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) {
+        if origin != state.expected_origin.as_ref() {
+            let diagnostic =
+                catalogue::PROXY_LIVE_ORIGIN_REJECTED.instantiate(DiagnosticContext::new());
+            live.publish_diagnostic(diagnostic.clone());
+            return Err((StatusCode::FORBIDDEN, Json(diagnostic)));
+        }
+    }
+    let token = bearer_token(headers).unwrap_or_default();
+    if token != live.auth_token() {
+        let diagnostic = catalogue::PROXY_LIVE_AUTH_REJECTED.instantiate(DiagnosticContext::new());
+        live.publish_diagnostic(diagnostic.clone());
+        return Err((StatusCode::UNAUTHORIZED, Json(diagnostic)));
+    }
+    Ok(())
+}
+
+/// Extracts a bearer token from the `Authorization` header, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1684,6 +2461,9 @@ mod tests {
             engine: Engine::new(),
             expected_origin: Arc::from("http://127.0.0.1:7777"),
             pipeline_runs: PipelineRegistry::default(),
+            pairing: DevicePairingRegistry::default(),
+            pending_pairing: PendingPairingRegistry::default(),
+            gui_port: 7777,
         };
         let live = state.engine.live_workbench();
         let mut headers = HeaderMap::new();
@@ -1701,6 +2481,235 @@ mod tests {
                 .expect_err("wrong origin")
                 .0,
             StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // End-to-end pairing walkthrough reads best whole.
+    async fn device_pairing_ca_and_token_exchange_mechanism() {
+        use apiaxess_workbench_proxy::SessionCa;
+
+        let engine = Engine::new();
+        let state = ApiState {
+            engine: engine.clone(),
+            expected_origin: Arc::from("http://127.0.0.1:7777"),
+            pipeline_runs: PipelineRegistry::default(),
+            pairing: DevicePairingRegistry::default(),
+            pending_pairing: PendingPairingRegistry::default(),
+            gui_port: 7777,
+        };
+
+        // CA endpoint fails cleanly before the session CA is provisioned.
+        let response = pairing_ca(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Provision the live session CA exactly as the workbench does at startup.
+        let ca = SessionCa::generate().expect("session CA");
+        engine.configure_browser_ca(ca.clone());
+
+        // CA endpoint serves the live PEM and echoes the pinnable fingerprint.
+        let response = pairing_ca(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let served_fingerprint = response
+            .headers()
+            .get("x-apiaxess-ca-fingerprint")
+            .and_then(|value| value.to_str().ok())
+            .expect("fingerprint header")
+            .to_owned();
+        assert_eq!(served_fingerprint, ca.fingerprint());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("ca body");
+        let pem = String::from_utf8(body.to_vec()).expect("pem is utf-8");
+        assert!(pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(pem, ca.root_certificate_pem());
+
+        // A *present* cross-origin request is rejected (the origin guard). An
+        // absent Origin is legitimate same-origin browser traffic, so the bearer
+        // token below — not the Origin — is the real authenticator.
+        let mut cross_origin = HeaderMap::new();
+        cross_origin.insert(ORIGIN, "http://evil.example".parse().expect("origin"));
+        cross_origin.insert(
+            AUTHORIZATION,
+            format!("Bearer {}", engine.live_workbench().auth_token())
+                .parse()
+                .expect("auth"),
+        );
+        assert_eq!(
+            mint_pairing_token(State(state.clone()), cross_origin)
+                .await
+                .expect_err("cross-origin is rejected")
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // Without the workbench session token, minting is rejected — even with no
+        // Origin header at all (a random local caller cannot mint).
+        let anon = HeaderMap::new();
+        assert_eq!(
+            mint_pairing_token(State(state.clone()), anon)
+                .await
+                .expect_err("missing token is rejected")
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // A wrong token is rejected.
+        let mut wrong_token = HeaderMap::new();
+        wrong_token.insert(AUTHORIZATION, "Bearer wrong".parse().expect("auth"));
+        assert_eq!(
+            mint_pairing_token(State(state.clone()), wrong_token)
+                .await
+                .expect_err("wrong token is rejected")
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The trusted operator UI mints a pairing token carrying the CA fingerprint.
+        let auth_token = engine.live_workbench().auth_token().to_owned();
+        let mut operator = HeaderMap::new();
+        operator.insert(ORIGIN, "http://127.0.0.1:7777".parse().expect("origin"));
+        operator.insert(
+            AUTHORIZATION,
+            format!("Bearer {auth_token}").parse().expect("auth"),
+        );
+        let Json(minted) = mint_pairing_token(State(state.clone()), operator)
+            .await
+            .expect("operator mints a pairing token");
+        assert_eq!(minted.ca_fingerprint_sha256, ca.fingerprint());
+
+        // A cross-origin device presents the pairing token — it does NOT get a
+        // session token immediately (Phase C5); it enters the accept/decline gate.
+        let Json(ack) = exchange_pairing_token(
+            State(state.clone()),
+            Json(PairingExchangeRequest {
+                pairing_token: minted.pairing_token.clone(),
+                device_name: Some("Test device".to_owned()),
+            }),
+        )
+        .await
+        .expect("device enters the pairing gate");
+        assert_eq!(ack.status, "pending");
+
+        // While pending, no session token exists.
+        let Json(pending_poll) =
+            poll_pairing_exchange(State(state.clone()), AxumPath(ack.request_id.clone()))
+                .await
+                .expect("poll pending");
+        assert_eq!(pending_poll.status, "pending");
+        assert!(pending_poll.session_token.is_none());
+
+        // The operator accepts (this request has no serial, so no device
+        // provisioning runs). Accept is operator-gated.
+        let mut operator_accept = HeaderMap::new();
+        operator_accept.insert(ORIGIN, "http://127.0.0.1:7777".parse().expect("origin"));
+        operator_accept.insert(
+            AUTHORIZATION,
+            format!("Bearer {auth_token}").parse().expect("auth"),
+        );
+        accept_pairing(
+            State(state.clone()),
+            operator_accept,
+            AxumPath(ack.request_id.clone()),
+        )
+        .await
+        .expect("operator accepts the device");
+
+        // The device now polls and receives its session token, which authenticates
+        // the device control channel; a rogue device's forged token does not.
+        let Json(accepted) =
+            poll_pairing_exchange(State(state.clone()), AxumPath(ack.request_id.clone()))
+                .await
+                .expect("poll accepted");
+        assert_eq!(accepted.status, "accepted");
+        let session_token = accepted
+            .session_token
+            .expect("session token issued on accept");
+        assert!(state.pairing.validate_session_token(&session_token));
+        assert!(!state.pairing.validate_session_token("rogue-device-token"));
+
+        // The one-time pairing token cannot be replayed by anyone.
+        assert_eq!(
+            exchange_pairing_token(
+                State(state.clone()),
+                Json(PairingExchangeRequest {
+                    pairing_token: minted.pairing_token,
+                    device_name: None,
+                }),
+            )
+            .await
+            .expect_err("replayed pairing token is rejected")
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_gate_requires_operator_accept_and_relays_decline() {
+        let engine = Engine::new();
+        let auth_token = engine.live_workbench().auth_token().to_owned();
+        let state = ApiState {
+            engine,
+            expected_origin: Arc::from("http://127.0.0.1:7777"),
+            pipeline_runs: PipelineRegistry::default(),
+            pairing: DevicePairingRegistry::default(),
+            pending_pairing: PendingPairingRegistry::default(),
+            gui_port: 7777,
+        };
+
+        // A device presents a valid (serial-less) pairing token → pending.
+        let token = state
+            .pairing
+            .issue_pairing_token(None)
+            .expect("pairing token");
+        let Json(ack) = exchange_pairing_token(
+            State(state.clone()),
+            Json(PairingExchangeRequest {
+                pairing_token: token.token,
+                device_name: None,
+            }),
+        )
+        .await
+        .expect("enters gate");
+
+        // Accepting requires operator auth: an unauthenticated accept is refused,
+        // so a rogue local caller cannot self-approve a device.
+        assert!(
+            accept_pairing(
+                State(state.clone()),
+                HeaderMap::new(),
+                AxumPath(ack.request_id.clone()),
+            )
+            .await
+            .is_err()
+        );
+        // The device is still pending — the failed accept changed nothing.
+        let Json(still_pending) =
+            poll_pairing_exchange(State(state.clone()), AxumPath(ack.request_id.clone()))
+                .await
+                .expect("still pending");
+        assert_eq!(still_pending.status, "pending");
+
+        // The operator declines → the device learns it was declined (403).
+        let mut operator = HeaderMap::new();
+        operator.insert(ORIGIN, "http://127.0.0.1:7777".parse().expect("origin"));
+        operator.insert(
+            AUTHORIZATION,
+            format!("Bearer {auth_token}").parse().expect("auth"),
+        );
+        decline_pairing(
+            State(state.clone()),
+            operator,
+            AxumPath(ack.request_id.clone()),
+        )
+        .await
+        .expect("operator declines");
+        assert_eq!(
+            poll_pairing_exchange(State(state.clone()), AxumPath(ack.request_id))
+                .await
+                .expect_err("declined is surfaced")
+                .0,
+            StatusCode::FORBIDDEN,
         );
     }
 
@@ -1769,6 +2778,9 @@ mod tests {
             engine,
             expected_origin: Arc::from("http://127.0.0.1:7777"),
             pipeline_runs: PipelineRegistry::default(),
+            pairing: DevicePairingRegistry::default(),
+            pending_pairing: PendingPairingRegistry::default(),
+            gui_port: 7777,
         };
         let (code, Json(queued)) = start_pipeline(
             State(state.clone()),

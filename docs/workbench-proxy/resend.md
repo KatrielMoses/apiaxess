@@ -1,6 +1,6 @@
-# Repeater
+# Resend
 
-The Phase 2.4 repeater is a manual, session-scoped request editor. A captured
+The Phase 2.4 resend is a manual, session-scoped request editor. A captured
 flow can be copied into an independent context, where method, absolute URL,
 headers, and body are edited without losing the original capture.
 
@@ -20,19 +20,19 @@ are written through the same SHA-256 blob directory used by captured traffic;
 the JSON session remains the portable authority and can rebuild a fresh
 runtime store.
 
-Repeater sends require an attached `ProxyRepeaterSender`. That sender targets
+Resend sends require an attached `ProxyResendSender`. That sender targets
 the running session `ProxyHandle` listener and trusts only the session CA, so
 resends use the established routed proxy path. There is no direct-request
 fallback. If the routed sender is absent, the attempt is recorded with
-`proxy.repeater-transport-unavailable`.
+`proxy.resend-transport-unavailable`.
 
 The local API exposes:
 
-- `POST /api/v1/workbench/repeater` with `{ "flowId": n }` to create from a
+- `POST /api/v1/workbench/resend` with `{ "flowId": n }` to create from a
   captured flow, or `{ "request": ... }` for an explicit request.
-- `GET /api/v1/workbench/repeater` and
-  `GET /api/v1/workbench/repeater/<id>` to list/read contexts.
-- `PUT /api/v1/workbench/repeater/<id>` to replace the current edit.
-- `POST /api/v1/workbench/repeater/<id>/send` to append a send revision.
-- `POST /api/v1/workbench/repeater/<id>/derive/<revision>` to edit from
+- `GET /api/v1/workbench/resend` and
+  `GET /api/v1/workbench/resend/<id>` to list/read contexts.
+- `PUT /api/v1/workbench/resend/<id>` to replace the current edit.
+- `POST /api/v1/workbench/resend/<id>/send` to append a send revision.
+- `POST /api/v1/workbench/resend/<id>/derive/<revision>` to edit from
   history.

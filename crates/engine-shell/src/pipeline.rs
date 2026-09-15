@@ -4,17 +4,22 @@
 //! handoffs. It owns ordering, session commits, progress, and diagnostics; the
 //! individual phase crates continue to own their analysis behavior.
 
-use std::{fmt, fmt::Write as _, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    fmt::Write as _,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use apiaxess_api_model::{RunId, SignerBinding, UnifiedApiSurface};
-use apiaxess_artifact_intake::NormalizedUnpackedArtifact;
-use apiaxess_confidence::ConfidenceConfig;
 use apiaxess_app_crawler::{
     AppCrawler, CrawlConfig, CrawlReport, CredentialAnswer, CredentialDecision, CredentialKind,
-    CredentialProvider, CredentialPromptReason, CredentialRedactor, CredentialRequest,
+    CredentialPromptReason, CredentialProvider, CredentialRedactor, CredentialRequest,
     PreRunDecision, Secret,
 };
-use apiaxess_workbench_proxy::{CredentialPrompt, CredentialPromptField};
+use apiaxess_artifact_intake::NormalizedUnpackedArtifact;
+use apiaxess_confidence::ConfidenceConfig;
 use apiaxess_diagnostics::{
     Diagnostic, DiagnosticContext, DiagnosticValue,
     catalogue::{
@@ -35,6 +40,7 @@ use apiaxess_session::{
 use apiaxess_static_pass::StaticPassReport;
 use apiaxess_target_apk::{ApkIntakeConfig, ApkTarget, cleanup_intake_workspace};
 use apiaxess_unified_surface::{UnifiedSurfaceConfig, UnifiedSurfaceReport};
+use apiaxess_workbench_proxy::{CredentialPrompt, CredentialPromptField};
 use apiaxess_workbench_proxy::{FlowObserver, LiveWorkbench, ProxyCore, SessionCa};
 use chrono::{DateTime, Utc};
 use tokio::runtime::Runtime;
@@ -968,11 +974,23 @@ fn drive_bundled_dynamic(
     // Setting it here guarantees no capture window exists in which an injected
     // credential could reach disk unredacted, regardless of capture path.
     let redactor = Arc::new(CredentialRedactor::new());
-    runtime.store().set_redactor(Arc::clone(&redactor) as Arc<dyn apiaxess_workbench_store::FlowRedactor>);
+    runtime
+        .store()
+        .set_redactor(Arc::clone(&redactor) as Arc<dyn apiaxess_workbench_store::FlowRedactor>);
 
     let observer = Arc::new(LiveWorkbench::new());
     observer.attach_store(runtime.store());
+    // Surface every host the sandboxed app is observed contacting. An APK
+    // engagement declares no allowed network targets (the operator cannot know the
+    // app's backend hosts up front), so classifying captured flows against a
+    // declared scope would discard all of them and fuse nothing. But the crawled
+    // app itself made every captured, decrypted call, so an observed hit *is* the
+    // honesty guarantee — no filler can enter, because nothing was fabricated.
+    // Admit them all: first-party backend and third-party SDK/telemetry alike are
+    // real pentest surface (a third-party weakness the app depends on is a valid
+    // finding). First-vs-third-party is a downstream *label*, not a capture filter.
     observer.set_engagement_scope(session.engagement_scope().clone());
+    observer.set_admit_all_observed(true);
     observer.set_provenance(format!("pipeline.{}.bundled-dynamic", config.run_id));
     let observer_for_proxy: Arc<dyn FlowObserver> = observer;
     let ca = SessionCa::generate().map_err(|error| vec![error])?;
@@ -986,9 +1004,11 @@ fn drive_bundled_dynamic(
         staged,
         prompt_timeout: Duration::from_secs(300),
     });
-    let crawl_config = CrawlConfig::new(package_name);
+    let crawl_config = CrawlConfig::new(package_name.clone());
     let interaction = config.interaction.clone();
     let crawl_redactor = Arc::clone(&redactor);
+    // The durable store, so the drain below can watch for late-arriving flows.
+    let drain_store = runtime.store();
 
     // The pipeline runs inside a Tokio runtime; run the whole async capture plus
     // the (synchronous, blocking) crawl on a dedicated OS thread that has no
@@ -1012,7 +1032,7 @@ fn drive_bundled_dynamic(
                 mechanism: L3Mechanism::Iptables,
                 lease_id: lease_id.clone(),
             },
-            CaTrustConfig::for_tier(SandboxTier::BundledEmulator, "openssl", &lease_id),
+            CaTrustConfig::for_tier(SandboxTier::BundledEmulator, &lease_id),
             Arc::new(ProcessToolRunner),
             None,
         ))?;
@@ -1026,12 +1046,17 @@ fn drive_bundled_dynamic(
         // Drive the app. The crawler borrows the control transport for its whole
         // run; it is dropped before teardown consumes the traffic session.
         let report = {
-            let mut crawler = AppCrawler::new(control.as_ref(), crawl_config, provider, crawl_redactor);
+            let mut crawler =
+                AppCrawler::new(control.as_ref(), crawl_config, provider, crawl_redactor);
             crawler.run()
         };
         drop(control);
-        // Brief drain so asynchronous post-action traffic can still be captured.
-        std::thread::sleep(Duration::from_secs(GENERIC_CAPTURE_WINDOW_SECONDS));
+        // Idle-detect drain: keep the capture window open while new flows are
+        // still arriving, so a slow app's post-auth initialization (calls that can
+        // fire 6–8s after sign-in, with no further UI interaction) is captured
+        // rather than cut off by a fixed short window. Stops after a quiet gap, or
+        // at a hard cap so a chatty background poller can't hold the pipeline open.
+        idle_drain(&drain_store);
         let teardown = capture_runtime.block_on(traffic.teardown());
 
         let report_diagnostic = crawl_report_diagnostic(&report);
@@ -1046,17 +1071,23 @@ fn drive_bundled_dynamic(
         }
         Ok(vec![report_diagnostic])
     });
+    // The capture outcome: the labeled summary of every host the app was observed
+    // hitting, or the honest "no calls — needs in-app setup, use the client" note
+    // when none. Read from the store after capture. Informational — never blocks.
+    let host_summary = observed_host_summary(runtime, &package_name);
     // Merge the bypass notes (informational, computed before capture) with the
     // capture outcome so both reach the pipeline diagnostics.
     match capture.join() {
         Ok(Ok(mut info)) => {
             let mut all = bypass_diagnostics;
             all.append(&mut info);
+            all.push(host_summary);
             Ok(all)
         }
         Ok(Err(mut errors)) => {
             let mut all = bypass_diagnostics;
             all.append(&mut errors);
+            all.push(host_summary);
             Err(all)
         }
         Err(_) => {
@@ -1069,7 +1100,45 @@ fn drive_bundled_dynamic(
     }
 }
 
-const GENERIC_CAPTURE_WINDOW_SECONDS: u64 = 8;
+/// Holds the capture window open until traffic goes quiet, so late post-auth
+/// initialization calls are captured without guessing a fixed window length.
+///
+/// Polls the durable store's flow count: every time the count grows, the quiet
+/// timer resets; the drain ends after `IDLE_STOP` of no new flows, or at the
+/// `MAX` hard cap (a background poller that never goes quiet must not stall the
+/// pipeline). `MIN` guarantees at least a short settle even on an instantly-quiet
+/// app.
+fn idle_drain(store: &apiaxess_workbench_store::TrafficStore) {
+    let flow_count = |store: &apiaxess_workbench_store::TrafficStore| {
+        store.summaries().map(|summaries| summaries.len()).ok()
+    };
+    let started = Instant::now();
+    let mut last_count = flow_count(store).unwrap_or(0);
+    let mut last_change = Instant::now();
+    loop {
+        std::thread::sleep(DRAIN_POLL);
+        if let Some(count) = flow_count(store) {
+            if count != last_count {
+                last_count = count;
+                last_change = Instant::now();
+            }
+        }
+        if drain_should_stop(started.elapsed(), last_change.elapsed()) {
+            break;
+        }
+    }
+}
+
+const DRAIN_POLL: Duration = Duration::from_millis(1000);
+const DRAIN_IDLE_STOP: Duration = Duration::from_secs(6);
+const DRAIN_MIN: Duration = Duration::from_secs(3);
+const DRAIN_MAX: Duration = Duration::from_secs(30);
+
+/// Whether the idle drain should end: at the hard cap regardless, or once a
+/// minimum settle has passed and traffic has been quiet for the idle gap.
+fn drain_should_stop(elapsed: Duration, since_last_flow: Duration) -> bool {
+    elapsed >= DRAIN_MAX || (elapsed >= DRAIN_MIN && since_last_flow >= DRAIN_IDLE_STOP)
+}
 
 /// Bypasses certificate pinning when the target enforces it, before capture.
 ///
@@ -1333,6 +1402,140 @@ fn assemble(
     config: &UnifiedSurfaceConfig,
 ) -> Result<UnifiedSurfaceReport, Vec<Diagnostic>> {
     apiaxess_unified_surface::assemble_document(document, config, Utc::now())
+}
+
+/// First- vs third-party classification of a host the app was observed hitting.
+///
+/// This is an honest *label*, never a capture filter — every observed host is
+/// surfaced regardless. First-party is decided by affinity between the host's
+/// registrable-domain labels and the app's own package tokens; a curated set of
+/// well-known SDK/analytics/tracker domains marks the obvious third parties. A
+/// host that matches neither signal is left unclassified rather than guessed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostParty {
+    FirstParty,
+    ThirdParty,
+    Unclassified,
+}
+
+/// Well-known third-party SDK / analytics / tracker / payment host suffixes. A
+/// host ending in one of these is external to the app's own backend. The list is
+/// a labeling aid, not exhaustive — an unrecognized host is left unclassified.
+const THIRD_PARTY_SUFFIXES: &[&str] = &[
+    "facebook.com",
+    "fbcdn.net",
+    "graph.facebook.com",
+    "google.com",
+    "googleapis.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "gstatic.com",
+    "doubleclick.net",
+    "crashlytics.com",
+    "app-measurement.com",
+    "firebaseio.com",
+    "firebaseinstallations.googleapis.com",
+    "clarity.ms",
+    "appsflyer.com",
+    "adjust.com",
+    "branch.io",
+    "sentry.io",
+    "bugsnag.com",
+    "mixpanel.com",
+    "amplitude.com",
+    "segment.io",
+    "segment.com",
+    "onesignal.com",
+    "cloudflareinsights.com",
+    "razorpay.com",
+    "juspay.in",
+    "cashfree.com",
+    "phonepe.com",
+    "paytm.in",
+];
+
+/// Classifies one observed host relative to the app package.
+fn classify_host_party(host: &str, package: &str) -> HostParty {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if THIRD_PARTY_SUFFIXES
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+    {
+        return HostParty::ThirdParty;
+    }
+    // Package tokens (`live.tamasha.playroom` → tamasha, playroom) matched against
+    // the host's own labels flags the app's own backend (`api.tamasha.live`).
+    let host_labels: Vec<&str> = host.split('.').collect();
+    let affinity = package
+        .split('.')
+        .filter(|token| token.len() >= 4 && !GENERIC_PACKAGE_TOKENS.contains(token))
+        .any(|token| host_labels.contains(&token));
+    if affinity {
+        HostParty::FirstParty
+    } else {
+        HostParty::Unclassified
+    }
+}
+
+/// Package name segments too generic to signal first-party affinity.
+const GENERIC_PACKAGE_TOKENS: &[&str] = &[
+    "com", "org", "net", "app", "apps", "android", "mobile", "www", "io", "co", "the",
+];
+
+/// Builds the honest, labeled summary of every host the app was observed hitting.
+///
+/// Read from the durable store after capture so it reflects exactly what was
+/// captured. Every host appears; first-/third-party is a label so the tester can
+/// distinguish the app's own backend from the SDKs and trackers it depends on.
+fn observed_host_summary(runtime: &SessionRuntime, package: &str) -> Diagnostic {
+    let hosts: Vec<String> = runtime.store().summaries().map_or_else(
+        |_| Vec::new(),
+        |summaries| {
+            let mut hosts: Vec<String> =
+                summaries.into_iter().filter_map(|flow| flow.host).collect();
+            hosts.sort();
+            hosts.dedup();
+            hosts
+        },
+    );
+    // No calls captured: this is the Breezy-class honest-empty. The autonomous
+    // crawler reached the app but no backend call fired — almost always because
+    // the app needs in-app setup it can't complete (a city/location, a selection,
+    // or an account step). Say so plainly and point to the right tool.
+    if hosts.is_empty() {
+        let mut diagnostic = PIPELINE_DYNAMIC_CRAWL.instantiate(DiagnosticContext::new());
+        diagnostic.why = "No API calls were captured. The app most likely requires in-app setup the autonomous crawler could not complete — e.g. choosing a location/city, making a selection, or an account step it lacks credentials for. Apps like this are best driven manually: install the APIaxess client APK on a device and interact with the app yourself while it captures live.".into();
+        return diagnostic;
+    }
+    let mut first = Vec::new();
+    let mut third = Vec::new();
+    let mut other = Vec::new();
+    for host in hosts {
+        match classify_host_party(&host, package) {
+            HostParty::FirstParty => first.push(host),
+            HostParty::ThirdParty => third.push(host),
+            HostParty::Unclassified => other.push(host),
+        }
+    }
+    let render = |label: &str, hosts: &[String]| {
+        if hosts.is_empty() {
+            String::new()
+        } else {
+            format!(" {label}: {}.", hosts.join(", "))
+        }
+    };
+    let detail = format!(
+        "Surfaced every host the app was observed contacting ({} first-party / {} third-party / {} unclassified).{}{}{}",
+        first.len(),
+        third.len(),
+        other.len(),
+        render("First-party", &first),
+        render("Third-party (SDK/analytics/tracker)", &third),
+        render("Unclassified", &other),
+    );
+    let mut diagnostic = PIPELINE_DYNAMIC_CRAWL.instantiate(DiagnosticContext::new());
+    diagnostic.why = detail.into();
+    diagnostic
 }
 
 fn commit_api_document(
@@ -1613,7 +1816,7 @@ fn fresh_pipeline_run_id() -> Result<String, Diagnostic> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Instant};
+    use std::fs;
 
     use super::*;
 
@@ -1659,6 +1862,79 @@ mod tests {
             .expect("config")
             .with_dynamic_capture(true);
         assert!(config.dynamic_requested);
+    }
+
+    #[test]
+    fn drain_stops_on_quiet_after_min_and_at_hard_cap() {
+        use std::time::Duration;
+        // Still-noisy (traffic within the idle gap) before the cap: keep draining.
+        assert!(!drain_should_stop(
+            Duration::from_secs(5),
+            Duration::from_secs(1)
+        ));
+        // Quiet for the idle gap, past the minimum settle: stop.
+        assert!(drain_should_stop(
+            Duration::from_secs(10),
+            Duration::from_secs(6)
+        ));
+        // Quiet but still inside the minimum settle: keep going (guards a slow
+        // app whose first call hasn't landed yet).
+        assert!(!drain_should_stop(
+            Duration::from_secs(2),
+            Duration::from_secs(6)
+        ));
+        // Hard cap reached even though traffic is still flowing: stop.
+        assert!(drain_should_stop(
+            Duration::from_secs(30),
+            Duration::from_millis(0)
+        ));
+    }
+
+    #[test]
+    fn host_party_flags_the_apps_own_backend_first_party() {
+        // Package tokens (tamasha, playroom) matched against the host's labels flag
+        // the app's own backend, even though the TLD differs from the package's.
+        assert_eq!(
+            classify_host_party("api.tamasha.live", "live.tamasha.playroom"),
+            HostParty::FirstParty
+        );
+        assert_eq!(
+            classify_host_party("cdn.playroom.io", "live.tamasha.playroom"),
+            HostParty::FirstParty
+        );
+    }
+
+    #[test]
+    fn host_party_flags_known_sdks_third_party() {
+        // Known SDK / analytics / payment hosts are third-party regardless of package.
+        for host in [
+            "graph.facebook.com",
+            "app-measurement.com",
+            "settings.crashlytics.com",
+            "api.razorpay.com",
+            "assets.juspay.in",
+            "www.clarity.ms",
+        ] {
+            assert_eq!(
+                classify_host_party(host, "live.tamasha.playroom"),
+                HostParty::ThirdParty,
+                "{host} should be third-party"
+            );
+        }
+    }
+
+    #[test]
+    fn host_party_leaves_unrecognized_hosts_unclassified() {
+        // Not a known SDK and no package affinity → left unclassified, not guessed.
+        assert_eq!(
+            classify_host_party("edge.some-cdn.io", "live.tamasha.playroom"),
+            HostParty::Unclassified
+        );
+        // Generic package tokens (com, app) never manufacture first-party affinity.
+        assert_eq!(
+            classify_host_party("app.example-tracker.net", "com.app.thing"),
+            HostParty::Unclassified
+        );
     }
 
     #[test]

@@ -328,7 +328,8 @@ fn replace_bytes(haystack: &[u8], needle: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(haystack.len());
     let mut index = 0;
     while index < haystack.len() {
-        if index + needle.len() <= haystack.len() && &haystack[index..index + needle.len()] == needle
+        if index + needle.len() <= haystack.len()
+            && &haystack[index..index + needle.len()] == needle
         {
             out.extend_from_slice(PLACEHOLDER);
             index += needle.len();
@@ -345,8 +346,7 @@ fn replace_bytes(haystack: &[u8], needle: &[u8]) -> Vec<u8> {
 fn percent_encode(value: &[u8], space_as_plus: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len());
     for &byte in value {
-        let unreserved = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
         if unreserved {
             out.push(byte);
         } else if byte == b' ' && space_as_plus {
@@ -452,7 +452,10 @@ mod tests {
         redactor.redact(&mut flow);
         assert!(!flow.url.as_ref().unwrap().contains("p%40ss%20w0rd"));
         let body = String::from_utf8(flow.request_body.unwrap()).unwrap();
-        assert!(!body.contains("p%40ss+w0rd"), "form-encoded value must be scrubbed: {body}");
+        assert!(
+            !body.contains("p%40ss+w0rd"),
+            "form-encoded value must be scrubbed: {body}"
+        );
     }
 
     #[test]
@@ -466,7 +469,10 @@ mod tests {
         );
         redactor.redact(&mut flow);
         let body = String::from_utf8(flow.request_body.unwrap()).unwrap();
-        assert!(!body.contains(r#"a\"b\\c"#), "json-escaped value must be scrubbed: {body}");
+        assert!(
+            !body.contains(r#"a\"b\\c"#),
+            "json-escaped value must be scrubbed: {body}"
+        );
     }
 
     #[test]

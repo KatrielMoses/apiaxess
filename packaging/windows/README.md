@@ -92,7 +92,7 @@ is present at its resolver path and runs from the install tree (java, apktool an
 jadx through the bundled runtime, ffuf directly), confirms `analysis-runtime\` is
 absent from the base installer, launches the installed executable, verifies the
 packaged GUI and local status API, routes a real HTTP request through the
-installed proxy, verifies durable SQLite capture, exercises repeater and intruder,
+installed proxy, verifies durable SQLite capture, exercises resend and fuzzer,
 runs the private Node and pnpm with Corepack network access disabled, uninstalls,
 and compares the Windows root certificate stores before and after. Logs are
 retained under the printed `%TEMP%` QA path for diagnosis.

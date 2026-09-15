@@ -60,6 +60,12 @@ pub struct CrawlReport {
     pub unreached_behind_wall: usize,
     /// Known interactive (state, action) pairs left untried when the run ended.
     pub skipped_actions: usize,
+    /// Runtime permissions pre-granted so permission gates didn't block the crawl.
+    #[serde(default)]
+    pub permissions_granted: usize,
+    /// Whether device location state was prepared for location-gated screens.
+    #[serde(default)]
+    pub location_prepared: bool,
     /// Credential-assistance summary.
     pub credentials: CredentialTelemetry,
     /// Activities visited, for the operator's inspection.
@@ -73,16 +79,26 @@ impl CrawlReport {
     #[must_use]
     pub fn summary_line(&self) -> String {
         format!(
-            "crawl of {}: {} states, {} activities, {} actions fired ({} pre-auth / {} post-auth); {} login gate(s), {} value(s) injected, post-auth {}; {} action(s) left untried; ended: {}",
+            "crawl of {}: {} states, {} activities, {} actions fired ({} pre-auth / {} post-auth); state prep: {} permission(s) granted, location {}; {} login gate(s), {} value(s) injected, post-auth {}; {} action(s) left untried; ended: {}",
             self.package,
             self.states_visited,
             self.activities_visited,
             self.actions_fired,
             self.pre_auth.actions_fired,
             self.post_auth.actions_fired,
+            self.permissions_granted,
+            if self.location_prepared {
+                "prepared"
+            } else {
+                "not prepared"
+            },
             self.credentials.login_gates_encountered,
             self.credentials.credential_values_injected,
-            if self.credentials.post_auth_reached { "reached" } else { "not reached" },
+            if self.credentials.post_auth_reached {
+                "reached"
+            } else {
+                "not reached"
+            },
             self.skipped_actions,
             self.termination,
         )

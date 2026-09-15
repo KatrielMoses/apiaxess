@@ -5,16 +5,16 @@ Phase 2.3 uses two layers with a deliberate authority boundary:
 - SQLite in WAL mode with `synchronous=FULL` is the session runtime cache. Flow
   metadata is stored in structured rows and request/response bodies are stored
   once under their SHA-256 hash in the session blob directory.
-- Repeater contexts and their append-only revisions use a dedicated SQLite
+- Resend contexts and their append-only revisions use a dedicated SQLite
   table and the same content-addressed body directory.
-- Intruder jobs, bounded results, and their attack configurations use a
+- Fuzzer jobs, bounded results, and their attack configurations use a
   dedicated SQLite table and the same content-addressed body directory.
 - The JSON session document is the only canonical portable artifact. Its
   `workbench.traffic` slot contains a normalized snapshot with headers,
   metadata, scope classification, provenance, body SHA-256 values, and portable
   base64 body content. The SQLite file is never the user-facing backbone.
-  The same slot includes repeater current edits, revision histories, and
-  intruder jobs/results.
+  The same slot includes resend current edits, revision histories, and
+  fuzzer jobs/results.
 
 `TrafficStore::serialize_session` commits the normalized snapshot through
 `Session::set_workbench_state` and then uses the invariant-checked

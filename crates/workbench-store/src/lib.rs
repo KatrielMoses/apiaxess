@@ -117,10 +117,10 @@ pub struct FlowSummary {
     pub provenance: String,
 }
 
-/// Editable HTTP request held by one repeater context or revision.
+/// Editable HTTP request held by one resend context or revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RepeaterRequest {
+pub struct ResendRequest {
     /// HTTP method.
     pub method: String,
     /// Absolute request URL.
@@ -132,10 +132,10 @@ pub struct RepeaterRequest {
     pub body: Option<Vec<u8>>,
 }
 
-/// Response captured from one repeater send.
+/// Response captured from one resend send.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RepeaterResponse {
+pub struct ResendResponse {
     /// HTTP status.
     pub status: u16,
     /// Response headers.
@@ -147,19 +147,19 @@ pub struct RepeaterResponse {
     pub duration_ms: u64,
 }
 
-/// One append-only repeater send revision.
+/// One append-only resend send revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RepeaterRevision {
+pub struct ResendRevision {
     /// One-based revision number within its context.
     pub revision: u64,
     /// Send timestamp.
     pub sent_at: DateTime<Utc>,
     /// Exact request sent.
-    pub request: RepeaterRequest,
+    pub request: ResendRequest,
     /// Response, when the upstream exchange completed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<RepeaterResponse>,
+    pub response: Option<ResendResponse>,
     /// Stable diagnostic when the send or persistence failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<Diagnostic>,
@@ -167,10 +167,10 @@ pub struct RepeaterRevision {
     pub scope: ScopeDisposition,
 }
 
-/// Independent repeater tab/context with a linear append-only history.
+/// Independent resend tab/context with a linear append-only history.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RepeaterContext {
+pub struct ResendContext {
     /// Stable session-local context identifier.
     pub id: String,
     /// Captured flow from which this context was created, when applicable.
@@ -179,15 +179,15 @@ pub struct RepeaterContext {
     /// Context creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Current editable request.
-    pub current: RepeaterRequest,
+    pub current: ResendRequest,
     /// Append-only sends, including failed attempts.
-    pub history: Vec<RepeaterRevision>,
+    pub history: Vec<ResendRevision>,
 }
 
-/// Request field where an intruder payload is substituted.
+/// Request field where a fuzzer payload is substituted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IntruderPositionLocation {
+pub enum FuzzerPositionLocation {
     /// Position in the complete URL, including path and query.
     Url,
     /// Position in a named header value.
@@ -201,7 +201,7 @@ pub enum IntruderPositionLocation {
 #[serde(rename_all = "camelCase")]
 pub struct PayloadPosition {
     /// Field containing the position.
-    pub location: IntruderPositionLocation,
+    pub location: FuzzerPositionLocation,
     /// Header name when the location is `Header`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header_name: Option<String>,
@@ -213,7 +213,7 @@ pub struct PayloadPosition {
     pub set_index: usize,
 }
 
-/// Named values available to an intruder position.
+/// Named values available to a fuzzer position.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadSet {
@@ -226,7 +226,7 @@ pub struct PayloadSet {
 /// Standard payload combination mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IntruderAttackType {
+pub enum FuzzerAttackType {
     /// Test one marked position at a time.
     Sniper,
     /// Cartesian product across payload sets.
@@ -238,7 +238,7 @@ pub enum IntruderAttackType {
 /// Match/filter rules used to surface interesting responses.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntruderMatchFilter {
+pub struct FuzzerMatchFilter {
     /// Status codes considered interesting; empty means any status.
     pub statuses: Vec<u16>,
     /// Minimum response-body size.
@@ -258,7 +258,7 @@ pub struct IntruderMatchFilter {
 /// Dynamic value extractor used by a stateful sequence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum IntruderTokenExtractor {
+pub enum FuzzerTokenExtractor {
     /// Extract a value from a JSON response using a simple dotted path.
     JsonPath {
         /// Variable name for later `{{variable}}` injection.
@@ -285,29 +285,29 @@ pub enum IntruderTokenExtractor {
 /// One request in a stateful native attack sequence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntruderSequenceStep {
+pub struct FuzzerSequenceStep {
     /// Step label shown in diagnostics.
     pub name: String,
     /// Request template; `{{variable}}` placeholders are injected before send.
-    pub request: RepeaterRequest,
+    pub request: ResendRequest,
     /// Values extracted from this response for subsequent steps.
-    pub extractors: Vec<IntruderTokenExtractor>,
+    pub extractors: Vec<FuzzerTokenExtractor>,
 }
 
 /// Automatically selected execution tier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IntruderTier {
+pub enum FuzzerTier {
     /// Hidden ffuf subprocess for stateless bulk work.
     Ffuf,
     /// Native Rust sender for stateful/authenticated sequences.
     Native,
 }
 
-/// Lifecycle of an intruder job.
+/// Lifecycle of a fuzzer job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IntruderJobState {
+pub enum FuzzerJobState {
     /// Created but not yet launched.
     Pending,
     /// Currently generating requests.
@@ -322,20 +322,20 @@ pub enum IntruderJobState {
     Failed,
 }
 
-/// Intruder attack configuration persisted with a job.
+/// Fuzzer attack configuration persisted with a job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntruderConfig {
+pub struct FuzzerConfig {
     /// Request template before payload substitution.
-    pub base_request: RepeaterRequest,
+    pub base_request: ResendRequest,
     /// Marked substitution positions.
     pub positions: Vec<PayloadPosition>,
     /// Payload values by set.
     pub payload_sets: Vec<PayloadSet>,
     /// Standard payload combination mode.
-    pub attack_type: IntruderAttackType,
+    pub attack_type: FuzzerAttackType,
     /// Optional response match/filter rules.
-    pub match_filter: IntruderMatchFilter,
+    pub match_filter: FuzzerMatchFilter,
     /// Maximum concurrent native requests.
     pub concurrency: usize,
     /// Maximum sends per second; zero means unlimited.
@@ -344,9 +344,9 @@ pub struct IntruderConfig {
     pub max_results: usize,
     /// Optional pre-request authentication.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_preflight: Option<RepeaterRequest>,
+    pub auth_preflight: Option<ResendRequest>,
     /// Stateful sequence steps after the optional pre-flight.
-    pub sequence: Vec<IntruderSequenceStep>,
+    pub sequence: Vec<FuzzerSequenceStep>,
     /// Enable the ffuf soft-404/catch-all auto-calibration (`-ac`) so a wildcard
     /// or WAF site that answers every path does not produce false-positive hits.
     /// Used by directory discovery; absent (false) for everything else.
@@ -354,10 +354,10 @@ pub struct IntruderConfig {
     pub auto_calibrate: bool,
 }
 
-/// Response comparison features used by the intruder UI.
+/// Response comparison features used by the fuzzer UI.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntruderResponseDiff {
+pub struct FuzzerResponseDiff {
     /// Whether status differs from the prior result.
     pub status_changed: bool,
     /// Whether body length differs from the prior result.
@@ -368,25 +368,25 @@ pub struct IntruderResponseDiff {
     pub content_changed: bool,
 }
 
-/// One captured intruder result.
+/// One captured fuzzer result.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntruderResult {
+pub struct FuzzerResult {
     /// One-based result ordinal.
     pub ordinal: u64,
     /// Payload values used for this request.
     pub payloads: Vec<String>,
     /// Exact request sent.
-    pub request: RepeaterRequest,
+    pub request: ResendRequest,
     /// Response, when a request completed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<RepeaterResponse>,
+    pub response: Option<ResendResponse>,
     /// Response match outcome.
     pub matched: bool,
     /// Whether the result was filtered from the primary view.
     pub filtered: bool,
     /// Comparison to the prior response when available.
-    pub diff: IntruderResponseDiff,
+    pub diff: FuzzerResponseDiff,
     /// Scope classification at send time.
     pub scope: ScopeDisposition,
     /// Failure diagnostic, if any.
@@ -394,22 +394,22 @@ pub struct IntruderResult {
     pub diagnostic: Option<Diagnostic>,
 }
 
-/// Durable intruder job, configuration, state, and bounded results.
+/// Durable fuzzer job, configuration, state, and bounded results.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntruderJob {
+pub struct FuzzerJob {
     /// Stable session-local job identifier.
     pub id: String,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Auto-selected execution tier.
-    pub tier: IntruderTier,
+    pub tier: FuzzerTier,
     /// Lifecycle state.
-    pub state: IntruderJobState,
+    pub state: FuzzerJobState,
     /// Persisted attack configuration.
-    pub config: IntruderConfig,
+    pub config: FuzzerConfig,
     /// Captured result rows.
-    pub results: Vec<IntruderResult>,
+    pub results: Vec<FuzzerResult>,
     /// Job-level diagnostics.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -480,6 +480,13 @@ impl TrafficStore {
                 &e.to_string(),
             )
         })?;
+        // Preserve durability across the Repeater→Resend / Intruder→Fuzzer
+        // rename: carry a legacy store's tables over to the new names. A failure
+        // (the old table is absent, or the new one already exists) is expected on
+        // fresh or already-migrated stores and is ignored — the CREATE TABLE IF
+        // NOT EXISTS below then owns the schema.
+        let _ = connection.execute("ALTER TABLE repeater_contexts RENAME TO resend_contexts", []);
+        let _ = connection.execute("ALTER TABLE intruder_jobs RENAME TO fuzzer_jobs", []);
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
@@ -504,14 +511,14 @@ impl TrafficStore {
                url TEXT
              );
              CREATE INDEX IF NOT EXISTS flows_captured_at ON flows(captured_at);
-             CREATE TABLE IF NOT EXISTS repeater_contexts (
+             CREATE TABLE IF NOT EXISTS resend_contexts (
                id TEXT PRIMARY KEY,
                source_flow_id INTEGER,
                created_at TEXT NOT NULL,
                current_json TEXT NOT NULL,
                history_json TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS intruder_jobs (
+             CREATE TABLE IF NOT EXISTS fuzzer_jobs (
                id TEXT PRIMARY KEY,
                created_at TEXT NOT NULL,
                tier TEXT NOT NULL,
@@ -775,8 +782,8 @@ impl TrafficStore {
         Ok(TrafficSnapshot {
             schema_version: TRAFFIC_SCHEMA_VERSION,
             flows,
-            repeater_contexts: self.repeater_contexts()?,
-            intruder_jobs: self.intruder_jobs()?,
+            resend_contexts: self.resend_contexts()?,
+            fuzzer_jobs: self.fuzzer_jobs()?,
         })
     }
 
@@ -866,11 +873,11 @@ impl TrafficStore {
             self.upsert(&flow.into_capture()?)?;
             count += 1;
         }
-        for context in snapshot.repeater_contexts {
-            self.upsert_repeater(&context)?;
+        for context in snapshot.resend_contexts {
+            self.upsert_resend(&context)?;
         }
-        for job in snapshot.intruder_jobs {
-            self.upsert_intruder(&job)?;
+        for job in snapshot.fuzzer_jobs {
+            self.upsert_fuzzer(&job)?;
         }
         Ok(count)
     }
@@ -972,27 +979,27 @@ impl TrafficStore {
         .map_err(|e| interchange_diag("export", &e.to_string()))
     }
 
-    /// Persists one repeater context and its append-only history.
+    /// Persists one resend context and its append-only history.
     ///
     /// # Errors
     ///
     /// Returns a diagnostic when request validation, body durability, JSON
     /// serialization, or the metadata transaction fails.
-    pub fn upsert_repeater(&self, context: &RepeaterContext) -> Result<(), Diagnostic> {
-        validate_repeater(context)?;
-        let current = self.stored_repeater_request(&context.current)?;
+    pub fn upsert_resend(&self, context: &ResendContext) -> Result<(), Diagnostic> {
+        validate_resend(context)?;
+        let current = self.stored_resend_request(&context.current)?;
         let history = context
             .history
             .iter()
-            .map(|entry| self.stored_repeater_revision(entry))
+            .map(|entry| self.stored_resend_revision(entry))
             .collect::<Result<Vec<_>, _>>()?;
         let current_json = serde_json::to_string(&current)
-            .map_err(|e| serialization_diag("repeater.current", &e.to_string()))?;
+            .map_err(|e| serialization_diag("resend.current", &e.to_string()))?;
         let history_json = serde_json::to_string(&history)
-            .map_err(|e| serialization_diag("repeater.history", &e.to_string()))?;
+            .map_err(|e| serialization_diag("resend.history", &e.to_string()))?;
         let connection = self.connection.lock().map_err(|_| {
             storage_diag(
-                catalogue::PROXY_REPEATER_HISTORY_FAILED,
+                catalogue::PROXY_RESEND_HISTORY_FAILED,
                 "lock",
                 &self.root,
                 "database mutex poisoned",
@@ -1000,7 +1007,7 @@ impl TrafficStore {
         })?;
         connection
             .execute(
-                "INSERT INTO repeater_contexts (id,source_flow_id,created_at,current_json,history_json)
+                "INSERT INTO resend_contexts (id,source_flow_id,created_at,current_json,history_json)
                  VALUES (?1,?2,?3,?4,?5)
                  ON CONFLICT(id) DO UPDATE SET source_flow_id=excluded.source_flow_id,created_at=excluded.created_at,current_json=excluded.current_json,history_json=excluded.history_json",
                 params![
@@ -1013,7 +1020,7 @@ impl TrafficStore {
             )
             .map_err(|e| {
                 storage_diag(
-                    catalogue::PROXY_REPEATER_HISTORY_FAILED,
+                    catalogue::PROXY_RESEND_HISTORY_FAILED,
                     "write",
                     &self.root,
                     &e.to_string(),
@@ -1022,16 +1029,16 @@ impl TrafficStore {
         Ok(())
     }
 
-    /// Loads all repeater contexts ordered by creation time.
+    /// Loads all resend contexts ordered by creation time.
     ///
     /// # Errors
     ///
     /// Returns a diagnostic when the context table or its serialized request
     /// and history records cannot be read.
-    pub fn repeater_contexts(&self) -> Result<Vec<RepeaterContext>, Diagnostic> {
+    pub fn resend_contexts(&self) -> Result<Vec<ResendContext>, Diagnostic> {
         let connection = self.connection.lock().map_err(|_| {
             storage_diag(
-                catalogue::PROXY_REPEATER_HISTORY_FAILED,
+                catalogue::PROXY_RESEND_HISTORY_FAILED,
                 "lock",
                 &self.root,
                 "database mutex poisoned",
@@ -1039,9 +1046,9 @@ impl TrafficStore {
         })?;
         let mut statement = connection
             .prepare(
-                "SELECT id,source_flow_id,created_at,current_json,history_json FROM repeater_contexts ORDER BY created_at,id",
+                "SELECT id,source_flow_id,created_at,current_json,history_json FROM resend_contexts ORDER BY created_at,id",
             )
-            .map_err(|e| storage_diag(catalogue::PROXY_REPEATER_HISTORY_FAILED, "query", &self.root, &e.to_string()))?;
+            .map_err(|e| storage_diag(catalogue::PROXY_RESEND_HISTORY_FAILED, "query", &self.root, &e.to_string()))?;
         let rows = statement
             .query_map([], |row| {
                 let current: String = row.get(3)?;
@@ -1056,7 +1063,7 @@ impl TrafficStore {
             })
             .map_err(|e| {
                 storage_diag(
-                    catalogue::PROXY_REPEATER_HISTORY_FAILED,
+                    catalogue::PROXY_RESEND_HISTORY_FAILED,
                     "row",
                     &self.root,
                     &e.to_string(),
@@ -1066,51 +1073,51 @@ impl TrafficStore {
         for row in rows {
             let (id, source_flow_id, created_at, current, history) = row.map_err(|e| {
                 storage_diag(
-                    catalogue::PROXY_REPEATER_HISTORY_FAILED,
+                    catalogue::PROXY_RESEND_HISTORY_FAILED,
                     "row",
                     &self.root,
                     &e.to_string(),
                 )
             })?;
-            contexts.push(RepeaterContext {
+            contexts.push(ResendContext {
                 id,
                 source_flow_id: source_flow_id.and_then(|id| u64::try_from(id).ok()),
                 created_at: parse_time(&created_at),
-                current: self.resolve_repeater_request(
+                current: self.resolve_resend_request(
                     serde_json::from_str(&current)
-                        .map_err(|e| serialization_diag("repeater.current", &e.to_string()))?,
+                        .map_err(|e| serialization_diag("resend.current", &e.to_string()))?,
                 )?,
-                history: serde_json::from_str::<Vec<StoredRepeaterRevision>>(&history)
-                    .map_err(|e| serialization_diag("repeater.history", &e.to_string()))?
+                history: serde_json::from_str::<Vec<StoredResendRevision>>(&history)
+                    .map_err(|e| serialization_diag("resend.history", &e.to_string()))?
                     .into_iter()
-                    .map(|entry| self.resolve_repeater_revision(entry))
+                    .map(|entry| self.resolve_resend_revision(entry))
                     .collect::<Result<Vec<_>, _>>()?,
             });
         }
         Ok(contexts)
     }
 
-    /// Persists one bounded intruder job and its results.
+    /// Persists one bounded fuzzer job and its results.
     ///
     /// # Errors
     ///
     /// Returns a diagnostic when the job cannot be serialized or committed.
-    pub fn upsert_intruder(&self, job: &IntruderJob) -> Result<(), Diagnostic> {
-        validate_intruder(job)?;
-        let config_json = serde_json::to_string(&self.stored_intruder_config(&job.config)?)
-            .map_err(|e| serialization_diag("intruder.config", &e.to_string()))?;
+    pub fn upsert_fuzzer(&self, job: &FuzzerJob) -> Result<(), Diagnostic> {
+        validate_fuzzer(job)?;
+        let config_json = serde_json::to_string(&self.stored_fuzzer_config(&job.config)?)
+            .map_err(|e| serialization_diag("fuzzer.config", &e.to_string()))?;
         let results_json = serde_json::to_string(
             &job.results
                 .iter()
-                .map(|result| self.stored_intruder_result(result))
+                .map(|result| self.stored_fuzzer_result(result))
                 .collect::<Result<Vec<_>, _>>()?,
         )
-        .map_err(|e| serialization_diag("intruder.results", &e.to_string()))?;
+        .map_err(|e| serialization_diag("fuzzer.results", &e.to_string()))?;
         let diagnostics_json = serde_json::to_string(&job.diagnostics)
-            .map_err(|e| serialization_diag("intruder.diagnostics", &e.to_string()))?;
+            .map_err(|e| serialization_diag("fuzzer.diagnostics", &e.to_string()))?;
         let connection = self.connection.lock().map_err(|_| {
             storage_diag(
-                catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED,
+                catalogue::PROXY_FUZZER_PERSISTENCE_FAILED,
                 "lock",
                 &self.root,
                 "database mutex poisoned",
@@ -1118,7 +1125,7 @@ impl TrafficStore {
         })?;
         connection
             .execute(
-                "INSERT INTO intruder_jobs (id,created_at,tier,state,config_json,results_json,diagnostics_json)
+                "INSERT INTO fuzzer_jobs (id,created_at,tier,state,config_json,results_json,diagnostics_json)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)
                  ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at,tier=excluded.tier,state=excluded.state,config_json=excluded.config_json,results_json=excluded.results_json,diagnostics_json=excluded.diagnostics_json",
                 params![
@@ -1131,28 +1138,28 @@ impl TrafficStore {
                     diagnostics_json,
                 ],
             )
-            .map_err(|e| storage_diag(catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED, "write", &self.root, &e.to_string()))?;
+            .map_err(|e| storage_diag(catalogue::PROXY_FUZZER_PERSISTENCE_FAILED, "write", &self.root, &e.to_string()))?;
         Ok(())
     }
 
-    /// Loads persisted intruder jobs ordered by creation time.
+    /// Loads persisted fuzzer jobs ordered by creation time.
     ///
     /// # Errors
     ///
     /// Returns a diagnostic when a job row or its structured payload is
     /// malformed.
-    pub fn intruder_jobs(&self) -> Result<Vec<IntruderJob>, Diagnostic> {
+    pub fn fuzzer_jobs(&self) -> Result<Vec<FuzzerJob>, Diagnostic> {
         let connection = self.connection.lock().map_err(|_| {
             storage_diag(
-                catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED,
+                catalogue::PROXY_FUZZER_PERSISTENCE_FAILED,
                 "lock",
                 &self.root,
                 "database mutex poisoned",
             )
         })?;
         let mut statement = connection
-            .prepare("SELECT id,created_at,tier,state,config_json,results_json,diagnostics_json FROM intruder_jobs ORDER BY created_at,id")
-            .map_err(|e| storage_diag(catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED, "query", &self.root, &e.to_string()))?;
+            .prepare("SELECT id,created_at,tier,state,config_json,results_json,diagnostics_json FROM fuzzer_jobs ORDER BY created_at,id")
+            .map_err(|e| storage_diag(catalogue::PROXY_FUZZER_PERSISTENCE_FAILED, "query", &self.root, &e.to_string()))?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1167,7 +1174,7 @@ impl TrafficStore {
             })
             .map_err(|e| {
                 storage_diag(
-                    catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED,
+                    catalogue::PROXY_FUZZER_PERSISTENCE_FAILED,
                     "row",
                     &self.root,
                     &e.to_string(),
@@ -1177,40 +1184,40 @@ impl TrafficStore {
         for row in rows {
             let (id, created_at, tier, state, config, results, diagnostics) = row.map_err(|e| {
                 storage_diag(
-                    catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED,
+                    catalogue::PROXY_FUZZER_PERSISTENCE_FAILED,
                     "row",
                     &self.root,
                     &e.to_string(),
                 )
             })?;
-            jobs.push(IntruderJob {
+            jobs.push(FuzzerJob {
                 id,
                 created_at: parse_time(&created_at),
                 tier: serde_json::from_str(&tier)
-                    .map_err(|e| serialization_diag("intruder.tier", &e.to_string()))?,
+                    .map_err(|e| serialization_diag("fuzzer.tier", &e.to_string()))?,
                 state: serde_json::from_str(&state)
-                    .map_err(|e| serialization_diag("intruder.state", &e.to_string()))?,
-                config: self.resolve_intruder_config(
+                    .map_err(|e| serialization_diag("fuzzer.state", &e.to_string()))?,
+                config: self.resolve_fuzzer_config(
                     serde_json::from_str(&config)
-                        .map_err(|e| serialization_diag("intruder.config", &e.to_string()))?,
+                        .map_err(|e| serialization_diag("fuzzer.config", &e.to_string()))?,
                 )?,
-                results: serde_json::from_str::<Vec<StoredIntruderResult>>(&results)
-                    .map_err(|e| serialization_diag("intruder.results", &e.to_string()))?
+                results: serde_json::from_str::<Vec<StoredFuzzerResult>>(&results)
+                    .map_err(|e| serialization_diag("fuzzer.results", &e.to_string()))?
                     .into_iter()
-                    .map(|result| self.resolve_intruder_result(result))
+                    .map(|result| self.resolve_fuzzer_result(result))
                     .collect::<Result<Vec<_>, _>>()?,
                 diagnostics: serde_json::from_str(&diagnostics)
-                    .map_err(|e| serialization_diag("intruder.diagnostics", &e.to_string()))?,
+                    .map_err(|e| serialization_diag("fuzzer.diagnostics", &e.to_string()))?,
             });
         }
         Ok(jobs)
     }
 
-    fn stored_repeater_request(
+    fn stored_resend_request(
         &self,
-        request: &RepeaterRequest,
-    ) -> Result<StoredRepeaterRequest, Diagnostic> {
-        Ok(StoredRepeaterRequest {
+        request: &ResendRequest,
+    ) -> Result<StoredResendRequest, Diagnostic> {
+        Ok(StoredResendRequest {
             method: request.method.clone(),
             url: request.url.clone(),
             headers: request.headers.clone(),
@@ -1218,12 +1225,12 @@ impl TrafficStore {
         })
     }
 
-    fn stored_intruder_config(
+    fn stored_fuzzer_config(
         &self,
-        config: &IntruderConfig,
-    ) -> Result<StoredIntruderConfig, Diagnostic> {
-        Ok(StoredIntruderConfig {
-            base_request: self.stored_repeater_request(&config.base_request)?,
+        config: &FuzzerConfig,
+    ) -> Result<StoredFuzzerConfig, Diagnostic> {
+        Ok(StoredFuzzerConfig {
+            base_request: self.stored_resend_request(&config.base_request)?,
             positions: config.positions.clone(),
             payload_sets: config.payload_sets.clone(),
             attack_type: config.attack_type,
@@ -1234,15 +1241,15 @@ impl TrafficStore {
             auth_preflight: config
                 .auth_preflight
                 .as_ref()
-                .map(|request| self.stored_repeater_request(request))
+                .map(|request| self.stored_resend_request(request))
                 .transpose()?,
             sequence: config
                 .sequence
                 .iter()
                 .map(|step| {
-                    Ok(StoredIntruderSequenceStep {
+                    Ok(StoredFuzzerSequenceStep {
                         name: step.name.clone(),
-                        request: self.stored_repeater_request(&step.request)?,
+                        request: self.stored_resend_request(&step.request)?,
                         extractors: step.extractors.clone(),
                     })
                 })
@@ -1251,12 +1258,12 @@ impl TrafficStore {
         })
     }
 
-    fn resolve_intruder_config(
+    fn resolve_fuzzer_config(
         &self,
-        config: StoredIntruderConfig,
-    ) -> Result<IntruderConfig, Diagnostic> {
-        Ok(IntruderConfig {
-            base_request: self.resolve_repeater_request(config.base_request)?,
+        config: StoredFuzzerConfig,
+    ) -> Result<FuzzerConfig, Diagnostic> {
+        Ok(FuzzerConfig {
+            base_request: self.resolve_resend_request(config.base_request)?,
             positions: config.positions,
             payload_sets: config.payload_sets,
             attack_type: config.attack_type,
@@ -1266,15 +1273,15 @@ impl TrafficStore {
             max_results: config.max_results,
             auth_preflight: config
                 .auth_preflight
-                .map(|request| self.resolve_repeater_request(request))
+                .map(|request| self.resolve_resend_request(request))
                 .transpose()?,
             sequence: config
                 .sequence
                 .into_iter()
                 .map(|step| {
-                    Ok(IntruderSequenceStep {
+                    Ok(FuzzerSequenceStep {
                         name: step.name,
-                        request: self.resolve_repeater_request(step.request)?,
+                        request: self.resolve_resend_request(step.request)?,
                         extractors: step.extractors,
                     })
                 })
@@ -1283,18 +1290,18 @@ impl TrafficStore {
         })
     }
 
-    fn stored_intruder_result(
+    fn stored_fuzzer_result(
         &self,
-        result: &IntruderResult,
-    ) -> Result<StoredIntruderResult, Diagnostic> {
-        Ok(StoredIntruderResult {
+        result: &FuzzerResult,
+    ) -> Result<StoredFuzzerResult, Diagnostic> {
+        Ok(StoredFuzzerResult {
             ordinal: result.ordinal,
             payloads: result.payloads.clone(),
-            request: self.stored_repeater_request(&result.request)?,
+            request: self.stored_resend_request(&result.request)?,
             response: result
                 .response
                 .as_ref()
-                .map(|response| self.stored_repeater_response(response))
+                .map(|response| self.stored_resend_response(response))
                 .transpose()?,
             matched: result.matched,
             filtered: result.filtered,
@@ -1304,18 +1311,18 @@ impl TrafficStore {
         })
     }
 
-    fn resolve_intruder_result(
+    fn resolve_fuzzer_result(
         &self,
-        result: StoredIntruderResult,
-    ) -> Result<IntruderResult, Diagnostic> {
-        Ok(IntruderResult {
+        result: StoredFuzzerResult,
+    ) -> Result<FuzzerResult, Diagnostic> {
+        Ok(FuzzerResult {
             ordinal: result.ordinal,
             payloads: result.payloads,
-            request: self.resolve_repeater_request(result.request)?,
+            request: self.resolve_resend_request(result.request)?,
             response: result
                 .response
                 .map(|response| {
-                    Ok(RepeaterResponse {
+                    Ok(ResendResponse {
                         status: response.status,
                         headers: response.headers,
                         body: self.read_blob(response.body_hash.as_deref())?,
@@ -1331,11 +1338,11 @@ impl TrafficStore {
         })
     }
 
-    fn stored_repeater_response(
+    fn stored_resend_response(
         &self,
-        response: &RepeaterResponse,
-    ) -> Result<StoredRepeaterResponse, Diagnostic> {
-        Ok(StoredRepeaterResponse {
+        response: &ResendResponse,
+    ) -> Result<StoredResendResponse, Diagnostic> {
+        Ok(StoredResendResponse {
             status: response.status,
             headers: response.headers.clone(),
             body_hash: self.write_blob(response.body.as_deref())?,
@@ -1343,29 +1350,29 @@ impl TrafficStore {
         })
     }
 
-    fn stored_repeater_revision(
+    fn stored_resend_revision(
         &self,
-        revision: &RepeaterRevision,
-    ) -> Result<StoredRepeaterRevision, Diagnostic> {
-        Ok(StoredRepeaterRevision {
+        revision: &ResendRevision,
+    ) -> Result<StoredResendRevision, Diagnostic> {
+        Ok(StoredResendRevision {
             revision: revision.revision,
             sent_at: revision.sent_at,
-            request: self.stored_repeater_request(&revision.request)?,
+            request: self.stored_resend_request(&revision.request)?,
             response: revision
                 .response
                 .as_ref()
-                .map(|response| self.stored_repeater_response(response))
+                .map(|response| self.stored_resend_response(response))
                 .transpose()?,
             diagnostic: revision.diagnostic.clone(),
             scope: revision.scope,
         })
     }
 
-    fn resolve_repeater_request(
+    fn resolve_resend_request(
         &self,
-        request: StoredRepeaterRequest,
-    ) -> Result<RepeaterRequest, Diagnostic> {
-        Ok(RepeaterRequest {
+        request: StoredResendRequest,
+    ) -> Result<ResendRequest, Diagnostic> {
+        Ok(ResendRequest {
             method: request.method,
             url: request.url,
             headers: request.headers,
@@ -1373,18 +1380,18 @@ impl TrafficStore {
         })
     }
 
-    fn resolve_repeater_revision(
+    fn resolve_resend_revision(
         &self,
-        revision: StoredRepeaterRevision,
-    ) -> Result<RepeaterRevision, Diagnostic> {
-        Ok(RepeaterRevision {
+        revision: StoredResendRevision,
+    ) -> Result<ResendRevision, Diagnostic> {
+        Ok(ResendRevision {
             revision: revision.revision,
             sent_at: revision.sent_at,
-            request: self.resolve_repeater_request(revision.request)?,
+            request: self.resolve_resend_request(revision.request)?,
             response: revision
                 .response
                 .map(|response| {
-                    Ok(RepeaterResponse {
+                    Ok(ResendResponse {
                         status: response.status,
                         headers: response.headers,
                         body: self.read_blob(response.body_hash.as_deref())?,
@@ -1532,7 +1539,7 @@ struct StoredParts {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredRepeaterRequest {
+struct StoredResendRequest {
     method: String,
     url: String,
     headers: Vec<(String, String)>,
@@ -1542,7 +1549,7 @@ struct StoredRepeaterRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredRepeaterResponse {
+struct StoredResendResponse {
     status: u16,
     headers: Vec<(String, String)>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1552,12 +1559,12 @@ struct StoredRepeaterResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredRepeaterRevision {
+struct StoredResendRevision {
     revision: u64,
     sent_at: DateTime<Utc>,
-    request: StoredRepeaterRequest,
+    request: StoredResendRequest,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response: Option<StoredRepeaterResponse>,
+    response: Option<StoredResendResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic: Option<Diagnostic>,
     scope: ScopeDisposition,
@@ -1565,41 +1572,41 @@ struct StoredRepeaterRevision {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredIntruderConfig {
-    base_request: StoredRepeaterRequest,
+struct StoredFuzzerConfig {
+    base_request: StoredResendRequest,
     positions: Vec<PayloadPosition>,
     payload_sets: Vec<PayloadSet>,
-    attack_type: IntruderAttackType,
-    match_filter: IntruderMatchFilter,
+    attack_type: FuzzerAttackType,
+    match_filter: FuzzerMatchFilter,
     concurrency: usize,
     rate_per_second: u32,
     max_results: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    auth_preflight: Option<StoredRepeaterRequest>,
-    sequence: Vec<StoredIntruderSequenceStep>,
+    auth_preflight: Option<StoredResendRequest>,
+    sequence: Vec<StoredFuzzerSequenceStep>,
     #[serde(default)]
     auto_calibrate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredIntruderSequenceStep {
+struct StoredFuzzerSequenceStep {
     name: String,
-    request: StoredRepeaterRequest,
-    extractors: Vec<IntruderTokenExtractor>,
+    request: StoredResendRequest,
+    extractors: Vec<FuzzerTokenExtractor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredIntruderResult {
+struct StoredFuzzerResult {
     ordinal: u64,
     payloads: Vec<String>,
-    request: StoredRepeaterRequest,
+    request: StoredResendRequest,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response: Option<StoredRepeaterResponse>,
+    response: Option<StoredResendResponse>,
     matched: bool,
     filtered: bool,
-    diff: IntruderResponseDiff,
+    diff: FuzzerResponseDiff,
     scope: ScopeDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic: Option<Diagnostic>,
@@ -1609,7 +1616,9 @@ struct StoredIntruderResult {
 /// id, so a reopened store never reissues an id already on disk.
 fn seed_next_flow_id(connection: &Connection, database: &Path) -> Result<u64, Diagnostic> {
     let max_id: i64 = connection
-        .query_row("SELECT COALESCE(MAX(id),0) FROM flows", [], |row| row.get(0))
+        .query_row("SELECT COALESCE(MAX(id),0) FROM flows", [], |row| {
+            row.get(0)
+        })
         .map_err(|error| {
             storage_diag(
                 catalogue::PROXY_STORE_OPEN_FAILED,
@@ -1691,12 +1700,12 @@ pub struct TrafficSnapshot {
     pub schema_version: u32,
     /// Portable flow records.
     pub flows: Vec<CanonicalFlow>,
-    /// Persisted repeater contexts and their linear histories.
+    /// Persisted resend contexts and their linear histories.
     #[serde(default)]
-    pub repeater_contexts: Vec<RepeaterContext>,
-    /// Persisted intruder jobs and bounded results.
+    pub resend_contexts: Vec<ResendContext>,
+    /// Persisted fuzzer jobs and bounded results.
     #[serde(default)]
-    pub intruder_jobs: Vec<IntruderJob>,
+    pub fuzzer_jobs: Vec<FuzzerJob>,
 }
 
 /// One portable flow in the canonical session payload.
@@ -2025,13 +2034,13 @@ fn validate_flow(flow: &FlowCapture) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-fn validate_repeater(context: &RepeaterContext) -> Result<(), Diagnostic> {
+fn validate_resend(context: &ResendContext) -> Result<(), Diagnostic> {
     if context.id.trim().is_empty()
         || context.current.method.trim().is_empty()
         || context.current.url.trim().is_empty()
     {
         return Err(storage_diag(
-            catalogue::PROXY_REPEATER_HISTORY_FAILED,
+            catalogue::PROXY_RESEND_HISTORY_FAILED,
             "validate",
             Path::new(""),
             "context ID, method, and URL must be non-empty",
@@ -2043,7 +2052,7 @@ fn validate_repeater(context: &RepeaterContext) -> Result<(), Diagnostic> {
             || entry.request.url.trim().is_empty()
         {
             return Err(storage_diag(
-                catalogue::PROXY_REPEATER_HISTORY_FAILED,
+                catalogue::PROXY_RESEND_HISTORY_FAILED,
                 "validate",
                 Path::new(""),
                 "history revisions must be contiguous and contain method and URL",
@@ -2053,7 +2062,7 @@ fn validate_repeater(context: &RepeaterContext) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-fn validate_intruder(job: &IntruderJob) -> Result<(), Diagnostic> {
+fn validate_fuzzer(job: &FuzzerJob) -> Result<(), Diagnostic> {
     if job.id.trim().is_empty()
         || job.config.base_request.method.trim().is_empty()
         || job.config.base_request.url.trim().is_empty()
@@ -2066,7 +2075,7 @@ fn validate_intruder(job: &IntruderJob) -> Result<(), Diagnostic> {
         || job.config.max_results == 0
     {
         return Err(storage_diag(
-            catalogue::PROXY_INTRUDER_CONFIG_INVALID,
+            catalogue::PROXY_FUZZER_CONFIG_INVALID,
             "validate",
             Path::new(""),
             "job ID, request, positions, payload sets, and result limit must be usable",
@@ -2074,7 +2083,7 @@ fn validate_intruder(job: &IntruderJob) -> Result<(), Diagnostic> {
     }
     if job.results.len() > job.config.max_results {
         return Err(storage_diag(
-            catalogue::PROXY_INTRUDER_PERSISTENCE_FAILED,
+            catalogue::PROXY_FUZZER_PERSISTENCE_FAILED,
             "validate-results",
             Path::new(""),
             "result count exceeds configured bound",
@@ -2239,7 +2248,9 @@ mod tests {
             }
         };
         assert_eq!(
-            other.import_har(&har, "har.import", classify).expect("import"),
+            other
+                .import_har(&har, "har.import", classify)
+                .expect("import"),
             1
         );
         let summaries = other.summaries().expect("summaries");
@@ -2305,28 +2316,28 @@ mod tests {
     }
 
     #[test]
-    fn repeater_contexts_round_trip_through_sqlite_and_snapshot() {
+    fn resend_contexts_round_trip_through_sqlite_and_snapshot() {
         let store = store();
-        let context = RepeaterContext {
-            id: "repeater-test".to_owned(),
+        let context = ResendContext {
+            id: "resend-test".to_owned(),
             source_flow_id: Some(7),
             created_at: Utc::now(),
-            current: RepeaterRequest {
+            current: ResendRequest {
                 method: "POST".to_owned(),
                 url: "https://api.example.test/items?id=1".to_owned(),
                 headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                 body: Some(br#"{"name":"first"}"#.to_vec()),
             },
-            history: vec![RepeaterRevision {
+            history: vec![ResendRevision {
                 revision: 1,
                 sent_at: Utc::now(),
-                request: RepeaterRequest {
+                request: ResendRequest {
                     method: "POST".to_owned(),
                     url: "https://api.example.test/items?id=1".to_owned(),
                     headers: vec![],
                     body: Some(b"first".to_vec()),
                 },
-                response: Some(RepeaterResponse {
+                response: Some(ResendResponse {
                     status: 201,
                     headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                     body: Some(b"{\"ok\":true}".to_vec()),
@@ -2336,35 +2347,35 @@ mod tests {
                 scope: ScopeDisposition::InScope,
             }],
         };
-        store.upsert_repeater(&context).expect("repeater persisted");
+        store.upsert_resend(&context).expect("resend persisted");
         assert_eq!(
-            store.repeater_contexts().expect("repeater loaded"),
+            store.resend_contexts().expect("resend loaded"),
             vec![context]
         );
         assert_eq!(
-            store.snapshot().expect("snapshot").repeater_contexts.len(),
+            store.snapshot().expect("snapshot").resend_contexts.len(),
             1
         );
     }
 
     #[test]
-    fn intruder_jobs_round_trip_with_content_addressed_request_and_response_bodies() {
+    fn fuzzer_jobs_round_trip_with_content_addressed_request_and_response_bodies() {
         let store = store();
-        let request = RepeaterRequest {
+        let request = ResendRequest {
             method: "GET".to_owned(),
             url: "https://api.example.test/items?id=FUZZ".to_owned(),
             headers: vec![("accept".to_owned(), "application/json".to_owned())],
             body: Some(b"request-body".to_vec()),
         };
-        let job = IntruderJob {
-            id: "intruder-test".to_owned(),
+        let job = FuzzerJob {
+            id: "fuzzer-test".to_owned(),
             created_at: Utc::now(),
-            tier: IntruderTier::Native,
-            state: IntruderJobState::Completed,
-            config: IntruderConfig {
+            tier: FuzzerTier::Native,
+            state: FuzzerJobState::Completed,
+            config: FuzzerConfig {
                 base_request: request.clone(),
                 positions: vec![PayloadPosition {
-                    location: IntruderPositionLocation::Url,
+                    location: FuzzerPositionLocation::Url,
                     header_name: None,
                     start: 31,
                     end: 35,
@@ -2374,8 +2385,8 @@ mod tests {
                     name: "ids".to_owned(),
                     values: vec!["1".to_owned()],
                 }],
-                attack_type: IntruderAttackType::Sniper,
-                match_filter: IntruderMatchFilter::default(),
+                attack_type: FuzzerAttackType::Sniper,
+                match_filter: FuzzerMatchFilter::default(),
                 concurrency: 1,
                 rate_per_second: 0,
                 max_results: 10,
@@ -2383,11 +2394,11 @@ mod tests {
                 sequence: Vec::new(),
                 auto_calibrate: false,
             },
-            results: vec![IntruderResult {
+            results: vec![FuzzerResult {
                 ordinal: 1,
                 payloads: vec!["1".to_owned()],
                 request,
-                response: Some(RepeaterResponse {
+                response: Some(ResendResponse {
                     status: 200,
                     headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                     body: Some(b"response-body".to_vec()),
@@ -2395,15 +2406,15 @@ mod tests {
                 }),
                 matched: true,
                 filtered: false,
-                diff: IntruderResponseDiff::default(),
+                diff: FuzzerResponseDiff::default(),
                 scope: ScopeDisposition::InScope,
                 diagnostic: None,
             }],
             diagnostics: Vec::new(),
         };
-        store.upsert_intruder(&job).expect("intruder persisted");
-        assert_eq!(store.intruder_jobs().expect("intruder loaded"), vec![job]);
-        assert_eq!(store.snapshot().expect("snapshot").intruder_jobs.len(), 1);
+        store.upsert_fuzzer(&job).expect("fuzzer persisted");
+        assert_eq!(store.fuzzer_jobs().expect("fuzzer loaded"), vec![job]);
+        assert_eq!(store.snapshot().expect("snapshot").fuzzer_jobs.len(), 1);
         assert_eq!(
             fs::read_dir(store.root().join("blobs"))
                 .expect("blobs")

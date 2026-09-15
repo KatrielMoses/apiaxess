@@ -1,11 +1,38 @@
+# Rust and JavaScript build outputs.
 /target/
 node_modules/
 /apps/gui/dist/
+/apps/gui/.vite/
 /apps/desktop/gen/
+
+# Android build products (the Android project also carries its local rules).
+/apps/android/artifacts/
+*.apk
+*.apkm
+*.aab
+
+# Installer packages are produced by packaging scripts, never checked in.
+*.deb
+*.msi
+
+# Local work areas and disposable intake/output artifacts.
 /artifacts/
+/apiaxess-artifacts/
 /testers/
+/tmp/
+/Delzyn/
+/_patch_test.txt
+*.session
+
+# Local proxy CA state and material are generated per machine/session.
+*.ca-state
+*.ca-state.*
+ca-state/
+
+# IDE and OS metadata.
 *.log
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
 
@@ -14,17 +41,20 @@ node_modules/
 # and apps/gui/src/brand/, which are committed.
 /assets/brand/*.html
 
-# Local scratch / working directories — not part of the tracked source tree.
-/tmp/
-/Delzyn/
-/_patch_test.txt
-*.session
-
-# Bundled third-party tool binaries: provided by packaging/installers, not committed.
+# Bundled third-party tool payloads: fetched by packaging, never committed.
 /tools/jadx-*/
 /tools/*.zip
+/tools/ffuf/
+/tools/java-runtime/
+/tools/jre/
+/tools/chromium/
+/tools/frida/
+/tools/analysis-runtime/
 
 # Large third-party copyrighted APK test fixtures: exceed GitHub's file limit and
 # are provided out-of-band for the capstone/bundled integration tests.
 /fixtures/capstone/*.apk
 /fixtures/capstone/*.apkm
+
+# WiX installer build output
+.wix/

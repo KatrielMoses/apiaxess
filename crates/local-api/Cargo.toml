@@ -14,13 +14,29 @@ apiaxess-session = { path = "../session" }
 apiaxess-workbench-proxy = { path = "../workbench-proxy" }
 apiaxess-workbench-store = { path = "../workbench-store" }
 axum.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
+http.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tower-http.workspace = true
+
+# Native OS file picker for the "Browse…" affordance, so selecting an APK yields
+# its full disk path (a browser file input exposes only the filename). Windows
+# only: rfd there is a light Win32 shim (no GTK); other platforms keep the
+# filename-prefix fallback in the GUI. Already in the workspace lock via the
+# desktop shell.
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+# So the native "Browse…" dialog opens owned by (on top of, focused over) the app
+# window instead of behind it: this helper hands rfd the current foreground window
+# as parent. It isolates the small Win32 unsafe the forbid-unsafe lint blocks here.
+apiaxess-native-dialog = { path = "../native-dialog" }
 
 [lints]
 workspace = true

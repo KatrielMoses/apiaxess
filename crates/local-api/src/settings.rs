@@ -111,6 +111,16 @@ const KNOBS: &[Knob] = &[
         choices: &[],
     },
     Knob {
+        key: "APIAXESS_ANDROID_TARGET",
+        label: "GUI Android target location",
+        group: "Dynamic analysis",
+        default_display: "beside the install",
+        advanced: false,
+        restart_required: true,
+        description: "Path to the optional GUI Android target add-on (a slim no-GApps root-capable AOSP emulator you install your own APK into and drive by hand). Blank resolves it beside the install.",
+        choices: &[],
+    },
+    Knob {
         key: "APIAXESS_JAVA",
         label: "Java runtime override",
         group: "Tool paths (advanced)",

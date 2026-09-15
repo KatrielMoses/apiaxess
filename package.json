@@ -5,6 +5,8 @@
   "scripts": {
     "ui:build": "pnpm --filter @apiaxess/gui build",
     "ui:check": "pnpm --filter @apiaxess/gui check",
+    "ui:lint-tokens": "pnpm --filter @apiaxess/gui lint:tokens",
+    "ui:lint-marks": "pnpm --filter @apiaxess/gui lint:marks",
     "ui:dev": "pnpm --filter @apiaxess/gui dev"
   }
 }

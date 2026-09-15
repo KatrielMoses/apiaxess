@@ -10,7 +10,9 @@ export type ViewName =
   | "start"
   | "apk"
   | "web"
+  | "android"
   | "workbench"
+  | "devices"
   | "surface"
   | "export"
   | "session"
@@ -21,7 +23,9 @@ const VIEWS: readonly ViewName[] = [
   "start",
   "apk",
   "web",
+  "android",
   "workbench",
+  "devices",
   "surface",
   "export",
   "session",
@@ -33,7 +37,9 @@ const TITLES: Record<ViewName, string> = {
   start: "APIaxess",
   apk: "APK analysis · APIaxess",
   web: "Web capture · APIaxess",
+  android: "Android target · APIaxess",
   workbench: "Workbench · APIaxess",
+  devices: "Devices · APIaxess",
   surface: "API surface · APIaxess",
   export: "Export · APIaxess",
   session: "Session · APIaxess",

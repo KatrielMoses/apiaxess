@@ -164,8 +164,8 @@
   mask-image: linear-gradient(
     to right,
     transparent 0,
-    #000 var(--space-4),
-    #000 calc(100% - var(--space-4)),
+    black var(--space-4),
+    black calc(100% - var(--space-4)),
     transparent 100%
   );
 }
@@ -572,8 +572,8 @@
   overflow: auto;
 }
 
-/* Repeater and intruder open beneath the grid as full-width workspaces. */
-/* Repeater and intruder share the column with the grid rather than pushing the
+/* Resend and fuzzer open beneath the grid as full-width workspaces. */
+/* Resend and fuzzer share the column with the grid rather than pushing the
    page taller, so the traffic list never scrolls out from under the operator. */
 .workbench__drawer {
   flex: 0 1 auto;
@@ -596,7 +596,7 @@
 /* Both drawers open at 46% each left nothing for the grid, which then clipped
    the flow detail mid-row. Two open share the space instead of each claiming
    the same half. */
-.workbench:has(#repeater-panel:not([hidden]) + #intruder-panel:not([hidden]))
+.workbench:has(#resend-panel:not([hidden]) + #fuzzer-panel:not([hidden]))
   .workbench__drawer {
   max-height: 34%;
 }
@@ -655,20 +655,110 @@
   overflow: auto;
 }
 
-.endpoint-row {
-  display: grid;
-  grid-template-columns: 4.5rem minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-4);
-  padding: var(--space-3) var(--space-5);
+.endpoint-item {
   border-bottom: var(--border);
 }
 
-.endpoint-row:last-child {
+.endpoint-item:last-child {
   border-bottom: 0;
 }
 
+.endpoint-row {
+  display: grid;
+  grid-template-columns: 1rem 4.5rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  width: 100%;
+  /* Reset the native button so the row reads as a list row, not a control. */
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
 .endpoint-row:hover {
+  background: var(--color-surface-sunken);
+}
+
+.endpoint-row__caret {
+  color: var(--color-text-subtle);
+  transition: transform var(--duration-fast) ease;
+}
+
+.endpoint-item.is-open .endpoint-row__caret {
+  transform: rotate(90deg);
+}
+
+.endpoint-detail {
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  background: var(--color-surface-sunken);
+  border-top: var(--border);
+}
+
+.endpoint-detail__grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-5);
+}
+
+.endpoint-detail__col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.endpoint-detail__headers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--text-small);
+}
+
+.endpoint-detail__actions {
+  margin-top: var(--space-4);
+}
+
+@media (max-width: 720px) {
+  .endpoint-detail__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Right-click send-to menu on a surface endpoint. */
+.context-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 12rem;
+  padding: var(--space-1);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-rule-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-popover);
+}
+
+.context-menu__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu__item:hover {
   background: var(--color-surface-sunken);
 }
 
@@ -687,6 +777,50 @@
   font-size: var(--text-micro);
   color: var(--color-text-subtle);
   white-space: nowrap;
+}
+
+/* First- vs third-party host label. Every endpoint is listed regardless; this
+   chip lets the tester tell the app's own backend from the SDK/tracker hosts it
+   also calls. Third-party gets the caution tone (noise to triage), first-party
+   the calm accent (the target's own API). */
+.party-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem var(--space-2);
+  border: var(--border-hairline) solid var(--color-rule-strong);
+  border-radius: var(--radius-xs);
+  font-size: var(--text-nano);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.party-chip--first {
+  border-color: var(--color-accent);
+  color: var(--color-text-accent);
+  background: var(--color-surface-accent-wash);
+}
+
+.party-chip--third {
+  border-color: var(--color-caution-ink);
+  color: var(--color-caution-ink);
+  background: var(--color-surface-caution-wash);
+}
+
+/* Evidence source: confirmed (observed being hit) vs static-inferred (a code
+   candidate, not observed). Confirmed reads as the calm "real" tone; inferred is
+   deliberately muted so it never looks like asserted fact. */
+.party-chip--confirmed {
+  border-color: var(--color-success-ink);
+  color: var(--color-success-ink);
+  background: var(--color-surface-success-wash);
+}
+
+.party-chip--inferred {
+  border-color: var(--color-rule-strong);
+  color: var(--color-text-subtle);
+  background: transparent;
 }
 
 /* Confidence is shown as a value plus a bar so honest coverage reads at a

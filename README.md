@@ -2,7 +2,7 @@
 
 APIaxess is a security-analysis workbench for recovering and working with an
 application's hidden API surface. The assembled product combines a durable,
-scope-aware session model; live proxy capture with repeater and intruder
+scope-aware session model; live proxy capture with resend and fuzzer
 workbenches; the APK analysis pipeline; structured diagnostics and progress;
 and artifact export for OpenAPI 3.1, Python httpx, Postman, and HAR.
 
@@ -42,7 +42,7 @@ cargo run -p apiaxess
 
 Open `http://127.0.0.1:7777`. The same process owns the session proxy at
 `127.0.0.1:8080`; captured traffic feeds the live GUI queue and session SQLite
-store, and that listener is also the repeater/intruder transport. Both listeners
+store, and that listener is also the resend/fuzzer transport. Both listeners
 are loopback-only. Override them with `APIAXESS_GUI_ADDRESS` and
 `APIAXESS_PROXY_ADDRESS`; non-loopback values are rejected. Declare comma-separated
 exact hosts or `*.domain` suffixes with `APIAXESS_ALLOWED_TARGETS` for advisory

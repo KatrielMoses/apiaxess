@@ -255,17 +255,17 @@ http.createServer((request, response) => {
         throw "Installed workbench did not create a non-empty SQLite traffic store."
     }
 
-    $repeaterRequest = @{ request = @{ method = "GET"; url = "http://127.0.0.1:$upstreamPort/repeater"; headers = @(); body = $null } } | ConvertTo-Json -Depth 6
-    $repeater = Invoke-RestMethod -Method Post -ContentType "application/json" -Body $repeaterRequest -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/repeater"
-    $repeaterResult = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/repeater/$($repeater.id)/send"
-    if ($repeaterResult.revision.response.status -ne 200) {
-        throw "Installed repeater did not complete through the live proxy."
+    $resendRequest = @{ request = @{ method = "GET"; url = "http://127.0.0.1:$upstreamPort/resend"; headers = @(); body = $null } } | ConvertTo-Json -Depth 6
+    $resend = Invoke-RestMethod -Method Post -ContentType "application/json" -Body $resendRequest -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/resend"
+    $resendResult = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/resend/$($resend.id)/send"
+    if ($resendResult.revision.response.status -ne 200) {
+        throw "Installed resend did not complete through the live proxy."
     }
 
-    $intruderUrl = "http://127.0.0.1:$upstreamPort/intruder/FUZZ"
-    $markerStart = $intruderUrl.IndexOf("FUZZ", [System.StringComparison]::Ordinal)
-    $intruderConfig = @{
-        baseRequest = @{ method = "GET"; url = $intruderUrl; headers = @(); body = $null }
+    $fuzzerUrl = "http://127.0.0.1:$upstreamPort/fuzzer/FUZZ"
+    $markerStart = $fuzzerUrl.IndexOf("FUZZ", [System.StringComparison]::Ordinal)
+    $fuzzerConfig = @{
+        baseRequest = @{ method = "GET"; url = $fuzzerUrl; headers = @(); body = $null }
         positions = @(@{ location = "url"; headerName = $null; start = $markerStart; end = $markerStart + 4; setIndex = 0 })
         payloadSets = @(@{ name = "qa"; values = @("one") })
         attackType = "sniper"
@@ -282,19 +282,19 @@ http.createServer((request, response) => {
         authPreflight = $null
         sequence = @(@{
             name = "send"
-            request = @{ method = "GET"; url = $intruderUrl; headers = @(); body = $null }
+            request = @{ method = "GET"; url = $fuzzerUrl; headers = @(); body = $null }
             extractors = @()
         })
     } | ConvertTo-Json -Depth 8
-    $intruder = Invoke-RestMethod -Method Post -ContentType "application/json" -Body $intruderConfig -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/intruder"
-    Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/intruder/$($intruder.id)/start" | Out-Null
+    $fuzzer = Invoke-RestMethod -Method Post -ContentType "application/json" -Body $fuzzerConfig -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/fuzzer"
+    Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/fuzzer/$($fuzzer.id)/start" | Out-Null
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
-        $intruder = Invoke-RestMethod -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/intruder/$($intruder.id)"
-        if ($intruder.state -in @("completed", "failed")) { break }
+        $fuzzer = Invoke-RestMethod -Uri "http://127.0.0.1:$guiPort/api/v1/workbench/fuzzer/$($fuzzer.id)"
+        if ($fuzzer.state -in @("completed", "failed")) { break }
         Start-Sleep -Milliseconds 250
     }
-    if ($intruder.state -ne "completed" -or $intruder.results[0].response.status -ne 200) {
-        throw "Installed intruder did not complete its native request path."
+    if ($fuzzer.state -ne "completed" -or $fuzzer.results[0].response.status -ne 200) {
+        throw "Installed fuzzer did not complete its native request path."
     }
 }
 finally {

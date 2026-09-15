@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="stylesheet" href="_ds/modernist-986e03d1-b830-402c-a2f3-90030fbd85ff/styles.css">
+<script src="_ds/modernist-986e03d1-b830-402c-a2f3-90030fbd85ff/_ds_bundle.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Outfit:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --s-bg:#F3F2F2; --s-surface:#FFFFFF; --s-surface2:#FAFAF9; --s-sel:#ECF3FE;
+    --s-ink:#0D0D0D; --s-ink2:#4A4948; --s-ink3:#8A8A8A;
+    --s-line:#DCDBDA; --s-line2:#EAE9E8; --s-rule:#0D0D0D; --s-track:#E3E2E1;
+    --s-blue:#2D7FF9; --s-blue2:#1B5FC4; --s-onblue:#FFFFFF;
+    --s-red:#B0230C; --s-redbg:#FBEEEB;
+    --s-shadow:rgba(0,0,0,0.16); --s-scrim:rgba(243,242,242,0.55);
+    --s-row:25px; --s-mono:'IBM Plex Mono',ui-monospace,monospace; --s-ui:'Archivo',sans-serif;
+  }
+  body{margin:0;background:var(--s-bg);}
+  a{color:var(--s-blue);text-decoration:none;}
+  a:hover{color:var(--s-ink);}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  ::-webkit-scrollbar-thumb{background:var(--s-line);border:2px solid transparent;background-clip:padding-box;}
+</style>
+</helmet>
+
+<section style="display:flex;flex-direction:column;gap:30px;padding:56px 56px 96px;font-family:var(--s-ui);color:var(--s-ink);background:var(--s-bg);">
+
+  <div style="display:flex;align-items:flex-end;justify-content:space-between;border-bottom:2px solid var(--s-rule);padding-bottom:15px;">
+    <div style="display:flex;flex-direction:column;gap:7px;">
+      <div style="font-size:11px;letter-spacing:0.26em;text-transform:uppercase;color:var(--s-ink3);">apiaxess desktop · production spec 2 of 4 · light</div>
+      <div style="font-size:31px;font-weight:600;letter-spacing:-0.03em;">Capture surfaces</div>
+    </div>
+    <div style="font-size:12px;line-height:1.55;color:var(--s-ink2);max-width:520px;text-wrap:pretty;">Start, APK analysis, Web capture, Android target, Devices. Same shell every time — only slots A–D change. Pane sizes are annotated where they differ from the defaults on sheet 1.</div>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:46px;">
+
+    <sc-for list="{{ surfaces }}" as="s" hint-placeholder-count="5">
+      <div id="{{ s.id }}" style="display:flex;flex-direction:column;gap:12px;width:1280px;">
+        <div style="display:flex;align-items:flex-start;gap:12px;">
+          <div style="width:30px;height:30px;background:var(--s-ink);color:var(--s-bg);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;flex:none;">{{ s.num }}</div>
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <div style="font-size:17px;font-weight:600;letter-spacing:-0.02em;">{{ s.heading }}</div>
+            <div style="font-size:12.5px;color:var(--s-ink2);">{{ s.blurb }}</div>
+          </div>
+        </div>
+        <div style="width:1280px;height:800px;background:var(--s-bg);border:1px solid var(--s-ink);box-shadow:0 14px 40px var(--s-shadow);display:flex;flex-direction:column;overflow:hidden;">
+
+          <div style="height:32px;flex:none;background:var(--s-surface);border-bottom:2px solid var(--s-rule);display:flex;align-items:stretch;">
+            <div style="display:flex;align-items:center;gap:8px;padding:0 12px;">
+              <svg width="15" height="15" viewBox="0 0 200 200" fill="none"><path d="M138 60 L100 22 L22 100 L100 178 L138 140" stroke="var(--s-ink)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path><path d="M52 100 H138" stroke="var(--s-blue)" stroke-width="18" stroke-linecap="round"></path><path d="M118 78 L142 100 L118 122" stroke="var(--s-blue)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path><path d="M168 78 L142 100 L168 122" stroke="var(--s-ink)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+              <span style="font-family:'Outfit',sans-serif;font-size:12.5px;font-weight:500;">apiaxess</span>
+            </div>
+            <div style="width:1px;background:var(--s-line);"></div>
+            <div style="display:flex;align-items:center;gap:14px;padding:0 13px;font-size:11px;color:var(--s-ink2);"><span>File</span><span>Session</span><span>Capture</span><span>View</span><span>Help</span></div>
+            <div style="flex:1;display:flex;align-items:center;justify-content:center;">
+              <div style="display:flex;align-items:center;gap:8px;height:21px;padding:0 9px;border:1px solid var(--s-line);background:var(--s-bg);width:420px;">
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--s-ink3)" stroke-width="2.6"><circle cx="11" cy="11" r="7"></circle><path d="M20 20 L16 16"></path></svg>
+                <span style="font-size:11px;color:var(--s-ink3);flex:1;">Go to surface, flow, endpoint or command</span>
+                <span style="font-family:var(--s-mono);font-size:10px;color:var(--s-ink3);">⌘K</span>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:9px;padding:0 12px;">
+              <span style="display:flex;align-items:center;gap:6px;height:20px;padding:0 8px;border:1px solid {{ s.scopeBorder }};color:{{ s.scopeFg }};font-size:10px;letter-spacing:0.1em;"><span style="width:5px;height:5px;background:{{ s.scopeDot }};"></span>{{ s.scope }}</span>
+              <span style="font-family:var(--s-mono);font-size:11px;color:var(--s-ink2);">{{ s.target }}</span>
+            </div>
+            <div style="width:1px;background:var(--s-line);"></div>
+            <div style="display:flex;align-items:stretch;">
+              <div style="width:34px;display:flex;align-items:center;justify-content:center;"><span style="width:9px;height:1px;background:var(--s-ink2);"></span></div>
+              <div style="width:34px;display:flex;align-items:center;justify-content:center;"><span style="width:8px;height:8px;border:1px solid var(--s-ink2);"></span></div>
+              <div style="width:34px;display:flex;align-items:center;justify-content:center;"><svg width="9" height="9" viewBox="0 0 10 10" stroke="var(--s-ink)" stroke-width="1.5"><path d="M1 1 L9 9 M9 1 L1 9"></path></svg></div>
+            </div>
+          </div>
+
+          <div style="flex:1;display:flex;min-height:0;">
+            <div style="width:48px;flex:none;background:var(--s-surface);border-right:1px solid var(--s-line);display:flex;flex-direction:column;align-items:center;">
+              <sc-for list="{{ s.rail }}" as="r" hint-placeholder-count="4">
+                <div style="width:48px;height:52px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;position:relative;background:{{ r.bg }};border-bottom:1px solid var(--s-line2);">
+                  <sc-if value="{{ r.on }}" hint-placeholder-val="{{ false }}">
+                    <span style="position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--s-blue);"></span>
+                  </sc-if>
+                  <span style="font-family:var(--s-mono);font-size:13px;color:{{ r.fg }};">{{ r.glyph }}</span>
+                  <span style="font-size:8px;letter-spacing:0.1em;color:{{ r.fg }};">{{ r.label }}</span>
+                </div>
+              </sc-for>
+              <div style="flex:1;"></div>
+              <div style="width:48px;height:44px;display:flex;align-items:center;justify-content:center;border-top:1px solid var(--s-line2);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--s-ink3)" stroke-width="1.8"><circle cx="12" cy="12" r="3.2"></circle><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"></path></svg></div>
+            </div>
+
+            <div style="width:192px;flex:none;background:var(--s-surface);border-right:2px solid var(--s-rule);display:flex;flex-direction:column;min-height:0;">
+              <div style="padding:9px 12px 8px;border-bottom:1px solid var(--s-line);display:flex;flex-direction:column;gap:3px;">
+                <span style="font-size:9.5px;letter-spacing:0.2em;color:var(--s-ink3);">SESSION</span>
+                <div style="display:flex;align-items:baseline;gap:7px;">
+                  <span style="font-family:var(--s-mono);font-size:12px;font-weight:500;flex:1;">{{ s.session }}</span>
+                  <span style="font-size:9px;letter-spacing:0.1em;color:var(--s-blue);">{{ s.sessionState }}</span>
+                </div>
+              </div>
+              <sc-for list="{{ s.mods }}" as="m" hint-placeholder-count="13">
+                <sc-if value="{{ m.group }}" hint-placeholder-val="{{ false }}">
+                  <div style="padding:11px 12px 5px;font-size:9.5px;letter-spacing:0.2em;color:var(--s-ink3);">{{ m.group }}</div>
+                </sc-if>
+                <sc-if value="{{ m.label }}" hint-placeholder-val="{{ true }}">
+                  <div style="height:28px;display:flex;align-items:center;gap:9px;padding:0 12px;background:{{ m.bg }};border-left:3px solid {{ m.edge }};">
+                    <span style="font-size:12.5px;font-weight:{{ m.weight }};color:{{ m.fg }};flex:1;">{{ m.label }}</span>
+                    <span style="font-family:var(--s-mono);font-size:10px;color:{{ m.cColor }};">{{ m.count }}</span>
+                  </div>
+                </sc-if>
+              </sc-for>
+              <div style="flex:1;"></div>
+              <div style="border-top:1px solid var(--s-line);padding:9px 12px;display:flex;flex-direction:column;gap:5px;">
+                <span style="font-size:9.5px;letter-spacing:0.2em;color:var(--s-ink3);">{{ s.footLabel }}</span>
+                <span style="font-size:12.5px;font-weight:600;">{{ s.footValue }}</span>
+                <span style="font-size:11px;color:var(--s-ink2);line-height:1.4;">{{ s.footNote }}</span>
+              </div>
+            </div>
+
+            <div style="flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;">
+              <div style="height:32px;flex:none;background:var(--s-surface);border-bottom:2px solid var(--s-rule);display:flex;align-items:center;gap:10px;padding:0 13px;">
+                <span style="font-size:13px;font-weight:600;">{{ s.toolbarTitle }}</span>
+                <sc-for list="{{ s.toolbar }}" as="t" hint-placeholder-count="3">
+                  <span style="height:22px;padding:0 10px;display:flex;align-items:center;font-size:11px;background:{{ t.bg }};color:{{ t.fg }};border:1px solid {{ t.border }};">{{ t.label }}</span>
+                </sc-for>
+                <div style="flex:1;"></div>
+                <span style="font-family:var(--s-mono);font-size:11px;color:var(--s-ink2);">{{ s.toolbarMeta }}</span>
+              </div>
+
+              <div style="flex:1;display:flex;min-height:0;">
+                <div style="flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;">{{ s.body }}</div>
+                <sc-if value="{{ s.hasAside }}" hint-placeholder-val="{{ false }}">
+                  <div style="width:6px;flex:none;background:var(--s-bg);border-left:1px solid var(--s-line);border-right:1px solid var(--s-line);display:flex;align-items:center;justify-content:center;"><span style="width:2px;height:22px;background:var(--s-line);"></span></div>
+                  <div style="width:{{ s.asideW }};flex:none;background:var(--s-surface);display:flex;flex-direction:column;min-height:0;overflow:hidden;">{{ s.aside }}</div>
+                </sc-if>
+              </div>
+
+              <sc-if value="{{ s.hasDock }}" hint-placeholder-val="{{ false }}">
+                <div style="height:{{ s.dockH }};flex:none;border-top:2px solid var(--s-rule);background:var(--s-surface);display:flex;flex-direction:column;overflow:hidden;">{{ s.dock }}</div>
+              </sc-if>
+            </div>
+          </div>
+
+          <div style="height:24px;flex:none;background:var(--s-surface);border-top:2px solid var(--s-rule);display:flex;align-items:center;font-family:var(--s-mono);font-size:10px;color:var(--s-ink2);">
+            <span style="padding:0 10px;height:100%;display:flex;align-items:center;background:var(--s-blue);color:var(--s-onblue);">{{ s.statusName }}</span>
+            <sc-for list="{{ s.status }}" as="c" hint-placeholder-count="4">
+              <span style="padding:0 10px;border-right:1px solid var(--s-line);height:100%;display:flex;align-items:center;gap:6px;color:{{ c.color }};">{{ c.t }}</span>
+            </sc-for>
+            <div style="flex:1;"></div>
+            <span style="padding:0 10px;border-left:1px solid var(--s-line);height:100%;display:flex;align-items:center;">{{ s.statusRight }}</span>
+            <span style="padding:0 10px;border-left:1px solid var(--s-line);height:100%;display:flex;align-items:center;color:var(--s-red);">3 DIAGNOSTICS</span>
+            <span style="padding:0 10px;border-left:1px solid var(--s-line);height:100%;display:flex;align-items:center;">127.0.0.1</span>
+          </div>
+        </div>
+      </div>
+    </sc-for>
+
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1400}}">
+const INK='var(--s-ink)', INK2='var(--s-ink2)', INK3='var(--s-ink3)', BLUE='var(--s-blue)', BLUE2='var(--s-blue2)', RED='var(--s-red)', SEL='var(--s-sel)', LINE='var(--s-line)', ON='var(--s-onblue)', SURF='var(--s-surface)';
+const h = React.createElement;
+const M = m => ({GET:BLUE2, POST:INK, PUT:INK2, PATCH:INK2, DELETE:RED, OPTIONS:INK3}[m] || INK2);
+
+const el = (tag, style, children, key) => h(tag, { style: (style && style.style && Object.keys(style).length === 1) ? style.style : style, key }, children);
+const lbl = (t, extra) => el('span', Object.assign({ fontSize: '9.5px', letterSpacing: '0.2em', color: INK3 }, extra || {}), t);
+const head = (kicker, title, right) => el('div', { flex: 'none', padding: '17px 20px 15px', borderBottom: '2px solid var(--s-rule)', background: SURF, display: 'flex', alignItems: 'flex-end', gap: '16px' }, [
+  el('div', { display: 'flex', flexDirection: 'column', gap: '4px', flex: 'none' }, [lbl(kicker, { key: 'k' }), el('span', { fontSize: '25px', fontWeight: 600, letterSpacing: '-0.03em', whiteSpace: 'nowrap' }, title, 't')], 'l'),
+  el('div', { flex: 1 }, null, 'sp'),
+  right ? el('div', { flex: 'none', display: 'flex', alignItems: 'center', gap: '12px', whiteSpace: 'nowrap' }, right, 'r') : null
+]);
+const btn = (label, kind) => {
+  const map = {
+    primary: { background: BLUE, color: ON, border: '1px solid ' + BLUE },
+    ghost: { background: 'transparent', color: INK, border: '1px solid ' + INK },
+    danger: { background: 'transparent', color: RED, border: '1px solid ' + RED }
+  };
+  return el('span', Object.assign({ height: '30px', padding: '0 14px', fontSize: '12.5px', fontWeight: 500, display: 'inline-flex', alignItems: 'center', whiteSpace: 'nowrap', flex: 'none' }, map[kind] || map.ghost), label, label);
+};
+const ruleHead = (t, right) => el('div', { display: 'flex', alignItems: 'center', gap: '13px', padding: '15px 20px 8px' }, [
+  el('span', { fontSize: '10.5px', letterSpacing: '0.2em', color: INK3 }, t, 'a'),
+  el('span', { flex: 1, height: '2px', background: 'var(--s-rule)' }, null, 'b'),
+  right ? el('span', { fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK2 }, right, 'c') : null
+], t);
+const field = (label, value, w, note) => el('div', { display: 'flex', flexDirection: 'column', gap: '5px', width: w || 'auto', flex: w ? 'none' : 1 }, [
+  lbl(label, { key: 'l', fontSize: '9.5px' }),
+  el('div', { display: 'flex', alignItems: 'center', gap: '9px' }, [
+    el('div', { flex: 1, height: '28px', border: '1px solid ' + LINE, background: SURF, display: 'flex', alignItems: 'center', padding: '0 10px' }, el('span', { style: { fontFamily: 'var(--s-mono)', fontSize: '11.5px' } }, value), 'i'),
+    note ? el('span', { fontSize: '11px', color: INK3, flex: 'none' }, note, 'n') : null
+  ], 'r')
+], label);
+const kv = (k, v, color) => el('div', { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid var(--s-line2)' }, [
+  el('span', { fontSize: '12px', color: INK2 }, k, 'k'),
+  el('span', { fontFamily: 'var(--s-mono)', fontSize: '12px', fontWeight: 600, color: color || INK }, v, 'v')
+], k);
+const meter = (label, value, pct, bar) => el('div', { display: 'flex', flexDirection: 'column', gap: '4px' }, [
+  el('div', { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }, [
+    el('span', { fontSize: '12px', color: INK2 }, label, 'l'), el('span', { fontFamily: 'var(--s-mono)', fontSize: '12px', fontWeight: 600 }, value, 'v')
+  ], 'a'),
+  el('span', { height: '4px', background: 'var(--s-track)', position: 'relative', display: 'block' }, el('span', { style: { position: 'absolute', left: 0, top: 0, bottom: 0, width: pct, background: bar || BLUE } }), 'b')
+], label);
+
+class Component extends DCLogic {
+  rail(active) {
+    return [['◧','CAPT'],['◨','BNCH'],['◫','SURF'],['◰','DLVR']].map(([glyph, label]) => {
+      const on = label === active;
+      return { glyph, label, on, bg: on ? SEL : 'transparent', fg: on ? BLUE : INK3 };
+    });
+  }
+
+  mods(active) {
+    const raw = [
+      ['group','CAPTURE'], ['Web capture','',0], ['APK analysis','0041',0], ['Android target','READY',0], ['Devices','2',0],
+      ['group','ANALYSE'], ['Workbench','2481',0], ['Intercept queue','3',0], ['API surface','128',0],
+      ['group','DELIVER'], ['Export','4',0], ['Session & audit','312',0], ['Settings','',0]
+    ];
+    return raw.map(r => {
+      if (r[0] === 'group') return { group: r[1], label: '', count: '', bg: 'transparent', edge: 'transparent', fg: INK, weight: 400, cColor: INK3 };
+      const on = r[0] === active;
+      return { group: '', label: r[0], count: r[1],
+        bg: on ? SEL : 'transparent', edge: on ? BLUE : 'transparent',
+        fg: on ? INK : INK2, weight: on ? 600 : 400,
+        cColor: r[0] === 'Intercept queue' ? BLUE : INK3 };
+    });
+  }
+
+  tb(label, kind) {
+    const map = {
+      primary: { bg: BLUE, fg: ON, border: BLUE },
+      ghost: { bg: 'transparent', fg: INK, border: INK },
+      quiet: { bg: 'transparent', fg: INK2, border: LINE },
+      danger: { bg: 'transparent', fg: RED, border: RED }
+    };
+    const m = map[kind] || map.ghost;
+    return { label, bg: m.bg, fg: m.fg, border: m.border };
+  }
+
+  startBody() {
+    const card = (kicker, title, steps, cta, note) => el('div', { flex: 1, background: SURF, border: '1px solid var(--s-line)', borderTop: '2px solid var(--s-rule)', padding: '20px', display: 'flex', flexDirection: 'column', gap: '14px' }, [
+      lbl(kicker, { key: 'k' }),
+      el('span', { fontSize: '22px', fontWeight: 600, letterSpacing: '-0.02em' }, title, 't'),
+      el('div', { display: 'flex', flexDirection: 'column', gap: '0' }, steps.map((s, i) => el('div', { display: 'flex', gap: '11px', padding: '8px 0', borderBottom: '1px solid var(--s-line2)' }, [
+        el('span', { fontFamily: 'var(--s-mono)', fontSize: '11px', color: BLUE, width: '16px', flex: 'none' }, String(i + 1).padStart(2, '0'), 'n'),
+        el('span', { fontSize: '12.5px', color: INK2, lineHeight: 1.45 }, s, 't')
+      ], s)), 's'),
+      el('div', { flex: 1 }, null, 'sp'),
+      el('div', { display: 'flex', alignItems: 'center', gap: '12px' }, [btn(cta, 'primary'), el('span', { fontSize: '11px', color: INK3 }, note, 'n')], 'c')
+    ], title);
+
+    return el('div', { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+      el('div', { padding: '30px 24px 22px', background: SURF, borderBottom: '2px solid var(--s-rule)', display: 'flex', flexDirection: 'column', gap: '10px' }, [
+        lbl('APIAXESS · LOCAL API SURFACE DISCOVERY', { key: 'k' }),
+        el('span', { fontSize: '34px', fontWeight: 600, letterSpacing: '-0.035em', lineHeight: 1.05 }, 'Start a session', 't'),
+        el('span', { fontSize: '13.5px', color: INK2, maxWidth: '620px', lineHeight: 1.5 }, 'Point apiaxess at an Android artifact or a web target. Everything runs on this machine, every action is audited, and nothing is claimed that was not observed.', 'b')
+      ], 'hero'),
+      el('div', { flex: 1, display: 'flex', gap: '20px', padding: '20px 24px', minHeight: 0 }, [
+        card('ANDROID APK', 'Analyse an artifact', ['Pick the .apk and an output root', 'Choose static only, or add the sandboxed dynamic pass', 'Read the assembled surface and export'], 'Choose APK…', 'static + dynamic'),
+        card('WEB DOMAIN', 'Capture a live target', ['Affirm you are authorized to test the target', 'Launch the bundled browser through the proxy', 'Fuse captured traffic into the surface'], 'Start web session', 'start here')
+      ], 'cards'),
+      el('div', { flex: 'none', display: 'flex', borderTop: '1px solid var(--s-line)', background: SURF }, [
+        ['LOCAL ONLY', 'Engine, proxy and browser all bind to 127.0.0.1. No artifact or capture leaves the machine.'],
+        ['HONEST COVERAGE', 'Endpoints carry confidence and provenance. Unconfirmed stays unconfirmed.'],
+        ['AUTHORIZATION', 'Active work needs an affirmed scope, recorded in the audit trail.']
+      ].map(([k, v]) => el('div', { flex: 1, padding: '15px 20px', borderRight: '1px solid var(--s-line2)', display: 'flex', flexDirection: 'column', gap: '6px' }, [
+        el('span', { fontSize: '9.5px', letterSpacing: '0.16em', color: BLUE }, k, 'k'),
+        el('span', { fontSize: '12px', color: INK2, lineHeight: 1.5 }, v, 'v')
+      ], k)), 'notes')
+    ]);
+  }
+
+  apkBody() {
+    const stages = [
+      ['01','INTAKE','COMPLETE','Artifact hashed, manifest parsed, 1 signer recorded','100%','0m 46s'],
+      ['02','STATIC','COMPLETE','812 classes decompiled · 141 path literals · 6 hosts','100%','2m 47s'],
+      ['03','DYNAMIC','RUNNING','AVD driving under capture — 318 requests, 41 paths','62%','3m 08s'],
+      ['04','SIGNING','QUEUED','Signer chain and certificate pinning report','0%','—'],
+      ['05','FUSION','QUEUED','Merge static literals with observed traffic','0%','—'],
+      ['06','CONFIDENCE','QUEUED','Score each endpoint; mark unconfirmed honestly','0%','—'],
+      ['07','SURFACE','QUEUED','Assemble the session-scoped API surface','0%','—']
+    ];
+    return el('div', { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+      head('ANALYSIS PIPELINE / RUN 0041', 'Static + dynamic pass', el('div', { style: { display: 'flex', gap: '9px' }, key: 'r' }, [btn('Refresh status', 'ghost'), btn('Cancel run', 'primary')])),
+      el('div', { flex: 'none', padding: '14px 20px', background: SURF, borderBottom: '1px solid var(--s-line)', display: 'flex', gap: '18px', alignItems: 'flex-end' }, [
+        field('APK PATH', './artifacts/northwind-retail.apk', '286px'),
+        el('span', { height: '28px', padding: '0 12px', border: '1px solid ' + INK, fontSize: '11.5px', display: 'inline-flex', alignItems: 'center', flex: 'none' }, 'Browse…', 'b'),
+        field('RUN ID', '0041', '84px'),
+        field('INTAKE OUTPUT ROOT', './out/0041', '160px')
+      ], 'form'),
+      el('div', { flex: 'none', padding: '12px 20px', background: SURF, borderBottom: '2px solid var(--s-rule)', display: 'flex', alignItems: 'center', gap: '22px' }, [
+        el('div', { display: 'flex', alignItems: 'center', gap: '9px' }, [
+          el('span', { width: '13px', height: '13px', border: '1px solid ' + INK, background: INK, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }, el('span', { width: '5px', height: '5px', background: SURF }, null, 'd'), 'r'),
+          el('span', { fontSize: '12.5px', fontWeight: 600 }, 'Run the sandbox dynamic pass', 't')
+        ], 'a'),
+        el('div', { display: 'flex', alignItems: 'center', gap: '9px' }, [
+          el('span', { width: '13px', height: '13px', border: '1px solid ' + LINE }, null, 'r'),
+          el('span', { fontSize: '12.5px', color: INK2 }, 'Static only', 't')
+        ], 'b'),
+        el('span', { fontSize: '11.5px', color: INK3 }, 'Mutually exclusive · dynamic needs a resolvable analysis-runtime', 'n')
+      ], 'passes'),
+      el('div', { flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }, [
+        ruleHead('STAGES', '3 of 7 · 6m 41s elapsed'),
+        el('div', { padding: '0 20px' }, stages.map(([i, label, state, note, pct, dur]) => el('div', { height: '40px', display: 'flex', alignItems: 'center', gap: '13px', borderBottom: '1px solid var(--s-line)', background: state === 'RUNNING' ? SEL : 'transparent' }, [
+          el('span', { width: '22px', fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK3 }, i, 'i'),
+          el('span', { width: '104px', fontSize: '13px', fontWeight: 600, letterSpacing: '0.02em' }, label, 'l'),
+          el('span', { width: '90px', fontSize: '10.5px', letterSpacing: '0.14em', color: state === 'RUNNING' ? BLUE : state === 'COMPLETE' ? INK2 : INK3 }, state, 's'),
+          el('span', { flex: 1, fontSize: '12px', color: INK2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }, note, 'n'),
+          el('span', { width: '96px', height: '5px', background: 'var(--s-track)', position: 'relative', display: 'block' }, el('span', { style: { position: 'absolute', left: 0, top: 0, bottom: 0, width: pct, background: state === 'RUNNING' ? BLUE : state === 'COMPLETE' ? INK : 'transparent' } }), 'p'),
+          el('span', { width: '58px', textAlign: 'right', fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK2 }, dur, 'd')
+        ], label)), 'rows')
+      ], 'stages')
+    ]);
+  }
+
+  apkAside() {
+    return el('div', { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+      el('div', { padding: '13px', borderBottom: '2px solid var(--s-rule)', display: 'flex', flexDirection: 'column', gap: '8px' }, [
+        lbl('AUTHORIZATION', { key: 'k' }),
+        el('span', { fontSize: '14px', fontWeight: 600, lineHeight: 1.35 }, 'Affirmed by operator at 14:02:11', 't'),
+        el('span', { fontSize: '11.5px', color: INK2, lineHeight: 1.5 }, 'Scope is advisory for APK runs — the artifact is analysed locally and nothing leaves the machine.', 'b'),
+        el('span', { height: '27px', padding: '0 11px', border: '1px solid ' + INK, fontSize: '11.5px', display: 'inline-flex', alignItems: 'center', alignSelf: 'flex-start' }, 'View audit record', 'a')
+      ], 'auth'),
+      el('div', { padding: '13px', borderBottom: '1px solid var(--s-line)', display: 'flex', flexDirection: 'column', gap: '10px' }, [
+        lbl('HONEST COVERAGE', { key: 'k' }),
+        meter('Observed on the wire', '41', '32%', INK),
+        meter('Inferred from schema', '73', '57%', BLUE),
+        meter('Static strings only', '14', '11%', INK3),
+        meter('Handoffs open', '2', '18%', RED)
+      ], 'cov'),
+      el('div', { padding: '13px', borderBottom: '1px solid var(--s-line)', display: 'flex', flexDirection: 'column', gap: '9px' }, [
+        lbl('PIPELINE DIAGNOSTICS', { key: 'k' }),
+        el('div', { borderLeft: '3px solid ' + RED, paddingLeft: '10px', display: 'flex', flexDirection: 'column', gap: '3px' }, [
+          el('span', { fontSize: '12.5px', fontWeight: 600 }, 'Dynamic pass at risk', 't'),
+          el('span', { fontSize: '11.5px', color: INK2, lineHeight: 1.45 }, 'Certificate pinning on 2 hosts · 18 findings grouped', 'w'),
+          el('span', { fontSize: '11.5px', color: BLUE, fontWeight: 500 }, 'Open diagnostics', 'f')
+        ], 'd')
+      ], 'diag'),
+      el('div', { flex: 1, padding: '13px', display: 'flex', flexDirection: 'column', gap: '8px' }, [
+        lbl('OUTPUT', { key: 'k' }),
+        kv('OpenAPI 3.1', 'READY'), kv('Postman collection', 'READY'),
+        kv('Python SDK', 'AFTER FUSION', INK3), kv('HAR of session', 'AFTER FUSION', INK3),
+        el('div', { flex: 1 }, null, 'sp'),
+        el('div', { display: 'flex', gap: '8px' }, [btn('View surface', 'primary'), btn('Export', 'ghost')], 'a')
+      ], 'out')
+    ]);
+  }
+
+  webBody() {
+    const healthRow = (label, state, note, color) => el('div', { height: '38px', display: 'flex', alignItems: 'center', gap: '13px', borderBottom: '1px solid var(--s-line)' }, [
+      el('span', { width: '4px', height: '20px', background: color, flex: 'none' }, null, 'd'),
+      el('span', { width: '190px', fontSize: '13px', fontWeight: 600 }, label, 'l'),
+      el('span', { width: '110px', fontSize: '10.5px', letterSpacing: '0.14em', color }, state, 's'),
+      el('span', { flex: 1, fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK2 }, note, 'n')
+    ], label);
+    return el('div', { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+      head('WEB CAPTURE / SESSION s_7f3a29c1', 'api.northwind-retail.io', el('div', { style: { display: 'flex', gap: '9px' }, key: 'r' }, [btn('Stop capture', 'danger'), btn('Fuse captured traffic', 'primary')])),
+      el('div', { flex: 'none', padding: '14px 20px', background: SURF, borderBottom: '1px solid var(--s-line)', display: 'flex', gap: '18px', alignItems: 'flex-end' }, [
+        field('TARGET URL', 'https://api.northwind-retail.io', '430px'),
+        el('div', { display: 'flex', alignItems: 'center', gap: '9px', paddingBottom: '5px' }, [
+          el('span', { width: '13px', height: '13px', border: '1px solid ' + INK, background: INK, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }, el('span', { width: '5px', height: '5px', background: SURF }, null, 'd'), 'c'),
+          el('span', { fontSize: '12.5px' }, 'I am authorized to test this target', 't')
+        ], 'affirm'),
+        el('div', { flex: 1 }, null, 'sp'),
+        el('span', { fontSize: '11px', color: INK3, paddingBottom: '8px' }, 'Affirm recorded 14:02 · a_0204', 'n')
+      ], 'target'),
+      el('div', { flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }, [
+        ruleHead('CAPTURE HEALTH', 'bundled chromium'),
+        el('div', { padding: '0 20px' }, [
+          healthRow('Session proxy', 'UP', '127.0.0.1:8081 · 2,481 flows', INK),
+          healthRow('Capture browser', 'UP', 'chromium 124 · pid 44113 · proxy pinned', INK),
+          healthRow('Captured traffic', 'FLOWING', '41 req/s · last 14:41:07', BLUE)
+        ], 'health'),
+        ruleHead('ACTIVE DISCOVERY', 'ffuf 2.1.0 · rate capped'),
+        el('div', { padding: '0 20px', display: 'flex', gap: '16px', alignItems: 'flex-end' }, [
+          el('div', { display: 'flex', flexDirection: 'column', gap: '5px', width: '250px' }, [
+            lbl('TYPE', { key: 'l' }),
+            el('div', { display: 'flex', border: '1px solid ' + INK }, [
+              el('span', { flex: 1, padding: '5px 0', textAlign: 'center', fontSize: '11px', background: INK, color: 'var(--s-bg)' }, 'Directories / paths', 'a'),
+              el('span', { flex: 1, padding: '5px 0', textAlign: 'center', fontSize: '11px', borderLeft: '1px solid ' + INK, color: INK2 }, 'Subdomains', 'b')
+            ], 'seg')
+          ], 'type'),
+          el('div', { display: 'flex', flexDirection: 'column', gap: '5px', width: '210px' }, [
+            lbl('WORDLIST', { key: 'l' }),
+            el('div', { display: 'flex', border: '1px solid ' + INK }, ['Small', 'Medium', 'Large'].map((w, i) => el('span', { flex: 1, padding: '5px 0', textAlign: 'center', fontSize: '11px', background: i === 1 ? INK : 'transparent', color: i === 1 ? 'var(--s-bg)' : INK2, borderLeft: i ? '1px solid ' + INK : 'none' }, w, w)), 'seg')
+          ], 'wl'),
+          el('div', { display: 'flex', gap: '8px' }, [btn('Estimate', 'ghost'), btn('Run discovery', 'primary'), btn('Cancel', 'danger')], 'acts'),
+          el('div', { flex: 1 }, null, 'sp'),
+          el('span', { fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK2, paddingBottom: '9px' }, '4,614 req · 8/s · ~9m', 'est')
+        ], 'disc'),
+        ruleHead('DISCOVERY RESULTS', '6 confirmed hits'),
+        el('div', { padding: '0 20px', flex: 1, overflow: 'hidden' }, [
+          el('div', { height: '22px', display: 'flex', alignItems: 'center', borderBottom: '1px solid var(--s-rule)', fontSize: '9.5px', letterSpacing: '0.12em', color: INK3 }, [
+            el('span', { width: '300px' }, 'PATH', 'a'), el('span', { width: '70px' }, 'CODE', 'b'), el('span', { width: '90px' }, 'LENGTH', 'c'), el('span', { flex: 1 }, 'NOTE', 'd')
+          ], 'th'),
+          ...[['/v1/admin', 403, '212 B', 'exists but out of authorized scope — not probed further'],
+              ['/v1/internal/metrics', 200, '18.2 KB', 'unauthenticated; added to surface as confirmed'],
+              ['/.git/config', 404, '0 B', ''],
+              ['/v1/debug', 401, '96 B', 'auth required'],
+              ['/openapi.json', 200, '214 KB', 'vendor schema — merged into inferred set'],
+              ['/status', 200, '42 B', '']].map(([p, c, l, n], i) => el('div', { height: '25px', display: 'flex', alignItems: 'center', borderBottom: '1px solid var(--s-line2)', background: i % 2 ? 'var(--s-surface2)' : 'transparent', fontFamily: 'var(--s-mono)', fontSize: '11px' }, [
+            el('span', { width: '300px' }, p, 'a'),
+            el('span', { width: '70px', color: String(c).startsWith('2') ? INK : RED }, c, 'b'),
+            el('span', { width: '90px', color: INK2 }, l, 'c'),
+            el('span', { flex: 1, fontFamily: 'var(--s-ui)', fontSize: '11.5px', color: INK2 }, n, 'd')
+          ], p))
+        ], 'res')
+      ], 'main')
+    ]);
+  }
+
+  androidBody() {
+    return el('div', { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+      el('div', { flex: 'none', height: '36px', background: SURF, borderBottom: '1px solid var(--s-line)', display: 'flex', alignItems: 'center', gap: '13px', padding: '0 13px' }, [
+        el('div', { display: 'flex', alignItems: 'center', gap: '9px' }, ['BOOT', 'PROVISION', 'STREAM', 'READY'].map((s, i) => el('div', { display: 'flex', alignItems: 'center', gap: '7px' }, [
+          el('span', { width: '6px', height: '6px', background: INK }, null, 'd'),
+          el('span', { fontSize: '10.5px', letterSpacing: '0.12em', color: INK2 }, s, 't'),
+          i < 3 ? el('span', { fontSize: '10px', color: LINE }, '›', 'c') : null
+        ], s)), 'steps'),
+        el('div', { flex: 1 }, null, 'sp'),
+        el('span', { fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK2 }, 'AVD apiaxess-34 · api 34 · 1080×2400 · 60 fps', 'm')
+      ], 'steps'),
+      el('div', { flex: 'none', padding: '13px', background: SURF, borderBottom: '2px solid var(--s-rule)', display: 'flex', gap: '16px', alignItems: 'flex-end' }, [
+        field('INSTALL TARGET APK', './artifacts/northwind-retail.apk', '430px'),
+        el('span', { height: '28px', padding: '0 13px', border: '1px solid ' + INK, fontSize: '11.5px', display: 'inline-flex', alignItems: 'center' }, 'Browse…', 'b'),
+        el('span', { height: '28px', padding: '0 13px', background: BLUE, color: ON, fontSize: '11.5px', fontWeight: 500, display: 'inline-flex', alignItems: 'center' }, 'adb install', 'i'),
+        el('div', { flex: 1 }, null, 'sp'),
+        el('span', { fontSize: '11px', color: INK3, paddingBottom: '8px' }, 'Installed 14:05 · com.northwind.retail 4.12.0', 'n')
+      ], 'install'),
+      el('div', { flex: 1, minHeight: 0, background: 'var(--s-bg)', backgroundImage: 'linear-gradient(var(--s-line2) 1px, transparent 1px), linear-gradient(90deg, var(--s-line2) 1px, transparent 1px)', backgroundSize: '28px 28px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '24px' }, [
+        el('div', { width: '250px', height: '530px', background: SURF, border: '1px solid ' + INK, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+          el('div', { height: '20px', flex: 'none', borderBottom: '1px solid var(--s-line)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 10px', fontFamily: 'var(--s-mono)', fontSize: '9px', color: INK3 }, [
+            el('span', {}, '14:41', 'a'), el('span', {}, 'NORTHWIND RETAIL', 'b'), el('span', {}, 'LTE', 'c')
+          ], 'sb'),
+          el('div', { flex: 1, padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }, [
+            lbl('CHECKOUT', { key: 'k', fontSize: '9px' }),
+            el('span', { fontSize: '16px', fontWeight: 600 }, 'Confirm payment', 't'),
+            ...[['Order', '#NW-4417'], ['Items', '3'], ['Total', '€89.40'], ['Risk token', 'rt_0a41…']].map(([k, v]) => el('div', { display: 'flex', justifyContent: 'space-between', paddingBottom: '8px', borderBottom: '1px solid var(--s-line2)' }, [
+              el('span', { fontSize: '11.5px', color: INK2 }, k, 'k'), el('span', { fontFamily: 'var(--s-mono)', fontSize: '11.5px' }, v, 'v')
+            ], k)),
+            el('div', { flex: 1 }, null, 'sp'),
+            el('span', { height: '34px', background: BLUE, color: ON, fontSize: '12.5px', fontWeight: 500, display: 'flex', alignItems: 'center', justifyContent: 'center' }, 'Pay €89.40', 'cta'),
+            el('span', { fontSize: '10px', color: INK3, textAlign: 'center' }, 'captured through the workbench proxy', 'n')
+          ], 'screen')
+        ], 'device'),
+        el('div', { width: '232px', display: 'flex', flexDirection: 'column', gap: '11px' }, [
+          el('div', { background: SURF, border: '1px solid var(--s-line)', padding: '11px 12px', display: 'flex', flexDirection: 'column', gap: '8px' }, [
+            lbl('STREAM', { key: 'k' }),
+            el('span', { fontSize: '11.5px', color: INK2, lineHeight: 1.5 }, 'Touch-drivable through the engine’s authenticated /android-stream proxy. Input is mirrored; nothing is recorded to disk.', 'b'),
+            el('div', { display: 'flex', gap: '6px' }, ['⟲', '⤢', '◉', '⌨'].map(g => el('span', { width: '28px', height: '24px', border: '1px solid ' + LINE, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK2 }, g, g)), 'tools')
+          ], 'a'),
+          el('div', { background: SURF, border: '1px solid var(--s-line)', padding: '11px 12px', display: 'flex', flexDirection: 'column', gap: '7px' }, [
+            lbl('FROM THIS DEVICE', { key: 'k' }),
+            kv('Flows captured', '318'), kv('Distinct paths', '41'), kv('Blocked by pinning', '18', RED)
+          ], 'b')
+        ], 'side')
+      ], 'stage')
+    ]);
+  }
+
+  devicesBody() {
+    const dev = (name, id, ca, caColor, traffic, state, stColor, action, bg) => el('div', { padding: '13px 0', borderBottom: '1px solid var(--s-line)', display: 'flex', alignItems: 'center', gap: '16px', background: bg }, [
+      el('span', { width: '4px', height: '36px', background: stColor, flex: 'none' }, null, 'd'),
+      el('div', { width: '210px', display: 'flex', flexDirection: 'column', gap: '3px' }, [
+        el('span', { fontSize: '14px', fontWeight: 600 }, name, 'n'),
+        el('span', { fontFamily: 'var(--s-mono)', fontSize: '10.5px', color: INK3 }, id, 'i')
+      ], 'a'),
+      el('div', { flex: 1, display: 'flex', flexDirection: 'column', gap: '3px' }, [
+        lbl('CA ON DEVICE', { key: 'l', fontSize: '9.5px', letterSpacing: '0.14em' }),
+        el('span', { fontFamily: 'var(--s-mono)', fontSize: '11.5px', color: caColor }, ca, 'v')
+      ], 'b'),
+      el('div', { width: '150px', display: 'flex', flexDirection: 'column', gap: '3px' }, [
+        lbl('TRAFFIC', { key: 'l', fontSize: '9.5px', letterSpacing: '0.14em' }),
+        el('span', { fontFamily: 'var(--s-mono)', fontSize: '11.5px', color: INK2 }, traffic, 'v')
+      ], 'c'),
+      el('span', { fontSize: '9.5px', letterSpacing: '0.12em', padding: '3px 8px', border: '1px solid ' + stColor, color: stColor }, state, 'st'),
+      el('span', { fontSize: '11.5px', color: BLUE, fontWeight: 500, width: '74px', textAlign: 'right' }, action, 'ac')
+    ], name);
+
+    return el('div', { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+      head('DEVICES', 'Attached and awaiting', btn('Arm a device', 'ghost')),
+      el('div', { flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }, [
+        ruleHead('ATTACHED DEVICES', 'over adb · rooted'),
+        el('div', { padding: '0 20px' }, [
+          dev('Pixel 7a', 'adb 10.0.2.16 · android 14 · rooted', 'MISMATCH — SHA-256 differs', RED, '0 flows', 'BLOCKED', RED, 'Re-pair', 'var(--s-redbg)'),
+          dev('AVD apiaxess-34', 'emulator-5554 · api 34 · bundled', 'MATCH', INK, '318 flows captured', 'STREAMING', BLUE, 'Open', 'transparent')
+        ], 'list'),
+        ruleHead('AWAITING DECISION', '1 request'),
+        el('div', { padding: '0 20px' }, el('div', { background: SURF, border: '1px solid var(--s-line)', borderLeft: '3px solid ' + BLUE, padding: '15px 16px', display: 'flex', alignItems: 'center', gap: '20px' }, [
+          el('div', { flex: 1, display: 'flex', flexDirection: 'column', gap: '6px' }, [
+            el('span', { fontSize: '15px', fontWeight: 600 }, 'Pixel 7a wants to attach', 't'),
+            el('span', { fontSize: '12.5px', color: INK2, lineHeight: 1.5 }, 'Scanned pairing code 4417-02 from 10.0.2.16 at 14:44:09. Compare its fingerprint with the workbench CA before accepting.', 'b')
+          ], 'a'),
+          el('div', { display: 'flex', gap: '9px' }, [btn('Accept', 'primary'), btn('Decline', 'danger')], 'c')
+        ], 'card'), 'pending')
+      ], 'main')
+    ]);
+  }
+
+  devicesAside() {
+    return el('div', { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }, [
+      el('div', { padding: '14px', borderBottom: '2px solid var(--s-rule)', display: 'flex', flexDirection: 'column', gap: '9px' }, [
+        lbl('WORKBENCH CA · SHA-256', { key: 'k' }),
+        el('span', { fontFamily: 'var(--s-mono)', fontSize: '15px', lineHeight: 1.55, letterSpacing: '0.02em', wordBreak: 'break-all' }, '9F:21:C8:4A:0E:7B:11:D3:66:AF:5C:20:E8:91:74:B2', 'v'),
+        el('span', { fontSize: '11.5px', color: INK2, lineHeight: 1.45 }, 'Must match on the device before you accept. Never accept a mismatch.', 'n')
+      ], 'ca'),
+      el('div', { padding: '14px', borderBottom: '1px solid var(--s-line)', display: 'flex', flexDirection: 'column', gap: '9px' }, [
+        lbl('PAIRING CODE', { key: 'k' }),
+        el('span', { fontFamily: 'var(--s-mono)', fontSize: '34px', fontWeight: 500, letterSpacing: '0.04em', lineHeight: 1 }, '4417-02', 'v'),
+        el('span', { fontSize: '11.5px', color: INK2 }, 'One-time · expires in 4:51', 'n'),
+        el('div', { display: 'flex', gap: '8px' }, [
+          el('span', { height: '28px', padding: '0 11px', border: '1px solid ' + INK, fontSize: '11.5px', display: 'inline-flex', alignItems: 'center' }, 'Show QR', 'a'),
+          el('span', { height: '28px', padding: '0 11px', border: '1px solid ' + INK, fontSize: '11.5px', display: 'inline-flex', alignItems: 'center' }, 'Regenerate', 'b')
+        ], 'acts')
+      ], 'code'),
+      el('div', { flex: 1, padding: '14px', display: 'flex', flexDirection: 'column', gap: '9px' }, [
+        lbl('HOW PAIRING WORKS', { key: 'k' }),
+        ...['Arm the workbench — a one-time code and QR are generated.', 'Scan or type the code on the device.', 'Compare the CA fingerprint shown on the device with the one above.', 'Accept here. The decision is written to the audit trail.'].map((t, i) => el('div', { display: 'flex', gap: '10px', padding: '7px 0', borderBottom: '1px solid var(--s-line2)' }, [
+          el('span', { fontFamily: 'var(--s-mono)', fontSize: '11px', color: INK3, width: '14px', flex: 'none' }, String(i + 1), 'n'),
+          el('span', { fontSize: '11.5px', color: INK2, lineHeight: 1.45 }, t, 't')
+        ], t))
+      ], 'steps')
+    ]);
+  }
+
+  surfaces() {
+    const st = (t, color) => ({ t, color: color || INK2 });
+    return [
+      { id: 'p-start', num: '2·1', heading: 'Start', blurb: 'Pure navigation, no backend. Two entry cards, three standing promises. The only surface with display-scale type.',
+        scope: 'NO SCOPE YET', scopeBorder: LINE, scopeFg: INK2, scopeDot: INK3, target: 'no target',
+        session: 's_7f3a29c1', sessionState: 'NEW', mods: this.mods(''), rail: this.rail('CAPT'),
+        footLabel: 'BUNDLED TOOLS', footValue: '7 of 7 resolved', footNote: 'java · apktool · jadx · ffuf · chromium · runtime · avd',
+        toolbarTitle: 'Start', toolbar: [], toolbarMeta: 'engine v0.9.4 · 127.0.0.1:8080',
+        body: this.startBody(), hasAside: false, aside: null, asideW: '0px', hasDock: false, dock: null, dockH: '0px',
+        statusName: 'START', status: [st('NO SESSION OPEN'), st('CONTROL WS UP'), st('TOOLS 7/7')], statusRight: 'READY' },
+
+      { id: 'p-apk', num: '2·2', heading: 'APK analysis', blurb: 'Artifact form, mutually exclusive passes, the seven-stage pipeline, and honest coverage in the inspector. Inspector 296 instead of 340.',
+        scope: 'AFFIRMED', scopeBorder: INK, scopeFg: INK, scopeDot: BLUE, target: 'northwind-retail.apk',
+        session: 's_9c04d7', sessionState: 'RUN ACTIVE', mods: this.mods('APK analysis'), rail: this.rail('CAPT'),
+        footLabel: 'BUNDLED TOOLS', footValue: '7 of 7 resolved', footNote: 'dynamic pass needs analysis-runtime',
+        toolbarTitle: 'APK analysis', toolbar: [this.tb('Run pipeline', 'primary'), this.tb('Refresh', 'quiet')], toolbarMeta: 'run 0041 · 6m 41s',
+        body: this.apkBody(), hasAside: true, aside: this.apkAside(), asideW: '296px', hasDock: false, dock: null, dockH: '0px',
+        statusName: 'APK ANALYSIS', status: [st('INTAKE ROOT ./out/0041'), st('STAGE 3 OF 7', BLUE), st('CONTROL WS UP')], statusRight: 'SURFACE PENDING' },
+
+      { id: 'p-web', num: '2·3', heading: 'Web capture', blurb: 'Authorization gate first, then capture health, then active discovery with its estimate. Discovery results are a table, not cards.',
+        scope: 'AUTHORIZED', scopeBorder: INK, scopeFg: INK, scopeDot: BLUE, target: 'api.northwind-retail.io',
+        session: 's_7f3a29c1', sessionState: 'CAPTURING', mods: this.mods('Web capture'), rail: this.rail('CAPT'),
+        footLabel: 'CAPTURE HEALTH', footValue: 'All three up', footNote: 'proxy · browser · traffic flowing',
+        toolbarTitle: 'Web capture', toolbar: [this.tb('Launch browser', 'quiet'), this.tb('Export artifacts', 'quiet')], toolbarMeta: '2,481 flows · 41/s',
+        body: this.webBody(), hasAside: false, aside: null, asideW: '0px', hasDock: false, dock: null, dockH: '0px',
+        statusName: 'WEB CAPTURE', status: [st('PROXY :8081'), st('TELEMETRY 41/s', BLUE), st('DISCOVERY IDLE')], statusRight: 'SURFACE 128 · CONFIRMED 41' },
+
+      { id: 'p-android', num: '2·4', heading: 'Android target', blurb: 'The stream owns the canvas on a ruled ground; controls sit above it and device facts beside it. Content pane has no inspector.',
+        scope: 'AUTHORIZED', scopeBorder: INK, scopeFg: INK, scopeDot: BLUE, target: 'AVD apiaxess-34',
+        session: 's_7f3a29c1', sessionState: 'STREAMING', mods: this.mods('Android target'), rail: this.rail('CAPT'),
+        footLabel: 'ANDROID TARGET', footValue: 'AVD ready', footNote: 'touch-drivable · /android-stream',
+        toolbarTitle: 'Android target', toolbar: [this.tb('Stop AVD', 'danger'), this.tb('Install APK…', 'quiet')], toolbarMeta: 'emulator-5554',
+        body: this.androidBody(), hasAside: false, aside: null, asideW: '0px', hasDock: false, dock: null, dockH: '0px',
+        statusName: 'ANDROID TARGET', status: [st('AVD READY'), st('ADB 2 DEVICES'), st('STREAM VIA /android-stream')], statusRight: 'TOUCH DRIVABLE' },
+
+      { id: 'p-devices', num: '2·5', heading: 'Devices', blurb: 'Trust made legible: fingerprint at 15px mono, pairing code at 34px, one blue decision. Inspector 296.',
+        scope: 'CA MISMATCH', scopeBorder: RED, scopeFg: RED, scopeDot: RED, target: '2 attached',
+        session: 's_7f3a29c1', sessionState: 'ACTIVE', mods: this.mods('Devices'), rail: this.rail('CAPT'),
+        footLabel: 'PAIRING', footValue: '1 awaiting', footNote: 'code 4417-02 · expires 4:51',
+        toolbarTitle: 'Devices', toolbar: [this.tb('Refresh devices', 'quiet'), this.tb('Arm a device', 'quiet')], toolbarMeta: 'adb · 2 attached',
+        body: this.devicesBody(), hasAside: true, aside: this.devicesAside(), asideW: '296px', hasDock: false, dock: null, dockH: '0px',
+        statusName: 'DEVICES', status: [st('2 ATTACHED · 1 AWAITING'), st('PROXY :8081'), st('1 CA MISMATCH', RED)], statusRight: 'PAIRING ARMED' }
+    ];
+  }
+
+  renderVals() {
+    return { surfaces: this.surfaces() };
+  }
+}
+
+</script>
+</body>
+</html>

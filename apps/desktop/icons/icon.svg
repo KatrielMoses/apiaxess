@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- App icon: the identity-kit mark on the kit's Ink ground (a dark rounded
+       tile), white recover-chevron + blue accent, matching the splash/lockup.
+       The prior icons rendered the mark on a white square, which is wrong. -->
+  <rect width="1024" height="1024" rx="224" fill="#0D0D0D"/>
+  <g transform="translate(207,202) scale(3.05)" fill="none" stroke-width="14"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M138 60 L100 22 L22 100 L100 178 L138 140" stroke="#FFFFFF"/>
+    <path d="M50 100 H140" stroke="#2D7FF9"/>
+    <path d="M118 78 L142 100 L118 122" stroke="#2D7FF9"/>
+    <path d="M168 78 L142 100 L168 122" stroke="#FFFFFF"/>
+  </g>
+</svg>

@@ -181,7 +181,19 @@ impl ManagedProcessCommand {
     pub fn spawn(self) -> io::Result<ManagedProcess> {
         let mut wrapped = CommandWrap::from(self.command);
         #[cfg(windows)]
-        wrapped.wrap(process_wrap::std::JobObject);
+        {
+            // Keep spawned children fully headless. The engine (and, through the
+            // engine, java/apktool/jadx/ffuf) are console-subsystem programs; when
+            // the windows-subsystem GUI shell — which has no console — spawns them,
+            // Windows would otherwise create a visible terminal window. The
+            // `CreationFlags` wrapper is the one way to set CREATE_NO_WINDOW that
+            // `JobObject` preserves (JobObject overwrites a command's own creation
+            // flags, reading only the wrapper's value).
+            wrapped.wrap(process_wrap::std::CreationFlags(
+                windows::Win32::System::Threading::CREATE_NO_WINDOW,
+            ));
+            wrapped.wrap(process_wrap::std::JobObject);
+        }
         #[cfg(unix)]
         wrapped.wrap(process_wrap::std::ProcessGroup::leader());
         wrapped.spawn().map(|child| ManagedProcess { child })
@@ -481,7 +493,14 @@ impl ExternalToolRunner for ProcessToolRunner {
 fn noninteractive_command(executable: &str) -> Command {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
         let mut command = Command::new(executable);
+        // CREATE_NO_WINDOW (0x0800_0000): the direct tool-runner spawns below use a
+        // plain `Command`, so setting the flag here keeps apktool/jadx/java/ffuf
+        // from flashing a console window during intake. (The ManagedProcessCommand
+        // path re-applies this via a process-wrap wrapper because JobObject would
+        // otherwise overwrite a command's own creation flags.)
+        command.creation_flags(0x0800_0000);
         if std::path::Path::new(executable)
             .extension()
             .and_then(std::ffi::OsStr::to_str)

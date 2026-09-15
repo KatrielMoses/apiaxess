@@ -20,7 +20,10 @@ impl Bounds {
     /// Center point, the tap target.
     #[must_use]
     pub fn center(&self) -> (i32, i32) {
-        (i32::midpoint(self.x1, self.x2), i32::midpoint(self.y1, self.y2))
+        (
+            i32::midpoint(self.x1, self.x2),
+            i32::midpoint(self.y1, self.y2),
+        )
     }
 
     /// Whether the node has positive area (a tappable region).
@@ -157,7 +160,10 @@ impl Hierarchy {
     /// The actionable nodes in traversal order.
     #[must_use]
     pub fn actionable(&self) -> Vec<&UiNode> {
-        self.nodes.iter().filter(|node| node.is_actionable()).collect()
+        self.nodes
+            .iter()
+            .filter(|node| node.is_actionable())
+            .collect()
     }
 }
 
@@ -243,7 +249,15 @@ mod tests {
 
     #[test]
     fn bounds_parse_is_robust_to_malformed_input() {
-        assert_eq!(parse_bounds("[10,20][30,40]"), Bounds { x1: 10, y1: 20, x2: 30, y2: 40 });
+        assert_eq!(
+            parse_bounds("[10,20][30,40]"),
+            Bounds {
+                x1: 10,
+                y1: 20,
+                x2: 30,
+                y2: 40
+            }
+        );
         assert_eq!(parse_bounds("garbage"), Bounds::default());
     }
 
@@ -255,11 +269,20 @@ mod tests {
             text: "Buy (3)".to_owned(),
             clickable: true,
             enabled: true,
-            bounds: Bounds { x1: 0, y1: 0, x2: 10, y2: 10 },
+            bounds: Bounds {
+                x1: 0,
+                y1: 0,
+                x2: 10,
+                y2: 10,
+            },
             ..UiNode::default()
         };
         let sig_a = a.signature();
         a.text = "Buy (7)".to_owned();
-        assert_eq!(sig_a, a.signature(), "resource-id anchored signature ignores volatile text");
+        assert_eq!(
+            sig_a,
+            a.signature(),
+            "resource-id anchored signature ignores volatile text"
+        );
     }
 }

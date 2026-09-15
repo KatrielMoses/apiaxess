@@ -3,7 +3,7 @@
 The canonical `session.json` remains the portable, evidence-complete authority.
 It is atomically/recoverably replaced on explicit save, clean shutdown, and each
 analysis-document commit. SQLite remains the immediate authority for live
-capture, repeater, and intruder runtime rows.
+capture, resend, and fuzzer runtime rows.
 
 Between full saves, `SessionRuntime` writes a sibling
 `session.checkpoint.json`. Each accepted in-memory mutation marks the runtime

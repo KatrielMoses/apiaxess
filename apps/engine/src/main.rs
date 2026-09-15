@@ -18,7 +18,7 @@ use apiaxess_session::{
     TargetIdentifier, TargetIdentity,
 };
 use apiaxess_workbench_proxy::{
-    CaStateLog, ProxyCore, ProxyRepeaterSender, SessionCa, SystemCaInstall, SystemStorePurger,
+    CaStateLog, ProxyCore, ProxyResendSender, SessionCa, SystemCaInstall, SystemStorePurger,
 };
 use apiaxess_workbench_store::TrafficStore;
 use chrono::Utc;
@@ -248,6 +248,7 @@ struct AnalyzeOptions {
     scope_json: Option<String>,
     allow_targets: Vec<String>,
     session_id: Option<String>,
+    staged_credentials: Vec<(String, String)>,
     dynamic: bool,
     json: bool,
     help: bool,
@@ -281,7 +282,7 @@ fn print_cli_help() {
         "Export: apiaxess export <session> --format <openapi|sdk|postman|har|all> --out <dir> [--json]"
     );
     println!(
-        "APIaxess\n\nCommands:\n  apiaxess                                    Launch the local workbench (loopback UI)\n  apiaxess serve [--port <n>] [--host <addr>] Run headless: serve the UI on a port until Ctrl-C\n  apiaxess analyze <apk> [options]\n  apiaxess web <domain-or-url> --authorize [options]\n  apiaxess inspect <session> [--json]\n\nWeb options:\n  --authorize               Affirm that you are authorized to test this target (required)\n  --output <path>           Persist the web session artifact at this path\n  --json                    Print the started session status as JSON\n\nAnalyze options:\n  --static-only             Run the static pipeline only (default)\n  --dynamic                 Request dynamic enrichment when session evidence exists\n  --session <path>          Resume an existing session artifact\n  --output <path>           Persist a new session artifact at this path\n  --scope <json|@file>      Declare the complete session EngagementScope\n  --allow-target <host>     Add an allowed host rule (repeatable)\n  --session-id <id>         Set the ID for a new session\n  --intake-output <dir>     Store normalized intake output below this directory\n  --json                    Print the unified surface as JSON\n  -h, --help                Show this help\n\nAPK analysis uses APIaxess's bundled Java runtime, apktool, and jadx by\ndefault, so nothing is required on the host. Advanced overrides:\nAPIAXESS_JAVA, APIAXESS_APKTOOL, APIAXESS_JADX (a .jar value runs through the\nbundled runtime; anything else is treated as a self-contained launcher)."
+        "APIaxess\n\nCommands:\n  apiaxess                                    Launch the local workbench (loopback UI)\n  apiaxess serve [--port <n>] [--host <addr>] Run headless: serve the UI on a port until Ctrl-C\n  apiaxess analyze <apk> [options]\n  apiaxess web <domain-or-url> --authorize [options]\n  apiaxess inspect <session> [--json]\n\nWeb options:\n  --authorize               Affirm that you are authorized to test this target (required)\n  --output <path>           Persist the web session artifact at this path\n  --json                    Print the started session status as JSON\n\nAnalyze options:\n  --static-only             Run the static pipeline only (default)\n  --dynamic                 Request dynamic enrichment when session evidence exists\n  --session <path>          Resume an existing session artifact\n  --output <path>           Persist a new session artifact at this path\n  --scope <json|@file>      Declare the complete session EngagementScope\n  --allow-target <host>     Add an allowed host rule (repeatable)\n  --staged-credential <kind=value>  Pre-stage a login credential for the crawler,\n                            keyed by field kind (phone, otp, password, pin, email,\n                            username). Repeatable. e.g. --staged-credential phone=8888888888\n  --session-id <id>         Set the ID for a new session\n  --intake-output <dir>     Store normalized intake output below this directory\n  --json                    Print the unified surface as JSON\n  -h, --help                Show this help\n\nAPK analysis uses APIaxess's bundled Java runtime, apktool, and jadx by\ndefault, so nothing is required on the host. Advanced overrides:\nAPIAXESS_JAVA, APIAXESS_APKTOOL, APIAXESS_JADX (a .jar value runs through the\nbundled runtime; anything else is treated as a self-contained launcher)."
     );
 }
 
@@ -503,13 +504,13 @@ async fn run_discover_cli(arguments: &[String]) -> Result<(), Box<dyn std::error
     println!("Discovery started: {}", job.id);
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let state = engine.intruder().get(&job.id).map(|job| job.state);
+        let state = engine.fuzzer().get(&job.id).map(|job| job.state);
         if matches!(
             state,
             Some(
-                apiaxess_workbench_store::IntruderJobState::Completed
-                    | apiaxess_workbench_store::IntruderJobState::Failed
-                    | apiaxess_workbench_store::IntruderJobState::Stopped
+                apiaxess_workbench_store::FuzzerJobState::Completed
+                    | apiaxess_workbench_store::FuzzerJobState::Failed
+                    | apiaxess_workbench_store::FuzzerJobState::Stopped
             ) | None
         ) {
             break;
@@ -802,6 +803,14 @@ fn run_analyze_cli(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     if let Some(root) = options.intake_output_root {
         config = config.with_intake_output_root(root);
     }
+    if !options.staged_credentials.is_empty() {
+        let staged = options
+            .staged_credentials
+            .into_iter()
+            .map(|(name, secret)| (name, apiaxess_engine_shell::Secret::from_text(&secret)))
+            .collect();
+        config = config.with_staged_credentials(staged);
+    }
     let json_progress = options.json;
     let printed_diagnostics = Arc::new(Mutex::new(HashSet::<String>::new()));
     let diagnostic_cursor = Arc::clone(&printed_diagnostics);
@@ -875,6 +884,15 @@ fn parse_analyze_options(
             }
             "--scope" => options.scope_json = Some(value(&mut index, argument)?),
             "--allow-target" => options.allow_targets.push(value(&mut index, argument)?),
+            "--staged-credential" => {
+                let raw = value(&mut index, argument)?;
+                let (name, secret) = raw.split_once('=').ok_or_else(|| {
+                    format!("--staged-credential expects name=value, got '{raw}'")
+                })?;
+                options
+                    .staged_credentials
+                    .push((name.to_owned(), secret.to_owned()));
+            }
             "--session-id" => options.session_id = Some(value(&mut index, argument)?),
             _ if argument.starts_with('-') => {
                 return Err(format!("unknown analyze option: {argument}").into());
@@ -1079,9 +1097,9 @@ impl WorkbenchRuntime {
         // health is always available; no external backend to probe or report.
         engine.set_proxy_health(proxy.health().await);
         engine.set_proxy_address(bound_address);
-        let sender = Arc::new(ProxyRepeaterSender::new(bound_address, ca.clone()));
-        engine.attach_repeater_sender(sender);
-        engine.set_intruder_ffuf_proxy(bound_address);
+        let sender = Arc::new(ProxyResendSender::new(bound_address, ca.clone()));
+        engine.attach_resend_sender(sender);
+        engine.set_fuzzer_ffuf_proxy(bound_address);
 
         Ok(Self {
             engine,
@@ -1096,6 +1114,16 @@ impl WorkbenchRuntime {
 
     async fn shutdown(mut self) -> Result<(), Diagnostic> {
         self.checkpoint_task.stop().await;
+        // Revert any device provisioning done via the C5 accept gate (removes the
+        // installed session CA + reverse tunnels) before the rest of teardown.
+        for diagnostic in self.engine.teardown_provisioned_devices() {
+            report_startup_diagnostic(&diagnostic);
+        }
+        // Stop the GUI Android target emulator (Phase D1) if one was launched this
+        // session, so its process is not left running after shutdown.
+        for diagnostic in self.engine.teardown_android_target() {
+            report_startup_diagnostic(&diagnostic);
+        }
         let trust_result = self.engine.teardown_browser_trust();
         let proxy_result = self.proxy.shutdown().await;
         let save_result = self.session_runtime.save();
@@ -1379,10 +1407,10 @@ mod tests {
         AuditActor, HostMatch, SessionId,
     };
     use apiaxess_target_apk::ApkIntakeConfig;
-    use apiaxess_workbench_proxy::{HudsuckerBackend, ProxyCore, RepeaterRequest};
+    use apiaxess_workbench_proxy::{HudsuckerBackend, ProxyCore, ResendRequest};
     use apiaxess_workbench_store::{
-        IntruderAttackType, IntruderConfig, IntruderJobState, IntruderMatchFilter,
-        IntruderPositionLocation, IntruderSequenceStep, PayloadPosition, PayloadSet, TrafficStore,
+        FuzzerAttackType, FuzzerConfig, FuzzerJobState, FuzzerMatchFilter,
+        FuzzerPositionLocation, FuzzerSequenceStep, PayloadPosition, PayloadSet, TrafficStore,
     };
     use chrono::Utc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1463,7 +1491,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn assembled_runtime_connects_capture_store_repeater_and_intruder() {
+    async fn assembled_runtime_connects_capture_store_resend_and_fuzzer() {
         let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("upstream bind");
@@ -1541,33 +1569,33 @@ mod tests {
             .expect("durable flow query")
             .expect("captured flow");
 
-        let repeater = engine
-            .repeater()
+        let resend = engine
+            .resend()
             .create_from_flow(&flow)
-            .expect("captured flow enters repeater");
-        let repeater_request = RepeaterRequest {
+            .expect("captured flow enters resend");
+        let resend_request = ResendRequest {
             method: "GET".to_owned(),
             url: format!("http://{upstream_address}/repeated"),
             headers: Vec::new(),
             body: None,
         };
         engine
-            .repeater()
-            .update_request(&repeater.id, repeater_request.clone())
-            .expect("repeater edit");
+            .resend()
+            .update_request(&resend.id, resend_request.clone())
+            .expect("resend edit");
         let mut audited_session = runtime
             .session_runtime
             .session_snapshot()
             .expect("active session snapshot");
         let send_result = engine
-            .repeater()
-            .send_in_session(&repeater.id, &mut audited_session)
+            .resend()
+            .send_in_session(&resend.id, &mut audited_session)
             .await
-            .expect("repeater sends through running proxy");
+            .expect("resend sends through running proxy");
         runtime
             .session_runtime
             .replace_session(audited_session)
-            .expect("persist repeater audit state");
+            .expect("persist resend audit state");
         assert_eq!(
             send_result
                 .revision
@@ -1578,22 +1606,22 @@ mod tests {
         );
         assert_eq!(
             store
-                .repeater_contexts()
-                .expect("persisted repeater contexts")[0]
+                .resend_contexts()
+                .expect("persisted resend contexts")[0]
                 .history
                 .len(),
             1
         );
 
-        let mut intruder_request = repeater_request;
-        intruder_request.url = format!("http://{upstream_address}/intruder/FUZZ");
-        let marker_start = intruder_request.url.find("FUZZ").expect("payload marker");
-        let intruder = engine.intruder();
-        let job = intruder
-            .create(IntruderConfig {
-                base_request: intruder_request.clone(),
+        let mut fuzzer_request = resend_request;
+        fuzzer_request.url = format!("http://{upstream_address}/fuzzer/FUZZ");
+        let marker_start = fuzzer_request.url.find("FUZZ").expect("payload marker");
+        let fuzzer = engine.fuzzer();
+        let job = fuzzer
+            .create(FuzzerConfig {
+                base_request: fuzzer_request.clone(),
                 positions: vec![PayloadPosition {
-                    location: IntruderPositionLocation::Url,
+                    location: FuzzerPositionLocation::Url,
                     header_name: None,
                     start: marker_start,
                     end: marker_start + 4,
@@ -1603,33 +1631,33 @@ mod tests {
                     name: "fixture".to_owned(),
                     values: vec!["one".to_owned()],
                 }],
-                attack_type: IntruderAttackType::Sniper,
-                match_filter: IntruderMatchFilter::default(),
+                attack_type: FuzzerAttackType::Sniper,
+                match_filter: FuzzerMatchFilter::default(),
                 concurrency: 1,
                 rate_per_second: 0,
                 max_results: 1,
                 auth_preflight: None,
-                sequence: vec![IntruderSequenceStep {
+                sequence: vec![FuzzerSequenceStep {
                     name: "send".to_owned(),
-                    request: intruder_request,
+                    request: fuzzer_request,
                     extractors: Vec::new(),
                 }],
                 auto_calibrate: false,
             })
-            .expect("intruder configuration");
+            .expect("fuzzer configuration");
         let mut audited_session = runtime
             .session_runtime
             .session_snapshot()
             .expect("active session snapshot");
-        intruder
+        fuzzer
             .launch_in_session(&job.id, &mut audited_session)
-            .expect("intruder launch");
+            .expect("fuzzer launch");
         runtime
             .session_runtime
             .replace_session(audited_session)
-            .expect("persist intruder launch audit state");
-        let completed = wait_for_intruder(&intruder, &job.id).await;
-        assert_eq!(completed.state, IntruderJobState::Completed);
+            .expect("persist fuzzer launch audit state");
+        let completed = wait_for_fuzzer(&fuzzer, &job.id).await;
+        assert_eq!(completed.state, FuzzerJobState::Completed);
         assert_eq!(
             completed.results[0]
                 .response
@@ -1638,7 +1666,7 @@ mod tests {
             Some(200)
         );
         assert_eq!(
-            store.intruder_jobs().expect("persisted intruder jobs")[0]
+            store.fuzzer_jobs().expect("persisted fuzzer jobs")[0]
                 .results
                 .len(),
             1
@@ -1649,9 +1677,9 @@ mod tests {
             .session_snapshot()
             .expect("active session snapshot");
         for result in &completed.results {
-            intruder
+            fuzzer
                 .record_result_in_session(&job.id, result.ordinal, &mut audited_session)
-                .expect("record intruder audit result");
+                .expect("record fuzzer audit result");
         }
         let outside_at = Utc::now();
         audited_session
@@ -1716,23 +1744,23 @@ mod tests {
                 .len(),
             3
         );
-        assert_eq!(resumed_engine.repeater().list().len(), 1);
-        assert_eq!(resumed_engine.intruder().list().len(), 1);
+        assert_eq!(resumed_engine.resend().list().len(), 1);
+        assert_eq!(resumed_engine.fuzzer().list().len(), 1);
         let audit = resumed_engine.session_audit().expect("resumed audit trail");
         assert!(
             audit
                 .iter()
-                .any(|record| record.action.kind == "workbench.repeater.send")
+                .any(|record| record.action.kind == "workbench.resend.send")
         );
         assert!(
             audit
                 .iter()
-                .any(|record| record.action.kind == "workbench.intruder.launch")
+                .any(|record| record.action.kind == "workbench.fuzzer.launch")
         );
         assert!(
             audit
                 .iter()
-                .any(|record| record.action.kind == "workbench.intruder.send")
+                .any(|record| record.action.kind == "workbench.fuzzer.send")
         );
         assert!(audit.iter().any(|record| {
             record.id == "test.outside-scope"
@@ -1751,7 +1779,7 @@ mod tests {
             session_id.as_str()
         );
         drop(resumed_engine);
-        drop(intruder);
+        drop(fuzzer);
         drop(engine);
         drop(store);
         fs::remove_dir_all(store_root).expect("remove test store");
@@ -1877,21 +1905,21 @@ mod tests {
         panic!("traffic store did not reach {minimum} flow(s)");
     }
 
-    async fn wait_for_intruder(
-        intruder: &Arc<apiaxess_workbench_proxy::IntruderWorkbench>,
+    async fn wait_for_fuzzer(
+        fuzzer: &Arc<apiaxess_workbench_proxy::FuzzerWorkbench>,
         job_id: &str,
-    ) -> apiaxess_workbench_store::IntruderJob {
+    ) -> apiaxess_workbench_store::FuzzerJob {
         for _ in 0..200 {
-            let job = intruder.get(job_id).expect("intruder job");
+            let job = fuzzer.get(job_id).expect("fuzzer job");
             if matches!(
                 job.state,
-                IntruderJobState::Completed | IntruderJobState::Failed
+                FuzzerJobState::Completed | FuzzerJobState::Failed
             ) {
                 return job;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("intruder job did not complete");
+        panic!("fuzzer job did not complete");
     }
 
     fn temporary_path(label: &str) -> PathBuf {

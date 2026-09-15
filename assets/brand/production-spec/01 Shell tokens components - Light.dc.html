@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="stylesheet" href="_ds/modernist-986e03d1-b830-402c-a2f3-90030fbd85ff/styles.css">
+<script src="_ds/modernist-986e03d1-b830-402c-a2f3-90030fbd85ff/_ds_bundle.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Outfit:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --s-bg:#F3F2F2; --s-surface:#FFFFFF; --s-surface2:#FAFAF9; --s-sel:#ECF3FE; --s-selrule:#2D7FF9;
+    --s-ink:#0D0D0D; --s-ink2:#4A4948; --s-ink3:#8A8A8A;
+    --s-line:#DCDBDA; --s-line2:#EAE9E8; --s-rule:#0D0D0D; --s-track:#E3E2E1;
+    --s-blue:#2D7FF9; --s-blue2:#1B5FC4; --s-onblue:#FFFFFF;
+    --s-red:#B0230C; --s-redbg:#FBEEEB;
+    --s-shadow:rgba(0,0,0,0.16); --s-scrim:rgba(243,242,242,0.55);
+    --s-row:25px; --s-mono:'IBM Plex Mono',ui-monospace,monospace; --s-ui:'Archivo',sans-serif;
+  }
+  body{margin:0;background:var(--s-bg);}
+  a{color:var(--s-blue);text-decoration:none;}
+  a:hover{color:var(--s-ink);}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  ::-webkit-scrollbar-thumb{background:var(--s-line);border:2px solid transparent;background-clip:padding-box;}
+</style>
+</helmet>
+
+<section style="display:flex;flex-direction:column;gap:34px;padding:56px 56px 96px;font-family:var(--s-ui);color:var(--s-ink);background:var(--s-bg);">
+
+  <div style="display:flex;align-items:flex-end;justify-content:space-between;border-bottom:2px solid var(--s-rule);padding-bottom:15px;">
+    <div style="display:flex;flex-direction:column;gap:7px;">
+      <div style="font-size:11px;letter-spacing:0.26em;text-transform:uppercase;color:var(--s-ink3);">apiaxess desktop · production spec 1 of 4 · light</div>
+      <div style="font-size:31px;font-weight:600;letter-spacing:-0.03em;">Shell anatomy, tokens, components</div>
+    </div>
+    <div style="font-size:12px;line-height:1.55;color:var(--s-ink2);max-width:540px;text-wrap:pretty;">Everything here is measured. The shell is the A1 structure: title bar, workspace rail, module sidebar, tabbed work area, right inspector, bottom dock, status bar. Sheets 2 and 3 apply it to all eleven surfaces; sheet 4 covers window sizes and pane resizing. The dark set is the same geometry with inverted tokens.</div>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:14px;">
+    <div style="font-size:13px;font-weight:600;letter-spacing:0.16em;">01 · SHELL ANATOMY</div>
+    <span style="flex:1;height:2px;background:var(--s-rule);"></span>
+    <span style="font-size:12px;color:var(--s-ink2);">Default window 1280 × 800. All values in CSS px at 1× scale.</span>
+  </div>
+
+  <div style="display:flex;gap:36px;flex-wrap:wrap;">
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span style="font-family:var(--s-mono);font-size:11px;color:var(--s-ink3);">1280</span>
+        <span style="flex:1;height:1px;background:var(--s-ink3);"></span>
+      </div>
+      <div style="position:relative;padding:30px 0 0 34px;">
+      <div style="position:relative;width:1280px;height:800px;background:var(--s-bg);border:1px solid var(--s-ink);box-shadow:0 14px 40px var(--s-shadow);display:flex;flex-direction:column;overflow:hidden;">
+
+        <div style="height:32px;flex:none;background:var(--s-surface);border-bottom:2px solid var(--s-rule);display:flex;align-items:stretch;">
+          <div style="display:flex;align-items:center;gap:8px;padding:0 12px;">
+            <svg width="15" height="15" viewBox="0 0 200 200" fill="none"><path d="M138 60 L100 22 L22 100 L100 178 L138 140" stroke="var(--s-ink)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path><path d="M52 100 H138" stroke="var(--s-blue)" stroke-width="18" stroke-linecap="round"></path><path d="M118 78 L142 100 L118 122" stroke="var(--s-blue)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path><path d="M168 78 L142 100 L168 122" stroke="var(--s-ink)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <span style="font-family:'Outfit',sans-serif;font-size:12.5px;font-weight:500;">apiaxess</span>
+          </div>
+          <div style="width:1px;background:var(--s-line);"></div>
+          <div style="display:flex;align-items:center;gap:14px;padding:0 13px;font-size:11px;color:var(--s-ink2);"><span>File</span><span>Session</span><span>Capture</span><span>View</span><span>Help</span></div>
+          <div style="flex:1;display:flex;align-items:center;justify-content:center;">
+            <div style="display:flex;align-items:center;gap:8px;height:21px;padding:0 9px;border:1px solid var(--s-line);background:var(--s-bg);width:420px;">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--s-ink3)" stroke-width="2.6"><circle cx="11" cy="11" r="7"></circle><path d="M20 20 L16 16"></path></svg>
+              <span style="font-size:11px;color:var(--s-ink3);flex:1;">Go to surface, flow, endpoint or command</span>
+              <span style="font-family:var(--s-mono);font-size:10px;color:var(--s-ink3);">⌘K</span>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:9px;padding:0 12px;">
+            <span style="display:flex;align-items:center;gap:6px;height:20px;padding:0 8px;border:1px solid var(--s-ink);font-size:10px;letter-spacing:0.1em;"><span style="width:5px;height:5px;background:var(--s-blue);"></span>AUTHORIZED</span>
+            <span style="font-family:var(--s-mono);font-size:11px;color:var(--s-ink2);">api.northwind-retail.io</span>
+          </div>
+          <div style="width:1px;background:var(--s-line);"></div>
+          <div style="display:flex;align-items:stretch;">
+            <div style="width:34px;display:flex;align-items:center;justify-content:center;"><span style="width:9px;height:1px;background:var(--s-ink2);"></span></div>
+            <div style="width:34px;display:flex;align-items:center;justify-content:center;"><span style="width:8px;height:8px;border:1px solid var(--s-ink2);"></span></div>
+            <div style="width:34px;display:flex;align-items:center;justify-content:center;"><svg width="9" height="9" viewBox="0 0 10 10" stroke="var(--s-ink)" stroke-width="1.5"><path d="M1 1 L9 9 M9 1 L1 9"></path></svg></div>
+          </div>
+        </div>
+
+        <div style="flex:1;display:flex;min-height:0;">
+          <div style="width:48px;flex:none;background:var(--s-surface);border-right:1px solid var(--s-line);display:flex;flex-direction:column;align-items:center;">
+            <sc-for list="{{ rail }}" as="r" hint-placeholder-count="4">
+              <div style="width:48px;height:52px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;position:relative;background:{{ r.bg }};border-bottom:1px solid var(--s-line2);">
+                <sc-if value="{{ r.on }}" hint-placeholder-val="{{ false }}">
+                  <span style="position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--s-blue);"></span>
+                </sc-if>
+                <span style="font-family:var(--s-mono);font-size:13px;color:{{ r.fg }};">{{ r.glyph }}</span>
+                <span style="font-size:8px;letter-spacing:0.1em;color:{{ r.fg }};">{{ r.label }}</span>
+              </div>
+            </sc-for>
+            <div style="flex:1;"></div>
+            <div style="width:48px;height:44px;display:flex;align-items:center;justify-content:center;border-top:1px solid var(--s-line2);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--s-ink3)" stroke-width="1.8"><circle cx="12" cy="12" r="3.2"></circle><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"></path></svg></div>
+          </div>
+
+          <div style="width:192px;flex:none;background:var(--s-surface);border-right:2px solid var(--s-rule);display:flex;flex-direction:column;min-height:0;">
+            <div style="padding:9px 12px 8px;border-bottom:1px solid var(--s-line);display:flex;flex-direction:column;gap:3px;">
+              <span style="font-size:9.5px;letter-spacing:0.2em;color:var(--s-ink3);">SESSION</span>
+              <div style="display:flex;align-items:baseline;gap:7px;">
+                <span style="font-family:var(--s-mono);font-size:12px;font-weight:500;flex:1;">s_7f3a29c1</span>
+                <span style="font-size:9px;letter-spacing:0.1em;color:var(--s-blue);">UNSAVED</span>
+              </div>
+            </div>
+            <sc-for list="{{ modsBench }}" as="m" hint-placeholder-count="13">
+              <sc-if value="{{ m.group }}" hint-placeholder-val="{{ false }}">
+                <div style="padding:11px 12px 5px;font-size:9.5px;letter-spacing:0.2em;color:var(--s-ink3);">{{ m.group }}</div>
+              </sc-if>
+              <sc-if value="{{ m.label }}" hint-placeholder-val="{{ true }}">
+                <div style="height:28px;display:flex;align-items:center;gap:9px;padding:0 12px;background:{{ m.bg }};border-left:3px solid {{ m.edge }};">
+                  <span style="font-size:12.5px;font-weight:{{ m.weight }};color:{{ m.fg }};flex:1;">{{ m.label }}</span>
+                  <span style="font-family:var(--s-mono);font-size:10px;color:{{ m.cColor }};">{{ m.count }}</span>
+                </div>
+              </sc-if>
+            </sc-for>
+            <div style="flex:1;"></div>
+            <div style="border-top:1px solid var(--s-line);padding:9px 12px;display:flex;flex-direction:column;gap:6px;">
+              <span style="font-size:9.5px;letter-spacing:0.2em;color:var(--s-ink3);">CAPTURE HEALTH</span>
+              <sc-for list="{{ health }}" as="h" hint-placeholder-count="3">
+                <div style="display:flex;align-items:center;gap:7px;"><span style="width:5px;height:5px;background:{{ h.color }};"></span><span style="font-size:11px;color:var(--s-ink2);flex:1;">{{ h.label }}</span><span style="font-family:var(--s-mono);font-size:10px;">{{ h.val }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;">
+            <div style="height:30px;flex:none;background:var(--s-bg);border-bottom:1px solid var(--s-line);display:flex;align-items:stretch;">
+              <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="3">
+                <div style="display:flex;align-items:center;gap:7px;padding:0 12px;background:{{ t.bg }};border-right:1px solid var(--s-line);border-top:2px solid {{ t.edge }};">
+                  <span style="font-family:var(--s-mono);font-size:10px;color:{{ t.mColor }};">{{ t.method }}</span>
+                  <span style="font-size:11px;color:{{ t.fg }};">{{ t.label }}</span>
+                  <span style="font-size:11px;color:var(--s-ink3);">×</span>
+                </div>
+              </sc-for>
+            </div>
+            <div style="height:32px;flex:none;background:var(--s-surface);border-bottom:1px solid var(--s-line);display:flex;align-items:center;gap:10px;padding:0 12px;">
+              <span style="display:flex;align-items:center;gap:7px;"><span style="width:24px;height:13px;background:var(--s-blue);position:relative;display:inline-block;"><span style="position:absolute;right:1px;top:1px;width:11px;height:11px;background:var(--s-onblue);"></span></span><span style="font-size:11px;">Intercept</span></span>
+              <div style="width:1px;height:18px;background:var(--s-line);"></div>
+              <div style="display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--s-line);width:230px;"><span style="font-size:10px;color:var(--s-ink3);">host ~</span><span style="font-family:var(--s-mono);font-size:11px;">*.northwind-retail.io</span></div>
+              <span style="font-size:11px;padding:2px 9px;border:1px solid var(--s-ink);">Import HAR</span>
+              <div style="flex:1;"></div>
+              <span style="font-family:var(--s-mono);font-size:11px;color:var(--s-ink2);">2,481 flows</span>
+            </div>
+            <div style="flex:1;display:flex;min-height:0;">
+              <div style="flex:1;display:flex;flex-direction:column;min-width:0;background:var(--s-surface);">
+                <div style="height:23px;flex:none;display:flex;align-items:center;border-bottom:2px solid var(--s-rule);font-size:9.5px;letter-spacing:0.1em;color:var(--s-ink3);">
+                  <span style="width:46px;padding-left:10px;">#</span><span style="width:66px;">METHOD</span><span style="flex:1;">PATH</span><span style="width:50px;">CODE</span><span style="width:58px;">SIZE</span><span style="width:52px;">MS</span>
+                </div>
+                <div style="flex:1;overflow:hidden;background:repeating-linear-gradient(to bottom, transparent 0 24px, var(--s-line2) 24px 25px);">
+                  <sc-for list="{{ flows12 }}" as="f" hint-placeholder-count="12">
+                    <div style="height:var(--s-row);display:flex;align-items:center;background:{{ f.bg }};border-bottom:1px solid var(--s-line2);border-left:2px solid {{ f.edge }};font-family:var(--s-mono);font-size:11px;">
+                      <span style="width:44px;padding-left:8px;color:var(--s-ink3);">{{ f.n }}</span>
+                      <span style="width:66px;color:{{ f.mColor }};font-weight:500;">{{ f.method }}</span>
+                      <span style="flex:1;color:var(--s-ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ f.path }}</span>
+                      <span style="width:50px;color:{{ f.sColor }};">{{ f.status }}</span>
+                      <span style="width:58px;color:var(--s-ink2);">{{ f.len }}</span>
+                      <span style="width:52px;color:var(--s-ink3);">{{ f.ms }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+              <div style="width:6px;flex:none;background:var(--s-bg);border-left:1px solid var(--s-line);border-right:1px solid var(--s-line);display:flex;align-items:center;justify-content:center;"><span style="width:2px;height:22px;background:var(--s-line);"></span></div>
+              <div style="width:340px;flex:none;background:var(--s-surface);display:flex;flex-direction:column;min-height:0;">
+                <div style="height:27px;flex:none;display:flex;align-items:stretch;border-bottom:1px solid var(--s-line);">
+                  <span style="padding:0 12px;display:flex;align-items:center;font-size:11px;border-bottom:2px solid var(--s-blue);font-weight:500;">Request</span>
+                  <span style="padding:0 12px;display:flex;align-items:center;font-size:11px;color:var(--s-ink2);">Response</span>
+                  <span style="padding:0 12px;display:flex;align-items:center;font-size:11px;color:var(--s-ink2);">Diff</span>
+                </div>
+                <div style="flex:1;overflow:hidden;padding:9px 12px;font-family:var(--s-mono);font-size:11px;line-height:1.7;">
+                  <sc-for list="{{ reqLines }}" as="l" hint-placeholder-count="12">
+                    <div style="display:flex;gap:10px;"><span style="color:var(--s-line);width:15px;text-align:right;flex:none;">{{ l.n }}</span><span style="color:{{ l.color }};white-space:pre;">{{ l.t }}</span></div>
+                  </sc-for>
+                </div>
+                <div style="flex:none;height:36px;border-top:1px solid var(--s-line);display:flex;align-items:center;gap:8px;padding:0 12px;">
+                  <span style="height:24px;padding:0 11px;background:var(--s-blue);color:var(--s-onblue);font-size:11px;font-weight:500;display:flex;align-items:center;">Send to Resend</span>
+                  <span style="height:24px;padding:0 11px;border:1px solid var(--s-ink);font-size:11px;display:flex;align-items:center;">Fuzzer</span>
+                </div>
+              </div>
+            </div>
+            <div style="height:132px;flex:none;border-top:2px solid var(--s-rule);background:var(--s-surface);display:flex;flex-direction:column;">
+              <div style="height:26px;flex:none;display:flex;align-items:stretch;border-bottom:1px solid var(--s-line);">
+                <span style="padding:0 12px;display:flex;align-items:center;gap:7px;font-size:11px;font-weight:500;border-top:2px solid var(--s-blue);">Intercept queue <span style="min-width:14px;height:14px;background:var(--s-blue);color:var(--s-onblue);font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center;">3</span></span>
+                <span style="padding:0 12px;display:flex;align-items:center;font-size:11px;color:var(--s-ink2);">Resend</span>
+                <span style="padding:0 12px;display:flex;align-items:center;font-size:11px;color:var(--s-ink2);">Fuzzer</span>
+                <span style="padding:0 12px;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--s-ink2);">Diagnostics <span style="color:var(--s-red);">3</span></span>
+                <div style="flex:1;"></div>
+                <span style="padding:0 12px;display:flex;align-items:center;font-size:9.5px;letter-spacing:0.12em;color:var(--s-ink3);">CONTROL · RELIABLE</span>
+              </div>
+              <sc-for list="{{ queue }}" as="q" hint-placeholder-count="3">
+                <div style="height:34px;display:flex;align-items:center;gap:11px;padding:0 12px;border-bottom:1px solid var(--s-line2);background:{{ q.bg }};">
+                  <span style="width:3px;height:18px;background:var(--s-blue);"></span>
+                  <span style="font-family:var(--s-mono);font-size:11px;color:{{ q.mColor }};width:50px;">{{ q.method }}</span>
+                  <span style="font-family:var(--s-mono);font-size:11px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--s-ink2);">{{ q.url }}</span>
+                  <span style="font-family:var(--s-mono);font-size:10px;color:var(--s-ink3);">held {{ q.held }}</span>
+                  <span style="height:21px;padding:0 10px;background:var(--s-blue);color:var(--s-onblue);font-size:11px;display:flex;align-items:center;">Forward</span>
+                  <span style="height:21px;padding:0 10px;border:1px solid var(--s-ink);font-size:11px;display:flex;align-items:center;">Modified</span>
+                  <span style="height:21px;padding:0 10px;border:1px solid var(--s-red);color:var(--s-red);font-size:11px;display:flex;align-items:center;">Drop</span>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+
+        <div style="height:24px;flex:none;background:var(--s-surface);border-top:2px solid var(--s-rule);display:flex;align-items:center;font-family:var(--s-mono);font-size:10px;color:var(--s-ink2);">
+          <span style="padding:0 10px;height:100%;display:flex;align-items:center;background:var(--s-blue);color:var(--s-onblue);">WORKBENCH</span>
+          <span style="padding:0 10px;border-right:1px solid var(--s-line);height:100%;display:flex;align-items:center;">s_7f3a29c1</span>
+          <span style="padding:0 10px;border-right:1px solid var(--s-line);height:100%;display:flex;align-items:center;gap:6px;"><span style="width:5px;height:5px;background:var(--s-ink);"></span>CONTROL</span>
+          <span style="padding:0 10px;border-right:1px solid var(--s-line);height:100%;display:flex;align-items:center;gap:6px;"><span style="width:5px;height:5px;background:var(--s-blue);"></span>TELEMETRY 41/s</span>
+          <span style="padding:0 10px;height:100%;display:flex;align-items:center;">PROXY :8081</span>
+          <div style="flex:1;"></div>
+          <span style="padding:0 10px;border-left:1px solid var(--s-line);height:100%;display:flex;align-items:center;">SURFACE 128 · CONFIRMED 41</span>
+          <span style="padding:0 10px;border-left:1px solid var(--s-line);height:100%;display:flex;align-items:center;color:var(--s-red);">3 DIAGNOSTICS</span>
+          <span style="padding:0 10px;border-left:1px solid var(--s-line);height:100%;display:flex;align-items:center;">127.0.0.1</span>
+        </div>
+
+      </div>
+      <sc-for list="{{ callouts }}" as="c" hint-placeholder-count="9">
+        <div style="position:absolute;left:{{ c.x }};top:{{ c.y }};display:flex;align-items:center;gap:4px;">
+          <span style="width:19px;height:19px;background:var(--s-blue);color:var(--s-onblue);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex:none;">{{ c.n }}</span>
+          <span style="width:11px;height:1px;background:var(--s-blue);"></span>
+        </div>
+      </sc-for>
+      </div>
+    </div>
+
+    <div style="width:420px;display:flex;flex-direction:column;gap:11px;">
+      <div style="font-size:10.5px;letter-spacing:0.2em;color:var(--s-ink3);">REGIONS · SIZE · RESIZE BEHAVIOUR</div>
+      <div style="height:2px;background:var(--s-rule);"></div>
+      <sc-for list="{{ regions }}" as="r" hint-placeholder-count="9">
+        <div style="display:flex;gap:11px;padding:9px 0;border-bottom:1px solid var(--s-line);align-items:baseline;">
+          <span style="width:19px;height:19px;background:var(--s-ink);color:var(--s-bg);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex:none;">{{ r.n }}</span>
+          <div style="flex:1;display:flex;flex-direction:column;gap:3px;">
+            <div style="display:flex;align-items:baseline;gap:8px;">
+              <span style="font-size:12.5px;font-weight:600;flex:1;">{{ r.name }}</span>
+              <span style="font-family:var(--s-mono);font-size:11px;color:var(--s-blue);">{{ r.size }}</span>
+            </div>
+            <span style="font-size:11.5px;color:var(--s-ink2);line-height:1.45;">{{ r.note }}</span>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:14px;margin-top:8px;">
+    <div style="font-size:13px;font-weight:600;letter-spacing:0.16em;">02 · TOKENS</div>
+    <span style="flex:1;height:2px;background:var(--s-rule);"></span>
+    <span style="font-size:12px;color:var(--s-ink2);">One variable per role. The dark sheet redefines these values and nothing else.</span>
+  </div>
+
+  <div style="display:flex;gap:30px;flex-wrap:wrap;">
+    <div style="width:596px;display:flex;flex-direction:column;">
+      <div style="display:flex;align-items:center;height:24px;border-bottom:2px solid var(--s-rule);font-size:9.5px;letter-spacing:0.12em;color:var(--s-ink3);">
+        <span style="width:44px;"></span><span style="width:150px;">VARIABLE</span><span style="width:86px;">LIGHT</span><span style="flex:1;">ROLE</span>
+      </div>
+      <sc-for list="{{ colorTokens }}" as="t" hint-placeholder-count="16">
+        <div style="display:flex;align-items:center;height:30px;border-bottom:1px solid var(--s-line);">
+          <span style="width:44px;display:flex;align-items:center;"><span style="width:26px;height:18px;background:{{ t.swatch }};border:1px solid var(--s-line);"></span></span>
+          <span style="width:150px;font-family:var(--s-mono);font-size:11px;">{{ t.v }}</span>
+          <span style="width:86px;font-family:var(--s-mono);font-size:11px;color:var(--s-ink2);">{{ t.hex }}</span>
+          <span style="flex:1;font-size:11.5px;color:var(--s-ink2);">{{ t.role }}</span>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="width:430px;display:flex;flex-direction:column;gap:22px;">
+      <div style="display:flex;flex-direction:column;gap:9px;">
+        <div style="font-size:10.5px;letter-spacing:0.2em;color:var(--s-ink3);">TYPE · ARCHIVO UI / IBM PLEX MONO DATA</div>
+        <div style="height:2px;background:var(--s-rule);"></div>
+        <sc-for list="{{ typeScale }}" as="t" hint-placeholder-count="8">
+          <div style="display:flex;align-items:baseline;gap:12px;padding:6px 0;border-bottom:1px solid var(--s-line);">
+            <span style="width:150px;font-family:{{ t.font }};font-size:{{ t.px }};font-weight:{{ t.w }};letter-spacing:{{ t.ls }};color:var(--s-ink);white-space:nowrap;overflow:hidden;">{{ t.sample }}</span>
+            <span style="font-family:var(--s-mono);font-size:10.5px;color:var(--s-blue);width:96px;">{{ t.spec }}</span>
+            <span style="flex:1;font-size:11px;color:var(--s-ink2);">{{ t.use }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:9px;">
+        <div style="font-size:10.5px;letter-spacing:0.2em;color:var(--s-ink3);">RULES, SPACING, RADIUS</div>
+        <div style="height:2px;background:var(--s-rule);"></div>
+        <sc-for list="{{ metricTokens }}" as="m" hint-placeholder-count="6">
+          <div style="display:flex;align-items:baseline;gap:12px;padding:6px 0;border-bottom:1px solid var(--s-line);">
+            <span style="width:150px;font-family:var(--s-mono);font-size:11px;">{{ m.k }}</span>
+            <span style="width:60px;font-family:var(--s-mono);font-size:11px;color:var(--s-blue);">{{ m.v }}</span>
+            <span style="flex:1;font-size:11px;color:var(--s-ink2);">{{ m.use }}</span>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:14px;margin-top:8px;">
+    <div style="font-size:13px;font-weight:600;letter-spacing:0.16em;">03 · COMPONENTS &amp; STATES</div>
+    <span style="flex:1;height:2px;background:var(--s-rule);"></span>
+    <span style="font-size:12px;color:var(--s-ink2);">Drawn at real size. Focus ring is always a 2px accent outline offset 2px.</span>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:26px;">
+    <sc-for list="{{ componentGroups }}" as="g" hint-placeholder-count="8">
+      <div style="width:{{ g.w }};background:var(--s-surface);border:1px solid var(--s-line);display:flex;flex-direction:column;">
+        <div style="height:28px;display:flex;align-items:center;gap:9px;padding:0 12px;border-bottom:2px solid var(--s-rule);">
+          <span style="font-size:10.5px;letter-spacing:0.16em;flex:1;">{{ g.title }}</span>
+          <span style="font-family:var(--s-mono);font-size:10px;color:var(--s-ink3);">{{ g.spec }}</span>
+        </div>
+        <div style="padding:13px 12px;display:flex;flex-direction:column;gap:12px;">
+          <sc-for list="{{ g.rows }}" as="r" hint-placeholder-count="4">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="width:74px;font-size:10px;letter-spacing:0.1em;color:var(--s-ink3);flex:none;">{{ r.label }}</span>
+              <div style="flex:1;min-width:0;overflow:hidden;">{{ r.demo }}</div>
+              <span style="font-family:var(--s-mono);font-size:10px;color:var(--s-ink3);">{{ r.note }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </sc-for>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:14px;margin-top:8px;">
+    <div style="font-size:13px;font-weight:600;letter-spacing:0.16em;">04 · NEW SURFACE TEMPLATE</div>
+    <span style="flex:1;height:2px;background:var(--s-rule);"></span>
+    <span style="font-size:12px;color:var(--s-ink2);">Drop-in skeleton for a surface that has no personality yet. Fill the slots; inherit everything else.</span>
+  </div>
+
+  <div style="display:flex;gap:30px;flex-wrap:wrap;">
+    <div style="width:1000px;height:560px;background:var(--s-bg);border:1px solid var(--s-ink);box-shadow:0 14px 40px var(--s-shadow);display:flex;flex-direction:column;overflow:hidden;">
+      <div style="height:32px;flex:none;background:var(--s-surface);border-bottom:2px solid var(--s-rule);display:flex;align-items:center;gap:10px;padding:0 12px;">
+        <svg width="15" height="15" viewBox="0 0 200 200" fill="none"><path d="M138 60 L100 22 L22 100 L100 178 L138 140" stroke="var(--s-ink)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path><path d="M52 100 H138" stroke="var(--s-blue)" stroke-width="18" stroke-linecap="round"></path><path d="M118 78 L142 100 L118 122" stroke="var(--s-blue)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path><path d="M168 78 L142 100 L168 122" stroke="var(--s-ink)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+        <span style="font-size:10px;letter-spacing:0.16em;color:var(--s-ink3);">TITLE BAR — INHERITED, NEVER RESTYLED PER SURFACE</span>
+      </div>
+      <div style="flex:1;display:flex;min-height:0;">
+        <div style="width:48px;flex:none;border-right:1px solid var(--s-line);background:var(--s-surface);display:flex;align-items:flex-start;justify-content:center;padding-top:10px;">
+          <span style="font-size:8px;letter-spacing:0.1em;color:var(--s-ink3);writing-mode:vertical-rl;">RAIL</span>
+        </div>
+        <div style="width:192px;flex:none;border-right:2px solid var(--s-rule);background:var(--s-surface);display:flex;flex-direction:column;">
+          <div style="padding:10px 12px;border-bottom:1px solid var(--s-line);font-size:9.5px;letter-spacing:0.16em;color:var(--s-ink3);">SIDEBAR — ADD ONE ROW IN ITS PHASE GROUP</div>
+          <div style="height:28px;display:flex;align-items:center;padding:0 12px;background:var(--s-sel);border-left:3px solid var(--s-blue);"><span style="font-size:12.5px;font-weight:600;">New surface</span></div>
+          <div style="flex:1;border:1px dashed var(--s-line);margin:10px;"></div>
+        </div>
+        <div style="flex:1;display:flex;flex-direction:column;min-width:0;">
+          <div style="height:30px;flex:none;border-bottom:1px solid var(--s-line);background:var(--s-bg);display:flex;align-items:center;padding:0 12px;">
+            <span style="font-size:9.5px;letter-spacing:0.16em;color:var(--s-ink3);">SLOT A — TAB STRIP (OPTIONAL, ONLY IF THE SURFACE OPENS DOCUMENTS)</span>
+          </div>
+          <div style="height:32px;flex:none;border-bottom:1px solid var(--s-line);background:var(--s-surface);display:flex;align-items:center;padding:0 12px;">
+            <span style="font-size:9.5px;letter-spacing:0.16em;color:var(--s-ink3);">SLOT B — TOOLBAR · 32 PX · PRIMARY ACTION LEFT, COUNTERS RIGHT</span>
+          </div>
+          <div style="flex:1;display:flex;min-height:0;">
+            <div style="flex:1;margin:12px;border:1px dashed var(--s-line);display:flex;align-items:center;justify-content:center;">
+              <span style="font-size:11.5px;color:var(--s-ink3);text-align:center;line-height:1.6;">SLOT C — CONTENT<br>table · list · form · stream · viewport</span>
+            </div>
+            <div style="width:6px;flex:none;background:var(--s-bg);border-left:1px solid var(--s-line);border-right:1px solid var(--s-line);"></div>
+            <div style="width:300px;flex:none;margin:12px;border:1px dashed var(--s-line);display:flex;align-items:center;justify-content:center;">
+              <span style="font-size:11.5px;color:var(--s-ink3);text-align:center;line-height:1.6;">SLOT D — INSPECTOR<br>optional · 280–520</span>
+            </div>
+          </div>
+          <div style="height:92px;flex:none;border-top:2px solid var(--s-rule);background:var(--s-surface);display:flex;align-items:center;justify-content:center;">
+            <span style="font-size:11.5px;color:var(--s-ink3);">SLOT E — BOTTOM DOCK · shared tabs: queue · resend · fuzzer · diagnostics</span>
+          </div>
+        </div>
+      </div>
+      <div style="height:24px;flex:none;background:var(--s-surface);border-top:2px solid var(--s-rule);display:flex;align-items:center;padding:0 10px;">
+        <span style="font-family:var(--s-mono);font-size:10px;color:var(--s-ink3);">STATUS BAR — FIRST CELL IS THE SURFACE NAME ON ACCENT; THE REST IS INHERITED SESSION AND TRANSPORT STATE</span>
+      </div>
+    </div>
+
+    <div style="width:420px;display:flex;flex-direction:column;gap:11px;">
+      <div style="font-size:10.5px;letter-spacing:0.2em;color:var(--s-ink3);">RULES FOR A NEW SURFACE</div>
+      <div style="height:2px;background:var(--s-rule);"></div>
+      <sc-for list="{{ newRules }}" as="r" hint-placeholder-count="8">
+        <div style="display:flex;gap:11px;padding:8px 0;border-bottom:1px solid var(--s-line);align-items:baseline;">
+          <span style="font-family:var(--s-mono);font-size:11px;color:var(--s-blue);width:18px;flex:none;">{{ r.n }}</span>
+          <span style="flex:1;font-size:12px;color:var(--s-ink2);line-height:1.5;">{{ r.t }}</span>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1920}}">
+const INK='var(--s-ink)', INK2='var(--s-ink2)', INK3='var(--s-ink3)', BLUE='var(--s-blue)', BLUE2='var(--s-blue2)', RED='var(--s-red)', SEL='var(--s-sel)', LINE='var(--s-line)', ON='var(--s-onblue)';
+const M = m => ({GET:BLUE2, POST:INK, PUT:INK2, PATCH:INK2, DELETE:RED, OPTIONS:INK3}[m] || INK2);
+const S = s => (String(s).startsWith('2') ? INK : String(s).startsWith('3') ? INK2 : String(s).startsWith('5') ? RED : RED);
+const h = React.createElement;
+
+class Component extends DCLogic {
+  rail() {
+    return [['◧','CAPT',0],['◨','BNCH',1],['◫','SURF',0],['◰','DLVR',0]].map(([glyph,label,on]) => ({
+      glyph, label, on: !!on, bg: on ? SEL : 'transparent', fg: on ? BLUE : INK3 }));
+  }
+
+  mods(active) {
+    const raw = [
+      ['group','CAPTURE'], ['Web capture','',0], ['APK analysis','0041',0], ['Android target','READY',0], ['Devices','2',0],
+      ['group','ANALYSE'], ['Workbench','2481',0], ['Intercept queue','3',0], ['API surface','128',0],
+      ['group','DELIVER'], ['Export','4',0], ['Session & audit','312',0], ['Settings','',0]
+    ];
+    return raw.map(r => {
+      if (r[0] === 'group') return { group: r[1], label: '', count: '', bg: 'transparent', edge: 'transparent', fg: INK, weight: 400, cColor: INK3 };
+      const on = r[0] === active;
+      return { group: '', label: r[0], count: r[1],
+        bg: on ? SEL : 'transparent', edge: on ? BLUE : 'transparent',
+        fg: on ? INK : INK2, weight: on ? 600 : 400,
+        cColor: r[0] === 'Intercept queue' ? BLUE : INK3 };
+    });
+  }
+
+  health() {
+    return [
+      { label: 'Session proxy', val: 'UP', color: INK },
+      { label: 'Capture browser', val: 'UP', color: INK },
+      { label: 'CA on device', val: 'MATCH', color: BLUE }
+    ];
+  }
+
+  tabs() {
+    return [
+      { label: 'Live traffic', method: '', bg: 'var(--s-surface)', edge: BLUE, fg: INK, mColor: INK3 },
+      { label: '/v1/checkout/session', method: 'POST', bg: 'transparent', edge: 'transparent', fg: INK2, mColor: M('POST') },
+      { label: 'Resend 2', method: '', bg: 'transparent', edge: 'transparent', fg: INK2, mColor: INK3 }
+    ];
+  }
+
+  flows(n) {
+    const raw = [
+      [2298,'GET','/v1/config/bootstrap',200,'1.1 KB',41],
+      [2301,'POST','/v1/auth/token',200,'612 B',88],
+      [2303,'GET','/v1/catalog/categories?depth=2',200,'18.4 KB',132],
+      [2305,'GET','/v1/catalog/items/SKU-88421',200,'3.9 KB',61],
+      [2307,'OPTIONS','/v1/cart',204,'0 B',12],
+      [2308,'POST','/v1/cart/items',201,'844 B',74],
+      [2310,'PATCH','/v1/cart/items/9f21',200,'820 B',69],
+      [2312,'POST','/v1/checkout/session',201,'4.2 KB',184],
+      [2314,'GET','/v1/checkout/session/ch_91ab/status',200,'512 B',33],
+      [2316,'POST','/v1/payments/intent',402,'388 B',211],
+      [2318,'GET','/internal/flags?env=prod',403,'96 B',18],
+      [2319,'GET','/v1/user/profile',200,'2.1 KB',57],
+      [2321,'PUT','/v1/user/profile/address',200,'1.4 KB',96],
+      [2323,'DELETE','/v1/sessions/current',204,'0 B',22],
+      [2325,'GET','/v1/telemetry/beacon',200,'42 B',9],
+      [2327,'POST','/graphql',200,'22.8 KB',240]
+    ].slice(0, n);
+    return raw.map(([num, method, path, status, len, ms], i) => ({
+      n: num, method, path, status, len, ms, mColor: M(method), sColor: S(status),
+      bg: num === 2312 ? SEL : i % 2 ? 'var(--s-surface2)' : 'transparent',
+      edge: num === 2312 ? BLUE : 'transparent'
+    }));
+  }
+
+  reqLines() {
+    return [
+      ['POST /v1/checkout/session HTTP/2', INK],
+      ['host: api.northwind-retail.io', INK],
+      ['authorization: Bearer eyJhbGciOi…', BLUE],
+      ['content-type: application/json', INK],
+      ['x-client: northwind-web/4.12.0', INK],
+      ['', INK3],
+      ['{', INK3],
+      ['  "cart_id": "9f21c8",', INK],
+      ['  "currency": "EUR",', INK],
+      ['  "shipping": { "method": "standard" },', INK],
+      ['  "risk_token": "rt_0a41…"', BLUE],
+      ['}', INK3]
+    ].map(([t, color], i) => ({ n: i + 1, t, color }));
+  }
+
+  queue() {
+    return [
+      ['POST','https://api.northwind-retail.io/v1/payments/intent','00:12'],
+      ['GET','https://api.northwind-retail.io/internal/flags?env=prod','00:04'],
+      ['POST','https://api.northwind-retail.io/v1/checkout/confirm','00:01']
+    ].map(([method, url, held], i) => ({ method, url, held, mColor: M(method), bg: i === 0 ? SEL : 'transparent' }));
+  }
+
+  callouts() {
+    return [
+      { n: '1', x: '0px', y: '36px' },
+      { n: '2', x: '48px', y: '3px' },
+      { n: '3', x: '160px', y: '3px' },
+      { n: '4', x: '0px', y: '66px' },
+      { n: '5', x: '0px', y: '96px' },
+      { n: '6', x: '0px', y: '330px' },
+      { n: '7', x: '1150px', y: '3px' },
+      { n: '8', x: '0px', y: '690px' },
+      { n: '9', x: '0px', y: '800px' }
+    ];
+  }
+
+  regions() {
+    return [
+      { n: '1', name: 'Title bar', size: '32 px fixed', note: 'Mark, menu bar, centred omnibox (420, min 280), scope pill, host, window controls 34×32. Never scrolls, never per-surface.' },
+      { n: '2', name: 'Workspace rail', size: '48 px fixed', note: 'Four phases plus settings at the foot. Active item carries a 3px accent edge and the tinted cell. Not resizable; hides below 960 (see sheet 4).' },
+      { n: '3', name: 'Module sidebar', size: '192 default · 160–320', note: 'Drag the 2px right rule to resize; double-click snaps back to 192. Collapses to 0 with ⌘B. Session block pinned top, health pinned bottom.' },
+      { n: '4', name: 'Document tabs', size: '30 px fixed', note: 'Only on surfaces that open documents (workbench, resend, fuzzer, surface). Active tab: surface fill + 2px accent top edge.' },
+      { n: '5', name: 'Surface toolbar', size: '32 px fixed', note: 'Per-surface controls. Primary action and toggles left, filters centre, counters right. One row only — overflow goes to a ⋯ menu.' },
+      { n: '6', name: 'Content pane', size: 'fluid · min 420', note: 'Takes all remaining width. Table rows 25 (22 compact). Row rules continue past the last row so the table reads as a surface.' },
+      { n: '7', name: 'Inspector', size: '340 default · 280–520', note: 'Resizable via a 6px splitter with a 2px grip. Tabs 27, action bar 36 pinned to the foot. Collapses with ⌘⌥I.' },
+      { n: '8', name: 'Bottom dock', size: '132 default · 88–360', note: 'Shared across surfaces: queue, resend, fuzzer, diagnostics. Drag its 2px top rule; ⌘J toggles. Keeps streaming while hidden.' },
+      { n: '9', name: 'Status bar', size: '24 px fixed', note: 'Surface name on accent, then session, transport (control solid / telemetry accent), proxy, counters, diagnostics in red, locality last.' }
+    ];
+  }
+
+  colorTokens() {
+    return [
+      ['--s-bg', '#F3F2F2', 'Application ground, splitters, inactive tab strip', 'var(--s-bg)'],
+      ['--s-surface', '#FFFFFF', 'Panels, tables, sidebar, title and status bars', 'var(--s-surface)'],
+      ['--s-surface2', '#FAFAF9', 'Zebra row', 'var(--s-surface2)'],
+      ['--s-sel', '#ECF3FE', 'Selected row, active nav item, held request', 'var(--s-sel)'],
+      ['--s-ink', '#0D0D0D', 'Primary text, 2px rules, data values', 'var(--s-ink)'],
+      ['--s-ink2', '#4A4948', 'Secondary text, inactive tabs', 'var(--s-ink2)'],
+      ['--s-ink3', '#8A8A8A', 'Labels, placeholders, meta', 'var(--s-ink3)'],
+      ['--s-line', '#DCDBDA', 'Hairline dividers, input borders', 'var(--s-line)'],
+      ['--s-line2', '#EAE9E8', 'Row rules inside tables', 'var(--s-line2)'],
+      ['--s-rule', '#0D0D0D', 'Structural 2px rules between regions', 'var(--s-rule)'],
+      ['--s-track', '#E3E2E1', 'Progress and meter tracks', 'var(--s-track)'],
+      ['--s-blue', '#2D7FF9', 'Accent: primary action, selection edge, live state', 'var(--s-blue)'],
+      ['--s-blue2', '#1B5FC4', 'Pressed accent, GET method, accent text on ground', 'var(--s-blue2)'],
+      ['--s-red', '#B0230C', 'Failure only — drop, mismatch, 4xx/5xx, diagnostics', 'var(--s-red)'],
+      ['--s-redbg', '#FBEEEB', 'Failure row tint', 'var(--s-redbg)'],
+      ['--s-onblue', '#FFFFFF', 'Text on accent fill', 'var(--s-onblue)']
+    ].map(([v, hex, role, swatch]) => ({ v, hex, role, swatch }));
+  }
+
+  typeScale() {
+    const UI = 'var(--s-ui)', MONO = 'var(--s-mono)';
+    return [
+      { sample: 'Surface title', font: UI, px: '25px', w: 600, ls: '-0.03em', spec: '25 / 600 / -3%', use: 'Surface heading' },
+      { sample: 'Section heading', font: UI, px: '15px', w: 600, ls: '-0.01em', spec: '15 / 600', use: 'Card and pane titles' },
+      { sample: 'Body copy', font: UI, px: '12.5px', w: 400, ls: '0', spec: '12.5 / 400', use: 'Explanatory text, nav rows' },
+      { sample: 'Control label', font: UI, px: '11px', w: 400, ls: '0', spec: '11 / 400', use: 'Buttons, tabs, toolbar' },
+      { sample: 'FIELD LABEL', font: UI, px: '9.5px', w: 400, ls: '0.2em', spec: '9.5 / 0.2em', use: 'All-caps labels' },
+      { sample: '/v1/checkout', font: MONO, px: '11px', w: 400, ls: '0', spec: '11 / mono', use: 'Table data, paths, ids' },
+      { sample: 'authorization:', font: MONO, px: '11px', w: 400, ls: '0', spec: '11 / 1.7 mono', use: 'Request and response bodies' },
+      { sample: '128', font: MONO, px: '30px', w: 500, ls: '0', spec: '30 / 500 mono', use: 'Stat tiles' }
+    ];
+  }
+
+  metricTokens() {
+    return [
+      { k: 'structural rule', v: '2 px', use: 'Between regions; colour --s-rule' },
+      { k: 'hairline', v: '1 px', use: 'Inside a region; --s-line / --s-line2' },
+      { k: 'radius', v: '0', use: 'Everywhere, no exceptions' },
+      { k: 'row height', v: '25 / 22', use: 'Standard / compact density' },
+      { k: 'pad step', v: '4 8 12 16 20', use: 'Only these; 12 is the default gutter' },
+      { k: 'splitter', v: '6 px', use: 'Hit area 6, grip 2×22, cursor col/row-resize' }
+    ];
+  }
+
+  chip(text, color, border) {
+    return h('span', { style: { fontSize: '9.5px', letterSpacing: '0.1em', padding: '2px 7px', border: '1px solid ' + border, color } }, text);
+  }
+
+  componentGroups() {
+    const btn = (label, bg, fg, border, extra) => h('span', { style: Object.assign({
+      height: '24px', padding: '0 11px', background: bg, color: fg, border: '1px solid ' + border,
+      fontSize: '11px', fontWeight: 500, display: 'inline-flex', alignItems: 'center', fontFamily: 'var(--s-ui)' }, extra || {}) }, label);
+    const row = (label, demo, note) => ({ label, demo, note });
+    const mono = (t, c) => h('span', { style: { fontFamily: 'var(--s-mono)', fontSize: '11px', color: c || INK } }, t);
+
+    const tableRow = (bg, edge, text, color) => h('div', { style: {
+      height: '25px', display: 'flex', alignItems: 'center', gap: '10px', background: bg,
+      borderBottom: '1px solid var(--s-line2)', borderLeft: '2px solid ' + edge, paddingLeft: '8px' } }, [
+      h('span', { key: 'm', style: { fontFamily: 'var(--s-mono)', fontSize: '11px', color: M('POST'), width: '46px', fontWeight: 500 } }, 'POST'),
+      h('span', { key: 'p', style: { fontFamily: 'var(--s-mono)', fontSize: '11px', color: color || INK, flex: 1 } }, text)
+    ]);
+
+    return [
+      { title: 'BUTTONS', spec: 'H 24 · 30 for page actions', w: '470px', rows: [
+        row('PRIMARY', btn('Send to Resend', BLUE, ON, BLUE), 'accent fill'),
+        row('HOVER/DOWN', btn('Send to Resend', BLUE2, ON, BLUE2), '--s-blue2'),
+        row('SECONDARY', btn('Import HAR', 'transparent', INK, INK), '1px ink'),
+        row('DANGER', btn('Drop', 'transparent', RED, RED), 'failure only'),
+        row('GHOST', btn('Show findings', 'transparent', INK2, 'transparent'), 'text only'),
+        row('DISABLED', btn('Export', 'transparent', INK3, LINE, { opacity: 0.45 }), '45% opacity'),
+        row('FOCUS', btn('Forward', BLUE, ON, BLUE, { outline: '2px solid ' + BLUE, outlineOffset: '2px' }), '2px offset 2')
+      ]},
+      { title: 'INPUTS & CHOICE', spec: 'H 22 field · 28 page field', w: '470px', rows: [
+        row('FIELD', h('div', { style: { height: '22px', border: '1px solid ' + LINE, display: 'flex', alignItems: 'center', padding: '0 8px', background: 'var(--s-surface)' } }, mono('*.northwind-retail.io')), '1px line'),
+        row('FOCUSED', h('div', { style: { height: '22px', border: '1px solid ' + BLUE, display: 'flex', alignItems: 'center', padding: '0 8px', background: 'var(--s-surface)' } }, [mono('status:402', INK), h('span', { key: 'c', style: { width: '1px', height: '12px', background: BLUE, marginLeft: '2px' } })]), 'accent border'),
+        row('TOGGLE', h('span', { style: { width: '24px', height: '13px', background: BLUE, position: 'relative', display: 'inline-block' } }, h('span', { style: { position: 'absolute', right: '1px', top: '1px', width: '11px', height: '11px', background: ON } })), '24×13'),
+        row('SEGMENTED', h('div', { style: { display: 'flex', border: '1px solid ' + INK, width: 'fit-content' } }, [
+          h('span', { key: 1, style: { padding: '3px 10px', fontSize: '11px', background: INK, color: 'var(--s-bg)' } }, 'All'),
+          h('span', { key: 2, style: { padding: '3px 10px', fontSize: '11px', borderLeft: '1px solid ' + INK } }, 'In scope'),
+          h('span', { key: 3, style: { padding: '3px 10px', fontSize: '11px', borderLeft: '1px solid ' + INK } }, 'Flagged')
+        ]), 'H 22'),
+        row('CHECKBOX', h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center' } }, [
+          h('span', { key: 1, style: { width: '14px', height: '14px', border: '1px solid ' + INK, background: INK, display: 'flex', alignItems: 'center', justifyContent: 'center' } }, h('span', { style: { width: '6px', height: '6px', background: 'var(--s-surface)' } })),
+          h('span', { key: 2, style: { width: '14px', height: '14px', border: '1px solid ' + INK } }),
+          h('span', { key: 3, style: { fontSize: '11px', color: INK2 } }, 'on / off')
+        ]), '14×14')
+      ]},
+      { title: 'TAGS & BADGES', spec: 'H 17 · label 9.5/0.1em', w: '470px', rows: [
+        row('STATE', h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
+          this.chip('AUTHORIZED', INK, INK), this.chip('CONFIRMED', INK, LINE), this.chip('INFERRED', BLUE, BLUE), this.chip('STATIC', INK3, LINE)
+        ]), 'outline only'),
+        row('FAILURE', h('div', { style: { display: 'flex', gap: '6px' } }, [this.chip('BLOCKED', RED, RED), this.chip('FAILURE', RED, RED)]), 'red border'),
+        row('COUNT', h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, [
+          h('span', { key: 1, style: { minWidth: '14px', height: '14px', background: BLUE, color: ON, fontSize: '9px', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center' } }, '3'),
+          h('span', { key: 2, style: { minWidth: '14px', height: '14px', background: RED, color: ON, fontSize: '9px', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center' } }, '18')
+        ]), '14×14 square'),
+        row('TRANSPORT', h('div', { style: { display: 'flex', gap: '14px', alignItems: 'center' } }, [
+          h('span', { key: 1, style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '10px', letterSpacing: '0.1em', color: INK2 } }, [h('span', { key: 'd', style: { width: '5px', height: '5px', background: INK } }), 'CONTROL']),
+          h('span', { key: 2, style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '10px', letterSpacing: '0.1em', color: INK2 } }, [h('span', { key: 'd', style: { width: '5px', height: '5px', background: BLUE } }), 'TELEMETRY'])
+        ]), '5px square dot')
+      ]},
+      { title: 'TABLE ROWS', spec: 'H 25 · mono 11', w: '470px', rows: [
+        row('DEFAULT', tableRow('transparent', 'transparent', '/v1/catalog/items'), '—'),
+        row('ZEBRA', tableRow('var(--s-surface2)', 'transparent', '/v1/cart/items'), 'odd rows'),
+        row('SELECTED', tableRow(SEL, BLUE, '/v1/checkout/session'), '2px accent edge'),
+        row('FAILURE', tableRow('var(--s-redbg)', RED, '/v1/orders?page=2', RED), 'tint + edge'),
+        row('HOVER', tableRow('var(--s-line2)', 'transparent', '/v1/user/profile'), 'line2 fill')
+      ]},
+      { title: 'TABS', spec: 'document 30 · pane 27', w: '470px', rows: [
+        row('DOCUMENT', h('div', { style: { display: 'flex', height: '30px', background: 'var(--s-bg)' } }, [
+          h('span', { key: 1, style: { display: 'flex', alignItems: 'center', padding: '0 12px', fontSize: '11px', background: 'var(--s-surface)', borderTop: '2px solid ' + BLUE, borderRight: '1px solid ' + LINE } }, 'Live traffic'),
+          h('span', { key: 2, style: { display: 'flex', alignItems: 'center', padding: '0 12px', fontSize: '11px', color: INK2, borderRight: '1px solid ' + LINE } }, 'Resend 2')
+        ]), 'accent top edge'),
+        row('PANE', h('div', { style: { display: 'flex', height: '27px', borderBottom: '1px solid ' + LINE } }, [
+          h('span', { key: 1, style: { display: 'flex', alignItems: 'center', padding: '0 12px', fontSize: '11px', fontWeight: 500, borderBottom: '2px solid ' + BLUE } }, 'Request'),
+          h('span', { key: 2, style: { display: 'flex', alignItems: 'center', padding: '0 12px', fontSize: '11px', color: INK2 } }, 'Response')
+        ]), 'accent underline'),
+        row('SIDEBAR', h('div', { style: { width: '180px' } }, [
+          h('div', { key: 1, style: { height: '28px', display: 'flex', alignItems: 'center', padding: '0 12px', background: SEL, borderLeft: '3px solid ' + BLUE, fontSize: '12.5px', fontWeight: 600 } }, 'Workbench'),
+          h('div', { key: 2, style: { height: '28px', display: 'flex', alignItems: 'center', padding: '0 12px', borderLeft: '3px solid transparent', fontSize: '12.5px', color: INK2 } }, 'API surface')
+        ]), '3px accent edge')
+      ]},
+      { title: 'SPLITTERS & SCROLL', spec: 'hit 6 px', w: '470px', rows: [
+        row('VERTICAL', h('div', { style: { display: 'flex', height: '40px' } }, [
+          h('div', { key: 1, style: { flex: 1, background: 'var(--s-surface)' } }),
+          h('div', { key: 2, style: { width: '6px', background: 'var(--s-bg)', borderLeft: '1px solid ' + LINE, borderRight: '1px solid ' + LINE, display: 'flex', alignItems: 'center', justifyContent: 'center' } }, h('span', { style: { width: '2px', height: '22px', background: LINE } })),
+          h('div', { key: 3, style: { flex: 1, background: 'var(--s-surface)' } })
+        ]), 'col-resize'),
+        row('HORIZONTAL', h('div', { style: { height: '40px', display: 'flex', flexDirection: 'column' } }, [
+          h('div', { key: 1, style: { flex: 1, background: 'var(--s-surface)' } }),
+          h('div', { key: 2, style: { height: '2px', background: 'var(--s-rule)' } }),
+          h('div', { key: 3, style: { flex: 1, background: 'var(--s-surface)' } })
+        ]), 'row-resize on the 2px rule'),
+        row('SCROLLBAR', h('div', { style: { height: '30px', width: '100%', background: 'var(--s-surface)', display: 'flex', justifyContent: 'flex-end' } }, h('span', { style: { width: '10px', background: 'var(--s-bg)', display: 'flex', justifyContent: 'center' } }, h('span', { style: { width: '6px', background: LINE } }))), '10 px, no arrows')
+      ]},
+      { title: 'FEEDBACK', spec: 'inline, never a toast for state', w: '470px', rows: [
+        row('PROGRESS', h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } }, [
+          h('span', { key: 1, style: { flex: 1, height: '6px', background: 'var(--s-track)', position: 'relative', display: 'block' } }, h('span', { style: { position: 'absolute', left: 0, top: 0, bottom: 0, width: '41%', background: BLUE } })),
+          h('span', { key: 2, style: { fontFamily: 'var(--s-mono)', fontSize: '10px', color: INK2 } }, '41%')
+        ]), 'H 6 · no animation'),
+        row('METER', h('span', { style: { height: '4px', background: 'var(--s-track)', position: 'relative', display: 'block' } }, h('span', { style: { position: 'absolute', left: 0, top: 0, bottom: 0, width: '32%', background: INK } })), 'coverage bars'),
+        row('EMPTY', h('span', { style: { fontSize: '11.5px', color: INK3 } }, 'No flows yet — start a capture to fill this pane.'), 'one sentence'),
+        row('DIAGNOSTIC', h('div', { style: { borderLeft: '3px solid ' + RED, paddingLeft: '10px', display: 'flex', flexDirection: 'column', gap: '2px' } }, [
+          h('span', { key: 1, style: { fontSize: '12px', fontWeight: 600 } }, 'CA not trusted on device'),
+          h('span', { key: 2, style: { fontSize: '11px', color: INK2 } }, 'what · why · fix, grouped by cause')
+        ]), '3px left edge')
+      ]}
+    ];
+  }
+
+  newRules() {
+    return [
+      { n: '01', t: 'Add one sidebar row inside an existing phase group. If it belongs to no phase, it is not a surface — it is a dock tab or a dialog.' },
+      { n: '02', t: 'Title bar, rail, sidebar, status bar and bottom dock are inherited verbatim. A surface owns slots A–D only.' },
+      { n: '03', t: 'The first status-bar cell becomes the surface name on accent. Everything right of it stays session and transport state.' },
+      { n: '04', t: 'Surface heading is 25/600 flush left with a 9.5/0.2em kicker above it; both live in slot B or a 17px header strip above slot C.' },
+      { n: '05', t: 'One primary action per surface, accent filled, top right of its own header — never two accents on one screen.' },
+      { n: '06', t: 'Numbers are mono. Any count, size, duration, id, path or fingerprint uses --s-mono, never the UI face.' },
+      { n: '07', t: 'Failure is the only use of red. Pending, live and selected are all accent; complete is ink.' },
+      { n: '08', t: 'If the surface streams, its container must survive a view switch — keep the node mounted and hidden, as the current shell does.' },
+      { n: '09', t: 'Empty, loading and error states are required before the surface ships: one sentence each, flush left, in --s-ink3.' },
+      { n: '10', t: 'Minimum content width is 420. Below it the inspector collapses first, then the sidebar (sheet 4).' }
+    ];
+  }
+
+  renderVals() {
+    return {
+      rail: this.rail(),
+      modsBench: this.mods('Workbench'),
+      health: this.health(),
+      tabs: this.tabs(),
+      flows12: this.flows(12),
+      reqLines: this.reqLines(),
+      queue: this.queue(),
+      callouts: this.callouts(),
+      regions: this.regions(),
+      colorTokens: this.colorTokens(),
+      typeScale: this.typeScale(),
+      metricTokens: this.metricTokens(),
+      componentGroups: this.componentGroups(),
+      newRules: this.newRules()
+    };
+  }
+}
+
+</script>
+</body>
+</html>

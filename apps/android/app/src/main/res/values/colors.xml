@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Identity kit: Ink / Accent. -->
+    <color name="ink">#0D0D0D</color>
+    <color name="accent">#2D7FF9</color>
+    <color name="paper">#FFFFFF</color>
+</resources>

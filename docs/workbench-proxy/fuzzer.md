@@ -1,9 +1,9 @@
-# Intruder
+# Fuzzer
 
 Phase 2.5 provides bounded, session-scoped payload iteration over a captured
 request. Positions may be marked in the URL, a named header value, or a UTF-8
 body. Sniper, clusterbomb, and pitchfork expansion is represented explicitly
-in the persisted `IntruderConfig`.
+in the persisted `FuzzerConfig`.
 
 The execution tier is selected when a job is created:
 
@@ -12,7 +12,7 @@ The execution tier is selected when a job is created:
   version-checked, time-bounded, and parsed from ffuf JSON output.
 - Jobs with an authentication pre-flight or multi-step token sequence use the
   native Rust sender. It performs each request through the same routed proxy
-  path as repeater sends, extracts JSON-path, header, or regex tokens, and
+  path as resend sends, extracts JSON-path, header, or regex tokens, and
   injects them into later steps.
 
 Every result records the exact substituted request, response metadata when
@@ -22,7 +22,7 @@ rate and concurrency controls in the configuration. Out-of-scope work is
 warned and recorded under the session's honor-system scope policy.
 
 The host session can append each completed result to the canonical audit trail
-through `IntruderWorkbench::record_result_in_session`; the record carries the
+through `FuzzerWorkbench::record_result_in_session`; the record carries the
 network target, completion/failure outcome, and the same structured
 diagnostics retained on the result.
 
@@ -33,11 +33,11 @@ deduplicated and a resumed session can reconstruct the same job state.
 
 The local API exposes:
 
-- `POST /api/v1/workbench/intruder` to create a job from an `IntruderConfig`.
-- `GET /api/v1/workbench/intruder` and
-  `GET /api/v1/workbench/intruder/<id>` to inspect jobs and results.
-- `POST /api/v1/workbench/intruder/<id>/start` to launch work.
-- `POST /api/v1/workbench/intruder/<id>/pause`, `/resume`, and `/stop` for
+- `POST /api/v1/workbench/fuzzer` to create a job from an `FuzzerConfig`.
+- `GET /api/v1/workbench/fuzzer` and
+  `GET /api/v1/workbench/fuzzer/<id>` to inspect jobs and results.
+- `POST /api/v1/workbench/fuzzer/<id>/start` to launch work.
+- `POST /api/v1/workbench/fuzzer/<id>/pause`, `/resume`, and `/stop` for
   lifecycle control.
 
 Missing ffuf, malformed positions, transport or sequence failures, cancelled

@@ -16,7 +16,8 @@ open = "5"
 rfd = { version = "0.15", features = ["common-controls-v6"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tauri = { version = "2", features = [] }
+# image-png lets us decode the embedded PNG for the explicit window/taskbar icon.
+tauri = { version = "2", features = ["image-png"] }
 
 [lints]
 workspace = true

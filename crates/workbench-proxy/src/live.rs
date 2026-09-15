@@ -151,6 +151,12 @@ pub struct LiveWorkbench {
     closed: AtomicBool,
     store: RwLock<Option<Arc<TrafficStore>>>,
     engagement_scope: RwLock<Option<EngagementScope>>,
+    /// When set, every captured flow classifies `InScope` regardless of the
+    /// declared scope. Used by the sandboxed APK dynamic pass, where the app
+    /// itself made every captured call: an observed, decrypted hit *is* the
+    /// honesty guarantee, so every host the app is seen contacting — first-party
+    /// backend and third-party SDK/telemetry alike — is real surface to fuse.
+    admit_all_observed: AtomicBool,
     provenance: RwLock<String>,
     prompt_pending: Mutex<HashMap<u64, mpsc::Sender<CredentialPromptAnswer>>>,
     prompt_next_id: AtomicU64,
@@ -186,6 +192,7 @@ impl LiveWorkbench {
             closed: AtomicBool::new(false),
             store: RwLock::new(None),
             engagement_scope: RwLock::new(None),
+            admit_all_observed: AtomicBool::new(false),
             provenance: RwLock::new("proxy.observer".to_owned()),
             prompt_pending: Mutex::new(HashMap::new()),
             prompt_next_id: AtomicU64::new(1),
@@ -226,6 +233,14 @@ impl LiveWorkbench {
         if let Ok(mut current) = self.engagement_scope.write() {
             *current = Some(scope);
         }
+    }
+
+    /// Admits every captured flow as `InScope`, bypassing declared-scope
+    /// classification. Set for the sandboxed APK dynamic pass, where the crawled
+    /// app made every captured call, so every observed host is real surface —
+    /// see [`Self::admit_all_observed`].
+    pub fn set_admit_all_observed(&self, admit: bool) {
+        self.admit_all_observed.store(admit, Ordering::SeqCst);
     }
 
     /// Sets the provenance label retained with every subsequently persisted flow.
@@ -585,6 +600,11 @@ impl LiveWorkbench {
     }
 
     fn classify_scope(&self, host: &str, url: Option<&str>) -> ScopeDisposition {
+        // Observed-hit mode: the sandboxed app itself made this call, so it is in
+        // scope for analysis regardless of any declared host list.
+        if self.admit_all_observed.load(Ordering::SeqCst) {
+            return ScopeDisposition::InScope;
+        }
         let Ok(scope) = self.engagement_scope.read() else {
             return ScopeDisposition::Undetermined;
         };
@@ -786,7 +806,14 @@ mod tests {
             reason: "login_gate".to_owned(),
             fields: Vec::new(),
         };
-        assert!(workbench.request_credential_prompt(prompt, Duration::from_millis(80)).is_none());
-        assert!(workbench.pending_prompt_ids().is_empty(), "timed-out prompt is cleaned up");
+        assert!(
+            workbench
+                .request_credential_prompt(prompt, Duration::from_millis(80))
+                .is_none()
+        );
+        assert!(
+            workbench.pending_prompt_ids().is_empty(),
+            "timed-out prompt is cleaned up"
+        );
     }
 }

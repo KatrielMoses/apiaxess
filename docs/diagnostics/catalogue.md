@@ -90,17 +90,17 @@ catalogue test.
 | `proxy.store-session-commit-failed` | persistence | Traffic could not be committed to the canonical JSON session. |
 | `proxy.har-interchange-failed` | persistence | HAR traffic interchange failed. |
 | `proxy.store-resume-failed` | persistence | The traffic runtime could not resume from the canonical session. |
-| `proxy.repeater-request-failed` | session | The repeater request was rejected or could not be sent. |
-| `proxy.repeater-history-failed` | persistence | The repeater revision could not be saved. |
-| `proxy.repeater-outside-scope` | scope | The repeater request targets outside the declared engagement scope. |
-| `proxy.repeater-transport-unavailable` | transport | The repeater has no running session proxy transport. |
-| `proxy.intruder-ffuf-unavailable` | external-tool | The stateless intruder engine is unavailable. |
-| `proxy.intruder-ffuf-failed` | external-tool | The stateless intruder process failed. |
-| `proxy.intruder-config-invalid` | session | The intruder attack configuration is invalid. |
-| `proxy.intruder-sequence-failed` | session | The stateful intruder sequence stopped before completion. |
-| `proxy.intruder-cancelled` | session | The intruder job was stopped. |
-| `proxy.intruder-outside-scope` | scope | The intruder attack targets outside the declared engagement scope. |
-| `proxy.intruder-persistence-failed` | persistence | The intruder job or result could not be saved. |
+| `proxy.resend-request-failed` | session | The resend request was rejected or could not be sent. |
+| `proxy.resend-history-failed` | persistence | The resend revision could not be saved. |
+| `proxy.resend-outside-scope` | scope | The resend request targets outside the declared engagement scope. |
+| `proxy.resend-transport-unavailable` | transport | The resend has no running session proxy transport. |
+| `proxy.fuzzer-ffuf-unavailable` | external-tool | The stateless fuzzer engine is unavailable. |
+| `proxy.fuzzer-ffuf-failed` | external-tool | The stateless fuzzer process failed. |
+| `proxy.fuzzer-config-invalid` | session | The fuzzer attack configuration is invalid. |
+| `proxy.fuzzer-sequence-failed` | session | The stateful fuzzer sequence stopped before completion. |
+| `proxy.fuzzer-cancelled` | session | The fuzzer job was stopped. |
+| `proxy.fuzzer-outside-scope` | scope | The fuzzer attack targets outside the declared engagement scope. |
+| `proxy.fuzzer-persistence-failed` | persistence | The fuzzer job or result could not be saved. |
 | `sandbox.virtualization-unavailable` | host capability | AVD hardware acceleration is unavailable; the diagnostic names the missing provider and remote fallback. |
 | `sandbox.hypervisor-driver-missing` | host capability | Windows has neither a usable WHPX platform nor AEHD. |
 | `sandbox.docker-unavailable` | host capability | Docker is absent or its daemon cannot be used for redroid. |

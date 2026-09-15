@@ -74,3 +74,47 @@ path, detects host virtualization, and boots the owned image accelerated (KVM/
 WHPX) or in QEMU software mode otherwise, with an honest fallback message. See
 `crates/sandbox/src/lib.rs` (`AccelerationMode`, `BundledEmulatorBackend`, and
 the planner tests).
+
+## GUI Android target (Phase D1 — separate optional add-on)
+
+`android-target.toml` pins the GUI-drivable Android target add-on: the same
+`sdkmanager` bootstrap plus the emulator engine, platform-tools, and a slim
+pure-AOSP `default` (**no GMS**, **userdebug** so `adb root` works) API-33 system
+image, and the owned `apiaxess-android-target` AVD. Unlike the analysis runtime,
+this is a target the user drives by hand — installing their own APK and completing
+logins the autonomous crawler cannot — so provisioning is **not** baked into a
+snapshot. `fetch-android-target.ps1` assembles the payload, stages this repo's
+client APK + the device-side frida-server as first-boot artifacts, and emits the
+**engine-read** `android-target-manifest.json` (id, version, AVD, emulator args,
+provisioning hook, and the ws-scrcpy port D2 streams over) alongside the payload's
+own SBOM, provenance, notices, and version. `install-android-target.{ps1,sh}` stage
+it into the engine-resolved location. This is a separate download — not the base
+installer, and independent of the analysis runtime.
+
+The engine's add-on resolver (`crates/sandbox/src/android_target.rs`,
+`AndroidTargetAddon`) reads the manifest by absolute path
+(`APIAXESS_ANDROID_TARGET` override, else beside the install), boots the AVD
+headless and **persistent** (no `-wipe-data`, so a completed login survives),
+detects host acceleration (WHPX/KVM, honest software-mode fallback), installs the
+client APK on first boot, and then runs the existing C2/C5 provisioning (live
+session CA + frida-server + adb-reverse tunnel) verbatim over this target's bundled
+`adb`. `Engine::launch_android_target` orchestrates it; a missing payload reports
+the honest `sandbox.android-target-missing` diagnostic. The CA installed on first
+boot is the live per-session CA, not a shipped static cert.
+
+Screen streaming (Phase D2) is bundled into the same add-on: a pinned **ws-scrcpy**
+fork (MIT) on a bundled **Node** runtime, staged by `fetch-android-target.ps1`
+(`[streaming]` in the manifest) and built with `npm run dist`. ws-scrcpy has no
+built-in auth and is bound to **127.0.0.1 only** — it is never directly reachable.
+The engine is the sole listener and reverse-proxies the Android view
+(`crates/local-api/src/stream_proxy.rs`, mounted at `/android-stream`) — both HTTP
+and the WebSocket upgrade — only after enforcing the workbench gate: the loopback
+`Origin` plus a valid workbench session or C1 device pairing token, checked on the
+WebSocket upgrade as well as the initial GET. Because it rides the one engine port,
+the view inherits the workbench's three access modes (loopback / SSH-tunnel /
+exposure-with-warning) unchanged. The fork is preconfigured for ws-scrcpy's "proxy
+over adb" interface mode (the emulator quirk: scrcpy-server listens on the AVD's
+internal interface). Streaming assembly runs in the release pipeline; a payload
+without it still boots and captures traffic (`sandbox.android-stream-unavailable`).
+The advanced `APIAXESS_ANDROID_STREAM_PORT` override points the reverse-proxy at an
+externally-run ws-scrcpy.

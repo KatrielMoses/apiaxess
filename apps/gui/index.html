@@ -7,6 +7,7 @@
     <meta name="theme-color" content="#0d0d0d" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="preload" href="/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="/fonts/outfit-latin.woff2" as="font" type="font/woff2" crossorigin />
     <title>APIaxess</title>
     <!-- The theme is resolved before the first pixel is painted. Without this a
@@ -41,87 +42,133 @@
       <p class="t-label">Starting local engine</p>
     </div>
 
-    <div class="app">
+    <div class="shell" id="shell" data-sidebar="open" data-inspector="open" data-dock="open">
       <!-- ============================================================
-           2. App shell — header, lockup, navigation, status
+           Region 1 · Title bar — inherited, never restyled per surface
            ============================================================ -->
-      <header class="app-header">
-        <div class="app-header__brand">
-          <span id="header-lockup"></span>
-          <div class="app-header__context">
-            <span class="app-header__context-label">Session</span>
-            <span id="header-session" class="app-header__context-value">No session</span>
-          </div>
+      <header class="titlebar">
+        <div class="titlebar__brand">
+          <span id="header-lockup" class="titlebar__lockup"></span>
         </div>
-
-        <nav class="app-nav" id="app-nav" aria-label="Primary">
-          <button class="app-nav__item" type="button" data-nav="start" title="Start">
-            <span data-icon="spark" data-icon-size="17"></span><span class="app-nav__label">Start</span>
+        <span class="titlebar__divider" aria-hidden="true"></span>
+        <nav class="menubar" id="menubar" aria-label="Application menu"></nav>
+        <div class="titlebar__omni">
+          <button
+            class="omnibox"
+            id="omnibox"
+            type="button"
+            aria-haspopup="dialog"
+            aria-label="Command palette: go to surface, flow, endpoint or command"
+          >
+            <span class="omnibox__icon" data-icon="search" data-icon-size="12"></span>
+            <span class="omnibox__text">Go to surface, flow, endpoint or command</span>
+            <span class="omnibox__key">⌘K</span>
           </button>
-          <button class="app-nav__item" type="button" data-nav="apk" title="APK analysis">
-            <span data-icon="apk" data-icon-size="17"></span><span class="app-nav__label">APK analysis</span>
-          </button>
-          <button class="app-nav__item" type="button" data-nav="web" title="Web capture">
-            <span data-icon="web" data-icon-size="17"></span><span class="app-nav__label">Web capture</span>
-          </button>
-          <button class="app-nav__item" type="button" data-nav="workbench" title="Workbench">
-            <span data-icon="traffic" data-icon-size="17"></span><span class="app-nav__label">Workbench</span>
-          </button>
-          <button class="app-nav__item" type="button" data-nav="surface" title="API surface">
-            <span data-icon="surface" data-icon-size="17"></span><span class="app-nav__label">API surface</span>
-          </button>
-          <button class="app-nav__item" type="button" data-nav="export" title="Export">
-            <span data-icon="export" data-icon-size="17"></span><span class="app-nav__label">Export</span>
-          </button>
-          <button class="app-nav__item" type="button" data-nav="session" title="Session">
-            <span data-icon="session" data-icon-size="17"></span><span class="app-nav__label">Session</span>
-          </button>
-        </nav>
-
-        <div class="app-header__aside">
-          <div class="engine-status" role="status" aria-live="polite">
+        </div>
+        <div class="titlebar__scope">
+          <span class="scope-pill" id="scope-pill" hidden>
+            <span class="scope-pill__dot" aria-hidden="true"></span>
+            <span class="scope-pill__label">AUTHORIZED</span>
+          </span>
+          <span class="scope-host" id="scope-host"></span>
+        </div>
+        <div class="titlebar__aside">
+          <div class="engine-status" role="status" aria-live="polite" title="Local engine">
             <span id="status-dot" class="dot" aria-hidden="true"></span>
             <span id="status-text" class="engine-status__text">Connecting…</span>
           </div>
           <button
             id="diagnostics-toggle"
-            class="btn btn--quiet btn--icon diagnostics-toggle"
+            class="titlebar__btn diagnostics-toggle"
             type="button"
             aria-expanded="false"
             aria-controls="diagnostics-drawer"
             title="Diagnostics"
           >
-            <span data-icon="alert" data-icon-size="18"></span><span class="visually-hidden">Diagnostics</span>
+            <span data-icon="alert" data-icon-size="15"></span><span class="visually-hidden">Diagnostics</span>
             <span id="diagnostics-count" class="diagnostics-toggle__count" hidden>0</span>
           </button>
-          <button
-            class="btn btn--quiet btn--icon"
-            type="button"
-            data-theme-toggle
-            title="Switch to light theme"
-          >
+          <button class="titlebar__btn" type="button" data-theme-toggle title="Switch to light theme">
             <span data-theme-glyph></span>
           </button>
-          <button
-            class="btn btn--quiet btn--icon"
-            type="button"
-            data-nav="settings"
-            title="Settings"
-          >
-            <span data-icon="settings" data-icon-size="18"></span><span class="visually-hidden">Settings</span>
+        </div>
+        <span class="titlebar__divider" aria-hidden="true"></span>
+        <div class="wincontrols">
+          <button class="wincontrol" data-win="min" type="button" aria-label="Minimize window">
+            <span class="wincontrol__glyph wincontrol__glyph--min"></span>
           </button>
-          <button
-            class="btn btn--quiet btn--icon"
-            type="button"
-            data-nav="about"
-            title="About and help"
-          >
-            <span data-icon="help" data-icon-size="18"></span><span class="visually-hidden">About and help</span>
+          <button class="wincontrol" data-win="max" type="button" aria-label="Maximize window">
+            <span class="wincontrol__glyph wincontrol__glyph--max"></span>
+          </button>
+          <button class="wincontrol wincontrol--close" data-win="close" type="button" aria-label="Close window">
+            <span class="wincontrol__glyph wincontrol__glyph--close"></span>
           </button>
         </div>
       </header>
 
-      <main class="app-main">
+      <div class="shell__body">
+        <!-- Region 2 · Workspace rail -->
+        <nav class="rail" aria-label="Workspace phases">
+          <button class="rail__cell" type="button" data-phase="capture" data-nav="web" title="Capture">
+            <span class="rail__glyph" data-icon="web" data-icon-size="16"></span>
+            <span class="rail__label" aria-hidden="true">CAPT</span>
+            <span class="visually-hidden">Capture phase</span>
+          </button>
+          <button class="rail__cell" type="button" data-phase="bench" data-nav="workbench" title="Workbench">
+            <span class="rail__glyph" data-icon="traffic" data-icon-size="16"></span>
+            <span class="rail__label" aria-hidden="true">BNCH</span>
+            <span class="visually-hidden">Workbench phase</span>
+          </button>
+          <button class="rail__cell" type="button" data-phase="surface" data-nav="surface" title="API surface">
+            <span class="rail__glyph" data-icon="surface" data-icon-size="16"></span>
+            <span class="rail__label" aria-hidden="true">SURF</span>
+            <span class="visually-hidden">API surface phase</span>
+          </button>
+          <button class="rail__cell" type="button" data-phase="deliver" data-nav="export" title="Deliver">
+            <span class="rail__glyph" data-icon="export" data-icon-size="16"></span>
+            <span class="rail__label" aria-hidden="true">DLVR</span>
+            <span class="visually-hidden">Deliver phase</span>
+          </button>
+          <span class="rail__spacer"></span>
+          <button class="rail__cell rail__cell--foot" type="button" data-phase="settings" data-nav="settings" title="Settings">
+            <span class="rail__glyph" data-icon="settings" data-icon-size="16"></span>
+            <span class="visually-hidden">Settings</span>
+          </button>
+        </nav>
+
+        <!-- Region 3 · Module sidebar -->
+        <aside class="sidebar" id="module-sidebar" aria-label="Modules">
+          <div class="sidebar__session">
+            <span class="sidebar__kicker">SESSION</span>
+            <div class="sidebar__session-row">
+              <span id="header-session" class="sidebar__session-id">No session</span>
+              <span class="sidebar__session-state" id="sidebar-session-state"></span>
+            </div>
+          </div>
+          <div class="sidebar__modules">
+            <div class="sidebar__group" role="presentation">CAPTURE</div>
+            <button class="modrow" type="button" data-nav="web"><span class="modrow__label">Web capture</span><span class="modrow__count t-mono" data-count="web"></span></button>
+            <button class="modrow" type="button" data-nav="apk"><span class="modrow__label">APK analysis</span><span class="modrow__count t-mono" data-count="apk"></span></button>
+            <button class="modrow" type="button" data-nav="android"><span class="modrow__label">Android target</span><span class="modrow__count t-mono" data-count="android"></span></button>
+            <button class="modrow" type="button" data-nav="devices"><span class="modrow__label">Devices</span><span class="modrow__count t-mono" data-count="devices"></span></button>
+            <div class="sidebar__group" role="presentation">ANALYSE</div>
+            <button class="modrow" type="button" data-nav="workbench"><span class="modrow__label">Workbench</span><span class="modrow__count t-mono" data-count="flows"></span></button>
+            <button class="modrow" type="button" data-nav="surface"><span class="modrow__label">API surface</span><span class="modrow__count t-mono" data-count="surface"></span></button>
+            <div class="sidebar__group" role="presentation">DELIVER</div>
+            <button class="modrow" type="button" data-nav="export"><span class="modrow__label">Export</span><span class="modrow__count t-mono" data-count="export"></span></button>
+            <button class="modrow" type="button" data-nav="session"><span class="modrow__label">Session &amp; audit</span><span class="modrow__count t-mono" data-count="audit"></span></button>
+            <button class="modrow" type="button" data-nav="settings"><span class="modrow__label">Settings</span></button>
+          </div>
+          <div class="sidebar__health">
+            <span class="sidebar__kicker">CAPTURE HEALTH</span>
+            <div id="sidebar-health" class="sidebar__health-list"></div>
+          </div>
+        </aside>
+        <div class="splitter splitter--sidebar" data-splitter="sidebar" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
+
+        <!-- Regions 4–8 · Content column -->
+        <div class="shell__content">
+          <main class="app-main">
         <!-- ==========================================================
              3. Landing / entry
              ========================================================== -->
@@ -525,6 +572,83 @@
         </section>
 
         <!-- ==========================================================
+             6b. Android target (Phase D3)
+             ========================================================== -->
+        <section class="view" id="view-android" data-view="android" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Input / Android target</p>
+              <h1 class="t-display">Android target</h1>
+              <p>
+                Launch a GUI-drivable Android target, install the app you want to capture, and
+                drive it on the embedded screen — its traffic flows into this workbench. Everything
+                runs behind this authenticated surface, on 127.0.0.1.
+              </p>
+            </div>
+            <div class="view-head__actions">
+              <button class="btn btn--primary" id="android-launch" type="button">
+                <span data-icon="play"></span> Launch Android target
+              </button>
+              <button class="btn" id="android-stop" type="button" hidden>
+                <span data-icon="stop"></span> Stop
+              </button>
+            </div>
+          </div>
+
+          <div class="workflow">
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="apk"></span><h2>Status</h2></div>
+                  <span id="android-phase-badge" class="panel__hint">idle</span>
+                </div>
+                <div class="panel__body" id="android-status"></div>
+              </article>
+
+              <article class="panel" id="android-install-panel" hidden>
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="folder"></span><h2>Install target APK</h2></div>
+                  <span class="panel__hint">adb install</span>
+                </div>
+                <div class="panel__body stack">
+                  <div class="field">
+                    <label class="field__label" for="android-apk-path">APK path</label>
+                    <div class="filepicker">
+                      <input
+                        class="input input--mono"
+                        id="android-apk-path"
+                        type="text"
+                        spellcheck="false"
+                        placeholder="C:\path\to\target.apk"
+                      />
+                      <button class="btn" id="android-apk-browse" type="button">Browse…</button>
+                    </div>
+                    <input id="android-apk-file" type="file" accept=".apk,.apks,.xapk" hidden />
+                    <p class="field__hint">
+                      The app you want to capture. It installs onto the running target; then drive
+                      it on the screen and its API calls appear in the workbench and surface.
+                    </p>
+                  </div>
+                  <button class="btn btn--primary" id="android-apk-install" type="button">
+                    <span data-icon="plus"></span> Install onto target
+                  </button>
+                </div>
+              </article>
+            </div>
+
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="traffic"></span><h2>Screen</h2></div>
+                  <span class="panel__hint">interactive</span>
+                </div>
+                <div class="panel__body panel__body--flush" id="android-screen"></div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==========================================================
              7. Workbench
              ========================================================== -->
         <section class="view view--full" id="view-workbench" data-view="workbench" hidden>
@@ -620,8 +744,68 @@
               </div>
             </div>
 
-            <section class="workbench__drawer" id="repeater-panel" hidden></section>
-            <section class="workbench__drawer" id="intruder-panel" hidden></section>
+            <section class="workbench__drawer" id="resend-panel" hidden></section>
+            <section class="workbench__drawer" id="fuzzer-panel" hidden></section>
+          </div>
+        </section>
+
+        <!-- ==========================================================
+             7b. Device pairing (Phase C5)
+             ========================================================== -->
+        <section class="view" id="view-devices" data-view="devices" hidden>
+          <div class="view-head">
+            <div class="view-head__text">
+              <p class="t-label">Input / Android device</p>
+              <h1 class="t-display">Devices</h1>
+              <p>
+                Pair a rooted Android device with this workbench. Arm a device to show a QR the
+                client scans, then accept its request to provision trust. Everything stays on
+                127.0.0.1.
+              </p>
+            </div>
+            <div class="view-head__actions">
+              <button class="btn" id="devices-refresh" type="button">
+                <span data-icon="refresh"></span> Refresh devices
+              </button>
+            </div>
+          </div>
+
+          <div class="workflow">
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="apk"></span><h2>Attached devices</h2></div>
+                  <span id="devices-count" class="panel__hint">—</span>
+                </div>
+                <div class="panel__body panel__body--flush" id="devices-list"></div>
+              </article>
+
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="lock"></span><h2>Workbench CA fingerprint</h2></div>
+                  <span class="panel__hint">SHA-256</span>
+                </div>
+                <div class="panel__body" id="pairing-ca"></div>
+              </article>
+            </div>
+
+            <div class="workflow__col">
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="shield"></span><h2>Pairing code</h2></div>
+                  <span id="pairing-arm-badge" class="panel__hint">not armed</span>
+                </div>
+                <div class="panel__body" id="pairing-arm-result"></div>
+              </article>
+
+              <article class="panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="clock"></span><h2>Awaiting decision</h2></div>
+                  <span id="pairing-pending-count" class="panel__hint">0 pending</span>
+                </div>
+                <div class="panel__body panel__body--flush" id="pairing-pending"></div>
+              </article>
+            </div>
           </div>
         </section>
 
@@ -739,7 +923,7 @@
               <p class="t-label">Durable state</p>
               <h1 class="t-display">Session</h1>
               <p>
-                Sessions are durable: captured traffic, repeater history, intruder jobs, pipeline
+                Sessions are durable: captured traffic, Resend history, Fuzzer jobs, pipeline
                 state, and the audit trail all survive a restart.
               </p>
             </div>
@@ -876,7 +1060,51 @@
             </article>
           </div>
         </section>
-      </main>
+          </main>
+
+          <!-- Region 8 · Bottom dock — shared across every surface -->
+          <div class="splitter splitter--dock" data-splitter="dock" role="separator" aria-orientation="horizontal" aria-label="Resize dock" tabindex="0"></div>
+          <section class="dock" id="dock" aria-label="Dock">
+            <div class="dock__tabs" role="tablist" aria-label="Dock tools">
+              <button class="dock__tab is-active" type="button" role="tab" data-docktab="queue" aria-selected="true">
+                Intercept queue <span class="dock__badge" id="dock-queue-badge" hidden>0</span>
+              </button>
+              <button class="dock__tab" type="button" role="tab" data-docktab="resend" aria-selected="false">Resend</button>
+              <button class="dock__tab" type="button" role="tab" data-docktab="fuzzer" aria-selected="false">Fuzzer</button>
+              <button class="dock__tab" type="button" role="tab" data-docktab="diagnostics" aria-selected="false">
+                Diagnostics <span class="dock__diag" id="dock-diag-count" hidden>0</span>
+              </button>
+              <span class="dock__spacer"></span>
+              <span class="dock__transport">CONTROL · RELIABLE</span>
+            </div>
+            <div class="dock__body">
+              <div class="dock__panel is-active" role="tabpanel" data-dockpanel="queue" id="dock-queue"></div>
+              <div class="dock__panel" role="tabpanel" data-dockpanel="resend" id="dock-resend"></div>
+              <div class="dock__panel" role="tabpanel" data-dockpanel="fuzzer" id="dock-fuzzer"></div>
+              <div class="dock__panel" role="tabpanel" data-dockpanel="diagnostics" id="dock-diagnostics"></div>
+            </div>
+          </section>
+        </div>
+        <!-- /shell__content -->
+      </div>
+      <!-- /shell__body -->
+
+      <!-- Region 9 · Status bar -->
+      <footer class="statusbar" id="statusbar">
+        <span class="statusbar__cell statusbar__cell--surface" id="statusbar-surface">START</span>
+        <span class="statusbar__cell" id="statusbar-session">no session</span>
+        <span class="statusbar__cell statusbar__cell--transport" title="Control channel — reliable">
+          <span class="statusbar__dot statusbar__dot--control" aria-hidden="true"></span>CONTROL
+        </span>
+        <span class="statusbar__cell statusbar__cell--transport" title="Telemetry channel — lossy">
+          <span class="statusbar__dot statusbar__dot--telemetry" aria-hidden="true"></span>TELEMETRY
+        </span>
+        <span class="statusbar__spacer"></span>
+        <button class="statusbar__cell statusbar__cell--action" id="statusbar-sidebar" data-toggle="sidebar" type="button" hidden>SIDEBAR ⌘B</button>
+        <button class="statusbar__cell statusbar__cell--action" id="statusbar-dock" data-toggle="dock" type="button" hidden>DOCK ⌘J</button>
+        <button class="statusbar__cell statusbar__cell--action statusbar__cell--diag" id="statusbar-diag" data-open="diagnostics" type="button" hidden>0 DIAGNOSTICS</button>
+        <span class="statusbar__cell" id="statusbar-locality">127.0.0.1</span>
+      </footer>
     </div>
 
     <!-- ============================================================

@@ -71,8 +71,17 @@ impl DroidBotFallback {
         let install_bin = exe.parent()?;
         // Mirrors the resolver layout used by the other bundled analysis tools.
         let candidates = [
-            install_bin.join("..").join("runtime").join("droidbot").join("droidbot.exe"),
-            install_bin.join("..").join("share").join("apiaxess").join("droidbot").join("droidbot"),
+            install_bin
+                .join("..")
+                .join("runtime")
+                .join("droidbot")
+                .join("droidbot.exe"),
+            install_bin
+                .join("..")
+                .join("share")
+                .join("apiaxess")
+                .join("droidbot")
+                .join("droidbot"),
         ];
         candidates.into_iter().find(|candidate| candidate.is_file())
     }
@@ -113,12 +122,50 @@ mod tests {
         // no vendored `DroidBot`, so resolve() returns None.)
         struct NoControl;
         impl SandboxControl for NoControl {
-            fn command(&self, _a: &[String], _t: Duration) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> { unreachable!() }
-            fn shell(&self, _a: &[String], _t: Duration) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> { unreachable!() }
-            fn put(&self, _b: &[u8], _p: &str, _t: Duration) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> { unreachable!() }
-            fn remove(&self, _p: &str, _t: Duration) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> { unreachable!() }
-            fn install_apks(&self, _p: &[PathBuf], _t: Duration) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic> { unreachable!() }
-            fn transport_id(&self) -> &'static str { "none" }
+            fn command(
+                &self,
+                _a: &[String],
+                _t: Duration,
+            ) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic>
+            {
+                unreachable!()
+            }
+            fn shell(
+                &self,
+                _a: &[String],
+                _t: Duration,
+            ) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic>
+            {
+                unreachable!()
+            }
+            fn put(
+                &self,
+                _b: &[u8],
+                _p: &str,
+                _t: Duration,
+            ) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic>
+            {
+                unreachable!()
+            }
+            fn remove(
+                &self,
+                _p: &str,
+                _t: Duration,
+            ) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic>
+            {
+                unreachable!()
+            }
+            fn install_apks(
+                &self,
+                _p: &[PathBuf],
+                _t: Duration,
+            ) -> Result<apiaxess_sandbox::SandboxCommandOutput, apiaxess_diagnostics::Diagnostic>
+            {
+                unreachable!()
+            }
+            fn transport_id(&self) -> &'static str {
+                "none"
+            }
         }
         let mut fallback = DroidBotFallback {
             launcher_override: None,

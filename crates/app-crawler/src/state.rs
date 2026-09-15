@@ -90,11 +90,10 @@ impl Action {
 /// call. Used only to *order* exploration (thoroughness is unchanged; this just
 /// surfaces API traffic sooner).
 const NETWORKY_HINTS: &[&str] = &[
-    "load", "refresh", "reload", "sync", "search", "submit", "send", "post",
-    "fetch", "feed", "list", "browse", "explore", "discover", "next", "more",
-    "view", "open", "detail", "details", "profile", "account", "order", "cart",
-    "checkout", "pay", "buy", "download", "upload", "update", "save", "login",
-    "sign", "connect", "apply", "confirm", "continue", "get", "show",
+    "load", "refresh", "reload", "sync", "search", "submit", "send", "post", "fetch", "feed",
+    "list", "browse", "explore", "discover", "next", "more", "view", "open", "detail", "details",
+    "profile", "account", "order", "cart", "checkout", "pay", "buy", "download", "upload",
+    "update", "save", "login", "sign", "connect", "apply", "confirm", "continue", "get", "show",
 ];
 
 /// Builds the ordered action set for a screen.
@@ -228,6 +227,10 @@ mod tests {
 </hierarchy>"#;
         let hierarchy = Hierarchy::parse(list);
         let actions = actions_for(&hierarchy);
-        assert_eq!(actions.len(), 1, "identical list rows dedupe to a single action");
+        assert_eq!(
+            actions.len(),
+            1,
+            "identical list rows dedupe to a single action"
+        );
     }
 }

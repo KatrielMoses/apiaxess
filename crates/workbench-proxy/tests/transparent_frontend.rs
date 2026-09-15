@@ -18,7 +18,9 @@ use tokio::net::{TcpListener, TcpStream};
 /// Minimal upstream that answers any request with `200 ok`, so hudsucker's
 /// forward completes and the flow is recorded.
 async fn spawn_upstream() -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
     let addr = listener.local_addr().expect("upstream addr");
     tokio::spawn(async move {
         loop {
@@ -29,7 +31,9 @@ async fn spawn_upstream() -> std::net::SocketAddr {
                 let mut buffer = [0u8; 2048];
                 let _ = socket.read(&mut buffer).await;
                 let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
                     .await;
             });
         }
@@ -82,9 +86,7 @@ async fn transparent_frontend_captures_redirected_origin_form_http() {
     let mut client = TcpStream::connect(frontend_loopback)
         .await
         .expect("connect frontend");
-    let request = format!(
-        "GET /tphttp HTTP/1.1\r\nHost: {upstream}\r\nConnection: close\r\n\r\n"
-    );
+    let request = format!("GET /tphttp HTTP/1.1\r\nHost: {upstream}\r\nConnection: close\r\n\r\n");
     client
         .write_all(request.as_bytes())
         .await

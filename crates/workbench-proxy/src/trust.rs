@@ -1486,7 +1486,10 @@ mod tests {
         {
             let _guard = IsolatedProfileGuard::new(leaked.clone());
         }
-        assert!(!leaked.exists(), "armed guard must remove the directory on drop");
+        assert!(
+            !leaked.exists(),
+            "armed guard must remove the directory on drop"
+        );
 
         // Disarmed: ownership transferred, so the directory survives for the
         // session and is torn down later by the controller.
@@ -1496,7 +1499,10 @@ mod tests {
             let mut guard = IsolatedProfileGuard::new(kept.clone());
             guard.disarm();
         }
-        assert!(kept.exists(), "disarmed guard must leave the directory in place");
+        assert!(
+            kept.exists(),
+            "disarmed guard must leave the directory in place"
+        );
         std::fs::remove_dir_all(&kept).expect("cleanup");
     }
 

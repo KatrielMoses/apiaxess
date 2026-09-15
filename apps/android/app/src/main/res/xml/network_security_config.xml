@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The client's control/pairing channel is cleartext HTTP/WS to the local workbench
+  (loopback 127.0.0.1 over the adb-reverse tunnel, or a user-entered host). Android
+  9+ blocks cleartext by default, which breaks pairing (`/pairing/ca`, `/pairing/
+  exchange`, the control WS). This permits the client's own control traffic only;
+  the captured app's traffic is redirected separately and is unaffected.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

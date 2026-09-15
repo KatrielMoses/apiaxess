@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
       Name="APIaxess"
       Manufacturer="APIaxess"
@@ -15,6 +16,43 @@
         DowngradeErrorMessage="A newer version of APIaxess is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <!-- A branded wizard instead of the bare Windows progress bar: welcome →
+         license → progress → finish. WixUI_Minimal is the simplest professional
+         flow; the install directory is fixed (per-user LocalAppData), so no
+         directory-selection step is needed. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <!-- Brand the wizard chrome with the identity-kit mark (Ink ground + chevron
+         + blue accent) so no generic WiX default graphic appears anywhere in the
+         install flow: the top banner and the Welcome/Exit side graphic. -->
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
+
+    <!-- Add/Remove Programs and shortcut identity: the desktop shell embeds the
+         app icon, so extracting it keeps ARP and both shortcuts on the real mark. -->
+    <Icon Id="AppIcon.exe" SourceFile="!(bindpath.Stage)\bin\apiaxess-desktop.exe" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.exe" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <!-- Finish page: offer to launch APIaxess immediately (checked by default),
+         the way a normal desktop app installer does. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch APIaxess now" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <CustomAction
+        Id="LaunchApplication"
+        FileRef="ApplicationExecutable"
+        ExeCommand=""
+        Return="asyncNoWait"
+        Impersonate="yes" />
+    <UI>
+      <Publish
+          Dialog="ExitDialog"
+          Control="Finish"
+          Event="DoAction"
+          Value="LaunchApplication"
+          Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="PerUserProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="APIaxess" />
@@ -24,8 +62,37 @@
       <Directory Id="ApplicationProgramsFolder" Name="APIaxess" />
     </StandardDirectory>
 
+    <!-- A desktop shortcut to the native shell, created by default and offered as
+         an option on the finish page (checked by default, like a normal app
+         installer). The property gates the component so it can also be turned off
+         for a silent/admin install (INSTALLDESKTOPSHORTCUT=0). Its own HKCU
+         registry keypath makes the component per-user-clean. -->
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="1" />
+    <StandardDirectory Id="DesktopFolder">
+      <Component
+          Id="DesktopShortcutComponent"
+          Guid="6C6E0A2B-7C4E-52F8-9C1D-0B7D5A2E9F31"
+          Condition="INSTALLDESKTOPSHORTCUT = 1">
+        <Shortcut
+            Id="DesktopShortcut"
+            Name="APIaxess"
+            Description="Launch the APIaxess local workbench"
+            Target="[#ApplicationExecutable]"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon.exe" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\APIaxess"
+            Name="DesktopShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
     <Feature Id="MainFeature" Title="APIaxess" Level="1">
       <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="DesktopShortcutComponent" />
     </Feature>
   </Package>
 </Wix>

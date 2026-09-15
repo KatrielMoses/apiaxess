@@ -112,6 +112,18 @@ impl BypassTechniqueRegistry {
                 "(java.lang.String,java.security.cert.Certificate[])",
                 ReturnStrategy::Null,
             ),
+            // OkHttp 4.x performs the actual pin check + throw in the internal
+            // `check$okhttp(String, Function0)` during the TLS handshake, not the
+            // public `check` overloads above — so this is the overload that must be
+            // neutralized for OkHttp 4.x pinned apps.
+            BypassSpec::java(
+                "java.okhttp.certificate-pinner.check-okhttp",
+                "*",
+                "okhttp3.CertificatePinner",
+                "check$okhttp",
+                "(java.lang.String,kotlin.jvm.functions.Function0)",
+                ReturnStrategy::Null,
+            ),
             BypassSpec::java(
                 "java.x509-trust-manager.check-server-trusted",
                 "*",
@@ -458,6 +470,36 @@ impl Default for BypassToolchain {
     }
 }
 
+/// Device-side frida-server port. `frida-server` binds this on the device; the
+/// workbench `adb forward`s a host loopback port to it.
+pub const DEVICE_FRIDA_SERVER_PORT: u16 = 27042;
+
+/// Which device hosts frida-server and how the workbench reaches it (Phase C4).
+///
+/// The bundled-emulator path leaves this at its default (`device_serial: None`,
+/// host port 27042); the `adb forward` there is already scoped to the emulator by
+/// the control transport's serial. For an arbitrary connected device the workbench
+/// sets `device_serial` (so it builds that device's control) and a distinct
+/// `frida_host_port` (so multiple attached devices do not collide on the host).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FridaTargeting {
+    /// adb serial of the device hosting frida-server. `None` targets whatever the
+    /// control transport is already bound to (the single bundled emulator).
+    pub device_serial: Option<String>,
+    /// Host loopback port `adb forward`ed to the device's frida-server. Frida-core
+    /// attaches to `127.0.0.1:<frida_host_port>`.
+    pub frida_host_port: u16,
+}
+
+impl Default for FridaTargeting {
+    fn default() -> Self {
+        Self {
+            device_serial: None,
+            frida_host_port: DEVICE_FRIDA_SERVER_PORT,
+        }
+    }
+}
+
 /// One complete automatic bypass request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BypassRequest {
@@ -471,6 +513,8 @@ pub struct BypassRequest {
     pub preference: LanePreference,
     /// External tools and reviewed session assets.
     pub toolchain: BypassToolchain,
+    /// Which device hosts frida-server and how the workbench reaches it.
+    pub frida: FridaTargeting,
     /// Parent for the session-only host workspace.
     pub workspace_root: Option<PathBuf>,
     /// Whether the patched package should be installed automatically.
@@ -491,6 +535,7 @@ impl BypassRequest {
             target,
             preference: LanePreference::Auto,
             toolchain: BypassToolchain::default(),
+            frida: FridaTargeting::default(),
             workspace_root: None,
             install_patched_app: true,
         }
@@ -748,14 +793,78 @@ pub fn apply_bypass(
     registry: &BypassTechniqueRegistry,
     runner: &Arc<dyn ExternalToolRunner>,
 ) -> Result<BypassOutcome, Vec<Diagnostic>> {
+    let control = lease.control();
+    let (outcome, cleanup) = run_bypass_core(&control, request, registry, runner)?;
+    lease.add_cleanup(Box::new(cleanup));
+    Ok(outcome)
+}
+
+/// Applies the planned lane against a device identified by its control transport,
+/// without a disposable sandbox lease (Phase C4).
+///
+/// This is how the pinned-app bypass targets the user's *chosen connected device*
+/// rather than the bundled emulator: build the device's control from its adb
+/// serial (see `device_provision::DeviceProvisioner::control_for`), set
+/// `request.frida.device_serial` + a distinct `frida_host_port`, and the same
+/// proven lanes (`plan_bypass`/`apply_frida`, the OkHttp/Java pinning hooks) run
+/// against that device's frida-server over the adb tunnel. The workbench owns the
+/// returned [`BypassSession`] and tears it down when capture ends.
+///
+/// # Errors
+///
+/// Returns the bypass diagnostics when planning hits an escalation boundary or a
+/// lane fails (attach/script/deploy); cleanup of any partial state runs first.
+pub fn apply_bypass_on_control(
+    control: &Arc<dyn SandboxControl>,
+    request: &BypassRequest,
+    registry: &BypassTechniqueRegistry,
+    runner: &Arc<dyn ExternalToolRunner>,
+) -> Result<(BypassOutcome, BypassSession), Vec<Diagnostic>> {
+    let (outcome, cleanup) = run_bypass_core(control, request, registry, runner)?;
+    Ok((outcome, BypassSession { cleanup }))
+}
+
+/// A live device-targeted bypass. Its Frida instrumentation and the device-side
+/// frida-server stay active until [`BypassSession::teardown`] is called.
+pub struct BypassSession {
+    cleanup: BypassCleanup,
+}
+
+impl std::fmt::Debug for BypassSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BypassSession")
+            .field("package", &self.cleanup.package_name)
+            .field("frida_server_started", &self.cleanup.server_started)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BypassSession {
+    /// Unloads the instrumentation and removes device-side bypass artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the teardown diagnostics for any artifact that could not be removed.
+    pub fn teardown(mut self) -> Result<(), Vec<Diagnostic>> {
+        self.cleanup.cleanup()
+    }
+}
+
+/// Shared bypass core over a control transport, independent of lease ownership.
+fn run_bypass_core(
+    control: &Arc<dyn SandboxControl>,
+    request: &BypassRequest,
+    registry: &BypassTechniqueRegistry,
+    runner: &Arc<dyn ExternalToolRunner>,
+) -> Result<(BypassOutcome, BypassCleanup), Vec<Diagnostic>> {
     let plan = plan_bypass(request, registry);
     if plan.lane == BypassLane::Escalation {
         return Err(plan.diagnostics);
     }
     let workspace = session_workspace(request)?;
-    let control = lease.control();
     let mut cleanup = BypassCleanup {
-        control: Arc::clone(&control),
+        control: Arc::clone(control),
         server_path: None,
         server_started: false,
         frida_process: None,
@@ -767,7 +876,7 @@ pub fn apply_bypass(
     };
     let applied = match plan.lane {
         BypassLane::PrimaryFrida => apply_frida(
-            &control,
+            control,
             runner,
             request,
             &plan,
@@ -776,7 +885,7 @@ pub fn apply_bypass(
             None,
         ),
         BypassLane::FallbackPatch => apply_patch_lane(
-            &control,
+            control,
             runner,
             request,
             &plan,
@@ -785,10 +894,10 @@ pub fn apply_bypass(
             None,
         ),
         BypassLane::FlutterNative => {
-            apply_flutter_lane(&control, runner, request, &plan, &workspace, &mut cleanup)
+            apply_flutter_lane(control, runner, request, &plan, &workspace, &mut cleanup)
         }
         BypassLane::XamarinMono => {
-            apply_xamarin_lane(&control, runner, request, &plan, &workspace, &mut cleanup)
+            apply_xamarin_lane(control, runner, request, &plan, &workspace, &mut cleanup)
         }
         BypassLane::Escalation => unreachable!(),
     };
@@ -796,13 +905,15 @@ pub fn apply_bypass(
         Ok((technique_ids, patched)) => {
             cleanup.installed_package = patched;
             let server_started = cleanup.server_started;
-            lease.add_cleanup(Box::new(cleanup));
-            Ok(BypassOutcome {
-                plan,
-                applied_technique_ids: technique_ids,
-                patched_app_installed: patched,
-                frida_server_started: server_started,
-            })
+            Ok((
+                BypassOutcome {
+                    plan,
+                    applied_technique_ids: technique_ids,
+                    patched_app_installed: patched,
+                    frida_server_started: server_started,
+                },
+                cleanup,
+            ))
         }
         Err(mut diagnostics) => {
             diagnostics.extend(cleanup.cleanup().err().unwrap_or_default());
@@ -949,18 +1060,22 @@ fn apply_frida_embedded(
     cleanup.server_started = true;
 
     // Forward a host port to the device-side frida-server so the embedded
-    // frida-core connects to it explicitly (`add_remote_device 127.0.0.1:27042`)
+    // frida-core connects to it explicitly (`add_remote_device 127.0.0.1:<port>`)
     // rather than enumerating USB devices — which mis-resolves a phantom device
     // for an emulator on Linux and never reaches this server. `adb forward` is a
     // HOST-side adb subcommand, so it must go through `control.command` (host
-    // transport), NOT `control.shell` (which runs it inside the guest shell where
-    // `forward` is not a command). Idempotent (re-adding replaces).
+    // transport, already scoped to this device's adb serial), NOT `control.shell`.
+    // Idempotent (re-adding replaces). The host port is parameterized (Phase C4)
+    // so multiple attached devices map to distinct host ports; the device port is
+    // always the frida-server default. The serial that disambiguates which device
+    // is carried by `control` (and recorded in `request.frida.device_serial`).
+    let host_port = request.frida.frida_host_port;
     control
         .command(
             &[
                 "forward".to_owned(),
-                "tcp:27042".to_owned(),
-                "tcp:27042".to_owned(),
+                format!("tcp:{host_port}"),
+                format!("tcp:{DEVICE_FRIDA_SERVER_PORT}"),
             ],
             Duration::from_secs(30),
         )
@@ -968,10 +1083,17 @@ fn apply_frida_embedded(
             vec![bypass_diagnostic(
                 catalogue::SANDBOX_BYPASS_FRIDA_SERVER_DEPLOY_FAILED,
                 "operation",
-                format!("adb forward frida-server port: {error}"),
+                format!(
+                    "adb forward frida-server port for device {}: {error}",
+                    request
+                        .frida
+                        .device_serial
+                        .as_deref()
+                        .unwrap_or("<default>"),
+                ),
             )]
         })?;
-    // frida-server needs a moment to bind 27042 after launch before the forward
+    // frida-server needs a moment to bind its port after launch before the forward
     // target is reachable by the embedded frida-core.
     std::thread::sleep(Duration::from_secs(2));
 
@@ -983,7 +1105,10 @@ fn apply_frida_embedded(
         mode: crate::instrumentation::InstrumentationMode::Spawn,
         script,
         workspace_root: Some(workspace.to_path_buf()),
-        config: crate::instrumentation::FridaSubstrateConfig::default(),
+        config: crate::instrumentation::FridaSubstrateConfig {
+            device_address: format!("127.0.0.1:{host_port}"),
+            ..crate::instrumentation::FridaSubstrateConfig::default()
+        },
     };
     let embedded = crate::frida_embedded::FridaCoreController::start(embedded_request)
         .map_err(|diagnostic| vec![diagnostic])?;
@@ -1428,10 +1553,20 @@ fn generate_frida_script(
     specs: &[BypassSpec],
     extra: Option<String>,
 ) -> String {
-    let mut script = format!(
-        "'use strict';\n// APIaxess Phase 3.3 one-shot spawn-gated pinning bypass for {package_name}\n"
+    // Frida 17 removed the built-in `Java` runtime bridge, so a raw `Java.perform`
+    // script throws `ReferenceError: Java is not defined` and installs no hooks
+    // (the bypass silently no-ops). Bundle the compiled frida-java-bridge and expose
+    // it as the `Java` global, exactly as frida-compile/frida-tools do.
+    let mut script = String::new();
+    script.push_str(include_str!("frida_java_bridge.js"));
+    script.push_str("\nglobalThis.Java = bridge;\n");
+    let _ = writeln!(
+        script,
+        "// APIaxess spawn-gated pinning bypass for {package_name}"
     );
-    script.push_str("function apiaxessInstall() {\n");
+    // `apiaxessDone` guards each technique so the retry loop below never stacks a
+    // second wrapper on an already-hooked method.
+    script.push_str("var apiaxessDone = {};\nfunction apiaxessInstall() {\n");
     for spec in specs {
         let return_value = match spec.return_strategy {
             ReturnStrategy::BooleanFalse => "false",
@@ -1442,13 +1577,20 @@ fn generate_frida_script(
         };
         let _ = writeln!(
             script,
-            "  try {{ var C = Java.use({:?}); var M = C[{method:?}]; M.overloads.forEach(function(O) {{ var original = O.implementation; O.implementation = function() {{ var __apiaxess_original = original; return {return_value}; }}; }}); }} catch (_) {{ /* unavailable overload */ }}",
-            spec.target_class,
+            "  try {{ if (!apiaxessDone[{id:?}]) {{ var C = Java.use({class:?}); var M = C[{method:?}]; M.overloads.forEach(function(O) {{ var original = O.implementation; O.implementation = function() {{ var __apiaxess_original = original; return {return_value}; }}; }}); apiaxessDone[{id:?}] = true; }} }} catch (_) {{ /* class not loaded yet; retried by the install interval */ }}",
+            id = spec.technique_id,
+            class = spec.target_class,
             method = spec.target_method,
             return_value = return_value
         );
     }
-    script.push_str("}\nJava.perform(function() { apiaxessInstall(); try { var A = Java.use('android.app.Application'); A.onCreate.overloads.forEach(function(O) { var original = O.implementation; O.implementation = function() { apiaxessInstall(); return original.call(this); }; }); } catch (_) {} });\n");
+    // Install immediately, again on Application.onCreate, and then re-attempt on a
+    // short interval: certificate-pinning classes (e.g. okhttp3.CertificatePinner)
+    // are frequently loaded lazily on first network use — after both the spawn-time
+    // install and Application.onCreate — so a one-shot hook misses them. The guarded
+    // interval re-runs the install until each technique's class has loaded and been
+    // hooked (bounded so the script does not spin forever).
+    script.push_str("}\nJava.perform(function() { apiaxessInstall(); try { var A = Java.use('android.app.Application'); A.onCreate.overloads.forEach(function(O) { var original = O.implementation; O.implementation = function() { apiaxessInstall(); return original.call(this); }; }); } catch (_) {} });\nvar apiaxessTries = 0;\nvar apiaxessTimer = setInterval(function() { apiaxessTries += 1; try { Java.perform(function() { apiaxessInstall(); }); } catch (_) {} if (apiaxessTries >= 120) { clearInterval(apiaxessTimer); } }, 250);\n");
     if let Some(extra) = extra {
         script.push_str(&extra);
         script.push('\n');
@@ -1838,7 +1980,10 @@ mod tests {
             scan_tree(&root, &["smali"], &["CertificatePinner"], &mut scan),
             "a deep pin literal must be found, not missed by the scan cap"
         );
-        assert!(!scan.truncated, "an ample scan completes without truncation");
+        assert!(
+            !scan.truncated,
+            "an ample scan completes without truncation"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1853,7 +1998,12 @@ mod tests {
         }
         let mut capped = ScanState::new();
         capped.max_files = 3;
-        assert!(!scan_tree(&root, &["smali"], &["CertificatePinner"], &mut capped));
+        assert!(!scan_tree(
+            &root,
+            &["smali"],
+            &["CertificatePinner"],
+            &mut capped
+        ));
         assert!(
             capped.truncated,
             "a scan stopped by the cap must be reported as truncated, not a false negative"
@@ -1948,6 +2098,111 @@ mod tests {
         assert_eq!(
             definition.id.as_ref(),
             "sandbox.bypass.framework-offset-miss"
+        );
+    }
+
+    #[test]
+    fn frida_targeting_defaults_to_the_bundled_emulator_and_no_serial() {
+        let targeting = FridaTargeting::default();
+        assert_eq!(targeting.frida_host_port, DEVICE_FRIDA_SERVER_PORT);
+        assert!(targeting.device_serial.is_none());
+        // A request built with `new` carries the default targeting, so the bundled
+        // emulator path is unchanged.
+        let request = BypassRequest::new("s", "l", inventory(true, None));
+        assert_eq!(request.frida, FridaTargeting::default());
+    }
+
+    #[test]
+    fn device_targeting_by_serial_and_distinct_host_port_is_retained() {
+        let mut request = BypassRequest::new("s", "l", inventory(true, None));
+        request.frida = FridaTargeting {
+            device_serial: Some("0A1B2C3D".to_owned()),
+            frida_host_port: 27055,
+        };
+        assert_eq!(request.frida.device_serial.as_deref(), Some("0A1B2C3D"));
+        assert_eq!(request.frida.frida_host_port, 27055);
+    }
+
+    /// A control transport whose methods are never reached on the escalation path.
+    struct UnreachableControl;
+    impl SandboxControl for UnreachableControl {
+        fn command(
+            &self,
+            _arguments: &[String],
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            unreachable!("escalation returns before the control transport is used")
+        }
+        fn shell(
+            &self,
+            _arguments: &[String],
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            unreachable!("escalation returns before the control transport is used")
+        }
+        fn put(
+            &self,
+            _bytes: &[u8],
+            _remote_path: &str,
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            unreachable!("escalation returns before the control transport is used")
+        }
+        fn remove(
+            &self,
+            _remote_path: &str,
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            unreachable!("escalation returns before the control transport is used")
+        }
+        fn install_apks(
+            &self,
+            _apk_paths: &[PathBuf],
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            unreachable!("escalation returns before the control transport is used")
+        }
+        fn transport_id(&self) -> &str {
+            "device-adb"
+        }
+    }
+
+    struct UnreachableRunner;
+    impl ExternalToolRunner for UnreachableRunner {
+        fn probe(
+            &self,
+            _request: &ToolProbeRequest,
+        ) -> Result<ToolProbe, apiaxess_external_tools::ExternalToolError> {
+            unreachable!("escalation returns before any tool is probed")
+        }
+        fn invoke(
+            &self,
+            _request: &ToolInvocationRequest,
+        ) -> Result<
+            apiaxess_external_tools::ToolInvocation,
+            apiaxess_external_tools::ExternalToolError,
+        > {
+            unreachable!("escalation returns before any tool is invoked")
+        }
+    }
+
+    #[test]
+    fn lease_free_device_entry_short_circuits_on_an_escalation_boundary() {
+        // apply_bypass_on_control is the Phase C4 lease-free entry used to target a
+        // device by serial. On an escalation boundary it must return the boundary
+        // diagnostics without touching the device transport.
+        let registry = BypassTechniqueRegistry::builtins();
+        let mut request = BypassRequest::new("session", "lease", inventory(true, None));
+        request.target.escalation_boundaries = vec![EscalationBoundary::ClientMtls];
+        request.frida.device_serial = Some("0A1B2C3D".to_owned());
+        let control: Arc<dyn SandboxControl> = Arc::new(UnreachableControl);
+        let runner: Arc<dyn ExternalToolRunner> = Arc::new(UnreachableRunner);
+        let diagnostics = apply_bypass_on_control(&control, &request, &registry, &runner)
+            .expect_err("escalation boundary is an error");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id.as_ref() == "sandbox.bypass.escalation-boundary")
         );
     }
 }
