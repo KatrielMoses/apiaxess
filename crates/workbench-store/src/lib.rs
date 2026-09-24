@@ -194,6 +194,12 @@ pub struct ResendResponse {
     pub body: Option<Vec<u8>>,
     /// Round-trip duration in milliseconds.
     pub duration_ms: u64,
+    /// HTTP version from the upstream status line (e.g. `HTTP/1.1`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_version: Option<String>,
+    /// Reason phrase from the upstream status line (e.g. `Found`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One append-only resend send revision.
@@ -2101,6 +2107,8 @@ impl TrafficStore {
                         headers: response.headers,
                         body: self.read_blob(response.body_hash.as_deref())?,
                         duration_ms: response.duration_ms,
+                        http_version: response.http_version,
+                        reason: response.reason,
                     })
                 })
                 .transpose()?,
@@ -2128,6 +2136,8 @@ impl TrafficStore {
             headers: response.headers.clone(),
             body_hash: self.write_blob(response.body.as_deref())?,
             duration_ms: response.duration_ms,
+            http_version: response.http_version.clone(),
+            reason: response.reason.clone(),
         })
     }
 
@@ -2177,6 +2187,8 @@ impl TrafficStore {
                         headers: response.headers,
                         body: self.read_blob(response.body_hash.as_deref())?,
                         duration_ms: response.duration_ms,
+                        http_version: response.http_version,
+                        reason: response.reason,
                     })
                 })
                 .transpose()?,
@@ -2338,6 +2350,10 @@ struct StoredResendResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     body_hash: Option<String>,
     duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3262,6 +3278,8 @@ mod tests {
                     headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                     body: Some(b"{\"ok\":true}".to_vec()),
                     duration_ms: 12,
+                    http_version: None,
+                    reason: None,
                 }),
                 diagnostic: None,
                 scope: ScopeDisposition::InScope,
@@ -3544,6 +3562,8 @@ mod tests {
                     headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                     body: Some(b"response-body".to_vec()),
                     duration_ms: 4,
+                    http_version: None,
+                    reason: None,
                 }),
                 matched: true,
                 filtered: false,

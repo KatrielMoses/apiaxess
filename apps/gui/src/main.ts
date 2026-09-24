@@ -27,9 +27,10 @@ import {
   type ParsedTemplate,
   countTemplatePositions,
   parseFuzzTemplate,
-  rawRequestText,
   stripFuzzMarks,
 } from "./fuzz/template";
+import { parseRawRequest, rawRequestText, splitRawRequest as splitRawRequestParts, splitUrl, syncContentLength, urlOrigin } from "./http/request-editor";
+import { prettyBody } from "./http/body-view";
 
 /* ==================================================================== *
  * Engine contracts. These mirror the local API's response shapes and are
@@ -42,7 +43,7 @@ interface WorkbenchHealth { readonly proxyRunning: boolean; readonly backend?: {
 interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; readonly origin?: string | null; }
 interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; }
 export interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
-interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; }
+interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; httpVersion?: string | null; reason?: string | null; }
 interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: Diagnostic | null; scope: string; }
 interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; }
 interface ResendSendResult { context: ResendContext; revision: ResendRevision; diagnostics: (Diagnostic | null)[]; }
@@ -1933,10 +1934,11 @@ async function createResend(flowId: number): Promise<void> {
 
 function renderResend(): void {
   if (resendPanel === null || selectedResend === null) return;
+  const ctx = selectedResend;
   resendPanel.hidden = false;
   selectedResendRevision = null;
   resendPanel.innerHTML = `<div class="panel__header">
-  <div class="panel__heading">${icon("send", { size: 16 })}<h2>Resend · ${escapeHtml(selectedResend.id.slice(-8))}</h2></div>
+  <div class="panel__heading">${icon("send", { size: 16 })}<h2 title="${escapeHtml(ctx.current.url)}">${escapeHtml(resendTitle(ctx))}</h2></div>
   <div class="row">
     <button class="btn btn--quiet btn--icon" type="button" data-close-resend><span class="visually-hidden">Close Resend</span>${icon("close", { size: 16 })}</button>
   </div>
@@ -1944,11 +1946,12 @@ function renderResend(): void {
 <div class="resend-split" data-resend-split>
   <div class="resend-split__pane resend-req">
     <div class="reqline">
-      <input class="input input--mono reqline__method" id="resend-method" aria-label="Method" value="${escapeHtml(selectedResend.current.method)}" />
-      <input class="input input--mono reqline__url" id="resend-url" aria-label="URL" value="${escapeHtml(selectedResend.current.url)}" />
+      <input class="input input--mono reqline__url" id="resend-target" aria-label="Target — scheme://host:port the connection goes to" title="Target — where the connection goes. The Host header below is sent exactly as written." spellcheck="false" value="${escapeHtml(urlOrigin(ctx.current.url))}" />
     </div>
-    <label class="field__label" for="resend-raw">Request — headers, then a blank line, then body</label>
-    <textarea class="textarea resend-raw" id="resend-raw" spellcheck="false">${escapeHtml(composeRawRequest(selectedResend.current.headers, selectedResend.current.body))}</textarea>
+    <div class="resend-req__head"><p class="section-label">Request</p>${viewToggleHtml("req", resendRequestView)}</div>
+    <textarea class="textarea resend-raw" id="resend-raw" aria-label="Raw HTTP request" spellcheck="false"${resendRequestView === "pretty" ? " hidden" : ""}>${escapeHtml(rawRequestText(ctx.current, { recomputeContentLength: true }))}</textarea>
+    <pre class="code resend-pretty" id="resend-req-pretty" aria-label="Request (pretty, read-only)"${resendRequestView === "pretty" ? "" : " hidden"}></pre>
+    <p class="t-small resend-parse-error" id="resend-parse-error" role="alert" hidden></p>
     <div class="row">
       <button class="btn btn--primary" id="resend-send" type="button">${icon("send", { size: 14 })}<span>Send request</span></button>
     </div>
@@ -1956,15 +1959,73 @@ function renderResend(): void {
   <div class="resend-split__gutter" data-resend-gutter role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize request and response"></div>
   <div class="resend-split__pane resend-res" id="resend-res-pane"></div>
 </div>`;
+  const raw = resendPanel.querySelector<HTMLTextAreaElement>("#resend-raw");
+  raw?.addEventListener("input", () => {
+    // Keep Content-Length showing what will be sent while the body is edited.
+    const synced = syncContentLength(raw.value);
+    if (synced === null) return;
+    const caret = raw.selectionStart;
+    raw.value = synced.text;
+    const next = caret > synced.at ? caret + synced.delta : caret;
+    raw.setSelectionRange(next, next);
+  });
+  resendPanel.querySelectorAll<HTMLButtonElement>('[data-view-toggle="req"] [data-view-mode]').forEach((button) => {
+    button.addEventListener("click", () => {
+      resendRequestView = button.dataset.viewMode === "pretty" ? "pretty" : "raw";
+      applyResendRequestView();
+    });
+  });
   resendPanel.querySelector("#resend-send")?.addEventListener("click", () => void sendResend());
   resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); });
-  if (resendInFlight.has(selectedResend.id)) {
+  applyResendRequestView();
+  if (resendInFlight.has(ctx.id)) {
     setResendSendBusy(true);
     showResendResponseLoading();
   } else {
     mountResendResponse();
   }
   initResendSplitter();
+}
+
+/** Pretty | Raw view for the Resend request/response bodies. Pretty is a view
+ *  only; the raw buffer is always what is sent. */
+type BodyView = "pretty" | "raw";
+let resendRequestView: BodyView = "raw";
+let resendResponseView: BodyView = "pretty";
+
+function viewToggleHtml(which: "req" | "res", mode: BodyView): string {
+  const button = (value: BodyView, label: string): string =>
+    `<button class="btn btn--sm btn--quiet" type="button" data-view-mode="${value}" aria-pressed="${mode === value}">${label}</button>`;
+  return `<div class="viewtoggle" role="group" aria-label="${which === "req" ? "Request" : "Response"} view" data-view-toggle="${which}">${button("pretty", "Pretty")}${button("raw", "Raw")}</div>`;
+}
+
+/** A readable label for a Resend item: its queue name, else METHOD + path. */
+function resendTitle(ctx: ResendContext): string {
+  const named = queueName(ctx.id);
+  if (named !== undefined) return named;
+  const { authority, pathAndQuery } = splitUrl(ctx.current.url);
+  const path = pathAndQuery.length > 60 ? `${pathAndQuery.slice(0, 57)}…` : pathAndQuery;
+  return `${(ctx.current.method || "GET").toUpperCase()} ${path}${authority === "" ? "" : ` · ${authority}`}`;
+}
+
+/** Shows the request as Raw (the editable buffer) or Pretty (a read-only view
+ *  of that same buffer with a JSON body formatted). */
+function applyResendRequestView(): void {
+  const raw = resendPanel?.querySelector<HTMLTextAreaElement>("#resend-raw");
+  const pretty = resendPanel?.querySelector<HTMLElement>("#resend-req-pretty");
+  if (raw === null || raw === undefined || pretty === null || pretty === undefined) return;
+  resendPanel?.querySelectorAll<HTMLButtonElement>('[data-view-toggle="req"] [data-view-mode]').forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.viewMode === resendRequestView));
+  });
+  if (resendRequestView === "pretty") {
+    const parts = splitRawRequestParts(raw.value);
+    const head = raw.value.replace(/\r\n/g, "\n").split("\n\n")[0];
+    const body = prettyBody(parts.headers, parts.body);
+    pretty.textContent = parts.body === "" ? head : `${head}\n\n${body.text}`;
+    pretty.title = "Display only — switch to Raw to edit. What is sent is always the Raw request.";
+  }
+  raw.hidden = resendRequestView === "pretty";
+  pretty.hidden = resendRequestView !== "pretty";
 }
 
 /** Reflects whether the visible item has a send in flight on its Send button;
@@ -1978,24 +2039,6 @@ function setResendSendBusy(busy: boolean): void {
   button.innerHTML = busy
     ? `${icon("refresh", { size: 16, className: "spinner" })}<span>Sending…</span>`
     : `${icon("send", { size: 14 })}<span>Send request</span>`;
-}
-
-/** Combines headers and body into one raw editor: header lines, a blank line,
- *  then the body — the shape sendResend parses back. */
-function composeRawRequest(headers: readonly [string, string][], body: number[] | null | undefined): string {
-  const headerText = formatHeaders(headers);
-  const bodyText = bytesToText(body);
-  return bodyText === "" ? headerText : `${headerText}\n\n${bodyText}`;
-}
-
-/** Splits the raw editor back into headers text and body text on the first
- *  blank line (CRLF-tolerant). */
-function splitRawRequest(raw: string): { headerText: string; bodyText: string } {
-  const normalized = raw.replace(/\r\n/g, "\n");
-  const sep = normalized.indexOf("\n\n");
-  return sep === -1
-    ? { headerText: normalized, bodyText: "" }
-    : { headerText: normalized.slice(0, sep), bodyText: normalized.slice(sep + 2) };
 }
 
 /** Drag-resize the Request | Response split inside the Resend panel (30–70%),
@@ -2026,16 +2069,26 @@ function initResendSplitter(): void {
   gutter.addEventListener("dblclick", () => split.style.setProperty("--resend-req", "50%"));
 }
 
-/** Combines a response's headers and body into one read-only view, mirroring the
- *  request editor's "headers, blank line, body" shape. */
-function composeRawResponse(response: ResendResponse): string {
-  const headerText = formatHeaders(response.headers);
-  const bodyText = bytesToText(response.body);
-  return bodyText === "" ? headerText : `${headerText}\n\n${bodyText}`;
+/** The response status line as received (`HTTP/1.1 302 Found`). Responses
+ *  recorded before the line was kept show just the code. */
+function responseStatusLine(response: ResendResponse): string {
+  const version = response.httpVersion ?? "";
+  const reason = response.reason ?? "";
+  return [version, String(response.status), reason].filter((part) => part !== "").join(" ");
+}
+
+/** A response as one read-only view: status line, headers, blank line, body —
+ *  the body pretty-printed when `view` is Pretty and it is JSON. */
+function composeRawResponse(response: ResendResponse, view: BodyView): string {
+  const headerText = response.headers.map(([name, value]) => `${name}: ${value}`).join("\n");
+  const rawBody = bytesToText(response.body);
+  const bodyText = view === "pretty" ? prettyBody(response.headers, rawBody).text : rawBody;
+  const head = headerText === "" ? responseStatusLine(response) : `${responseStatusLine(response)}\n${headerText}`;
+  return bodyText === "" ? head : `${head}\n\n${bodyText}`;
 }
 
 /** Builds the Response pane so it mirrors the Request pane: an endpoint + status
- *  line, then the response (headers/body) in a full-height read-only editor. A
+ *  line, then the response in a full-height read-only view with Pretty | Raw. A
  *  dropdown beside "Response" traverses prior sends; the latest is shown by
  *  default. No inline history list. */
 function resendResponsePaneHtml(ctx: ResendContext): string {
@@ -2050,27 +2103,27 @@ function resendResponsePaneHtml(ctx: ResendContext): string {
         }).join("")
       }</select>`
     : "";
-  const head = `<div class="resend-res__head"><p class="section-label">Response</p>${picker}</div>`;
   if (history.length === 0) {
-    return `${head}<div class="resend-res__empty">${stateBlock({ icon: "clock", title: "No sends yet", body: "Send the request; the latest response appears here.", compact: true })}</div>`;
+    return `<div class="resend-res__head"><p class="section-label">Response</p></div><div class="resend-res__empty">${stateBlock({ icon: "clock", title: "No sends yet", body: "Send the request; the latest response appears here.", compact: true })}</div>`;
   }
   const revision = selectedResendRevision ?? history[history.length - 1].revision;
   const entry = history.find((candidate) => candidate.revision === revision) ?? history[history.length - 1];
+  const head = `<div class="resend-res__head"><p class="section-label">Response</p>${entry.response ? viewToggleHtml("res", resendResponseView) : ""}${picker}</div>`;
   const status = entry.response?.status;
-  const statusLabel = status ?? escapeHtml(entry.diagnostic?.id ?? "failed");
+  const statusLabel = entry.response ? escapeHtml(responseStatusLine(entry.response)) : escapeHtml(entry.diagnostic?.id ?? "failed");
   const endpoint = `${entry.request.method.toUpperCase()} ${entry.request.url}`;
   const meta = entry.response
     ? `${entry.response.durationMs} ms · ${formatBytes(entry.response.body?.length ?? 0)} · ${escapeHtml(entry.scope)}`
     : escapeHtml(entry.scope);
   const bodyText = entry.response
-    ? composeRawResponse(entry.response)
+    ? composeRawResponse(entry.response, resendResponseView)
     : entry.diagnostic?.what ?? "No response was received.";
   return `${head}
 <div class="reqline">
   <span class="resend-res__status list-row__status" data-class="${statusClass(status)}">${statusLabel}</span>
   <input class="input input--mono reqline__url" id="resend-response-endpoint" readonly value="${escapeHtml(endpoint)}" aria-label="Response endpoint" />
 </div>
-<label class="field__label">Response — headers, then a blank line, then body · ${escapeHtml(meta)}</label>
+<label class="field__label" for="resend-response-body">Response · ${escapeHtml(meta)}</label>
 <textarea class="textarea resend-raw" id="resend-response-body" readonly spellcheck="false">${escapeHtml(bodyText)}</textarea>`;
 }
 
@@ -2080,6 +2133,12 @@ function mountResendResponse(): void {
   const pane = resendPanel?.querySelector<HTMLElement>("#resend-res-pane");
   if (pane === null || pane === undefined || selectedResend === null) return;
   pane.innerHTML = resendResponsePaneHtml(selectedResend);
+  pane.querySelectorAll<HTMLButtonElement>('[data-view-toggle="res"] [data-view-mode]').forEach((button) => {
+    button.addEventListener("click", () => {
+      resendResponseView = button.dataset.viewMode === "raw" ? "raw" : "pretty";
+      mountResendResponse();
+    });
+  });
   pane.querySelector<HTMLSelectElement>("#resend-response-pick")?.addEventListener("change", (event) => {
     selectedResendRevision = Number((event.target as HTMLSelectElement).value);
     mountResendResponse();
@@ -2101,8 +2160,21 @@ async function sendResend(): Promise<void> {
   if (resend === null) return;
   const resendId = resend.id;
   if (resendInFlight.has(resendId)) return;
-  const { headerText, bodyText } = splitRawRequest(valueOf("#resend-raw"));
-  const request: ResendRequest = { method: valueOf("#resend-method"), url: valueOf("#resend-url"), headers: parseHeaders(headerText), body: [...new TextEncoder().encode(bodyText)] };
+  const parsed = parseRawRequest(valueOf("#resend-raw"), valueOf("#resend-target").trim());
+  const parseError = resendPanel?.querySelector<HTMLElement>("#resend-parse-error");
+  if (parseError !== null && parseError !== undefined) {
+    parseError.hidden = parsed.error === undefined;
+    parseError.textContent = parsed.error ?? "";
+  }
+  if (parsed.error !== undefined) return;
+  const request: ResendRequest = { method: parsed.method, url: parsed.url, headers: parsed.headers, body: parsed.body };
+  // Show exactly what goes on the wire (e.g. a Content-Length the send adds).
+  const raw = resendPanel?.querySelector<HTMLTextAreaElement>("#resend-raw");
+  const asSent = rawRequestText(request, { recomputeContentLength: true });
+  if (raw !== null && raw !== undefined && raw.value.replace(/\r\n/g, "\n") !== asSent) {
+    raw.value = asSent;
+    applyResendRequestView();
+  }
   // Keep the sent edit on this item locally, so switching away and back shows
   // what was sent rather than the pre-edit request.
   const edited: ResendContext = { ...resend, current: request };

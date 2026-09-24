@@ -18,7 +18,11 @@ use apiaxess_workbench_store::{
 use getrandom::fill;
 use reqwest::header::{HeaderName, HeaderValue};
 
-use crate::backend::{HOST_OVERRIDE_HEADER, ORIGIN_MARKER_HEADER};
+use crate::backend::ORIGIN_MARKER_HEADER;
+use crate::raw_http::{
+    UPSTREAM_HEADERS_MARKER, UPSTREAM_STATUS_MARKER, WIRE_HEADERS_MARKER, decode_header_list,
+    encode_header_list,
+};
 use crate::{FlowDetail, SessionCa};
 
 /// A host-in-scope predicate supplied by the caller (the fuzzer) so the send
@@ -622,14 +626,25 @@ impl ResendWorkbench {
     }
 }
 
-/// The plain resend path: follows redirects with reqwest's default policy and
-/// recomputes Content-Length — the historical behavior, unchanged.
+/// The plain resend path: follows redirects (up to 10, like the historical
+/// reqwest default) and recomputes Content-Length. Following is done here, hop
+/// by hop, so every hop is written byte-faithfully with its own header list.
 async fn send_through_proxy(
     proxy_addr: std::net::SocketAddr,
     ca: SessionCa,
     request: ResendRequest,
 ) -> Result<ResendResponse, Diagnostic> {
-    send_core(proxy_addr, ca, request, true, true).await
+    let options = SendOptions {
+        redirect: RedirectPolicy {
+            mode: RedirectMode::Always,
+            process_cookies: false,
+            max_hops: 10,
+        },
+        ..SendOptions::default()
+    };
+    send_following_redirects(proxy_addr, ca, request, &options)
+        .await
+        .map(|(response, _)| response)
 }
 
 /// One raw request with no client-side redirect following (the Fuzzer follows
@@ -640,14 +655,18 @@ async fn send_raw(
     request: ResendRequest,
     update_content_length: bool,
 ) -> Result<ResendResponse, Diagnostic> {
-    send_core(proxy_addr, ca, request, false, update_content_length).await
+    send_core(proxy_addr, ca, request, update_content_length).await
 }
 
+/// Sends one request through the session proxy with no redirect following.
+///
+/// The request travels to the proxy with its authored header list in a
+/// private marker; the proxy writes exactly that list upstream (order, case,
+/// `Host`) and returns the upstream status line and header list the same way.
 async fn send_core(
     proxy_addr: std::net::SocketAddr,
     ca: SessionCa,
     request: ResendRequest,
-    follow_redirects: bool,
     update_content_length: bool,
 ) -> Result<ResendResponse, Diagnostic> {
     validate_request(&request)?;
@@ -655,44 +674,25 @@ async fn send_core(
         .map_err(|error| request_diagnostic("proxy", &error.to_string()))?;
     let root = reqwest::Certificate::from_pem(ca.root_certificate_pem().as_bytes())
         .map_err(|error| request_diagnostic("ca", &error.to_string()))?;
-    let mut client_builder = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .proxy(proxy)
         .add_root_certificate(root)
-        .http2_adaptive_window(true);
-    if !follow_redirects {
-        client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
-    }
-    let client = client_builder
+        .http2_adaptive_window(true)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| request_diagnostic("client", &error.to_string()))?;
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .map_err(|error| request_diagnostic("method", &error.to_string()))?;
+    let wire_headers = wire_header_list(&request, update_content_length);
     let mut builder = client.request(method, &request.url);
-    // The URL authority is the connection target; an authored `Host` that
-    // differs rides to the proxy in a marker, which puts it on the wire verbatim.
-    let host_override = authored_host_override(&request);
-    if let Some(host) = &host_override {
-        let value = HeaderValue::try_from(host.as_str())
-            .map_err(|error| request_diagnostic("header-value", &error.to_string()))?;
-        builder = builder.header(HOST_OVERRIDE_HEADER, value);
+    if let Some((_, origin)) = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(ORIGIN_MARKER_HEADER))
+    {
+        builder = builder.header(ORIGIN_MARKER_HEADER, origin);
     }
-    for (name, value) in &request.headers {
-        if host_override.is_some() && name.eq_ignore_ascii_case("host") {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("content-length")
-            && request.body.is_some()
-            && update_content_length
-        {
-            // Recompute from the (possibly edited) body; drop the template value.
-            continue;
-        }
-        let name = HeaderName::try_from(name)
-            .map_err(|error| request_diagnostic("header-name", &error.to_string()))?;
-        let value = HeaderValue::try_from(value)
-            .map_err(|error| request_diagnostic("header-value", &error.to_string()))?;
-        builder = builder.header(name, value);
-    }
+    builder = builder.header(WIRE_HEADERS_MARKER, encode_header_list(&wire_headers));
     if let Some(body) = request.body {
         builder = builder.body(body);
     }
@@ -708,16 +708,30 @@ async fn send_core(
         diagnostic
     })?;
     let status = response.status().as_u16();
+    let (http_version, reason) = response
+        .headers()
+        .get(UPSTREAM_STATUS_MARKER)
+        .and_then(|value| value.to_str().ok())
+        .map_or((None, None), parse_status_line);
     let headers = response
         .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.to_string(),
-                value.to_str().unwrap_or("<non-utf8>").to_owned(),
-            )
-        })
-        .collect();
+        .get(UPSTREAM_HEADERS_MARKER)
+        .and_then(|value| decode_header_list(value.as_bytes()))
+        .unwrap_or_else(|| {
+            response
+                .headers()
+                .iter()
+                .filter(|(name, _)| {
+                    *name != UPSTREAM_STATUS_MARKER && *name != UPSTREAM_HEADERS_MARKER
+                })
+                .map(|(name, value)| {
+                    (
+                        name.to_string(),
+                        value.to_str().unwrap_or("<non-utf8>").to_owned(),
+                    )
+                })
+                .collect()
+        });
     let body = response
         .bytes()
         .await
@@ -728,6 +742,68 @@ async fn send_core(
         headers,
         body,
         duration_ms: 0,
+        http_version,
+        reason,
+    })
+}
+
+/// Splits `HTTP/1.1 302 Found` into its version and reason phrase.
+fn parse_status_line(line: &str) -> (Option<String>, Option<String>) {
+    let mut parts = line.splitn(3, ' ');
+    let version = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned);
+    let _code = parts.next();
+    let reason = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned);
+    (version, reason)
+}
+
+/// The exact header list to put on the wire: the authored headers in order and
+/// case, minus private control markers. `Host` is added (first) only when the
+/// request has none. `Content-Length` is as-sent: with `update_content_length`
+/// its value is recomputed in place from the body, and a body with no framing
+/// header gets one appended so it is not silently dropped by the target.
+fn wire_header_list(request: &ResendRequest, update_content_length: bool) -> Vec<(String, String)> {
+    let body_len = request.body.as_ref().map_or(0, Vec::len);
+    let mut headers: Vec<(String, String)> = request
+        .headers
+        .iter()
+        .filter(|(name, _)| !name.to_ascii_lowercase().starts_with("x-apiaxess-"))
+        .map(|(name, value)| {
+            if update_content_length && name.eq_ignore_ascii_case("content-length") {
+                (name.clone(), body_len.to_string())
+            } else {
+                (name.clone(), value.clone())
+            }
+        })
+        .collect();
+    let has = |headers: &[(String, String)], wanted: &str| {
+        headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(wanted))
+    };
+    if !has(&headers, "host") {
+        if let Some(authority) = url_authority(&request.url) {
+            headers.insert(0, ("Host".to_owned(), authority));
+        }
+    }
+    if body_len > 0 && !has(&headers, "content-length") && !has(&headers, "transfer-encoding") {
+        headers.push(("Content-Length".to_owned(), body_len.to_string()));
+    }
+    headers
+}
+
+/// `host[:port]` as a client derives `Host` from the URL (default port omitted).
+fn url_authority(url: &str) -> Option<String> {
+    let parsed = url.parse::<reqwest::Url>().ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
     })
 }
 
@@ -906,33 +982,6 @@ fn strip_proxy_artifact_headers(headers: &[(String, String)]) -> Vec<(String, St
         })
         .cloned()
         .collect()
-}
-
-/// The authored `Host` value when it differs from the URL authority (the value
-/// the client would derive). `None` when absent or equivalent, so ordinary
-/// requests take the unchanged path.
-fn authored_host_override(request: &ResendRequest) -> Option<String> {
-    let authored = request
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
-        .map(|(_, value)| value.trim())?;
-    if authored.is_empty() {
-        return None;
-    }
-    let url = request.url.parse::<reqwest::Url>().ok()?;
-    let host = url.host_str()?;
-    let equivalent = |candidate: &str| authored.eq_ignore_ascii_case(candidate);
-    let derived_matches = match url.port() {
-        Some(port) => equivalent(&format!("{host}:{port}")),
-        None => {
-            equivalent(host)
-                || url
-                    .port_or_known_default()
-                    .is_some_and(|port| equivalent(&format!("{host}:{port}")))
-        }
-    };
-    (!derived_matches).then(|| authored.to_owned())
 }
 
 fn validate_request(request: &ResendRequest) -> Result<(), Diagnostic> {
@@ -1124,6 +1173,8 @@ mod tests {
             headers: vec![("set-cookie".to_owned(), "s=2; Path=/".to_owned())],
             body: None,
             duration_ms: 0,
+            http_version: None,
+            reason: None,
         };
         // 303 -> GET, body dropped, cookies carried and overridden by Set-Cookie.
         let next =
@@ -1142,6 +1193,8 @@ mod tests {
             headers: Vec::new(),
             body: None,
             duration_ms: 0,
+            http_version: None,
+            reason: None,
         };
         let kept =
             next_redirect_request(&current, &response307, "https://api.example.test/b", false);
@@ -1214,6 +1267,8 @@ mod tests {
                     headers: Vec::new(),
                     body: None,
                     duration_ms: 0,
+                    http_version: None,
+                    reason: None,
                 })
             })
         }
@@ -1257,6 +1312,8 @@ mod tests {
                     headers: vec![("content-type".to_owned(), "application/json".to_owned())],
                     body: Some(b"{\"ok\":true}".to_vec()),
                     duration_ms: 0,
+                    http_version: None,
+                    reason: None,
                 })
             })
         }
@@ -1316,44 +1373,74 @@ mod tests {
     }
 
     #[test]
-    fn authored_host_override_only_when_host_differs_from_authority() {
-        let with_host = |url: &str, host: Option<&str>| ResendRequest {
-            method: "GET".to_owned(),
-            url: url.to_owned(),
-            headers: host
-                .map(|host| vec![("Host".to_owned(), host.to_owned())])
-                .unwrap_or_default(),
-            body: None,
+    fn wire_header_list_keeps_authored_order_case_and_as_sent_length() {
+        let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
         };
-        assert_eq!(
-            authored_host_override(&with_host("http://127.0.0.1:9111/", Some("evil.test"))),
-            Some("evil.test".to_owned())
+        let request = |headers: &[(&str, &str)], body: Option<&[u8]>| ResendRequest {
+            method: "POST".to_owned(),
+            url: "http://127.0.0.1:9111/items".to_owned(),
+            headers: owned(headers),
+            body: body.map(<[u8]>::to_vec),
+        };
+        // Order and case kept; stale Content-Length recomputed in place; the
+        // private origin marker never joins the wire list.
+        let edited = request(
+            &[
+                ("X-Zeta", "z"),
+                ("Host", "evil.test"),
+                ("Content-Length", "999"),
+                ("x-apiaxess-origin", "resend"),
+                ("accept", "*/*"),
+            ],
+            Some(b"hello"),
         );
         assert_eq!(
-            authored_host_override(&with_host("http://127.0.0.1:9111/", Some("127.0.0.1"))),
-            Some("127.0.0.1".to_owned())
+            wire_header_list(&edited, true),
+            owned(&[
+                ("X-Zeta", "z"),
+                ("Host", "evil.test"),
+                ("Content-Length", "5"),
+                ("accept", "*/*"),
+            ])
+        );
+        // With the toggle off the authored value is sent as written.
+        assert_eq!(wire_header_list(&edited, false)[2].1, "999");
+        // Missing Host is derived first; an unframed body gains Content-Length.
+        assert_eq!(
+            wire_header_list(&request(&[("Accept", "*/*")], Some(b"{}")), true),
+            owned(&[
+                ("Host", "127.0.0.1:9111"),
+                ("Accept", "*/*"),
+                ("Content-Length", "2"),
+            ])
+        );
+        // An empty body adds no framing header.
+        assert_eq!(
+            wire_header_list(&request(&[("Host", "h")], Some(b"")), true),
+            owned(&[("Host", "h")])
+        );
+    }
+
+    #[test]
+    fn status_line_splits_version_and_reason() {
+        assert_eq!(
+            parse_status_line("HTTP/1.1 302 Found"),
+            (Some("HTTP/1.1".to_owned()), Some("Found".to_owned()))
         );
         assert_eq!(
-            authored_host_override(&with_host("http://127.0.0.1:9111/", Some("127.0.0.1:9111"))),
-            None
+            parse_status_line("HTTP/1.1 418 I am a teapot"),
+            (
+                Some("HTTP/1.1".to_owned()),
+                Some("I am a teapot".to_owned())
+            )
         );
         assert_eq!(
-            authored_host_override(&with_host(
-                "https://API.example.test/",
-                Some("api.example.test")
-            )),
-            None
-        );
-        assert_eq!(
-            authored_host_override(&with_host(
-                "https://api.example.test/",
-                Some("api.example.test:443")
-            )),
-            None
-        );
-        assert_eq!(
-            authored_host_override(&with_host("https://api.example.test/", None)),
-            None
+            parse_status_line("HTTP/1.0 200"),
+            (Some("HTTP/1.0".to_owned()), None)
         );
     }
 

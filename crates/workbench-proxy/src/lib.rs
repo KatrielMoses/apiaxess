@@ -13,6 +13,7 @@ pub mod fuzzer;
 pub mod live;
 mod payload_lists;
 mod payloads;
+mod raw_http;
 pub mod resend;
 pub mod transparent;
 pub mod trust;

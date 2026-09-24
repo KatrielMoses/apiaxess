@@ -17,6 +17,7 @@ chrono.workspace = true
 h2.workspace = true
 getrandom.workspace = true
 http-body-util.workspace = true
+httparse.workspace = true
 hudsucker.workspace = true
 hyper-rustls.workspace = true
 md-5.workspace = true
@@ -28,6 +29,7 @@ serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 webpki-roots.workspace = true
 x509-parser.workspace = true
 
@@ -35,7 +37,6 @@ x509-parser.workspace = true
 http.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
-tokio-rustls.workspace = true
 
 [lints]
 workspace = true

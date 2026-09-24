@@ -1043,6 +1043,8 @@ impl FuzzerWorkbench {
                             .get("duration")
                             .and_then(serde_json::Value::as_u64)
                             .map_or(0, |nanos| nanos / 1_000_000),
+                        http_version: None,
+                        reason: None,
                     }
                 });
             let matched = response
@@ -2890,6 +2892,8 @@ mod tests {
                         headers: Vec::new(),
                         body: Some(b"ok".to_vec()),
                         duration_ms: 1,
+                        http_version: None,
+                        reason: None,
                     })
                 })
             }
@@ -2906,6 +2910,8 @@ mod tests {
                             headers: Vec::new(),
                             body: Some(b"ok".to_vec()),
                             duration_ms: 1,
+                            http_version: None,
+                            reason: None,
                         }),
                         diagnostic: None,
                         redirect_chain: vec![apiaxess_workbench_store::RedirectHop {
@@ -3023,6 +3029,8 @@ mod tests {
             headers: vec![("x-error".to_owned(), "ERROR".to_owned())],
             body: Some(b"Error 42 <v>token</v> id=99 alpha".to_vec()),
             duration_ms: 1,
+            http_version: None,
+            reason: None,
         };
         let outcome = grep.evaluate(&response, &["alpha".to_owned()]);
         // Literal "error", case-insensitive, body-only: the header ERROR is excluded.
@@ -3055,6 +3063,8 @@ mod tests {
             headers: Vec::new(),
             body: Some(b"v=alpha v=bravo".to_vec()),
             duration_ms: 1,
+            http_version: None,
+            reason: None,
         };
         let outcome = grep.evaluate(&response, &[]);
         // All occurrences joined; each capped to 3 chars.
@@ -3079,6 +3089,8 @@ mod tests {
             headers: Vec::new(),
             body: Some(b"reflected: <x> here".to_vec()),
             duration_ms: 1,
+            http_version: None,
+            reason: None,
         };
         // The sent payload was URL-encoded; the response reflects the decoded form.
         let outcome = grep.evaluate(&response, &["%3Cx%3E".to_owned()]);
@@ -3159,6 +3171,8 @@ mod tests {
                         headers: Vec::new(),
                         body: Some(body.into_bytes()),
                         duration_ms: 1,
+                        http_version: None,
+                        reason: None,
                     })
                 })
             }
@@ -3254,6 +3268,8 @@ mod tests {
                         headers: Vec::new(),
                         body: Some(b"ok".to_vec()),
                         duration_ms: 1,
+                        http_version: None,
+                        reason: None,
                     })
                 })
             }
@@ -3496,6 +3512,8 @@ mod tests {
                         headers: Vec::new(),
                         body: Some(b"ok".to_vec()),
                         duration_ms: 1,
+                        http_version: None,
+                        reason: None,
                     })
                 })
             }
@@ -3615,6 +3633,8 @@ mod tests {
                     headers: Vec::new(),
                     body: Some(vec![b'x'; 512]),
                     duration_ms: 1,
+                    http_version: None,
+                    reason: None,
                 })
             })
         }

@@ -817,7 +817,7 @@
   display: none;
 }
 
-/* Resend editor: combined method + URL on one line. */
+/* Resend editor: the Target (scheme://host:port) line above the raw request. */
 .reqline {
   display: flex;
   gap: var(--space-2);
@@ -905,8 +905,51 @@
   min-width: 3.5rem;
   padding: 0 var(--space-2);
   font-family: var(--font-mono);
+  white-space: nowrap;
   border: var(--border-hairline) solid var(--color-rule-strong);
   border-radius: var(--radius-xs);
+}
+/* Pretty | Raw view toggle (display-only; never changes what is sent). */
+.viewtoggle {
+  display: inline-flex;
+  border: var(--border-hairline) solid var(--color-rule);
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+}
+.viewtoggle .btn {
+  border: 0;
+  border-radius: 0;
+}
+.viewtoggle .btn[aria-pressed="true"] {
+  background: var(--color-surface-accent-wash);
+  color: var(--color-text-accent);
+}
+.resend-req__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.resend-req__head .section-label {
+  margin: 0;
+}
+.resend-req__head .viewtoggle,
+.resend-res__head .viewtoggle {
+  margin-left: auto;
+}
+.resend-res__head .viewtoggle + #resend-response-pick {
+  margin-left: 0;
+}
+.resend-pretty {
+  flex: 1;
+  min-height: 8rem;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.resend-parse-error {
+  margin: 0;
+  color: var(--color-danger-ink);
 }
 .resend-res__empty {
   flex: 1;

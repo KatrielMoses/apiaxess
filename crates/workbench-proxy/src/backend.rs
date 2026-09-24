@@ -26,6 +26,10 @@ use tokio::sync::Notify;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::SessionCa;
+use crate::raw_http::{
+    UPSTREAM_HEADERS_MARKER, UPSTREAM_STATUS_MARKER, WIRE_HEADERS_MARKER, decode_header_list,
+    encode_header_list,
+};
 use apiaxess_workbench_store::FlowOrigin;
 
 /// Request header the Resend/Fuzz senders attach so the proxy can tag the
@@ -34,32 +38,49 @@ use apiaxess_workbench_store::FlowOrigin;
 /// reaches the target and never appears in stored traffic.
 pub(crate) const ORIGIN_MARKER_HEADER: &str = "x-apiaxess-origin";
 
-/// Request header the Resend/Fuzz senders attach when the authored `Host`
-/// header differs from the URL authority. The connection target stays the URL
-/// authority; this carries the `Host` value to put on the wire verbatim. Like
-/// the origin marker, the proxy removes it before recording or forwarding.
-pub(crate) const HOST_OVERRIDE_HEADER: &str = "x-apiaxess-host";
-
-/// Upstream client for requests carrying an authored `Host`. Hudsucker strips
-/// `Host` from every request it forwards and re-derives it from the URI, so the
-/// proxy forwards these itself over HTTP/1.1, where `Host` is sent as written.
-type HostOverrideClient = hudsucker::hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hudsucker::hyper_util::client::legacy::connect::HttpConnector>,
-    Body,
->;
-
-/// Reads and removes the host-override marker. When present and valid, the
-/// request's `Host` header is replaced with it and `true` is returned.
-fn take_host_override(req: &mut Request<Body>) -> bool {
-    let Some(value) = req.headers_mut().remove(HOST_OVERRIDE_HEADER) else {
-        return false;
-    };
-    if value.is_empty() {
-        return false;
+/// Reads and removes the authored-header marker a workbench sender attaches
+/// (see [`crate::raw_http`]). When present, the request's headers are replaced
+/// by that list, in order, so the recorded flow shows what goes on the wire, and
+/// the authored list is returned for the byte-faithful upstream write.
+fn take_wire_headers(req: &mut Request<Body>) -> Option<Vec<(String, String)>> {
+    let value = req.headers_mut().remove(WIRE_HEADERS_MARKER)?;
+    let list = decode_header_list(value.as_bytes())?;
+    let mut replaced = hudsucker::hyper::HeaderMap::new();
+    for (name, value) in &list {
+        let (Ok(name), Ok(value)) = (
+            hudsucker::hyper::header::HeaderName::try_from(name.as_str()),
+            hudsucker::hyper::header::HeaderValue::try_from(value.as_str()),
+        ) else {
+            return None;
+        };
+        replaced.append(name, value);
     }
-    req.headers_mut()
-        .insert(hudsucker::hyper::header::HOST, value);
-    true
+    *req.headers_mut() = replaced;
+    Some(list)
+}
+
+/// The header list to write after an intercept edit replaced the headers:
+/// the edited map in its order, keeping authored case for names that survive.
+fn wire_headers_after_edit(
+    authored: &[(String, String)],
+    edited: &hudsucker::hyper::HeaderMap,
+) -> Vec<(String, String)> {
+    edited
+        .iter()
+        .map(|(name, value)| {
+            let cased = authored
+                .iter()
+                .find(|(original, _)| original.eq_ignore_ascii_case(name.as_str()))
+                .map_or_else(
+                    || name.as_str().to_owned(),
+                    |(original, _)| original.clone(),
+                );
+            (
+                cased,
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
 }
 
 /// Reads and removes the origin marker header, returning the tagged origin.
@@ -460,17 +481,10 @@ impl ProxyBackend for HudsuckerBackend {
                 .enable_http1()
                 .enable_http2()
                 .build();
-            let host_override_client = hudsucker::hyper_util::client::legacy::Client::builder(
-                hudsucker::hyper_util::rt::TokioExecutor::new(),
-            )
-            .build(
-                hyper_rustls::HttpsConnectorBuilder::new()
-                    .with_tls_config(upstream_tls.clone())
-                    .https_or_http()
-                    .enable_http1()
-                    .build(),
-            );
-            let handler = handler.with_host_override_client(host_override_client);
+            // Workbench sends are written upstream byte-for-byte over HTTP/1.1.
+            let mut raw_tls = upstream_tls.clone();
+            raw_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let handler = handler.with_raw_upstream_tls(Arc::new(raw_tls));
             let proxy = hudsucker::Proxy::builder()
                 .with_listener(listener)
                 .with_ca(config.ca)
@@ -719,8 +733,8 @@ struct ObserveHandler {
     intercept: Option<Arc<InterceptController>>,
     /// Flow id of the request currently being handled by this per-request clone.
     current_flow_id: Option<u64>,
-    /// Forwards requests whose authored `Host` must reach the wire verbatim.
-    host_override_client: Option<HostOverrideClient>,
+    /// TLS config for byte-faithful workbench sends (see [`crate::raw_http`]).
+    raw_upstream_tls: Option<Arc<hudsucker::rustls::ClientConfig>>,
 }
 
 impl ObserveHandler {
@@ -734,12 +748,12 @@ impl ObserveHandler {
             observer,
             intercept,
             current_flow_id: None,
-            host_override_client: None,
+            raw_upstream_tls: None,
         }
     }
 
-    fn with_host_override_client(mut self, client: HostOverrideClient) -> Self {
-        self.host_override_client = Some(client);
+    fn with_raw_upstream_tls(mut self, tls: Arc<hudsucker::rustls::ClientConfig>) -> Self {
+        self.raw_upstream_tls = Some(tls);
         self
     }
 
@@ -795,9 +809,9 @@ impl HttpHandler for ObserveHandler {
         // never leaks upstream and never appears in stored traffic. Ordinary
         // observed traffic carries no marker and tags as `Capture`.
         let origin = take_origin_marker(&mut req);
-        // Applied before observation so the recorded request shows the `Host`
-        // that actually goes on the wire.
-        let host_override = take_host_override(&mut req);
+        // Applied before observation so the recorded request shows the headers
+        // that actually go on the wire.
+        let mut wire_headers = take_wire_headers(&mut req);
         // A CONNECT reaching the MITM request handler over HTTP/2 is an RFC 8441
         // extended-CONNECT (WebSocket-over-h2); ordinary CONNECT tunnels are
         // handled below this layer. Surface the known limitation as a signal.
@@ -827,6 +841,9 @@ impl HttpHandler for ObserveHandler {
                                 flow_id, &error,
                             )));
                     }
+                    if let Some(authored) = &wire_headers {
+                        wire_headers = Some(wire_headers_after_edit(authored, req.headers()));
+                    }
                 }
                 InterceptDecision::Drop => {
                     return RequestOrResponse::Response(
@@ -842,21 +859,18 @@ impl HttpHandler for ObserveHandler {
                 }
             }
         }
-        let (mut parts, body) = req.into_parts();
+        let (parts, body) = req.into_parts();
         let body = capture_body(
             body,
             flow_id,
             BodyDirection::Request,
             Arc::clone(&self.observer),
         );
-        if host_override && parts.method != Method::CONNECT {
-            if let Some(client) = self.host_override_client.clone() {
-                parts.version = Version::HTTP_11;
-                join_cookie_headers(&mut parts.headers);
-                let response = match client.request(Request::from_parts(parts, body)).await {
-                    Ok(upstream) => self.handle_response(ctx, upstream.map(Body::from)).await,
-                    Err(error) => self.handle_error(ctx, error).await,
-                };
+        if let (Some(wire_headers), Some(tls)) = (wire_headers, self.raw_upstream_tls.clone()) {
+            if parts.method != Method::CONNECT {
+                let response = self
+                    .forward_raw(ctx, tls, &parts, &wire_headers, body)
+                    .await;
                 return RequestOrResponse::Response(response);
             }
         }
@@ -890,15 +904,6 @@ impl HttpHandler for ObserveHandler {
         ctx: &HttpContext,
         error: hudsucker::hyper_util::client::legacy::Error,
     ) -> Response<Body> {
-        let mut context = DiagnosticContext::new();
-        context.insert(
-            "session_id".to_owned(),
-            DiagnosticValue::String(self.session_id.to_string()),
-        );
-        context.insert(
-            "client_addr".to_owned(),
-            DiagnosticValue::String(ctx.client_addr.to_string()),
-        );
         // Walk the error source chain so upstream failures (TLS, connect,
         // protocol) are diagnosable rather than a bare "client error (Connect)".
         let mut chain = error.to_string();
@@ -908,6 +913,75 @@ impl HttpHandler for ObserveHandler {
             chain.push_str(&inner.to_string());
             source = inner.source();
         }
+        self.upstream_failure(ctx, chain)
+    }
+}
+
+impl ObserveHandler {
+    /// Writes a workbench send upstream byte-for-byte and returns the recorded
+    /// response, carrying the upstream status line and raw header list back to
+    /// the sender in private markers (added after recording, so never stored).
+    async fn forward_raw(
+        &mut self,
+        ctx: &HttpContext,
+        tls: Arc<hudsucker::rustls::ClientConfig>,
+        parts: &hudsucker::hyper::http::request::Parts,
+        wire_headers: &[(String, String)],
+        body: Body,
+    ) -> Response<Body> {
+        let body = match http_body_util::BodyExt::collect(body).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => return self.upstream_failure(ctx, format!("read request body: {error}")),
+        };
+        let raw = match crate::raw_http::exchange(
+            tls,
+            &parts.uri,
+            parts.method.as_str(),
+            wire_headers,
+            &body,
+        )
+        .await
+        {
+            Ok(raw) => raw,
+            Err(error) => return self.upstream_failure(ctx, error),
+        };
+        let status_line = raw.status_line();
+        let header_list = encode_header_list(&raw.headers);
+        let mut builder = Response::builder().status(raw.status);
+        for (name, value) in &raw.headers {
+            if let (Ok(name), Ok(value)) = (
+                hudsucker::hyper::header::HeaderName::try_from(name.as_str()),
+                hudsucker::hyper::header::HeaderValue::try_from(value.as_str()),
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+        let Ok(response) = builder.body(Body::from(bytes::Bytes::from(raw.body))) else {
+            return self.upstream_failure(ctx, format!("unrepresentable status {}", raw.status));
+        };
+        let mut response = self.handle_response(ctx, response).await;
+        for (marker, value) in [
+            (UPSTREAM_STATUS_MARKER, status_line),
+            (UPSTREAM_HEADERS_MARKER, header_list),
+        ] {
+            if let Ok(value) = hudsucker::hyper::header::HeaderValue::try_from(value) {
+                response.headers_mut().insert(marker, value);
+            }
+        }
+        response
+    }
+
+    /// Records an upstream failure diagnostic and answers `502`.
+    fn upstream_failure(&self, ctx: &HttpContext, chain: String) -> Response<Body> {
+        let mut context = DiagnosticContext::new();
+        context.insert(
+            "session_id".to_owned(),
+            DiagnosticValue::String(self.session_id.to_string()),
+        );
+        context.insert(
+            "client_addr".to_owned(),
+            DiagnosticValue::String(ctx.client_addr.to_string()),
+        );
         context.insert("error".to_owned(), DiagnosticValue::String(chain));
         self.observer.observe(FlowEvent::Diagnostic(
             catalogue::PROXY_UPSTREAM_UNREACHABLE.instantiate(context),
@@ -916,24 +990,6 @@ impl HttpHandler for ObserveHandler {
             .status(StatusCode::BAD_GATEWAY)
             .body(Body::empty())
             .expect("static proxy error response is valid")
-    }
-}
-
-/// HTTP/1.1 allows a single `Cookie` header; join any split (HTTP/2) values
-/// the way hudsucker does for the requests it forwards.
-fn join_cookie_headers(headers: &mut hudsucker::hyper::HeaderMap) {
-    use hudsucker::hyper::header::{COOKIE, HeaderValue};
-    let values: Vec<&[u8]> = headers
-        .get_all(COOKIE)
-        .iter()
-        .map(HeaderValue::as_bytes)
-        .collect();
-    if values.len() < 2 {
-        return;
-    }
-    let joined = values.join(&b"; "[..]);
-    if let Ok(value) = HeaderValue::from_bytes(&joined) {
-        headers.insert(COOKIE, value);
     }
 }
 
@@ -1272,10 +1328,12 @@ mod tests {
                 }
             }
             socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .write_all(
+                    b"HTTP/1.1 200 Fine Thanks\r\nX-Upstream-Case: Kept\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
                 .await
                 .expect("upstream response");
-            String::from_utf8_lossy(&request).to_ascii_lowercase()
+            String::from_utf8_lossy(&request).into_owned()
         });
         let store_path = env::temp_dir().join(format!(
             "apiaxess-proxy-host-override-{}",
@@ -1306,7 +1364,12 @@ mod tests {
         let send = sender.send(ResendRequest {
             method: "GET".to_owned(),
             url: format!("http://{upstream_address}/vhost"),
-            headers: vec![("Host".to_owned(), "evil.test".to_owned())],
+            headers: vec![
+                ("X-Zeta".to_owned(), "first".to_owned()),
+                ("Host".to_owned(), "evil.test".to_owned()),
+                ("accept".to_owned(), "*/*".to_owned()),
+                ("X-MiXeD-Case".to_owned(), "v".to_owned()),
+            ],
             body: None,
         });
         let response = tokio::time::timeout(std::time::Duration::from_secs(10), send)
@@ -1316,11 +1379,24 @@ mod tests {
         assert_eq!(response.status, 200);
         let wire = upstream_task.await.expect("upstream task");
         handle.shutdown().await.expect("proxy shutdown");
-        // Connected to the URL authority, yet the authored Host went out verbatim,
-        // exactly once, and the private marker never reached the target.
-        assert!(wire.contains("\r\nhost: evil.test\r\n"), "{wire}");
-        assert_eq!(wire.matches("\r\nhost:").count(), 1, "{wire}");
-        assert!(!wire.contains("x-apiaxess-host"), "{wire}");
+        // Connected to the URL authority, yet the request went out byte-for-byte
+        // as authored: order, case and Host verbatim, nothing added, and no
+        // private marker reached the target.
+        assert_eq!(
+            wire,
+            "GET /vhost HTTP/1.1\r\nX-Zeta: first\r\nHost: evil.test\r\naccept: */*\r\nX-MiXeD-Case: v\r\n\r\n"
+        );
+        // The upstream status line and header case come back to the sender.
+        assert_eq!(response.http_version.as_deref(), Some("HTTP/1.1"));
+        assert_eq!(response.reason.as_deref(), Some("Fine Thanks"));
+        assert_eq!(response.headers[0].0, "X-Upstream-Case");
+        assert!(
+            response
+                .headers
+                .iter()
+                .all(|(name, _)| !name.starts_with("x-apiaxess"))
+        );
+        assert_eq!(response.body.as_deref(), Some(&b"ok"[..]));
         let summaries = store.summaries().expect("traffic summaries");
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status, Some(200));

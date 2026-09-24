@@ -475,6 +475,7 @@ dependencies = [
  "h2",
  "http",
  "http-body-util",
+ "httparse",
  "hudsucker",
  "hyper-rustls",
  "md-5",
