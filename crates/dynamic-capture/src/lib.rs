@@ -1197,9 +1197,17 @@ fn schema_from_values(
     ids: &mut IdFactory,
     activity: &apiaxess_api_model::ActivityId,
 ) -> SchemaSlot {
-    let shape = infer_shape(values, evidence, ids, activity);
+    schema_from_tagged(&tag_samples(values), evidence, ids, activity)
+}
+
+fn schema_from_tagged(
+    values: &[Tagged],
+    evidence: &[EntityId],
+    ids: &mut IdFactory,
+    activity: &apiaxess_api_model::ActivityId,
+) -> SchemaSlot {
     SchemaSlot {
-        shape,
+        shape: infer_shape_tagged(values, evidence, ids, activity),
         observations: Vec::new(),
     }
 }
@@ -1263,6 +1271,26 @@ fn infer_shape(
     ids: &mut IdFactory,
     activity: &apiaxess_api_model::ActivityId,
 ) -> Fact<SchemaShape> {
+    infer_shape_tagged(&tag_samples(values), evidence, ids, activity)
+}
+
+/// A JSON value tagged with the index of the observed sample (flow) it came
+/// from. Array elements inherit their parent's sample, so shape inference can
+/// tally requiredness per *sample* — the unit the dynamic provenance counts —
+/// rather than per array element.
+type Tagged = (usize, Value);
+
+/// Tags top-level values: each one is its own sample.
+fn tag_samples(values: &[Value]) -> Vec<Tagged> {
+    values.iter().cloned().enumerate().collect()
+}
+
+fn infer_shape_tagged(
+    values: &[Tagged],
+    evidence: &[EntityId],
+    ids: &mut IdFactory,
+    activity: &apiaxess_api_model::ActivityId,
+) -> Fact<SchemaShape> {
     let shape = infer_shape_value(values, evidence, ids, activity);
     dynamic_fact(
         FieldClass::TypeShape,
@@ -1274,8 +1302,26 @@ fn infer_shape(
     )
 }
 
+/// Requiredness of object property `name` over `objects`, tallied per sample:
+/// `total` is the number of distinct samples observed, `present` the number of
+/// those in which *every* object carried the property. A property missing
+/// from any element of a sample's array therefore stays optional, and the
+/// tally never exceeds the samples backing it.
+fn sample_requiredness(objects: &[Tagged], name: &str) -> (u64, u64) {
+    let mut per_sample: BTreeMap<usize, bool> = BTreeMap::new();
+    for (sample, value) in objects {
+        let has = value.get(name).is_some();
+        per_sample
+            .entry(*sample)
+            .and_modify(|all| *all &= has)
+            .or_insert(has);
+    }
+    let present = per_sample.values().filter(|all| **all).count() as u64;
+    (present, per_sample.len() as u64)
+}
+
 fn infer_shape_value(
-    values: &[Value],
+    values: &[Tagged],
     evidence: &[EntityId],
     ids: &mut IdFactory,
     activity: &apiaxess_api_model::ActivityId,
@@ -1283,9 +1329,9 @@ fn infer_shape_value(
     if values.is_empty() {
         return SchemaShape::Unknown;
     }
-    if values.iter().all(Value::is_object) {
+    if values.iter().all(|(_, value)| value.is_object()) {
         let mut names = BTreeSet::new();
-        for value in values {
+        for (_, value) in values {
             if let Some(object) = value.as_object() {
                 names.extend(object.keys().cloned());
             }
@@ -1295,22 +1341,21 @@ fn infer_shape_value(
             .filter_map(|name| {
                 let present = values
                     .iter()
-                    .filter_map(|value| value.get(&name))
-                    .cloned()
+                    .filter_map(|(sample, value)| value.get(&name).map(|v| (*sample, v.clone())))
                     .collect::<Vec<_>>();
+                let (present_samples, total_samples) = sample_requiredness(values, &name);
                 let name_id = ParameterName::new(name).ok()?;
-                let present_count = present.len() as u64;
                 Some(SchemaProperty {
                     name: name_id,
-                    schema: schema_from_values(&present, evidence, ids, activity),
+                    schema: schema_from_tagged(&present, evidence, ids, activity),
                     requiredness: dynamic_fact(
                         FieldClass::Requiredness,
                         ResolutionPolicy::SampleGated,
                         RequirednessAssertion::Observed {
-                            present_samples: present_count,
-                            total_samples: NonZeroU64::new(values.len() as u64).unwrap_or_else(
-                                || NonZeroU64::new(1).expect("literal is non-zero"),
-                            ),
+                            present_samples,
+                            total_samples: NonZeroU64::new(total_samples).unwrap_or_else(|| {
+                                NonZeroU64::new(1).expect("literal is non-zero")
+                            }),
                         },
                         evidence,
                         ids.candidate(),
@@ -1324,17 +1369,26 @@ fn infer_shape_value(
             openness: apiaxess_api_model::ObjectOpenness::Unknown,
         };
     }
-    if values.iter().all(Value::is_array) {
+    if values.iter().all(|(_, value)| value.is_array()) {
+        // Elements keep their parent's sample tag: three objects in one
+        // request's array are one sample, not three.
         let items = values
             .iter()
-            .flat_map(|value| value.as_array().into_iter().flatten().cloned())
+            .flat_map(|(sample, value)| {
+                value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(move |item| (*sample, item.clone()))
+            })
             .collect::<Vec<_>>();
         return SchemaShape::Array {
-            items: Box::new(schema_from_values(&items, evidence, ids, activity)),
+            items: Box::new(schema_from_tagged(&items, evidence, ids, activity)),
         };
     }
     let mut variants = Vec::new();
-    for value in values {
+    for tagged in values {
+        let (_, value) = tagged;
         let shape = match value {
             Value::Null => SchemaShape::Null,
             Value::Bool(_) => SchemaShape::Boolean,
@@ -1344,7 +1398,7 @@ fn infer_shape_value(
             Value::Number(_) => SchemaShape::Number { format: None },
             Value::String(_) => SchemaShape::String { format: None },
             Value::Array(_) | Value::Object(_) => {
-                infer_shape_value(std::slice::from_ref(value), evidence, ids, activity)
+                infer_shape_value(std::slice::from_ref(tagged), evidence, ids, activity)
             }
         };
         if !variants.contains(&shape) {
@@ -1553,5 +1607,113 @@ mod tests {
             2
         );
         report.document.validate().expect("valid dynamic document");
+    }
+
+    fn post(id: u64, path: &str, request: &[u8]) -> FlowCapture {
+        let mut flow = flow(id, path, br#"{"ok":true}"#);
+        flow.method = Some("POST".to_owned());
+        flow.request_headers
+            .push(("content-type".to_owned(), "application/json".to_owned()));
+        flow.request_body = Some(request.to_vec());
+        flow
+    }
+
+    fn empty_document() -> ApiDocument {
+        ApiDocument::new(ApiSurface {
+            provenance: ProvenanceRegistry::default(),
+            endpoints: Vec::new(),
+            protocol_operations: Vec::new(),
+            loose_findings: Vec::new(),
+            signers: Vec::new(),
+        })
+    }
+
+    /// The selected shape of a schema slot.
+    fn shape(slot: &SchemaSlot) -> &SchemaShape {
+        &slot.shape.candidates[0].value
+    }
+
+    fn property<'a>(shape: &'a SchemaShape, name: &str) -> &'a SchemaProperty {
+        let SchemaShape::Object { properties, .. } = shape else {
+            panic!("expected an object shape, got {shape:?}");
+        };
+        properties
+            .iter()
+            .find(|property| property.name.as_str() == name)
+            .unwrap_or_else(|| panic!("property {name} missing"))
+    }
+
+    fn tally(property: &SchemaProperty) -> (u64, u64) {
+        match property.requiredness.candidates[0].value {
+            RequirednessAssertion::Observed {
+                present_samples,
+                total_samples,
+            } => (present_samples, total_samples.get()),
+            RequirednessAssertion::Declared { .. } => panic!("expected observed requiredness"),
+        }
+    }
+
+    /// Regression (P0 fuse blocker): objects inside a request-body array were
+    /// tallied per array element, so a single request with three items claimed
+    /// a requiredness tally of 3 against 1 dynamic sample and the whole surface
+    /// failed model validation. The tally is per sample now.
+    #[test]
+    fn array_of_objects_body_tallies_requiredness_per_sample() {
+        let config = DynamicCaptureConfig::new("run:test").expect("config");
+        let flows = [
+            post(
+                1,
+                "/api/batch",
+                br#"{"items":[{"id":1,"tag":"x"},{"id":2},{"id":3,"tag":"y"}]}"#,
+            ),
+            post(2, "/api/batch", br#"{"items":[{"id":4,"tag":"z"}]}"#),
+        ];
+        let report = capture_into_document(&empty_document(), &flows, &config, Utc::now())
+            .expect("array-of-objects bodies commit");
+        report.document.validate().expect("valid document");
+        let endpoint = &report.document.surface.endpoints[0];
+        let body = shape(endpoint.request_body.as_ref().expect("request body"));
+        let items = property(body, "items");
+        let SchemaShape::Array { items: element } = shape(&items.schema) else {
+            panic!("items is an array");
+        };
+        let element = shape(element);
+        // `id` is in every element of both samples: required (2 of 2).
+        assert_eq!(tally(property(element, "id")), (2, 2));
+        // `tag` is missing from one element of sample 1: optional (1 of 2).
+        assert_eq!(tally(property(element, "tag")), (1, 2));
+        // Top-level fields keep their per-sample tally.
+        assert_eq!(tally(items), (2, 2));
+    }
+
+    #[test]
+    fn json_body_across_samples_and_refuse_commit() {
+        let config = DynamicCaptureConfig::new("run:test").expect("config");
+        let flows = [
+            post(1, "/api/items", br#"{"name":"a","qty":1}"#),
+            post(2, "/api/items", br#"{"name":"b"}"#),
+        ];
+        let first = capture_into_document(&empty_document(), &flows, &config, Utc::now())
+            .expect("first fuse");
+        first.document.validate().expect("first valid");
+        let body = shape(
+            first.document.surface.endpoints[0]
+                .request_body
+                .as_ref()
+                .expect("body"),
+        );
+        assert_eq!(tally(property(body, "name")), (2, 2));
+        assert_eq!(tally(property(body, "qty")), (1, 2));
+        // The GUI re-fuses repeatedly, onto the already-fused document, with
+        // the capture growing in between.
+        let more = [
+            post(1, "/api/items", br#"{"name":"a","qty":1}"#),
+            post(2, "/api/items", br#"{"name":"b"}"#),
+            post(3, "/api/items", br#"{"items":[{"k":1},{"k":2}]}"#),
+        ];
+        let config = DynamicCaptureConfig::new("run:test2").expect("config");
+        let second = capture_into_document(&first.document, &more, &config, Utc::now())
+            .expect("re-fuse commits");
+        second.document.validate().expect("re-fuse valid");
     }
 }

@@ -3260,6 +3260,7 @@ function showSurfaceSection(section: "app" | "web"): void {
 
 function renderSurface(surface: SurfaceSummary): void {
   if (surfaceView === null) return;
+  surfaceShown = true;
   // Tag the surface by its source (web capture vs APK) and activate that section.
   surfaceSource = lastSessionStatus?.scope?.target?.target_type === "web.url" ? "web" : "app";
   document.querySelectorAll<HTMLElement>(".surface-section").forEach((tab) => {
@@ -4133,11 +4134,29 @@ function initWorkbenchSplitters(): void {
 
 function renderSurfaceEmpty(): void {
   if (surfaceView === null) return;
-  surfaceView.innerHTML = stateBlock({
-    icon: "surface",
-    title: "No surface assembled yet",
-    body: "Run the APK pipeline to completion, or capture web traffic and fuse it. The assembled surface, its coverage, and its provenance appear here.",
-  });
+  surfaceShown = false;
+  const fuse = `<div class="row surface-empty__actions"><button class="btn btn--primary" type="button" data-surface-fuse>${icon("surface", { size: 14 })}<span>${lastFuseFailure === null ? "Fuse captured traffic" : "Retry fuse"}</span></button></div>`;
+  if (lastFuseFailure !== null) {
+    const failure = lastFuseFailure;
+    const detail = diagnosticText(failure, "detail") ?? diagnosticText(failure, "error");
+    surfaceView.innerHTML = `<div class="notice notice--danger surface-fuse-error" role="alert" data-diagnostic-id="${escapeHtml(failure.id)}">
+  <span class="notice__icon">${icon("alert", { size: 18 })}</span>
+  <div class="notice__body">
+    <p class="notice__title">Couldn't assemble the API surface</p>
+    <p>${escapeHtml(failure.what)}</p>
+    <p class="t-small">${escapeHtml(failure.why)}</p>
+    ${detail === undefined ? "" : `<p class="t-small t-subtle"><code>${escapeHtml(detail)}</code></p>`}
+    <p class="t-small"><strong>Fix:</strong> ${escapeHtml(failure.fix)}</p>
+  </div>
+</div>${fuse}`;
+  } else {
+    surfaceView.innerHTML = `${stateBlock({
+      icon: "surface",
+      title: "No surface assembled yet",
+      body: "Run the APK pipeline to completion, or capture web traffic and fuse it. The assembled surface, its coverage, and its provenance appear here.",
+    })}${fuse}`;
+  }
+  surfaceView.querySelector<HTMLButtonElement>("[data-surface-fuse]")?.addEventListener("click", (event) => void fuseWebTraffic(event.currentTarget as HTMLButtonElement));
 }
 
 /** Header names that are transport/CDN/date noise, not part of the API's own
@@ -4950,32 +4969,86 @@ async function stopDiscovery(): Promise<void> {
  * Fusion
  * ==================================================================== */
 
-/** Best-effort live fusion while capturing: keeps the API surface current with
- *  no toast and no navigation, so it is ready the instant the operator opens it. */
-let autoFuseTick = 0;
-async function autoFuseWebTraffic(): Promise<void> {
-  try {
-    const response = await fetch("/api/v1/web/fuse", { method: "POST" });
-    if (response.ok) renderSurface(normalizeFusedSurface(await response.json()));
-  } catch {
-    /* the next tick retries; a fuse with no in-scope traffic simply no-ops */
+/** Why the last fusion failed (null after a success). Shown inline on the API
+ *  surface panel instead of a permanent "No surface assembled yet". */
+let lastFuseFailure: ContextDiagnostic | null = null;
+/** Whether the surface panel currently shows an assembled surface. */
+let surfaceShown = false;
+/** The failure already announced by toast, so a repeating auto-fuse does not
+ *  toast the same failure every tick. */
+let announcedFuseFailure = "";
+
+/** Records a fusion failure: inline on the surface panel when no surface is
+ *  shown (a surface already on screen stays), a toast once per distinct
+ *  failure, and the diagnostics register. */
+function reportFuseFailure(diagnostic: ContextDiagnostic): void {
+  lastFuseFailure = diagnostic;
+  showDiagnostic(diagnostic);
+  if (!surfaceShown) renderSurfaceEmpty();
+  const key = `${diagnostic.id}:${diagnosticText(diagnostic, "detail") ?? ""}`;
+  if (key !== announcedFuseFailure) {
+    announcedFuseFailure = key;
+    toast(`Couldn't assemble the API surface — ${diagnostic.what}`, "danger");
   }
 }
 
-async function fuseWebTraffic(): Promise<void> {
-  const button = document.querySelector<HTMLButtonElement>("#web-fuse");
+function fuseSucceeded(surface: unknown): number {
+  lastFuseFailure = null;
+  announcedFuseFailure = "";
+  const normalized = normalizeFusedSurface(surface);
+  renderSurface(normalized);
+  return Array.isArray(normalized?.endpoints) ? normalized.endpoints.length : 0;
+}
+
+/** The engine's diagnostic from a failed fuse response, or a stand-in naming
+ *  the HTTP status when the body was not a diagnostic. */
+async function fuseDiagnostic(response: Response): Promise<ContextDiagnostic> {
   try {
-    await withBusy(button, "Fusing…", async () => {
-      const response = await fetch("/api/v1/web/fuse", { method: "POST" });
-      await requireOk(response, "web fusion failed");
-      renderSurface(normalizeFusedSurface(await response.json()));
-      setStatus("Web traffic fused · observation-based coverage", "ready");
-      toast("Captured traffic fused into a surface", "success");
-      showView("surface");
-    });
-  } catch (error) {
-    reportUnexpected(error, { id: "web.fusion-failed", what: "Captured web traffic could not be fused.", why: "", fix: "Capture at least one in-scope request and retry." });
+    const candidate = (await response.json()) as Partial<ContextDiagnostic>;
+    if (typeof candidate.id === "string" && typeof candidate.what === "string") return candidate as ContextDiagnostic;
+  } catch { /* fall through */ }
+  return { id: "web.fusion-failed", what: "The engine rejected the fuse request.", why: `HTTP ${response.status} without a diagnostic.`, fix: "Retry; if it persists, check the engine log." };
+}
+
+/** Live fusion while capturing: keeps the API surface current with no
+ *  navigation, so it is ready the instant the operator opens it. A failure is
+ *  never swallowed — it is reported inline on the surface panel. */
+let autoFuseTick = 0;
+async function autoFuseWebTraffic(): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch("/api/v1/web/fuse", { method: "POST" });
+  } catch {
+    return; // the engine is unreachable; the connection status already says so
   }
+  if (response.ok) fuseSucceeded(await response.json());
+  else reportFuseFailure(await fuseDiagnostic(response));
+}
+
+/** The Fuse control: assembles the surface from everything captured so far,
+ *  with progress on the button and the result as a toast + the surface view. */
+async function fuseWebTraffic(trigger?: HTMLButtonElement | null): Promise<void> {
+  const button = trigger ?? document.querySelector<HTMLButtonElement>("#web-fuse");
+  await withBusy(button, "Fusing…", async () => {
+    let response: Response;
+    try {
+      response = await fetch("/api/v1/web/fuse", { method: "POST" });
+    } catch (error) {
+      reportFuseFailure({ id: "web.fusion-failed", what: "The engine could not be reached.", why: String(error), fix: "Confirm the engine is running, then retry." });
+      return;
+    }
+    if (!response.ok) {
+      reportFuseFailure(await fuseDiagnostic(response));
+      showView("surface");
+      return;
+    }
+    const endpoints = fuseSucceeded(await response.json());
+    setStatus("Web traffic fused · observation-based coverage", "ready");
+    toast(endpoints === 0
+      ? "Fused — no in-scope API endpoints captured yet. Browse the target, then fuse again."
+      : `API surface assembled · ${endpoints} endpoint${endpoints === 1 ? "" : "s"}`, endpoints === 0 ? "info" : "success");
+    showView("surface");
+  });
 }
 
 /* ==================================================================== *
@@ -5266,6 +5339,7 @@ document.querySelector<HTMLInputElement>("#discovery-upload")?.addEventListener(
 discoveryWordlist?.addEventListener("change", () => { updateWordlistHint(); prefetchDiscoveryEstimate(); });
 discoveryKind?.addEventListener("change", () => prefetchDiscoveryEstimate());
 document.querySelector("#web-fuse")?.addEventListener("click", () => void fuseWebTraffic());
+
 document.querySelector("#web-export")?.addEventListener("click", () => showView("export"));
 document.querySelector("#apk-run")?.addEventListener("click", () => void startPipeline());
 document.querySelector("#apk-refresh")?.addEventListener("click", () => void refreshPipeline());

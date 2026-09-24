@@ -1043,6 +1043,18 @@
   font-family: var(--font-mono);
   word-break: break-word;
 }
+.surface-empty__actions {
+  justify-content: center;
+  margin-top: var(--space-3);
+}
+.surface-fuse-error {
+  margin: var(--space-4) auto 0;
+  max-width: 48rem;
+}
+.surface-fuse-error code {
+  font-family: var(--font-mono);
+  word-break: break-word;
+}
 .resend-empty__actions {
   justify-content: center;
   margin-top: var(--space-2);
