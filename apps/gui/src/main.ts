@@ -267,6 +267,10 @@ let bundledListsRequested = false;
 let discoveryJob: FuzzerJob | null = null;
 /** Resend queue (Repeater): every request sent here, newest first. */
 const resendContexts = new Map<string, ResendContext>();
+/** Resend contexts with a send in flight. Each send is bound to its own id for
+ *  its whole lifecycle; a completion only touches the visible editor when that
+ *  id is still the selected item. */
+const resendInFlight = new Set<string>();
 /** Fuzz queue (Intruder): manually-created attacks only (discovery excluded). */
 const fuzzerJobsList = new Map<string, FuzzerJob>();
 let activeWorkbenchTab: "live" | "resend" | "fuzz" = "live";
@@ -1954,8 +1958,26 @@ function renderResend(): void {
 </div>`;
   resendPanel.querySelector("#resend-send")?.addEventListener("click", () => void sendResend());
   resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); });
-  mountResendResponse();
+  if (resendInFlight.has(selectedResend.id)) {
+    setResendSendBusy(true);
+    showResendResponseLoading();
+  } else {
+    mountResendResponse();
+  }
   initResendSplitter();
+}
+
+/** Reflects whether the visible item has a send in flight on its Send button;
+ *  one send per item at a time. */
+function setResendSendBusy(busy: boolean): void {
+  const button = resendPanel?.querySelector<HTMLButtonElement>("#resend-send");
+  if (button === null || button === undefined) return;
+  button.disabled = busy;
+  if (busy) button.setAttribute("aria-busy", "true");
+  else button.removeAttribute("aria-busy");
+  button.innerHTML = busy
+    ? `${icon("refresh", { size: 16, className: "spinner" })}<span>Sending…</span>`
+    : `${icon("send", { size: 14 })}<span>Send request</span>`;
 }
 
 /** Combines headers and body into one raw editor: header lines, a blank line,
@@ -2073,39 +2095,58 @@ function showResendResponseLoading(): void {
 }
 
 async function sendResend(): Promise<void> {
+  // The editor always shows the selected item, so the request read here and
+  // the id it is PUT/sent to belong to the same item.
   const resend = selectedResend;
   if (resend === null) return;
   const resendId = resend.id;
+  if (resendInFlight.has(resendId)) return;
   const { headerText, bodyText } = splitRawRequest(valueOf("#resend-raw"));
   const request: ResendRequest = { method: valueOf("#resend-method"), url: valueOf("#resend-url"), headers: parseHeaders(headerText), body: [...new TextEncoder().encode(bodyText)] };
-  const sendButton = resendPanel?.querySelector<HTMLButtonElement>("#resend-send") ?? null;
+  // Keep the sent edit on this item locally, so switching away and back shows
+  // what was sent rather than the pre-edit request.
+  const edited: ResendContext = { ...resend, current: request };
+  resendContexts.set(resendId, edited);
+  selectedResend = edited;
+  const isVisible = (): boolean => selectedResend?.id === resendId;
+  resendInFlight.add(resendId);
+  setResendSendBusy(true);
   showResendResponseLoading();
+  renderResendList();
   try {
-    await withBusy(sendButton, "Sending…", async () => {
-      const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
-      await requireOk(update, "resend edit failed");
-      const sent = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId) + "/send", { method: "POST" });
-      await requireOk(sent, "resend send failed");
-      const result = (await sent.json()) as Partial<ResendSendResult>;
-      let context = result.context;
-      if (context === null || context === undefined || typeof context.id !== "string") {
-        const refreshed = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId));
-        await requireOk(refreshed, "resend history refresh failed");
-        context = (await refreshed.json()) as ResendContext;
-      }
-      if (context === null || typeof context.id !== "string") throw new Error("resend response did not include a valid context");
+    const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
+    await requireOk(update, "resend edit failed");
+    const sent = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId) + "/send", { method: "POST" });
+    await requireOk(sent, "resend send failed");
+    const result = (await sent.json()) as Partial<ResendSendResult>;
+    let context = result.context;
+    if (context === null || context === undefined || typeof context.id !== "string") {
+      const refreshed = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId));
+      await requireOk(refreshed, "resend history refresh failed");
+      context = (await refreshed.json()) as ResendContext;
+    }
+    if (context === null || typeof context.id !== "string" || context.id !== resendId) throw new Error("resend response did not include this item's context");
+    resendInFlight.delete(resendId);
+    // A context removed while its send was in flight stays removed.
+    if (resendContexts.has(resendId)) resendContexts.set(resendId, context);
+    (result.diagnostics ?? []).forEach(showDiagnostic);
+    showDiagnostic(result.revision?.diagnostic);
+    if (isVisible()) {
+      // Re-mount only the Response pane so the request editor and split ratio
+      // the operator set are preserved; show the just-arrived (latest) revision.
       selectedResend = context;
-      resendContexts.set(context.id, context);
-      (result.diagnostics ?? []).forEach(showDiagnostic);
-      showDiagnostic(result.revision?.diagnostic);
-    });
-    // Re-mount only the Response pane so the request editor and split ratio the
-    // operator set are preserved; show the just-arrived (latest) revision.
-    selectedResendRevision = null;
-    mountResendResponse();
+      selectedResendRevision = null;
+      setResendSendBusy(false);
+      mountResendResponse();
+    }
     renderResendList();
   } catch (error) {
-    mountResendResponse();
+    resendInFlight.delete(resendId);
+    if (isVisible()) {
+      setResendSendBusy(false);
+      mountResendResponse();
+    }
+    renderResendList();
     reportUnexpected(error, { id: "proxy.resend-request-failed", what: "The resend send failed.", why: "", fix: "Review the request and confirm the session proxy is running." });
   }
 }
@@ -2702,7 +2743,8 @@ function renderResendList(): void {
   list.innerHTML = items
     .map((ctx) => {
       const last = ctx.history[ctx.history.length - 1]?.response?.status;
-      return queueRowHtml({ id: ctx.id, attr: "resend-id", method: ctx.current.method, url: ctx.current.url, status: last === undefined ? "—" : String(last), active: selectedResend?.id === ctx.id });
+      const status = resendInFlight.has(ctx.id) ? "…" : last === undefined ? "—" : String(last);
+      return queueRowHtml({ id: ctx.id, attr: "resend-id", method: ctx.current.method, url: ctx.current.url, status, active: selectedResend?.id === ctx.id });
     })
     .join("");
   list.querySelectorAll<HTMLElement>("[data-resend-id]").forEach((row) => {

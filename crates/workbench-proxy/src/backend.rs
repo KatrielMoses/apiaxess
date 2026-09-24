@@ -34,6 +34,34 @@ use apiaxess_workbench_store::FlowOrigin;
 /// reaches the target and never appears in stored traffic.
 pub(crate) const ORIGIN_MARKER_HEADER: &str = "x-apiaxess-origin";
 
+/// Request header the Resend/Fuzz senders attach when the authored `Host`
+/// header differs from the URL authority. The connection target stays the URL
+/// authority; this carries the `Host` value to put on the wire verbatim. Like
+/// the origin marker, the proxy removes it before recording or forwarding.
+pub(crate) const HOST_OVERRIDE_HEADER: &str = "x-apiaxess-host";
+
+/// Upstream client for requests carrying an authored `Host`. Hudsucker strips
+/// `Host` from every request it forwards and re-derives it from the URI, so the
+/// proxy forwards these itself over HTTP/1.1, where `Host` is sent as written.
+type HostOverrideClient = hudsucker::hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hudsucker::hyper_util::client::legacy::connect::HttpConnector>,
+    Body,
+>;
+
+/// Reads and removes the host-override marker. When present and valid, the
+/// request's `Host` header is replaced with it and `true` is returned.
+fn take_host_override(req: &mut Request<Body>) -> bool {
+    let Some(value) = req.headers_mut().remove(HOST_OVERRIDE_HEADER) else {
+        return false;
+    };
+    if value.is_empty() {
+        return false;
+    }
+    req.headers_mut()
+        .insert(hudsucker::hyper::header::HOST, value);
+    true
+}
+
 /// Reads and removes the origin marker header, returning the tagged origin.
 ///
 /// Absent or unparseable markers default to [`FlowOrigin::Capture`], so ordinary
@@ -432,6 +460,17 @@ impl ProxyBackend for HudsuckerBackend {
                 .enable_http1()
                 .enable_http2()
                 .build();
+            let host_override_client = hudsucker::hyper_util::client::legacy::Client::builder(
+                hudsucker::hyper_util::rt::TokioExecutor::new(),
+            )
+            .build(
+                hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_tls_config(upstream_tls.clone())
+                    .https_or_http()
+                    .enable_http1()
+                    .build(),
+            );
+            let handler = handler.with_host_override_client(host_override_client);
             let proxy = hudsucker::Proxy::builder()
                 .with_listener(listener)
                 .with_ca(config.ca)
@@ -680,6 +719,8 @@ struct ObserveHandler {
     intercept: Option<Arc<InterceptController>>,
     /// Flow id of the request currently being handled by this per-request clone.
     current_flow_id: Option<u64>,
+    /// Forwards requests whose authored `Host` must reach the wire verbatim.
+    host_override_client: Option<HostOverrideClient>,
 }
 
 impl ObserveHandler {
@@ -693,7 +734,13 @@ impl ObserveHandler {
             observer,
             intercept,
             current_flow_id: None,
+            host_override_client: None,
         }
+    }
+
+    fn with_host_override_client(mut self, client: HostOverrideClient) -> Self {
+        self.host_override_client = Some(client);
+        self
     }
 
     fn observe_request(&self, req: &Request<Body>, origin: FlowOrigin) -> u64 {
@@ -739,7 +786,7 @@ fn normalize_origin_form(req: &mut Request<Body>) {
 impl HttpHandler for ObserveHandler {
     async fn handle_request(
         &mut self,
-        _ctx: &HttpContext,
+        ctx: &HttpContext,
         mut req: Request<Body>,
     ) -> RequestOrResponse {
         normalize_origin_form(&mut req);
@@ -748,6 +795,9 @@ impl HttpHandler for ObserveHandler {
         // never leaks upstream and never appears in stored traffic. Ordinary
         // observed traffic carries no marker and tags as `Capture`.
         let origin = take_origin_marker(&mut req);
+        // Applied before observation so the recorded request shows the `Host`
+        // that actually goes on the wire.
+        let host_override = take_host_override(&mut req);
         // A CONNECT reaching the MITM request handler over HTTP/2 is an RFC 8441
         // extended-CONNECT (WebSocket-over-h2); ordinary CONNECT tunnels are
         // handled below this layer. Surface the known limitation as a signal.
@@ -792,16 +842,25 @@ impl HttpHandler for ObserveHandler {
                 }
             }
         }
-        let (parts, body) = req.into_parts();
-        RequestOrResponse::Request(Request::from_parts(
-            parts,
-            capture_body(
-                body,
-                flow_id,
-                BodyDirection::Request,
-                Arc::clone(&self.observer),
-            ),
-        ))
+        let (mut parts, body) = req.into_parts();
+        let body = capture_body(
+            body,
+            flow_id,
+            BodyDirection::Request,
+            Arc::clone(&self.observer),
+        );
+        if host_override && parts.method != Method::CONNECT {
+            if let Some(client) = self.host_override_client.clone() {
+                parts.version = Version::HTTP_11;
+                join_cookie_headers(&mut parts.headers);
+                let response = match client.request(Request::from_parts(parts, body)).await {
+                    Ok(upstream) => self.handle_response(ctx, upstream.map(Body::from)).await,
+                    Err(error) => self.handle_error(ctx, error).await,
+                };
+                return RequestOrResponse::Response(response);
+            }
+        }
+        RequestOrResponse::Request(Request::from_parts(parts, body))
     }
 
     async fn handle_response(&mut self, ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
@@ -857,6 +916,24 @@ impl HttpHandler for ObserveHandler {
             .status(StatusCode::BAD_GATEWAY)
             .body(Body::empty())
             .expect("static proxy error response is valid")
+    }
+}
+
+/// HTTP/1.1 allows a single `Cookie` header; join any split (HTTP/2) values
+/// the way hudsucker does for the requests it forwards.
+fn join_cookie_headers(headers: &mut hudsucker::hyper::HeaderMap) {
+    use hudsucker::hyper::header::{COOKIE, HeaderValue};
+    let values: Vec<&[u8]> = headers
+        .get_all(COOKIE)
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .collect();
+    if values.len() < 2 {
+        return;
+    }
+    let joined = values.join(&b"; "[..]);
+    if let Ok(value) = HeaderValue::from_bytes(&joined) {
+        headers.insert(COOKIE, value);
     }
 }
 
@@ -1166,6 +1243,87 @@ mod tests {
                 .iter()
                 .any(|summary| summary.path.as_deref() == Some("/origin"))
         );
+        drop(observer);
+        drop(store);
+        fs::remove_dir_all(store_path).expect("remove test traffic store");
+    }
+
+    #[tokio::test]
+    async fn authored_host_reaches_the_wire_while_connecting_to_the_url_authority() {
+        use crate::resend::{ProxyResendSender, ResendSender};
+        use apiaxess_workbench_store::ResendRequest;
+
+        let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("upstream listener");
+        let upstream_address = upstream.local_addr().expect("upstream address");
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.expect("upstream accept");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("upstream read");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("upstream response");
+            String::from_utf8_lossy(&request).to_ascii_lowercase()
+        });
+        let store_path = env::temp_dir().join(format!(
+            "apiaxess-proxy-host-override-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = Arc::new(
+            TrafficStore::open(&store_path, "session:host-override-test").expect("traffic store"),
+        );
+        let observer = Arc::new(LiveWorkbench::new());
+        observer.attach_store(Arc::clone(&store));
+        let ca = SessionCa::generate().expect("CA");
+        let handle = HudsuckerBackend
+            .start(
+                ProxyConfig {
+                    session_id: "session:host-override-test".to_owned(),
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    ca: ca.clone(),
+                    intercept: None,
+                },
+                observer.clone(),
+            )
+            .await
+            .expect("proxy starts");
+        let sender = ProxyResendSender::new(handle.local_addr(), ca);
+        let send = sender.send(ResendRequest {
+            method: "GET".to_owned(),
+            url: format!("http://{upstream_address}/vhost"),
+            headers: vec![("Host".to_owned(), "evil.test".to_owned())],
+            body: None,
+        });
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), send)
+            .await
+            .expect("send completes")
+            .expect("send");
+        assert_eq!(response.status, 200);
+        let wire = upstream_task.await.expect("upstream task");
+        handle.shutdown().await.expect("proxy shutdown");
+        // Connected to the URL authority, yet the authored Host went out verbatim,
+        // exactly once, and the private marker never reached the target.
+        assert!(wire.contains("\r\nhost: evil.test\r\n"), "{wire}");
+        assert_eq!(wire.matches("\r\nhost:").count(), 1, "{wire}");
+        assert!(!wire.contains("x-apiaxess-host"), "{wire}");
+        let summaries = store.summaries().expect("traffic summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status, Some(200));
         drop(observer);
         drop(store);
         fs::remove_dir_all(store_path).expect("remove test traffic store");

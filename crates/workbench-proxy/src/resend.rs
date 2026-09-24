@@ -18,7 +18,7 @@ use apiaxess_workbench_store::{
 use getrandom::fill;
 use reqwest::header::{HeaderName, HeaderValue};
 
-use crate::backend::ORIGIN_MARKER_HEADER;
+use crate::backend::{HOST_OVERRIDE_HEADER, ORIGIN_MARKER_HEADER};
 use crate::{FlowDetail, SessionCa};
 
 /// A host-in-scope predicate supplied by the caller (the fuzzer) so the send
@@ -427,7 +427,7 @@ impl ResendWorkbench {
                 .clone()
                 .unwrap_or_else(|| "GET".to_owned()),
             url,
-            headers: flow.request_headers.clone(),
+            headers: strip_proxy_artifact_headers(&flow.request_headers),
             body: flow.request_body.clone(),
         };
         self.create(request, Some(flow.summary.id))
@@ -668,7 +668,18 @@ async fn send_core(
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .map_err(|error| request_diagnostic("method", &error.to_string()))?;
     let mut builder = client.request(method, &request.url);
+    // The URL authority is the connection target; an authored `Host` that
+    // differs rides to the proxy in a marker, which puts it on the wire verbatim.
+    let host_override = authored_host_override(&request);
+    if let Some(host) = &host_override {
+        let value = HeaderValue::try_from(host.as_str())
+            .map_err(|error| request_diagnostic("header-value", &error.to_string()))?;
+        builder = builder.header(HOST_OVERRIDE_HEADER, value);
+    }
     for (name, value) in &request.headers {
+        if host_override.is_some() && name.eq_ignore_ascii_case("host") {
+            continue;
+        }
         if name.eq_ignore_ascii_case("content-length")
             && request.body.is_some()
             && update_content_length
@@ -876,6 +887,52 @@ fn merged_cookies(current: &ResendRequest, response: &ResendResponse) -> String 
         }
     }
     jar.join("; ")
+}
+
+/// Headers a capturing client adds for the proxy itself; they are not part of
+/// the request to the target and must not be replayed to it.
+fn strip_proxy_artifact_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    const PROXY_ARTIFACTS: [&str; 3] = [
+        "proxy-connection",
+        "proxy-authorization",
+        "proxy-authenticate",
+    ];
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            !PROXY_ARTIFACTS
+                .iter()
+                .any(|artifact| name.eq_ignore_ascii_case(artifact))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The authored `Host` value when it differs from the URL authority (the value
+/// the client would derive). `None` when absent or equivalent, so ordinary
+/// requests take the unchanged path.
+fn authored_host_override(request: &ResendRequest) -> Option<String> {
+    let authored = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())?;
+    if authored.is_empty() {
+        return None;
+    }
+    let url = request.url.parse::<reqwest::Url>().ok()?;
+    let host = url.host_str()?;
+    let equivalent = |candidate: &str| authored.eq_ignore_ascii_case(candidate);
+    let derived_matches = match url.port() {
+        Some(port) => equivalent(&format!("{host}:{port}")),
+        None => {
+            equivalent(host)
+                || url
+                    .port_or_known_default()
+                    .is_some_and(|port| equivalent(&format!("{host}:{port}")))
+        }
+    };
+    (!derived_matches).then(|| authored.to_owned())
 }
 
 fn validate_request(request: &ResendRequest) -> Result<(), Diagnostic> {
@@ -1256,6 +1313,89 @@ mod tests {
             Some("proxy.resend-transport-unavailable")
         );
         assert_eq!(result.context.history.len(), 1);
+    }
+
+    #[test]
+    fn authored_host_override_only_when_host_differs_from_authority() {
+        let with_host = |url: &str, host: Option<&str>| ResendRequest {
+            method: "GET".to_owned(),
+            url: url.to_owned(),
+            headers: host
+                .map(|host| vec![("Host".to_owned(), host.to_owned())])
+                .unwrap_or_default(),
+            body: None,
+        };
+        assert_eq!(
+            authored_host_override(&with_host("http://127.0.0.1:9111/", Some("evil.test"))),
+            Some("evil.test".to_owned())
+        );
+        assert_eq!(
+            authored_host_override(&with_host("http://127.0.0.1:9111/", Some("127.0.0.1"))),
+            Some("127.0.0.1".to_owned())
+        );
+        assert_eq!(
+            authored_host_override(&with_host("http://127.0.0.1:9111/", Some("127.0.0.1:9111"))),
+            None
+        );
+        assert_eq!(
+            authored_host_override(&with_host(
+                "https://API.example.test/",
+                Some("api.example.test")
+            )),
+            None
+        );
+        assert_eq!(
+            authored_host_override(&with_host(
+                "https://api.example.test/",
+                Some("api.example.test:443")
+            )),
+            None
+        );
+        assert_eq!(
+            authored_host_override(&with_host("https://api.example.test/", None)),
+            None
+        );
+    }
+
+    #[test]
+    fn create_from_flow_strips_proxy_artifact_headers() {
+        let resend = ResendWorkbench::new();
+        resend.attach_store(store()).expect("attach");
+        let flow = FlowDetail {
+            summary: FlowSummary {
+                id: 10,
+                protocol: Some("h1".to_owned()),
+                method: Some("GET".to_owned()),
+                host: Some("api.example.test".to_owned()),
+                url: Some("http://api.example.test/items".to_owned()),
+                path: Some("/items".to_owned()),
+                status: Some(200),
+                duration_ms: Some(3),
+                content_type: None,
+                size: Some(2),
+                origin: FlowOrigin::Capture,
+            },
+            request_headers: vec![
+                ("host".to_owned(), "api.example.test".to_owned()),
+                ("Proxy-Connection".to_owned(), "Keep-Alive".to_owned()),
+                (
+                    "proxy-authorization".to_owned(),
+                    "Basic Zm9vOmJhcg==".to_owned(),
+                ),
+                ("accept".to_owned(), "*/*".to_owned()),
+            ],
+            response_headers: Vec::new(),
+            request_body: None,
+            response_body: None,
+        };
+        let context = resend.create_from_flow(&flow).expect("flow enters resend");
+        let names: Vec<&str> = context
+            .current
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, ["host", "accept"]);
     }
 
     #[test]
