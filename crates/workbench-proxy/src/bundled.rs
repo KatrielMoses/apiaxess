@@ -96,7 +96,7 @@ fn controlled_environment() -> Vec<(String, String)> {
 /// The directory holding `tools/`, relative to the installed executable.
 /// Windows keeps it beside `bin/`; the Unix prefix layout places it under
 /// `share/apiaxess/`, matching the other bundled components.
-fn resource_base() -> PathBuf {
+pub(crate) fn resource_base() -> PathBuf {
     let Some(bin) = env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))

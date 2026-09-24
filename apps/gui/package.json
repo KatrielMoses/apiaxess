@@ -8,6 +8,7 @@
     "check": "tsc --noEmit",
     "lint:tokens": "node scripts/check-tokens.mjs",
     "lint:marks": "node scripts/check-marks.mjs",
+    "lint:fuzz-template": "node scripts/check-fuzz-template.mjs",
     "dev": "vite --host 127.0.0.1"
   },
   "devDependencies": {

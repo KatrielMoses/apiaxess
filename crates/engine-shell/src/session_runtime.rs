@@ -497,7 +497,7 @@ mod tests {
         AllowedNetworkTarget, AnalysisPipelineState, EngagementScope, HostMatch, ScopeDisposition,
         Session, SessionId, TargetIdentifier, TargetIdentity,
     };
-    use apiaxess_workbench_store::{FlowCapture, TrafficStore};
+    use apiaxess_workbench_store::{FlowCapture, FlowOrigin, TrafficStore};
     use chrono::{Duration, Utc};
 
     use super::{SessionRuntime, checkpoint_path};
@@ -565,6 +565,7 @@ mod tests {
                 response_body: None,
                 scope: ScopeDisposition::InScope,
                 provenance: "test.kill".to_owned(),
+                origin: FlowOrigin::Capture,
             })
             .unwrap();
         let mut changed = runtime.session_snapshot().unwrap();

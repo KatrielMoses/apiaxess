@@ -92,18 +92,6 @@
             <span data-theme-glyph></span>
           </button>
         </div>
-        <span class="titlebar__divider" aria-hidden="true"></span>
-        <div class="wincontrols">
-          <button class="wincontrol" data-win="min" type="button" aria-label="Minimize window">
-            <span class="wincontrol__glyph wincontrol__glyph--min"></span>
-          </button>
-          <button class="wincontrol" data-win="max" type="button" aria-label="Maximize window">
-            <span class="wincontrol__glyph wincontrol__glyph--max"></span>
-          </button>
-          <button class="wincontrol wincontrol--close" data-win="close" type="button" aria-label="Close window">
-            <span class="wincontrol__glyph wincontrol__glyph--close"></span>
-          </button>
-        </div>
       </header>
 
       <div class="shell__body">
@@ -399,6 +387,12 @@
             <div class="view-head__actions">
               <button class="btn" type="button" data-nav="workbench">Open workbench</button>
               <button class="btn" type="button" data-nav="surface">View surface</button>
+              <button class="btn btn--primary" id="capture-launch" type="button">
+                <span data-icon="browser"></span> Launch browser
+              </button>
+              <button class="btn btn--danger" id="capture-stop" type="button" hidden>
+                <span data-icon="stop"></span> Stop browser
+              </button>
             </div>
           </div>
 
@@ -457,59 +451,6 @@
                 </div>
               </article>
 
-              <article class="panel">
-                <div class="panel__header">
-                  <div class="panel__heading"><span data-icon="browser"></span><h2>Capture browser</h2></div>
-                  <span class="panel__hint">bundled chromium</span>
-                </div>
-                <div class="panel__body stack">
-                  <p class="t-small t-muted">
-                    Traffic is captured through the session proxy. Browse the target the way a user
-                    would; every in-scope request becomes evidence.
-                  </p>
-                  <div id="browser-state" class="notice">
-                    <span class="notice__icon" data-icon="info"></span>
-                    <div class="notice__body">
-                      <p class="notice__title">Browser not running</p>
-                      <p>Start a session first, then launch the capture browser.</p>
-                    </div>
-                  </div>
-                  <div id="capture-health"></div>
-                </div>
-                <div class="panel__footer row">
-                  <button class="btn btn--primary" id="capture-launch" type="button">
-                    <span data-icon="browser"></span> Launch capture browser
-                  </button>
-                  <button class="btn btn--danger" id="capture-stop" type="button">
-                    <span data-icon="stop"></span> Stop browser
-                  </button>
-                </div>
-              </article>
-
-              <article class="panel">
-                <div class="panel__header">
-                  <div class="panel__heading"><span data-icon="surface"></span><h2>API surface</h2></div>
-                  <span class="panel__hint">live · observation-based</span>
-                </div>
-                <div class="panel__body">
-                  <p class="t-small t-muted">
-                    Captured traffic is fused into the web API surface continuously while the capture
-                    browser runs — no manual step. Coverage reflects only what was observed; unvisited
-                    routes stay absent rather than inferred.
-                  </p>
-                </div>
-                <div class="panel__footer row">
-                  <button class="btn btn--primary" type="button" data-nav="surface">
-                    <span data-icon="surface"></span> View API surface
-                  </button>
-                  <button class="btn btn--quiet" id="web-fuse" type="button" title="Re-fuse now (e.g. after importing a HAR while the browser is not running)">
-                    <span data-icon="refresh"></span> Re-fuse now
-                  </button>
-                  <button class="btn" id="web-export" type="button">
-                    <span data-icon="export"></span> Export artifacts
-                  </button>
-                </div>
-              </article>
             </div>
 
             <div class="workflow__col">
@@ -683,6 +624,23 @@
                   <span class="workbench__search-icon" data-icon="discovery" aria-hidden="true"></span>
                   <input class="input input--mono" id="flow-search" type="search" placeholder="Filter traffic — host, path, method, status" spellcheck="false" aria-label="Filter live traffic" />
                 </div>
+                <select class="input input--sm" id="flow-filter-method" aria-label="Filter by request method" title="Filter by request method">
+                  <option value="">Any method</option>
+                  <option value="GET">GET</option>
+                  <option value="POST">POST</option>
+                  <option value="PUT">PUT</option>
+                  <option value="PATCH">PATCH</option>
+                  <option value="DELETE">DELETE</option>
+                  <option value="HEAD">HEAD</option>
+                  <option value="OPTIONS">OPTIONS</option>
+                </select>
+                <select class="input input--sm" id="flow-filter-status" aria-label="Filter by response status" title="Filter by response status code">
+                  <option value="">Any status</option>
+                  <option value="2">2xx success</option>
+                  <option value="3">3xx redirect</option>
+                  <option value="4">4xx client error</option>
+                  <option value="5">5xx server error</option>
+                </select>
                 <span class="spacer"></span>
                 <button class="btn btn--sm btn--quiet" id="har-import" type="button" title="Import a Burp/Chrome HAR into this session's traffic"><span data-icon="folder"></span> Import HAR</button>
                 <button class="btn btn--sm btn--quiet" id="har-export" type="button" title="Export this session's captured traffic as HAR"><span data-icon="export"></span> Export HAR</button>
@@ -724,7 +682,11 @@
             <div class="wb-workspace" data-wbpanel="resend" role="tabpanel" hidden>
               <div class="wb-split" data-wbsplit="resend">
                 <div class="wb-split__pane wb-split__pane--list">
-                  <div class="wb-list__head"><span class="section-label">Resend queue</span><span class="panel__hint">right-click traffic → Resend</span></div>
+                  <div class="wb-list__head">
+                    <button class="wb-list__collapse btn--icon" type="button" data-wb-collapse="resend" title="Collapse queue" aria-label="Collapse queue"><span data-icon="menu"></span></button>
+                    <span class="section-label wb-list__title">Resend queue</span>
+                    <span class="panel__hint wb-list__hint">right-click traffic → Resend</span>
+                  </div>
                   <div class="workbench__scroll"><div class="list" id="resend-list" aria-live="polite"></div></div>
                 </div>
                 <div class="wb-split__gutter" data-wbgutter="resend" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize resend list"></div>
@@ -738,7 +700,11 @@
             <div class="wb-workspace" data-wbpanel="fuzz" role="tabpanel" hidden>
               <div class="wb-split" data-wbsplit="fuzz">
                 <div class="wb-split__pane wb-split__pane--list">
-                  <div class="wb-list__head"><span class="section-label">Fuzz queue</span><span class="panel__hint">right-click traffic → Fuzz</span></div>
+                  <div class="wb-list__head">
+                    <button class="wb-list__collapse btn--icon" type="button" data-wb-collapse="fuzz" title="Collapse queue" aria-label="Collapse queue"><span data-icon="menu"></span></button>
+                    <span class="section-label wb-list__title">Fuzz queue</span>
+                    <span class="panel__hint wb-list__hint">right-click traffic → Fuzz</span>
+                  </div>
                   <div class="workbench__scroll"><div class="list" id="fuzz-list" aria-live="polite"></div></div>
                 </div>
                 <div class="wb-split__gutter" data-wbgutter="fuzz" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize fuzz list"></div>

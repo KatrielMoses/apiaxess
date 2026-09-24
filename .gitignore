@@ -58,3 +58,6 @@ Thumbs.db
 
 # WiX installer build output
 .wix/
+
+# Local GUI/UX regression test skill — invoked in-repo, never published.
+/.claude/skills/test-apiaxess/

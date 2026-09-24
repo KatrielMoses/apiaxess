@@ -41,7 +41,7 @@ use apiaxess_static_pass::StaticPassReport;
 use apiaxess_target_apk::{ApkIntakeConfig, ApkTarget, cleanup_intake_workspace};
 use apiaxess_unified_surface::{UnifiedSurfaceConfig, UnifiedSurfaceReport};
 use apiaxess_workbench_proxy::{CredentialPrompt, CredentialPromptField};
-use apiaxess_workbench_proxy::{FlowObserver, LiveWorkbench, ProxyCore, SessionCa};
+use apiaxess_workbench_proxy::{FlowObserver, FlowOrigin, LiveWorkbench, ProxyCore, SessionCa};
 use chrono::{DateTime, Utc};
 use tokio::runtime::Runtime;
 
@@ -1491,8 +1491,11 @@ fn observed_host_summary(runtime: &SessionRuntime, package: &str) -> Diagnostic 
     let hosts: Vec<String> = runtime.store().summaries().map_or_else(
         |_| Vec::new(),
         |summaries| {
-            let mut hosts: Vec<String> =
-                summaries.into_iter().filter_map(|flow| flow.host).collect();
+            let mut hosts: Vec<String> = summaries
+                .into_iter()
+                .filter(|flow| flow.origin == FlowOrigin::Capture)
+                .filter_map(|flow| flow.host)
+                .collect();
             hosts.sort();
             hosts.dedup();
             hosts

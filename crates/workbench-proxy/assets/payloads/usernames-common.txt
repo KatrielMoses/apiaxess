@@ -1,0 +1,21 @@
+# Common account/username candidates for authorized access testing.
+admin
+administrator
+root
+user
+test
+guest
+demo
+operator
+support
+service
+api
+apiuser
+dev
+developer
+staff
+manager
+superuser
+sysadmin
+webadmin
+info

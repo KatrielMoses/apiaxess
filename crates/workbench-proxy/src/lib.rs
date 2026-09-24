@@ -11,12 +11,14 @@ pub use bundled::resolved_ffuf;
 pub mod ca;
 pub mod fuzzer;
 pub mod live;
+mod payload_lists;
+mod payloads;
 pub mod resend;
 pub mod transparent;
 pub mod trust;
 
 pub use apiaxess_workbench_store::{
-    ResendContext, ResendRequest, ResendResponse, ResendRevision, TrafficStore,
+    FlowOrigin, ResendContext, ResendRequest, ResendResponse, ResendRevision, TrafficStore,
 };
 pub use backend::{
     BackendHealth, BackendKind, BodyDirection, FlowEvent, FlowObserver, HudsuckerBackend,
@@ -24,12 +26,16 @@ pub use backend::{
     ProxyHandle, WebSocketDirection,
 };
 pub use ca::{CaExport, SessionCa};
-pub use fuzzer::FuzzerWorkbench;
+pub use fuzzer::{FuzzerWorkbench, RequestCountPreview, preview_request_count};
 pub use live::{
     CredentialPrompt, CredentialPromptAnswer, CredentialPromptField, FlowDetail, FlowRecord,
     FlowSummary, LiveUpdate, LiveWorkbench,
 };
-pub use resend::{ProxyResendSender, ResendSendResult, ResendSender, ResendWorkbench};
+pub use payload_lists::{PayloadListInfo, bundled_payload_lists, read_payload_list};
+pub use resend::{
+    OriginTaggingSender, ProxyResendSender, ResendSendResult, ResendSender, ResendWorkbench,
+    ScopePredicate, SendOptions, SendOutcome,
+};
 pub use transparent::TransparentFrontend;
 pub use trust::{
     BrowserKind, BrowserPlatform, BrowserProfileInstall, BrowserTrustController,

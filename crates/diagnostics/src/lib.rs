@@ -1399,6 +1399,16 @@ pub mod catalogue {
         fix: "If the actual rate differs materially from the estimate, set APIAXESS_DISCOVERY_RATE to the observed value for future estimates.",
     };
 
+    /// A fuzzer attack's actual request rate was measured.
+    pub const PROXY_FUZZER_RATE_OBSERVED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.fuzzer-rate-observed",
+        category: DiagnosticCategory::ExternalTool,
+        severity: DiagnosticSeverity::Info,
+        what: "The fuzz attack's actual request rate was measured.",
+        why: "End-to-end throughput through the routed proxy is latency-bound; the actual rate is reported so the configured throttle can be judged against reality rather than trusted blindly.",
+        fix: "If the actual rate differs materially from the configured rate, adjust the attack's delay/rate setting for future runs.",
+    };
+
     /// A fuzzer payload set or position configuration is malformed.
     pub const PROXY_FUZZER_CONFIG_INVALID: DiagnosticDefinition = DiagnosticDefinition {
         id: "proxy.fuzzer-config-invalid",
@@ -3562,6 +3572,7 @@ pub mod catalogue {
         PROXY_FUZZER_FFUF_UNAVAILABLE,
         PROXY_FUZZER_FFUF_FAILED,
         WEB_DISCOVERY_RATE_OBSERVED,
+        PROXY_FUZZER_RATE_OBSERVED,
         PROXY_FUZZER_CONFIG_INVALID,
         PROXY_FUZZER_SEQUENCE_FAILED,
         PROXY_FUZZER_CANCELLED,

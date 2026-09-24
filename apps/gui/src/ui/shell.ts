@@ -526,27 +526,6 @@ function initMenubar(): void {
 }
 
 /* ------------------------------------------------------------------ *
- * Window controls (native under the desktop shell, inert in a browser)
- * ------------------------------------------------------------------ */
-
-function initWindowControls(): void {
-  const tauri = (window as unknown as { __TAURI__?: { window?: { appWindow?: Record<string, () => void> } } }).__TAURI__;
-  const appWindow = tauri?.window?.appWindow;
-  shell.querySelectorAll<HTMLButtonElement>(".wincontrol").forEach((btn) => {
-    const which = btn.dataset.win;
-    if (appWindow === undefined) {
-      btn.title = "Window controls — active in the desktop app";
-      return;
-    }
-    btn.addEventListener("click", () => {
-      if (which === "min") appWindow.minimize?.();
-      else if (which === "max") appWindow.toggleMaximize?.();
-      else if (which === "close") appWindow.close?.();
-    });
-  });
-}
-
-/* ------------------------------------------------------------------ *
  * Init
  * ------------------------------------------------------------------ */
 
@@ -561,7 +540,6 @@ export function initShell(): void {
   initSplitters();
   restoreLayout();
   initResponsive();
-  initWindowControls();
 
   // Brand lockup returns to Start.
   document.getElementById("header-lockup")?.addEventListener("click", () => showView("start"));

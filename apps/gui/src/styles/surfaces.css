@@ -683,19 +683,12 @@
   padding-left: 26px;
 }
 
-/* Resend/Fuzz queue rows */
+/* Resend/Fuzz queue rows: a clickable main button plus a hover rename control. */
 .qrow {
-  display: grid;
-  grid-template-columns: 3.4rem minmax(0, 1fr) 2.8rem;
-  align-items: baseline;
-  gap: var(--space-2);
+  display: flex;
+  align-items: stretch;
   width: 100%;
-  padding: var(--space-2) var(--space-4);
-  background: none;
-  border: 0;
   border-bottom: var(--border-hairline) solid var(--color-rule);
-  text-align: left;
-  cursor: pointer;
 }
 .qrow:hover {
   background: var(--color-row);
@@ -704,18 +697,66 @@
   background: var(--color-selection, var(--color-row));
   box-shadow: inset 2px 0 0 var(--color-accent);
 }
+.qrow__open {
+  display: grid;
+  grid-template-columns: 3.4rem minmax(0, 1fr) 2.8rem;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  background: none;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+.qrow__rename,
+.qrow__delete {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--space-2);
+  background: none;
+  border: 0;
+  color: var(--color-text-subtle);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+.qrow__delete {
+  padding-right: var(--space-3);
+}
+.qrow:hover .qrow__rename,
+.qrow:focus-within .qrow__rename,
+.qrow:hover .qrow__delete,
+.qrow:focus-within .qrow__delete {
+  opacity: 1;
+}
+.qrow__rename:hover {
+  color: var(--color-accent);
+}
+.qrow__delete:hover {
+  color: var(--color-danger-ink);
+}
 .qrow__method {
   font-family: var(--font-mono);
   font-size: var(--text-nano);
   color: var(--color-text-muted);
 }
+.qrow__name,
 .qrow__target {
   font-family: var(--font-mono);
   font-size: var(--text-small);
-  color: var(--color-text-muted);
+  color: var(--color-text);
+  font-weight: var(--weight-medium);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.qrow__target {
+  color: var(--color-text-muted);
+  font-weight: var(--weight-regular);
 }
 .qrow__target b {
   color: var(--color-text);
@@ -726,6 +767,294 @@
   font-size: var(--text-nano);
   color: var(--color-text-muted);
   text-align: right;
+}
+.qrow__rename-input {
+  flex: 1;
+  min-width: 0;
+  margin: var(--space-1) var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+  border: var(--border-hairline) solid var(--color-accent);
+  border-radius: var(--radius-xs);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+/* Collapsible queue rail: shrinks the list pane so the request/response editor
+   claims the width. The head's toggle stays visible to expand it again. */
+.wb-list__collapse {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+.wb-list__collapse:hover {
+  color: var(--color-text);
+}
+.wb-split.is-list-collapsed .wb-list__collapse {
+  color: var(--color-accent);
+}
+.wb-split.is-list-collapsed .wb-split__pane--list {
+  flex-basis: 2.6rem;
+  min-width: 2.6rem;
+}
+.wb-split.is-list-collapsed .wb-list__head {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+.wb-split.is-list-collapsed .wb-list__title,
+.wb-split.is-list-collapsed .wb-list__hint,
+.wb-split.is-list-collapsed .wb-split__pane--list .workbench__scroll {
+  display: none;
+}
+.wb-split.is-list-collapsed .wb-split__gutter {
+  display: none;
+}
+
+/* Resend editor: combined method + URL on one line. */
+.reqline {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+.reqline__method {
+  flex: 0 0 6.5rem;
+  text-transform: uppercase;
+}
+.reqline__url {
+  flex: 1;
+  min-width: 0;
+}
+.reqres__col .textarea {
+  min-height: 9rem;
+}
+
+/* Resend Request | Response — a draggable split that fills the panel so the
+   editor and response occupy the height instead of leaving whitespace. */
+#resend-panel.workbench__drawer {
+  overflow: hidden;
+  padding: 0;
+}
+.resend-split {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  --resend-req: 50%;
+}
+.resend-split__pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  min-height: 0;
+  padding: var(--space-4);
+}
+.resend-req {
+  flex: 0 0 var(--resend-req);
+}
+.resend-res {
+  flex: 1 1 0;
+}
+.resend-split__gutter {
+  flex: none;
+  width: 6px;
+  cursor: col-resize;
+  position: relative;
+  background: var(--color-rule);
+}
+.resend-split__gutter::before {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: var(--color-rule-strong);
+}
+.resend-split__gutter:hover::before,
+.resend-split__gutter:focus-visible::before {
+  background: var(--color-accent);
+}
+.resend-raw {
+  flex: 1;
+  min-height: 8rem;
+  resize: none;
+}
+/* Response pane mirrors the request pane: a head row (label + history picker),
+   an endpoint+status line, then the body editor filling the height. */
+.resend-res__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.resend-res__head .section-label {
+  margin: 0;
+}
+.resend-res__head #resend-response-pick {
+  margin-left: auto;
+  max-width: 60%;
+}
+.resend-res__status {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 3.5rem;
+  padding: 0 var(--space-2);
+  font-family: var(--font-mono);
+  border: var(--border-hairline) solid var(--color-rule-strong);
+  border-radius: var(--radius-xs);
+}
+.resend-res__empty {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Fuzz request template is the centerpiece: give it most of the initial height,
+   with the attack config reading as supplements below it. */
+.fuzzer-base {
+  min-height: 18rem;
+  max-height: 55vh;
+  overflow: auto;
+  resize: vertical;
+}
+.fuzzer-base--compact {
+  max-height: 12rem;
+  overflow: auto;
+}
+
+/* Clickable results table: sortable headers + row selection for the inspector. */
+.data-table--clickable th[data-sort] {
+  cursor: pointer;
+  user-select: none;
+}
+.data-table--clickable th[data-sort]:hover {
+  color: var(--color-text);
+}
+.data-table--clickable tbody tr {
+  cursor: pointer;
+}
+.data-table tr.is-selected td,
+.data-table tr.is-selected:hover td {
+  background: var(--color-selection, var(--color-row));
+}
+.fuzz-detail {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: var(--border-hairline) solid var(--color-rule);
+}
+.fuzz-detail .code {
+  max-height: 20rem;
+  overflow: auto;
+}
+.t-danger {
+  color: var(--color-danger-ink);
+}
+
+/* Fuzz payload-set editor: source settings, list actions, processing pipeline. */
+.split-3 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(8rem, 100%), 1fr));
+  gap: var(--space-4);
+}
+.select--sm {
+  width: auto;
+  min-height: var(--control-height-sm, 1.9rem);
+  padding: 0.2rem var(--space-6) 0.2rem var(--space-3);
+  font-size: var(--text-small);
+}
+.fuzz-set {
+  padding: var(--space-4);
+  border: var(--border-hairline) solid var(--color-rule);
+  border-radius: var(--radius-3, 0.5rem);
+  background: var(--color-surface-sunken, transparent);
+}
+.fuzz-set + .fuzz-set {
+  margin-top: var(--space-4);
+}
+.fuzz-list-actions,
+.fuzz-modes {
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+.fuzz-processing {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: var(--border-hairline) solid var(--color-rule);
+}
+.proc-row {
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+.fuzz-slot + .fuzz-slot {
+  margin-top: var(--space-3);
+}
+
+/* WS3 grep settings + dynamic results grid. */
+.grep-row {
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+.grep-row .input {
+  flex: 1 1 8rem;
+  min-width: 6rem;
+}
+.grep-num {
+  flex: 0 0 auto;
+  width: auto;
+  max-width: 6rem;
+}
+.check--sm {
+  font-size: var(--text-small);
+  white-space: nowrap;
+}
+.fuzz-filter {
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  margin-bottom: var(--space-3);
+}
+.fuzz-filter .input {
+  flex: 0 1 16rem;
+}
+.fuzz-comment {
+  min-width: 6rem;
+  width: 100%;
+}
+.t-strong {
+  font-weight: 600;
+}
+.fuzz-redirect-chain {
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border: var(--border-hairline) solid var(--color-rule);
+  border-radius: var(--radius-3, 0.5rem);
+}
+
+/* Attention pulse when something is added to a Workbench tool from another view. */
+@keyframes wb-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--color-accent);
+  }
+  70% {
+    box-shadow: 0 0 0 7px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+.is-pulsing {
+  animation: wb-pulse 1.1s var(--ease-out) 1;
+  border-radius: var(--radius-xs);
 }
 
 /* API surface source sections (by web capture / by app) */

@@ -30,14 +30,17 @@ use axum::{
     extract::{Path as AxumPath, Query, State, WebSocketUpgrade},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN},
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, ORIGIN},
     },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{any_service, get},
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    set_header::SetResponseHeaderLayer,
+};
 
 /// Creates the local API router on the default engine port.
 ///
@@ -60,7 +63,23 @@ pub fn router(engine: Engine, gui_directory: &Path) -> io::Result<Router> {
 pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::Result<Router> {
     let index = gui_directory.join("index.html");
     index.metadata()?;
-    let gui_assets = ServeDir::new(gui_directory).not_found_service(ServeFile::new(index));
+    // Cache policy for the packaged GUI, so a rebuilt bundle is picked up without a
+    // manual hard-refresh. Vite fingerprints everything under `/assets/` by content
+    // hash, so those are safe to cache forever (immutable). `index.html` and every
+    // other non-fingerprinted static file (fonts, favicons) must revalidate on each
+    // load (`no-cache` = revalidate, a 304 is fine) so a new build's new asset
+    // hashes are always requested. Applied as thin response-header layers over the
+    // static services rather than per-file special-casing.
+    let hashed_assets = any_service(ServeDir::new(gui_directory.join("assets"))).layer(
+        SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ),
+    );
+    let gui_assets =
+        any_service(ServeDir::new(gui_directory).not_found_service(ServeFile::new(index))).layer(
+            SetResponseHeaderLayer::overriding(CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        );
     let state = ApiState {
         engine,
         expected_origin: Arc::from(format!("http://127.0.0.1:{port}")),
@@ -159,7 +178,7 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         )
         .route(
             "/api/v1/workbench/resend/{context_id}",
-            get(get_resend).put(update_resend),
+            get(get_resend).put(update_resend).delete(delete_resend),
         )
         .route(
             "/api/v1/workbench/resend/{context_id}/send",
@@ -173,7 +192,22 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             "/api/v1/workbench/fuzzer",
             get(list_fuzzer).post(create_fuzzer),
         )
-        .route("/api/v1/workbench/fuzzer/{job_id}", get(get_fuzzer))
+        .route(
+            "/api/v1/workbench/fuzzer/preview",
+            axum::routing::post(preview_fuzzer),
+        )
+        .route(
+            "/api/v1/workbench/fuzzer/payload-lists",
+            get(list_payload_lists),
+        )
+        .route(
+            "/api/v1/workbench/fuzzer/payload-lists/{list_id}",
+            get(get_payload_list),
+        )
+        .route(
+            "/api/v1/workbench/fuzzer/{job_id}",
+            get(get_fuzzer).delete(delete_fuzzer),
+        )
         .route(
             "/api/v1/workbench/fuzzer/{job_id}/start",
             axum::routing::post(start_fuzzer),
@@ -189,6 +223,10 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         .route(
             "/api/v1/workbench/fuzzer/{job_id}/stop",
             axum::routing::post(stop_fuzzer),
+        )
+        .route(
+            "/api/v1/workbench/fuzzer/{job_id}/results/{ordinal}/comment",
+            axum::routing::post(comment_fuzzer_result),
         )
         .route("/api/v1/workbench/ws/control", get(control_ws))
         .route("/api/v1/workbench/ws/telemetry", get(telemetry_ws))
@@ -229,6 +267,9 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             "/android-stream/{*rest}",
             axum::routing::any(stream_proxy::stream_proxy),
         )
+        // Fingerprinted assets get the long-lived immutable policy; index.html and
+        // any other static file fall through to the `no-cache` fallback below.
+        .nest_service("/assets", hashed_assets)
         .fallback_service(gui_assets)
         .with_state(state))
 }
@@ -1498,6 +1539,18 @@ async fn get_resend(
         })
 }
 
+async fn delete_resend(
+    State(state): State<ApiState>,
+    AxumPath(context_id): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    state
+        .engine
+        .resend()
+        .remove(&context_id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(storage_response)
+}
+
 async fn update_resend(
     State(state): State<ApiState>,
     AxumPath(context_id): AxumPath<String>,
@@ -1577,6 +1630,29 @@ async fn create_fuzzer(
         .map_err(storage_response)
 }
 
+/// Returns the honest pre-run request-count estimate for a draft configuration,
+/// so the GUI count preview shares the payload engine's cardinality math rather
+/// than reimplementing it. Requires no persisted job.
+async fn preview_fuzzer(
+    Json(config): Json<apiaxess_workbench_store::FuzzerConfig>,
+) -> Json<apiaxess_workbench_proxy::RequestCountPreview> {
+    Json(apiaxess_workbench_proxy::preview_request_count(&config))
+}
+
+/// Lists the bundled predefined payload lists ("Add from list").
+async fn list_payload_lists() -> Json<Vec<apiaxess_workbench_proxy::PayloadListInfo>> {
+    Json(apiaxess_workbench_proxy::bundled_payload_lists())
+}
+
+/// Returns one bundled payload list's values by id.
+async fn get_payload_list(
+    AxumPath(list_id): AxumPath<String>,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    apiaxess_workbench_proxy::read_payload_list(&list_id)
+        .map(Json)
+        .map_err(storage_response)
+}
+
 async fn get_fuzzer(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<String>,
@@ -1595,6 +1671,18 @@ async fn get_fuzzer(
                 Json(catalogue::PROXY_LIVE_DESYNC.instantiate(DiagnosticContext::new())),
             )
         })
+}
+
+async fn delete_fuzzer(
+    State(state): State<ApiState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    state
+        .engine
+        .fuzzer()
+        .remove(&job_id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(storage_response)
 }
 
 async fn start_fuzzer(
@@ -1717,6 +1805,30 @@ async fn stop_fuzzer(
         .engine
         .fuzzer()
         .stop(&job_id)
+        .map(Json)
+        .map_err(storage_response)
+}
+
+/// Request body for annotating a fuzzer result row.
+#[derive(serde::Deserialize)]
+struct FuzzerCommentRequest {
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+/// Sets (or clears with an empty/absent value) the user comment on a result row.
+async fn comment_fuzzer_result(
+    State(state): State<ApiState>,
+    AxumPath((job_id, ordinal)): AxumPath<(String, u64)>,
+    Json(body): Json<FuzzerCommentRequest>,
+) -> Result<
+    Json<apiaxess_workbench_store::FuzzerJob>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    state
+        .engine
+        .fuzzer()
+        .set_result_comment(&job_id, ordinal, body.comment)
         .map(Json)
         .map_err(storage_response)
 }
@@ -2817,5 +2929,89 @@ mod tests {
         let status = observed.expect("failed intake becomes queryable");
         assert_eq!(status.stage, PipelineStage::Intake);
         assert!(!status.diagnostics.is_empty());
+    }
+
+    /// The packaged GUI must be served with cache headers that survive a rebuild:
+    /// `index.html` (and non-fingerprinted static files) revalidate every load so a
+    /// new build's asset hashes are picked up without a hard-refresh, while Vite's
+    /// content-hashed `/assets/*` files are cached hard (immutable).
+    #[tokio::test]
+    async fn gui_static_serving_sets_cache_control_by_path() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "apiaxess-gui-cache-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("assets")).expect("assets dir");
+        std::fs::create_dir_all(dir.join("fonts")).expect("fonts dir");
+        std::fs::write(
+            dir.join("index.html"),
+            b"<!doctype html><script src=\"/assets/index-abc123.js\"></script>",
+        )
+        .expect("index");
+        std::fs::write(dir.join("assets/index-abc123.js"), b"console.log(1)").expect("asset");
+        std::fs::write(dir.join("fonts/archivo-latin.woff2"), b"font").expect("font");
+
+        let router = router_with_port(Engine::new(), &dir, 7777).expect("router");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let client = reqwest::Client::new();
+        let cache_control = |response: &reqwest::Response| {
+            response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        // index.html revalidates every load.
+        let index = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("GET /");
+        assert_eq!(index.status(), reqwest::StatusCode::OK);
+        assert_eq!(cache_control(&index).as_deref(), Some("no-cache"));
+        assert!(
+            index
+                .text()
+                .await
+                .expect("body")
+                .contains("index-abc123.js"),
+            "the served index references the current asset hash"
+        );
+
+        // Fingerprinted assets are cached hard and served correctly.
+        let asset = client
+            .get(format!("http://{addr}/assets/index-abc123.js"))
+            .send()
+            .await
+            .expect("GET asset");
+        assert_eq!(asset.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            cache_control(&asset).as_deref(),
+            Some("public, max-age=31536000, immutable")
+        );
+
+        // Non-fingerprinted static files (fonts) revalidate like index.html.
+        let font = client
+            .get(format!("http://{addr}/fonts/archivo-latin.woff2"))
+            .send()
+            .await
+            .expect("GET font");
+        assert_eq!(font.status(), reqwest::StatusCode::OK);
+        assert_eq!(cache_control(&font).as_deref(), Some("no-cache"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

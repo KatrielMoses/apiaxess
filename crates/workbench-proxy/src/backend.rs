@@ -26,6 +26,26 @@ use tokio::sync::Notify;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::SessionCa;
+use apiaxess_workbench_store::FlowOrigin;
+
+/// Request header the Resend/Fuzz senders attach so the proxy can tag the
+/// resulting flow's [`FlowOrigin`]. It is a private control marker: the proxy
+/// removes it before the request is recorded or forwarded upstream, so it never
+/// reaches the target and never appears in stored traffic.
+pub(crate) const ORIGIN_MARKER_HEADER: &str = "x-apiaxess-origin";
+
+/// Reads and removes the origin marker header, returning the tagged origin.
+///
+/// Absent or unparseable markers default to [`FlowOrigin::Capture`], so ordinary
+/// observed proxy traffic is unaffected.
+fn take_origin_marker(req: &mut Request<Body>) -> FlowOrigin {
+    match req.headers_mut().remove(ORIGIN_MARKER_HEADER) {
+        Some(value) => value
+            .to_str()
+            .map_or(FlowOrigin::Capture, FlowOrigin::from_db_str),
+        None => FlowOrigin::Capture,
+    }
+}
 
 /// Boxed future used to keep the backend trait object-safe.
 pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -286,6 +306,9 @@ pub enum FlowEvent {
         version: String,
         /// Header names and values captured without consuming the body.
         headers: Vec<(String, String)>,
+        /// How the request entered the proxy (observed capture vs. a request
+        /// synthesized by the Resend/Fuzz senders).
+        origin: FlowOrigin,
     },
     /// An HTTP response reached the proxy.
     Response {
@@ -673,7 +696,7 @@ impl ObserveHandler {
         }
     }
 
-    fn observe_request(&self, req: &Request<Body>) -> u64 {
+    fn observe_request(&self, req: &Request<Body>, origin: FlowOrigin) -> u64 {
         let flow_id = self.observer.allocate_flow_id();
         self.observer.observe(FlowEvent::Request {
             flow_id,
@@ -681,6 +704,7 @@ impl ObserveHandler {
             uri: req.uri().to_string(),
             version: format!("{:?}", req.version()),
             headers: headers(req.headers()),
+            origin,
         });
         flow_id
     }
@@ -719,6 +743,11 @@ impl HttpHandler for ObserveHandler {
         mut req: Request<Body>,
     ) -> RequestOrResponse {
         normalize_origin_form(&mut req);
+        // Resend/Fuzz senders route through this same proxy; strip their private
+        // origin marker before the request is recorded or forwarded so the tag
+        // never leaks upstream and never appears in stored traffic. Ordinary
+        // observed traffic carries no marker and tags as `Capture`.
+        let origin = take_origin_marker(&mut req);
         // A CONNECT reaching the MITM request handler over HTTP/2 is an RFC 8441
         // extended-CONNECT (WebSocket-over-h2); ordinary CONNECT tunnels are
         // handled below this layer. Surface the known limitation as a signal.
@@ -726,7 +755,7 @@ impl HttpHandler for ObserveHandler {
             self.observer
                 .observe(FlowEvent::Diagnostic(rfc8441_diagnostic()));
         }
-        let flow_id = self.observe_request(&req);
+        let flow_id = self.observe_request(&req, origin);
         // Record on this per-request handler clone so `handle_response` correlates
         // to exactly this request — never to another concurrent stream on the same
         // connection or another client sharing transport attributes.
@@ -1027,6 +1056,31 @@ mod tests {
         )
         .await??;
         Ok(response)
+    }
+
+    #[test]
+    fn origin_marker_is_read_and_stripped() {
+        use super::{FlowOrigin, ORIGIN_MARKER_HEADER, take_origin_marker};
+        use hudsucker::{Body, hyper::Request};
+
+        // A marked request tags its origin and no longer carries the marker, so it
+        // is neither recorded nor forwarded upstream.
+        let mut marked = Request::builder()
+            .uri("http://api.example.test/items")
+            .header(ORIGIN_MARKER_HEADER, "fuzz")
+            .header("accept", "application/json")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(take_origin_marker(&mut marked), FlowOrigin::Fuzz);
+        assert!(!marked.headers().contains_key(ORIGIN_MARKER_HEADER));
+        assert!(marked.headers().contains_key("accept"));
+
+        // An unmarked request is ordinary observed capture traffic.
+        let mut plain = Request::builder()
+            .uri("http://api.example.test/items")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(take_origin_marker(&mut plain), FlowOrigin::Capture);
     }
 
     #[tokio::test]

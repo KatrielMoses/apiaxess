@@ -28,6 +28,49 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// concurrent writers of the same blob never share (and stomp) a temp path.
 static BLOB_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// How a recorded flow entered the traffic store.
+///
+/// Every flow is written through one path, so the origin is tagged at write
+/// time and used as a read-time filter: the Live traffic list and the fused API
+/// surface show only [`FlowOrigin::Capture`] flows, while tool-synthesized
+/// traffic ([`FlowOrigin::Resend`] / [`FlowOrigin::Fuzz`]) stays recorded but
+/// hidden so the Resend history and Fuzz results views keep working and a future
+/// "show attack traffic" toggle remains possible.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowOrigin {
+    /// Observed proxy traffic — the only origin surfaced by default.
+    #[default]
+    Capture,
+    /// A request replayed by the Resend tool.
+    Resend,
+    /// A request synthesized by the Fuzz tool.
+    Fuzz,
+}
+
+impl FlowOrigin {
+    /// Stable lowercase token used for the durable `origin` column.
+    #[must_use]
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            FlowOrigin::Capture => "capture",
+            FlowOrigin::Resend => "resend",
+            FlowOrigin::Fuzz => "fuzz",
+        }
+    }
+
+    /// Parses a durable `origin` token, defaulting unknown/legacy values to
+    /// [`FlowOrigin::Capture`].
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "resend" => FlowOrigin::Resend,
+            "fuzz" => FlowOrigin::Fuzz,
+            _ => FlowOrigin::Capture,
+        }
+    }
+}
+
 /// One captured flow accepted by the durable store.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +114,9 @@ pub struct FlowCapture {
     pub scope: ScopeDisposition,
     /// Capture provenance.
     pub provenance: String,
+    /// How this flow entered the store (capture vs. Resend/Fuzz-synthesized).
+    #[serde(default)]
+    pub origin: FlowOrigin,
 }
 
 /// Metadata-only flow row for list views.
@@ -115,6 +161,9 @@ pub struct FlowSummary {
     pub scope: ScopeDisposition,
     /// Capture provenance.
     pub provenance: String,
+    /// How this flow entered the store (capture vs. Resend/Fuzz-synthesized).
+    #[serde(default)]
+    pub origin: FlowOrigin,
 }
 
 /// Editable HTTP request held by one resend context or revision.
@@ -213,22 +262,430 @@ pub struct PayloadPosition {
     pub set_index: usize,
 }
 
-/// Named values available to a fuzzer position.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// A payload set: how raw values are produced (`source`), an ordered
+/// per-value processing pipeline (`processors`), and an optional final
+/// URL-encode step (`url_encode_chars`).
+///
+/// Deserialization is backward compatible with the legacy shape
+/// `{ "name": ..., "values": [...] }`, which is mapped to a
+/// [`PayloadSource::SimpleList`] with an empty pipeline so old persisted jobs
+/// still load.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadSet {
     /// Human-readable payload-set label.
     pub name: String,
-    /// Values substituted in attack order.
-    pub values: Vec<String>,
+    /// How raw payload values are produced.
+    pub source: PayloadSource,
+    /// Ordered processing pipeline applied to each raw value before insertion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processors: Vec<PayloadProcessor>,
+    /// Burp-style "URL-encode these characters", applied after all processors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_encode_chars: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PayloadSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A permissive intermediate that accepts both the current shape and the
+        // legacy `{ name, values }` shape. When `source` is absent the legacy
+        // `values` list becomes a `SimpleList`, preserving old persisted jobs.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Compat {
+            name: String,
+            #[serde(default)]
+            source: Option<PayloadSource>,
+            #[serde(default)]
+            processors: Vec<PayloadProcessor>,
+            #[serde(default)]
+            url_encode_chars: Option<String>,
+            #[serde(default)]
+            values: Option<Vec<String>>,
+        }
+        let compat = Compat::deserialize(deserializer)?;
+        let source = compat.source.unwrap_or(PayloadSource::SimpleList {
+            values: compat.values.unwrap_or_default(),
+        });
+        Ok(Self {
+            name: compat.name,
+            source,
+            processors: compat.processors,
+            url_encode_chars: compat.url_encode_chars,
+        })
+    }
+}
+
+/// How a payload set produces its raw values, before processing.
+///
+/// Every variant is designed to be generated lazily so astronomically large
+/// sources (numbers, brute-force, cluster products) never materialize a full
+/// list. Payloads are UTF-8 strings; variants that describe non-UTF-8 bytes
+/// (illegal Unicode, bit flips, block shuffles) emit the standard textual
+/// representation used to deliver those bytes over HTTP (percent-encoding or
+/// ASCII-hex), which is documented on each variant.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PayloadSource {
+    /// A literal, caller-managed list of values.
+    SimpleList {
+        /// Values emitted in order.
+        values: Vec<String>,
+    },
+    /// A file streamed line-by-line at run time; never fully materialized.
+    RuntimeFile {
+        /// Absolute path to the newline-delimited payload file.
+        path: PathBuf,
+    },
+    /// Up to eight ordered slots whose cross-product is joined into one value.
+    CustomIterator {
+        /// Ordered slots; each slot contributes one item per emitted value.
+        slots: Vec<IteratorSlot>,
+    },
+    /// Each base value with every character-substitution rule applied.
+    CharacterSubstitution {
+        /// Base values transformed by the rules.
+        base: Vec<String>,
+        /// Ordered `(from, to)` character replacements applied to each base.
+        rules: Vec<CharacterRule>,
+    },
+    /// Each base value emitted once per selected case transform.
+    CaseModification {
+        /// Base values transformed by the modes.
+        base: Vec<String>,
+        /// Case transforms applied, one emitted value each.
+        modes: Vec<CaseMode>,
+    },
+    /// Payloads seeded from a previous response's extract item (Grep-Extract).
+    ///
+    /// Runs only in sequential mode and requires a configured extract item;
+    /// until that is wired it is validate-rejected rather than silently no-op.
+    RecursiveGrep {
+        /// Initial seed values used before any extract feedback exists.
+        seed: Vec<String>,
+    },
+    /// Illegal / overlong UTF-8 encodings of a target character, spliced into
+    /// each base value and emitted percent-encoded (e.g. `%C0%AE` for `.`).
+    IllegalUnicode {
+        /// Base values the illegal encodings are spliced into.
+        base: Vec<String>,
+        /// Character whose illegal encodings are generated.
+        target: char,
+    },
+    /// A single item repeated in growing blocks from `min` to `max` by `step`.
+    CharacterBlocks {
+        /// The repeated unit.
+        item: String,
+        /// Smallest repeat count (inclusive).
+        min: usize,
+        /// Largest repeat count (inclusive).
+        max: usize,
+        /// Repeat-count increment.
+        step: usize,
+    },
+    /// A numeric range, formatted per radix and digit padding.
+    Numbers {
+        /// Range start (inclusive).
+        from: f64,
+        /// Range end (inclusive).
+        to: f64,
+        /// Step between successive numbers; sign is honored for descending.
+        step: f64,
+        /// Sequential stepping or uniformly random draws within the range.
+        order: NumberOrder,
+        /// Decimal or hexadecimal formatting.
+        radix: NumberRadix,
+        /// Minimum integer digits, left-padded with zeros.
+        min_integer_digits: usize,
+        /// Maximum fractional digits retained.
+        max_fraction_digits: usize,
+    },
+    /// A date range formatted with a `chrono` format string.
+    Dates {
+        /// Range start (inclusive), `YYYY-MM-DD`.
+        from: chrono::NaiveDate,
+        /// Range end (inclusive), `YYYY-MM-DD`.
+        to: chrono::NaiveDate,
+        /// Days between successive dates.
+        step_days: i64,
+        /// `chrono` strftime format string.
+        format: String,
+    },
+    /// Every string over `charset` from `min_len` to `max_len` characters.
+    BruteForcer {
+        /// Alphabet drawn from, one position at a time.
+        charset: String,
+        /// Shortest generated length (inclusive).
+        min_len: usize,
+        /// Longest generated length (inclusive).
+        max_len: usize,
+    },
+    /// Empty payloads, either a fixed count or continuously (capped at run time).
+    NullPayloads {
+        /// How many empty payloads to emit.
+        count: NullCount,
+    },
+    /// Each base value with one character position incremented by one code, one
+    /// emitted value per position.
+    CharacterFrobber {
+        /// Base values frobbed one position at a time.
+        base: Vec<String>,
+    },
+    /// Each base value with a single bit flipped, one emitted value per bit.
+    BitFlipper {
+        /// Base values whose bits are flipped.
+        base: Vec<String>,
+        /// Whether the base is literal text or an ASCII-hex byte string.
+        format: BitFlipFormat,
+    },
+    /// Common username schemes derived from full names or email addresses.
+    UsernameGenerator {
+        /// Full names (`First Last`) or email addresses.
+        names: Vec<String>,
+    },
+    /// Every block-ordering (permutation) of each base value split into fixed
+    /// `block_size` byte blocks; emitted percent-encoded when not valid UTF-8.
+    EcbBlockShuffler {
+        /// Base values split into blocks.
+        base: Vec<String>,
+        /// Block size in bytes.
+        block_size: usize,
+    },
+    /// Mirrors another position's current payload; only meaningful in Pitchfork
+    /// and Cluster bomb, where it is slaved to the referenced position.
+    CopyOtherPayload {
+        /// Index of the position whose current value is mirrored.
+        source_position: usize,
+    },
+}
+
+impl PayloadSet {
+    /// Whether this set is trivially empty — a simple list with no values.
+    /// Generated sources (numbers, brute-force, dates, …) are never trivially
+    /// empty; their emptiness, if any, only becomes known at generation time.
+    #[must_use]
+    pub fn is_trivially_empty(&self) -> bool {
+        matches!(&self.source, PayloadSource::SimpleList { values } if values.is_empty())
+    }
+}
+
+/// One slot of a [`PayloadSource::CustomIterator`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IteratorSlot {
+    /// Items this slot cycles through.
+    pub items: Vec<String>,
+    /// Separator emitted immediately before this slot's item.
+    pub separator: String,
+}
+
+/// One character-substitution rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterRule {
+    /// Character to replace.
+    pub from: char,
+    /// Replacement character.
+    pub to: char,
+}
+
+/// A case transform applied by [`PayloadSource::CaseModification`] and the
+/// [`PayloadProcessor::ModifyCase`] processor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseMode {
+    /// Lowercase every character.
+    Lower,
+    /// Uppercase every character.
+    Upper,
+    /// Uppercase the first character, lowercase the rest (per whitespace word).
+    Propercase,
+    /// Swap the case of every character.
+    Toggle,
+}
+
+/// Stepping order for [`PayloadSource::Numbers`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NumberOrder {
+    /// Deterministic stepped sequence from `from` to `to`.
+    Sequential,
+    /// Uniformly random draws within `[from, to]` (with replacement).
+    Random,
+}
+
+/// Numeric radix for [`PayloadSource::Numbers`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NumberRadix {
+    /// Base-10 formatting, honoring the digit-padding settings.
+    Dec,
+    /// Base-16 formatting of the integer value.
+    Hex,
+}
+
+/// How many empty payloads [`PayloadSource::NullPayloads`] emits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NullCount {
+    /// Exactly this many empty payloads.
+    Fixed(u64),
+    /// Emit continuously; the run loop caps it at `max_results`.
+    Continuous,
+}
+
+/// How [`PayloadSource::BitFlipper`] interprets its base values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitFlipFormat {
+    /// Base is literal text; output is percent-encoded when not valid UTF-8.
+    Literal,
+    /// Base is an ASCII-hex byte string; output is re-encoded as ASCII hex.
+    AsciiHex,
+}
+
+/// One ordered processing step applied to each generated payload before it is
+/// inserted. `apply` returning `None` drops the payload (it is not sent).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PayloadProcessor {
+    /// Prepend a fixed string.
+    AddPrefix {
+        /// Text placed before the value.
+        text: String,
+    },
+    /// Append a fixed string.
+    AddSuffix {
+        /// Text placed after the value.
+        text: String,
+    },
+    /// Replace regex matches with a replacement string.
+    MatchReplace {
+        /// Rust regex pattern.
+        pattern: String,
+        /// Replacement (supports `$1` capture references).
+        replacement: String,
+    },
+    /// Keep a substring starting at `from` for an optional `length`.
+    Substring {
+        /// Start character offset.
+        from: usize,
+        /// Optional length in characters; to the end when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<usize>,
+    },
+    /// Keep a substring counted from the end.
+    ReverseSubstring {
+        /// Offset from the end.
+        from: usize,
+        /// Optional length in characters; to the end when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<usize>,
+    },
+    /// Apply a case transform.
+    ModifyCase {
+        /// Case transform applied.
+        mode: CaseMode,
+    },
+    /// Encode the value with a named scheme.
+    Encode {
+        /// Encoding scheme.
+        scheme: EncodeScheme,
+    },
+    /// Decode the value with a named scheme; drops the payload on failure.
+    Decode {
+        /// Decoding scheme.
+        scheme: DecodeScheme,
+    },
+    /// Hash the value and emit the digest.
+    Hash {
+        /// Digest algorithm.
+        algorithm: HashAlgorithm,
+        /// Digest output encoding.
+        output: HashOutput,
+    },
+    /// Append the pre-processing raw value after the processed value.
+    AddRawPayload,
+    /// Drop the payload when it matches the regex.
+    SkipIfMatchesRegex {
+        /// Rust regex pattern; a match drops the payload.
+        pattern: String,
+    },
+}
+
+/// Encoding scheme for [`PayloadProcessor::Encode`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncodeScheme {
+    /// Percent-encode URL-unsafe characters.
+    Url,
+    /// Percent-encode every character.
+    UrlAll,
+    /// HTML-entity encode the five reserved characters.
+    Html,
+    /// Standard Base64.
+    Base64,
+    /// Lowercase ASCII-hex of the UTF-8 bytes.
+    AsciiHex,
+}
+
+/// Decoding scheme for [`PayloadProcessor::Decode`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeScheme {
+    /// Percent-decode.
+    Url,
+    /// HTML-entity decode.
+    Html,
+    /// Standard Base64 decode.
+    Base64,
+    /// ASCII-hex decode.
+    AsciiHex,
+}
+
+/// Digest algorithm for [`PayloadProcessor::Hash`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashAlgorithm {
+    /// MD5.
+    Md5,
+    /// SHA-1.
+    Sha1,
+    /// SHA-256.
+    Sha256,
+    /// SHA-512.
+    Sha512,
+}
+
+/// Digest output encoding for [`PayloadProcessor::Hash`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashOutput {
+    /// Lowercase hexadecimal.
+    Hex,
+    /// Standard Base64.
+    Base64,
 }
 
 /// Standard payload combination mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzerAttackType {
-    /// Test one marked position at a time.
+    /// Test one marked position at a time with a single payload set.
     Sniper,
+    /// Place each payload from a single set into every marked position at once.
+    BatteringRam,
     /// Cartesian product across payload sets.
     Clusterbomb,
     /// Pair values by ordinal across payload sets.
@@ -322,6 +779,206 @@ pub enum FuzzerJobState {
     Failed,
 }
 
+/// The grep subsystem: additive response inspection that flags and annotates
+/// results without filtering them. Distinct from [`FuzzerMatchFilter`], which is
+/// the keep/display filter — grep only adds columns (match counts, extracts,
+/// reflected counts), it never drops a result.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrepConfig {
+    /// Named match expressions; each yields an occurrence-count column.
+    pub match_rules: Vec<GrepMatchRule>,
+    /// Named extract expressions; each yields an extracted-value column.
+    pub extract_rules: Vec<GrepExtractRule>,
+    /// Reflected-payload detection settings.
+    pub reflected: GrepReflectedConfig,
+}
+
+/// One named grep-match expression counted per response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrepMatchRule {
+    /// Column label.
+    pub name: String,
+    /// Literal string or regex, per `is_regex`.
+    pub pattern: String,
+    /// Whether `pattern` is a regex.
+    pub is_regex: bool,
+    /// Whether matching is case-sensitive.
+    pub case_sensitive: bool,
+    /// Whether to search the body only (excluding response headers).
+    pub exclude_headers: bool,
+}
+
+/// One named grep-extract expression producing a per-result value column.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrepExtractRule {
+    /// Column label.
+    pub name: String,
+    /// How the value is located in the response.
+    pub locator: ExtractLocator,
+    /// Hard cap on the extracted string length.
+    pub max_length: usize,
+    /// Extract only the first occurrence (vs. joining all occurrences).
+    pub first_only: bool,
+}
+
+/// How a [`GrepExtractRule`] locates its value in the response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ExtractLocator {
+    /// The text between a start and end delimiter.
+    BetweenDelimiters {
+        /// Delimiter that precedes the value.
+        start: String,
+        /// Delimiter that follows the value.
+        end: String,
+    },
+    /// A regex capture group (group 0 = whole match).
+    Regex {
+        /// Rust regex pattern.
+        pattern: String,
+        /// Capture-group index to extract.
+        group: usize,
+    },
+    /// A fixed byte offset and length into the response body.
+    Offset {
+        /// Start byte offset into the body.
+        start: usize,
+        /// Number of bytes to take.
+        length: usize,
+    },
+}
+
+/// Reflected-payload detection: counts how often the sent payload appears in the
+/// response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub struct GrepReflectedConfig {
+    /// Whether reflected detection is on.
+    pub enabled: bool,
+    /// Whether reflection matching is case-sensitive.
+    pub case_sensitive: bool,
+    /// Whether to search the body only (excluding response headers).
+    pub exclude_headers: bool,
+    /// Also count the pre-URL-encoded form of the payload.
+    pub match_pre_url_encoded: bool,
+}
+
+/// How the send path follows HTTP redirects during an attack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedirectMode {
+    /// Never follow; the 3xx is the result.
+    Never,
+    /// Follow only when the target host equals the original request host.
+    OnSite,
+    /// Follow only when the target is within the session engagement scope.
+    InScope,
+    /// Follow every redirect, up to `max_hops`.
+    Always,
+}
+
+/// Redirect-following policy for an attack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedirectPolicy {
+    /// When to follow redirects.
+    pub mode: RedirectMode,
+    /// Carry `Set-Cookie` forward across the redirect chain when following.
+    pub process_cookies: bool,
+    /// Maximum redirects to follow before returning the last response.
+    pub max_hops: u8,
+}
+
+impl Default for RedirectPolicy {
+    fn default() -> Self {
+        // Burp-style: do not follow — the 3xx is surfaced as the result (more
+        // honest for a security tool, and lets the all-default status-only sweep
+        // ride the fast ffuf tier). This is a deliberate change from the prior
+        // fuzzer behavior (reqwest silently followed up to 10); operators pick
+        // On-site / In-scope / Always to follow. The manual Resend tool is
+        // unaffected and still follows.
+        Self {
+            mode: RedirectMode::Never,
+            process_cookies: false,
+            max_hops: 10,
+        }
+    }
+}
+
+/// Retry policy for transient transport failures / timeouts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryPolicy {
+    /// Additional attempts after the first failure (0 = no retry).
+    pub max_retries: u32,
+    /// Pause between attempts, in milliseconds.
+    pub pause_ms: u64,
+}
+
+/// Inter-request delay strategy pacing dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DelayPolicy {
+    /// Cap sends per second (0 = unlimited) — the historical control.
+    Fixed {
+        /// Maximum sends per second; zero means unlimited.
+        rate_per_second: u32,
+    },
+    /// A fixed gap between successive requests.
+    Interval {
+        /// Milliseconds between requests.
+        ms: u64,
+    },
+    /// A uniformly random gap in `[min_ms, max_ms]` between requests.
+    Random {
+        /// Minimum gap in milliseconds.
+        min_ms: u64,
+        /// Maximum gap in milliseconds.
+        max_ms: u64,
+    },
+}
+
+impl Default for DelayPolicy {
+    fn default() -> Self {
+        Self::Fixed { rate_per_second: 0 }
+    }
+}
+
+/// One followed redirect hop, recorded on the result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedirectHop {
+    /// The 3xx status that triggered this hop.
+    pub status: u16,
+    /// The resolved absolute target followed to.
+    pub location: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Migrates a persisted delay setting: the new `delay` wins; a legacy
+/// `rate_per_second` (no `delay`) becomes `DelayPolicy::Fixed`; neither present
+/// yields the unlimited default.
+fn migrate_delay(delay: Option<DelayPolicy>, rate_per_second: Option<u32>) -> DelayPolicy {
+    delay.unwrap_or(DelayPolicy::Fixed {
+        rate_per_second: rate_per_second.unwrap_or(0),
+    })
+}
+
 /// Fuzzer attack configuration persisted with a job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -334,12 +991,31 @@ pub struct FuzzerConfig {
     pub payload_sets: Vec<PayloadSet>,
     /// Standard payload combination mode.
     pub attack_type: FuzzerAttackType,
-    /// Optional response match/filter rules.
+    /// Optional response match/filter rules (the keep/display filter).
     pub match_filter: FuzzerMatchFilter,
+    /// Additive grep inspection (match counts, extracts, reflected). Defaults to
+    /// empty so legacy configs load unchanged.
+    #[serde(default)]
+    pub grep: GrepConfig,
     /// Maximum concurrent native requests.
     pub concurrency: usize,
-    /// Maximum sends per second; zero means unlimited.
-    pub rate_per_second: u32,
+    /// Inter-request delay strategy. Defaults to unlimited fixed rate; a legacy
+    /// `ratePerSecond` config is migrated into `Fixed` on load (see the store).
+    #[serde(default)]
+    pub delay: DelayPolicy,
+    /// Per-request retry policy for transient failures/timeouts.
+    #[serde(default)]
+    pub retry: RetryPolicy,
+    /// Redirect-following policy.
+    #[serde(default)]
+    pub redirect: RedirectPolicy,
+    /// Send `Connection: close` on each request.
+    #[serde(default)]
+    pub connection_close: bool,
+    /// Recompute `Content-Length` from the (possibly edited) body. Default true —
+    /// already the effective behavior; exposed as a toggle for parity.
+    #[serde(default = "default_true")]
+    pub update_content_length: bool,
     /// Hard result bound.
     pub max_results: usize,
     /// Optional pre-request authentication.
@@ -389,9 +1065,30 @@ pub struct FuzzerResult {
     pub diff: FuzzerResponseDiff,
     /// Scope classification at send time.
     pub scope: ScopeDisposition,
-    /// Failure diagnostic, if any.
+    /// Failure diagnostic, if any (surfaced as the Error column).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<Diagnostic>,
+    /// Whether the request timed out (distinct from a transport error).
+    #[serde(default)]
+    pub timeout: bool,
+    /// User-editable annotation for the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Occurrence count per `grep.match_rules`, in order.
+    #[serde(default)]
+    pub grep_match_counts: Vec<u32>,
+    /// Extracted value per `grep.extract_rules`, in order.
+    #[serde(default)]
+    pub grep_extracts: Vec<Option<String>>,
+    /// Reflected-payload occurrence count, when reflected detection is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflected_count: Option<u32>,
+    /// Followed redirect hops (empty when none followed or mode is Never).
+    #[serde(default)]
+    pub redirect_chain: Vec<RedirectHop>,
+    /// Number of retries performed before this result (0 = first attempt).
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 /// Durable fuzzer job, configuration, state, and bounded results.
@@ -508,7 +1205,8 @@ impl TrafficStore {
                response_body_hash TEXT,
                scope TEXT NOT NULL,
                provenance TEXT NOT NULL,
-               url TEXT
+               url TEXT,
+               origin TEXT NOT NULL DEFAULT 'capture'
              );
              CREATE INDEX IF NOT EXISTS flows_captured_at ON flows(captured_at);
              CREATE TABLE IF NOT EXISTS resend_contexts (
@@ -537,7 +1235,7 @@ impl TrafficStore {
                     &e.to_string(),
                 )
             })?;
-        ensure_flows_url_column(&connection, &database)?;
+        ensure_flows_columns(&connection, &database)?;
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(|e| {
@@ -654,14 +1352,14 @@ impl TrafficStore {
             )
         })?;
         connection.execute(
-            "INSERT INTO flows (id,captured_at,protocol,method,host,path,status,duration_ms,request_headers,response_headers,request_body_hash,response_body_hash,scope,provenance,url)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-             ON CONFLICT(id) DO UPDATE SET captured_at=excluded.captured_at,protocol=excluded.protocol,method=excluded.method,host=excluded.host,path=excluded.path,status=excluded.status,duration_ms=excluded.duration_ms,request_headers=excluded.request_headers,response_headers=excluded.response_headers,request_body_hash=excluded.request_body_hash,response_body_hash=excluded.response_body_hash,scope=excluded.scope,provenance=excluded.provenance,url=excluded.url",
+            "INSERT INTO flows (id,captured_at,protocol,method,host,path,status,duration_ms,request_headers,response_headers,request_body_hash,response_body_hash,scope,provenance,url,origin)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO UPDATE SET captured_at=excluded.captured_at,protocol=excluded.protocol,method=excluded.method,host=excluded.host,path=excluded.path,status=excluded.status,duration_ms=excluded.duration_ms,request_headers=excluded.request_headers,response_headers=excluded.response_headers,request_body_hash=excluded.request_body_hash,response_body_hash=excluded.response_body_hash,scope=excluded.scope,provenance=excluded.provenance,url=excluded.url,origin=excluded.origin",
             params![
                 i64::try_from(flow.id).unwrap_or(i64::MAX), flow.captured_at.to_rfc3339_opts(SecondsFormat::Nanos, true), flow.protocol,
                 flow.method, flow.host, flow.path, flow.status.map(i64::from),
                 flow.duration_ms.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-                request_headers, response_headers, request_hash, response_hash, scope, flow.provenance, flow.url,
+                request_headers, response_headers, request_hash, response_hash, scope, flow.provenance, flow.url, flow.origin.as_db_str(),
             ],
         ).map_err(|e| storage_diag(catalogue::PROXY_STORE_WRITE_FAILED, "flow", &self.root, &e.to_string()))?;
         Ok(())
@@ -683,7 +1381,7 @@ impl TrafficStore {
             )
         })?;
         let parts = connection.query_row(
-            "SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_headers,response_headers,request_body_hash,response_body_hash,scope,provenance,url FROM flows WHERE id=?1",
+            "SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_headers,response_headers,request_body_hash,response_body_hash,scope,provenance,url,origin FROM flows WHERE id=?1",
             params![i64::try_from(id).unwrap_or(i64::MAX)], row_to_parts,
         ).optional().map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "read", &self.root, &e.to_string()))?;
         drop(connection);
@@ -705,7 +1403,7 @@ impl TrafficStore {
                 "database mutex poisoned",
             )
         })?;
-        let mut statement = connection.prepare("SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_body_hash,response_body_hash,response_headers,scope,provenance,url FROM flows ORDER BY captured_at,id")
+        let mut statement = connection.prepare("SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_body_hash,response_body_hash,response_headers,scope,provenance,url,origin FROM flows ORDER BY captured_at,id")
             .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "query", &self.root, &e.to_string()))?;
         let rows = statement
             .query_map([], |row| {
@@ -741,6 +1439,7 @@ impl TrafficStore {
                     scope: serde_json::from_str(&scope).unwrap_or(ScopeDisposition::Undetermined),
                     provenance: row.get(12)?,
                     url: row.get(13)?,
+                    origin: FlowOrigin::from_db_str(&row.get::<_, String>(14)?),
                 })
             })
             .map_err(|e| {
@@ -946,6 +1645,7 @@ impl TrafficStore {
                 },
                 scope,
                 provenance: provenance.to_owned(),
+                origin: FlowOrigin::Capture,
             };
             self.upsert(&flow)?;
             count += 1;
@@ -1022,6 +1722,33 @@ impl TrafficStore {
                 storage_diag(
                     catalogue::PROXY_RESEND_HISTORY_FAILED,
                     "write",
+                    &self.root,
+                    &e.to_string(),
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Deletes one resend context. Removing an absent id is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the metadata database cannot be written.
+    pub fn remove_resend(&self, id: &str) -> Result<(), Diagnostic> {
+        let connection = self.connection.lock().map_err(|_| {
+            storage_diag(
+                catalogue::PROXY_RESEND_HISTORY_FAILED,
+                "lock",
+                &self.root,
+                "database mutex poisoned",
+            )
+        })?;
+        connection
+            .execute("DELETE FROM resend_contexts WHERE id = ?1", params![id])
+            .map_err(|e| {
+                storage_diag(
+                    catalogue::PROXY_RESEND_HISTORY_FAILED,
+                    "delete",
                     &self.root,
                     &e.to_string(),
                 )
@@ -1142,6 +1869,33 @@ impl TrafficStore {
         Ok(())
     }
 
+    /// Deletes one fuzzer job. Removing an absent id is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the metadata database cannot be written.
+    pub fn remove_fuzzer(&self, id: &str) -> Result<(), Diagnostic> {
+        let connection = self.connection.lock().map_err(|_| {
+            storage_diag(
+                catalogue::PROXY_FUZZER_PERSISTENCE_FAILED,
+                "lock",
+                &self.root,
+                "database mutex poisoned",
+            )
+        })?;
+        connection
+            .execute("DELETE FROM fuzzer_jobs WHERE id = ?1", params![id])
+            .map_err(|e| {
+                storage_diag(
+                    catalogue::PROXY_FUZZER_PERSISTENCE_FAILED,
+                    "delete",
+                    &self.root,
+                    &e.to_string(),
+                )
+            })?;
+        Ok(())
+    }
+
     /// Loads persisted fuzzer jobs ordered by creation time.
     ///
     /// # Errors
@@ -1235,8 +1989,14 @@ impl TrafficStore {
             payload_sets: config.payload_sets.clone(),
             attack_type: config.attack_type,
             match_filter: config.match_filter.clone(),
+            grep: config.grep.clone(),
             concurrency: config.concurrency,
-            rate_per_second: config.rate_per_second,
+            delay: Some(config.delay),
+            rate_per_second: None,
+            retry: config.retry,
+            redirect: config.redirect,
+            connection_close: config.connection_close,
+            update_content_length: config.update_content_length,
             max_results: config.max_results,
             auth_preflight: config
                 .auth_preflight
@@ -1268,8 +2028,15 @@ impl TrafficStore {
             payload_sets: config.payload_sets,
             attack_type: config.attack_type,
             match_filter: config.match_filter,
+            grep: config.grep,
             concurrency: config.concurrency,
-            rate_per_second: config.rate_per_second,
+            // Legacy blobs carry `rate_per_second` but no `delay`; migrate it into
+            // `DelayPolicy::Fixed` so old jobs pace exactly as before.
+            delay: migrate_delay(config.delay, config.rate_per_second),
+            retry: config.retry,
+            redirect: config.redirect,
+            connection_close: config.connection_close,
+            update_content_length: config.update_content_length,
             max_results: config.max_results,
             auth_preflight: config
                 .auth_preflight
@@ -1308,6 +2075,13 @@ impl TrafficStore {
             diff: result.diff.clone(),
             scope: result.scope,
             diagnostic: result.diagnostic.clone(),
+            timeout: result.timeout,
+            comment: result.comment.clone(),
+            grep_match_counts: result.grep_match_counts.clone(),
+            grep_extracts: result.grep_extracts.clone(),
+            reflected_count: result.reflected_count,
+            redirect_chain: result.redirect_chain.clone(),
+            retry_count: result.retry_count,
         })
     }
 
@@ -1335,6 +2109,13 @@ impl TrafficStore {
             diff: result.diff,
             scope: result.scope,
             diagnostic: result.diagnostic,
+            timeout: result.timeout,
+            comment: result.comment,
+            grep_match_counts: result.grep_match_counts,
+            grep_extracts: result.grep_extracts,
+            reflected_count: result.reflected_count,
+            redirect_chain: result.redirect_chain,
+            retry_count: result.retry_count,
         })
     }
 
@@ -1488,6 +2269,7 @@ impl TrafficStore {
             scope: serde_json::from_str(&parts.scope)
                 .map_err(|e| serialization_diag("scope", &e.to_string()))?,
             provenance: parts.provenance,
+            origin: FlowOrigin::from_db_str(&parts.origin),
         })
     }
 
@@ -1535,6 +2317,7 @@ struct StoredParts {
     response_body_hash: Option<String>,
     scope: String,
     provenance: String,
+    origin: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1578,8 +2361,23 @@ struct StoredFuzzerConfig {
     payload_sets: Vec<PayloadSet>,
     attack_type: FuzzerAttackType,
     match_filter: FuzzerMatchFilter,
+    #[serde(default)]
+    grep: GrepConfig,
     concurrency: usize,
-    rate_per_second: u32,
+    /// New delay model; absent in legacy blobs (migrated from `rate_per_second`).
+    #[serde(default)]
+    delay: Option<DelayPolicy>,
+    /// Legacy sends-per-second; migrated into `delay` on load.
+    #[serde(default)]
+    rate_per_second: Option<u32>,
+    #[serde(default)]
+    retry: RetryPolicy,
+    #[serde(default)]
+    redirect: RedirectPolicy,
+    #[serde(default)]
+    connection_close: bool,
+    #[serde(default = "default_true")]
+    update_content_length: bool,
     max_results: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_preflight: Option<StoredResendRequest>,
@@ -1610,6 +2408,20 @@ struct StoredFuzzerResult {
     scope: ScopeDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic: Option<Diagnostic>,
+    #[serde(default)]
+    timeout: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
+    #[serde(default)]
+    grep_match_counts: Vec<u32>,
+    #[serde(default)]
+    grep_extracts: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reflected_count: Option<u32>,
+    #[serde(default)]
+    redirect_chain: Vec<RedirectHop>,
+    #[serde(default)]
+    retry_count: u32,
 }
 
 /// Computes the initial flow-id allocator value: one above the highest persisted
@@ -1630,7 +2442,7 @@ fn seed_next_flow_id(connection: &Connection, database: &Path) -> Result<u64, Di
     Ok(u64::try_from(max_id).unwrap_or(0).saturating_add(1))
 }
 
-fn ensure_flows_url_column(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
+fn ensure_flows_columns(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
     let mut statement = connection
         .prepare("PRAGMA table_info(flows)")
         .map_err(|error| {
@@ -1641,7 +2453,7 @@ fn ensure_flows_url_column(connection: &Connection, database: &Path) -> Result<(
                 &error.to_string(),
             )
         })?;
-    let columns = statement
+    let columns: Vec<String> = statement
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|error| {
             storage_diag(
@@ -1650,11 +2462,29 @@ fn ensure_flows_url_column(connection: &Connection, database: &Path) -> Result<(
                 database,
                 &error.to_string(),
             )
-        })?;
-    let has_url = columns.filter_map(Result::ok).any(|name| name == "url");
-    if !has_url {
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    if !columns.iter().any(|name| name == "url") {
         connection
             .execute("ALTER TABLE flows ADD COLUMN url TEXT", [])
+            .map_err(|error| {
+                storage_diag(
+                    catalogue::PROXY_STORE_OPEN_FAILED,
+                    "schema",
+                    database,
+                    &error.to_string(),
+                )
+            })?;
+    }
+    // Legacy stores predate flow-origin tagging; every existing row is observed
+    // capture traffic, so the added column defaults to `'capture'`.
+    if !columns.iter().any(|name| name == "origin") {
+        connection
+            .execute(
+                "ALTER TABLE flows ADD COLUMN origin TEXT NOT NULL DEFAULT 'capture'",
+                [],
+            )
             .map_err(|error| {
                 storage_diag(
                     catalogue::PROXY_STORE_OPEN_FAILED,
@@ -1689,6 +2519,7 @@ fn row_to_parts(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredParts> {
         response_body_hash: row.get(11)?,
         scope: row.get(12)?,
         provenance: row.get(13)?,
+        origin: row.get(15)?,
     })
 }
 
@@ -1757,6 +2588,9 @@ pub struct CanonicalFlow {
     pub scope: ScopeDisposition,
     /// Provenance.
     pub provenance: String,
+    /// How this flow entered the store (capture vs. Resend/Fuzz-synthesized).
+    #[serde(default)]
+    pub origin: FlowOrigin,
 }
 
 impl CanonicalFlow {
@@ -1779,6 +2613,7 @@ impl CanonicalFlow {
             response_body_sha256: flow.response_body.as_deref().map(digest_hex),
             scope: flow.scope,
             provenance: flow.provenance.clone(),
+            origin: flow.origin,
         }
     }
 
@@ -1799,6 +2634,7 @@ impl CanonicalFlow {
             response_body: decode_snapshot(self.response_body_base64, self.response_body_sha256)?,
             scope: self.scope,
             provenance: self.provenance,
+            origin: self.origin,
         })
     }
 }
@@ -2070,7 +2906,7 @@ fn validate_fuzzer(job: &FuzzerJob) -> Result<(), Diagnostic> {
             .config
             .payload_sets
             .iter()
-            .any(|set| set.values.is_empty())
+            .any(PayloadSet::is_trivially_empty)
         || job.config.positions.is_empty()
         || job.config.max_results == 0
     {
@@ -2193,6 +3029,7 @@ mod tests {
             response_body: Some(br#"{"ok":true}"#.to_vec()),
             scope: ScopeDisposition::InScope,
             provenance: "proxy.hudsucker".to_owned(),
+            origin: FlowOrigin::Capture,
         }
     }
 
@@ -2229,6 +3066,89 @@ mod tests {
             .into_capture()
             .expect("capture");
         assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn flow_origin_persists_through_upsert_get_and_summaries() {
+        let store = store();
+        let mut fuzz = flow(1);
+        fuzz.origin = FlowOrigin::Fuzz;
+        let mut resend = flow(2);
+        resend.origin = FlowOrigin::Resend;
+        let capture = flow(3); // defaults to Capture
+        store.upsert(&fuzz).expect("insert fuzz");
+        store.upsert(&resend).expect("insert resend");
+        store.upsert(&capture).expect("insert capture");
+
+        assert_eq!(
+            store.get(1).expect("read").expect("present").origin,
+            FlowOrigin::Fuzz
+        );
+        assert_eq!(
+            store.get(2).expect("read").expect("present").origin,
+            FlowOrigin::Resend
+        );
+        assert_eq!(
+            store.get(3).expect("read").expect("present").origin,
+            FlowOrigin::Capture
+        );
+
+        let by_id: std::collections::BTreeMap<u64, FlowOrigin> = store
+            .summaries()
+            .expect("summaries")
+            .into_iter()
+            .map(|summary| (summary.id, summary.origin))
+            .collect();
+        assert_eq!(by_id[&1], FlowOrigin::Fuzz);
+        assert_eq!(by_id[&2], FlowOrigin::Resend);
+        assert_eq!(by_id[&3], FlowOrigin::Capture);
+    }
+
+    #[test]
+    fn flow_capture_without_origin_field_deserializes_as_capture() {
+        // Legacy canonical/JSON payloads predate the origin tag; they must load as
+        // observed capture traffic rather than fail to deserialize.
+        let legacy = r#"{
+            "id": 5,
+            "capturedAt": "2026-01-01T00:00:00Z",
+            "protocol": "HTTP/1.1",
+            "requestHeaders": [],
+            "responseHeaders": [],
+            "scope": "in_scope",
+            "provenance": "proxy.hudsucker"
+        }"#;
+        let flow: FlowCapture = serde_json::from_str(legacy).expect("legacy flow loads");
+        assert_eq!(flow.origin, FlowOrigin::Capture);
+    }
+
+    #[test]
+    fn legacy_flows_table_without_origin_column_migrates_to_capture() {
+        // A store created before flow-origin tagging has a `flows` table with no
+        // `origin` column. Opening it must add the column defaulting existing rows
+        // to `'capture'` so legacy traffic reads back as observed capture.
+        let connection = Connection::open_in_memory().expect("memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE flows (
+                   id INTEGER PRIMARY KEY,
+                   captured_at TEXT NOT NULL,
+                   protocol TEXT NOT NULL,
+                   method TEXT, host TEXT, path TEXT, status INTEGER, duration_ms INTEGER,
+                   request_headers TEXT NOT NULL, response_headers TEXT NOT NULL,
+                   request_body_hash TEXT, response_body_hash TEXT,
+                   scope TEXT NOT NULL, provenance TEXT NOT NULL
+                 );
+                 INSERT INTO flows (id,captured_at,protocol,request_headers,response_headers,scope,provenance)
+                 VALUES (1,'2026-01-01T00:00:00Z','HTTP/1.1','[]','[]','\"in_scope\"','proxy.observer');",
+            )
+            .expect("legacy schema");
+
+        ensure_flows_columns(&connection, Path::new("test")).expect("migrate");
+
+        let origin: String = connection
+            .query_row("SELECT origin FROM flows WHERE id=1", [], |row| row.get(0))
+            .expect("origin column present");
+        assert_eq!(FlowOrigin::from_db_str(&origin), FlowOrigin::Capture);
     }
 
     #[test]
@@ -2359,6 +3279,218 @@ mod tests {
     }
 
     #[test]
+    fn legacy_simple_list_payload_set_blob_deserializes_as_simple_list() {
+        // A payload set persisted before the payload engine existed carried a
+        // flat `{ name, values }` shape. It must still load, as a SimpleList
+        // with an empty pipeline, so old jobs survive the upgrade.
+        let legacy = r#"{ "name": "ids", "values": ["1", "2", "3"] }"#;
+        let set: PayloadSet = serde_json::from_str(legacy).expect("legacy set loads");
+        assert_eq!(set.name, "ids");
+        assert!(set.processors.is_empty());
+        assert!(set.url_encode_chars.is_none());
+        match set.source {
+            PayloadSource::SimpleList { values } => {
+                assert_eq!(values, vec!["1", "2", "3"]);
+            }
+            other => panic!("legacy values must map to SimpleList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_set_round_trips_through_serde_with_source_and_processors() {
+        let set = PayloadSet {
+            name: "numbers".to_owned(),
+            source: PayloadSource::Numbers {
+                from: 0.0,
+                to: 10.0,
+                step: 1.0,
+                order: NumberOrder::Sequential,
+                radix: NumberRadix::Dec,
+                min_integer_digits: 2,
+                max_fraction_digits: 0,
+            },
+            processors: vec![
+                PayloadProcessor::AddPrefix {
+                    text: "id-".to_owned(),
+                },
+                PayloadProcessor::Encode {
+                    scheme: EncodeScheme::Base64,
+                },
+            ],
+            url_encode_chars: Some("&=".to_owned()),
+        };
+        let json = serde_json::to_string(&set).expect("serialize");
+        // Struct-variant fields must be camelCase (the API contract), which needs
+        // `rename_all_fields` on the enum — enum `rename_all` alone only renames
+        // variants, leaving multi-word fields snake_case and breaking the GUI.
+        assert!(
+            json.contains("\"minIntegerDigits\""),
+            "multi-word source fields must be camelCase: {json}"
+        );
+        assert!(
+            !json.contains("min_integer_digits"),
+            "no snake_case leak: {json}"
+        );
+        let restored: PayloadSet = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(set, restored);
+        // A camelCase blob from the GUI must deserialize.
+        let from_gui = r#"{"name":"n","source":{"type":"numbers","from":0.0,"to":9.0,"step":1.0,"order":"sequential","radix":"dec","minIntegerDigits":2,"maxFractionDigits":0}}"#;
+        let parsed: PayloadSet = serde_json::from_str(from_gui).expect("camelCase GUI blob loads");
+        assert!(matches!(
+            parsed.source,
+            PayloadSource::Numbers {
+                min_integer_digits: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn grep_config_round_trips_camelcase_on_the_wire() {
+        let grep = GrepConfig {
+            match_rules: vec![GrepMatchRule {
+                name: "err".to_owned(),
+                pattern: "error".to_owned(),
+                is_regex: false,
+                case_sensitive: false,
+                exclude_headers: true,
+            }],
+            extract_rules: vec![GrepExtractRule {
+                name: "csrf".to_owned(),
+                locator: ExtractLocator::BetweenDelimiters {
+                    start: "name=\"csrf\" value=\"".to_owned(),
+                    end: "\"".to_owned(),
+                },
+                max_length: 100,
+                first_only: true,
+            }],
+            reflected: GrepReflectedConfig {
+                enabled: true,
+                case_sensitive: false,
+                exclude_headers: false,
+                match_pre_url_encoded: true,
+            },
+        };
+        let json = serde_json::to_string(&grep).expect("serialize");
+        for expected in [
+            "\"matchRules\"",
+            "\"isRegex\"",
+            "\"excludeHeaders\"",
+            "\"maxLength\"",
+            "\"firstOnly\"",
+            "\"matchPreUrlEncoded\"",
+        ] {
+            assert!(json.contains(expected), "missing {expected} in {json}");
+        }
+        assert_eq!(grep, serde_json::from_str(&json).expect("deserialize"));
+        // ExtractLocator is tag = "type", camelCase, with camelCase fields.
+        let offset = serde_json::to_string(&ExtractLocator::Offset {
+            start: 3,
+            length: 5,
+        })
+        .expect("serialize locator");
+        assert!(offset.contains("\"type\":\"offset\""), "{offset}");
+        let between = serde_json::to_string(&ExtractLocator::BetweenDelimiters {
+            start: "a".to_owned(),
+            end: "b".to_owned(),
+        })
+        .expect("serialize locator");
+        assert!(
+            between.contains("\"type\":\"betweenDelimiters\""),
+            "{between}"
+        );
+    }
+
+    #[test]
+    fn legacy_fuzzer_result_without_grep_fields_deserializes_with_defaults() {
+        // A result persisted before WS3 has none of the grep/timeout/comment
+        // fields. Strip them from a fresh result's JSON and confirm it still
+        // loads with empty/false defaults.
+        let result = FuzzerResult {
+            ordinal: 1,
+            payloads: vec!["a".to_owned()],
+            request: ResendRequest {
+                method: "GET".to_owned(),
+                url: "http://x.test/".to_owned(),
+                headers: Vec::new(),
+                body: None,
+            },
+            response: None,
+            matched: false,
+            filtered: true,
+            diff: FuzzerResponseDiff::default(),
+            scope: ScopeDisposition::InScope,
+            diagnostic: None,
+            timeout: true,
+            comment: Some("x".to_owned()),
+            grep_match_counts: vec![1, 2],
+            grep_extracts: vec![Some("v".to_owned())],
+            reflected_count: Some(3),
+            redirect_chain: Vec::new(),
+            retry_count: 0,
+        };
+        let mut value = serde_json::to_value(&result).expect("to value");
+        let object = value.as_object_mut().expect("object");
+        for key in [
+            "timeout",
+            "comment",
+            "grepMatchCounts",
+            "grepExtracts",
+            "reflectedCount",
+        ] {
+            object.remove(key);
+        }
+        let legacy: FuzzerResult = serde_json::from_value(value).expect("legacy result loads");
+        assert!(!legacy.timeout);
+        assert!(legacy.comment.is_none());
+        assert!(legacy.grep_match_counts.is_empty());
+        assert!(legacy.grep_extracts.is_empty());
+        assert!(legacy.reflected_count.is_none());
+    }
+
+    #[test]
+    fn legacy_rate_per_second_migrates_to_fixed_delay() {
+        // A pre-WS4 config had `rate_per_second` and no `delay`.
+        assert_eq!(
+            migrate_delay(None, Some(25)),
+            DelayPolicy::Fixed {
+                rate_per_second: 25
+            }
+        );
+        // Absent both -> unlimited default.
+        assert_eq!(migrate_delay(None, None), DelayPolicy::default());
+        // An explicit new delay always wins over the legacy field.
+        assert_eq!(
+            migrate_delay(Some(DelayPolicy::Interval { ms: 500 }), Some(25)),
+            DelayPolicy::Interval { ms: 500 }
+        );
+    }
+
+    #[test]
+    fn attack_settings_round_trip_camelcase() {
+        let delay = serde_json::to_string(&DelayPolicy::Random {
+            min_ms: 10,
+            max_ms: 50,
+        })
+        .expect("serialize delay");
+        assert!(delay.contains("\"type\":\"random\""), "{delay}");
+        assert!(delay.contains("\"minMs\""), "{delay}");
+        let redirect =
+            serde_json::to_string(&RedirectPolicy::default()).expect("serialize redirect");
+        assert!(redirect.contains("\"processCookies\""), "{redirect}");
+        assert!(redirect.contains("\"maxHops\""), "{redirect}");
+        let mode = serde_json::to_string(&RedirectMode::OnSite).expect("serialize mode");
+        assert_eq!(mode, "\"on_site\"");
+        let retry = serde_json::to_string(&RetryPolicy {
+            max_retries: 3,
+            pause_ms: 250,
+        })
+        .expect("serialize retry");
+        assert!(retry.contains("\"maxRetries\""), "{retry}");
+        assert!(retry.contains("\"pauseMs\""), "{retry}");
+    }
+
+    #[test]
     fn fuzzer_jobs_round_trip_with_content_addressed_request_and_response_bodies() {
         let store = store();
         let request = ResendRequest {
@@ -2383,12 +3515,21 @@ mod tests {
                 }],
                 payload_sets: vec![PayloadSet {
                     name: "ids".to_owned(),
-                    values: vec!["1".to_owned()],
+                    source: PayloadSource::SimpleList {
+                        values: vec!["1".to_owned()],
+                    },
+                    processors: Vec::new(),
+                    url_encode_chars: None,
                 }],
                 attack_type: FuzzerAttackType::Sniper,
                 match_filter: FuzzerMatchFilter::default(),
+                grep: GrepConfig::default(),
                 concurrency: 1,
-                rate_per_second: 0,
+                delay: DelayPolicy::default(),
+                retry: RetryPolicy::default(),
+                redirect: RedirectPolicy::default(),
+                connection_close: false,
+                update_content_length: true,
                 max_results: 10,
                 auth_preflight: None,
                 sequence: Vec::new(),
@@ -2409,6 +3550,13 @@ mod tests {
                 diff: FuzzerResponseDiff::default(),
                 scope: ScopeDisposition::InScope,
                 diagnostic: None,
+                timeout: false,
+                comment: None,
+                grep_match_counts: Vec::new(),
+                grep_extracts: Vec::new(),
+                reflected_count: None,
+                redirect_chain: Vec::new(),
+                retry_count: 0,
             }],
             diagnostics: Vec::new(),
         };

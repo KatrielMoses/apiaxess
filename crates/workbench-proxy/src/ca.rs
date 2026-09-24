@@ -11,7 +11,6 @@ use std::{
 };
 
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
-use md5::Md5;
 use hudsucker::{
     certificate_authority::CertificateAuthority,
     rcgen::{
@@ -20,6 +19,7 @@ use hudsucker::{
     },
     rustls::{self, ServerConfig, crypto::CryptoProvider, pki_types::CertificateDer},
 };
+use md5::Md5;
 use sha2::{Digest, Sha256};
 
 const ROOT_COMMON_NAME: &str = "APIaxess ephemeral interception CA";

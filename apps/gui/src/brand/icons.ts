@@ -43,6 +43,8 @@ const PATHS = {
   browser:
     '<rect x="3" y="4.5" width="18" height="15" rx="1.75"/><path d="M3 9.25h18"/><path d="M6.5 6.9h.01M9.25 6.9h.01"/>',
   copy: '<rect x="8.5" y="8.5" width="11.75" height="11.75" rx="1.5"/><path d="M15.5 5.75V5.25A1.5 1.5 0 0 0 14 3.75H5.25a1.5 1.5 0 0 0-1.5 1.5V14a1.5 1.5 0 0 0 1.5 1.5h.5"/>',
+  edit: '<path d="M4 20.25h4l10.5-10.5a2.12 2.12 0 1 0-3-3L5 17.25Z"/><path d="m14 6.75 3 3"/>',
+  menu: '<path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/>',
 
   /* States and meaning */
   shield:

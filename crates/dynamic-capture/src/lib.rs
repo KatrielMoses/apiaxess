@@ -21,7 +21,7 @@ use apiaxess_api_model::{
 };
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use apiaxess_session::Session;
-use apiaxess_workbench_store::{FlowCapture, TrafficStore};
+use apiaxess_workbench_store::{FlowCapture, FlowOrigin, TrafficStore};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
@@ -98,6 +98,13 @@ pub fn capture_into_session(
     })?;
     let mut flows = Vec::with_capacity(summaries.len());
     for summary in summaries {
+        // Only observed capture traffic feeds the fused API surface. Resend/Fuzz
+        // requests are replayed through the same proxy and recorded as flows, but
+        // they are tool-synthesized — folding them in would pollute the unified
+        // surface with endpoints that were never actually observed.
+        if summary.origin != FlowOrigin::Capture {
+            continue;
+        }
         match store.get(summary.id) {
             Ok(Some(flow)) => flows.push(flow),
             Ok(None) => {
@@ -1502,6 +1509,7 @@ mod tests {
             response_body: Some(body.to_vec()),
             scope: ScopeDisposition::InScope,
             provenance: "proxy.test".to_owned(),
+            origin: apiaxess_workbench_store::FlowOrigin::Capture,
         }
     }
 

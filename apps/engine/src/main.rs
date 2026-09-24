@@ -1409,8 +1409,9 @@ mod tests {
     use apiaxess_target_apk::ApkIntakeConfig;
     use apiaxess_workbench_proxy::{HudsuckerBackend, ProxyCore, ResendRequest};
     use apiaxess_workbench_store::{
-        FuzzerAttackType, FuzzerConfig, FuzzerJobState, FuzzerMatchFilter,
-        FuzzerPositionLocation, FuzzerSequenceStep, PayloadPosition, PayloadSet, TrafficStore,
+        DelayPolicy, FuzzerAttackType, FuzzerConfig, FuzzerJobState, FuzzerMatchFilter,
+        FuzzerPositionLocation, FuzzerSequenceStep, GrepConfig, PayloadPosition, PayloadSet,
+        PayloadSource, RedirectPolicy, RetryPolicy, TrafficStore,
     };
     use chrono::Utc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1629,12 +1630,21 @@ mod tests {
                 }],
                 payload_sets: vec![PayloadSet {
                     name: "fixture".to_owned(),
-                    values: vec!["one".to_owned()],
+                    source: PayloadSource::SimpleList {
+                        values: vec!["one".to_owned()],
+                    },
+                    processors: Vec::new(),
+                    url_encode_chars: None,
                 }],
                 attack_type: FuzzerAttackType::Sniper,
                 match_filter: FuzzerMatchFilter::default(),
+                grep: GrepConfig::default(),
                 concurrency: 1,
-                rate_per_second: 0,
+                delay: DelayPolicy::default(),
+                retry: RetryPolicy::default(),
+                redirect: RedirectPolicy::default(),
+                connection_close: false,
+                update_content_length: true,
                 max_results: 1,
                 auth_preflight: None,
                 sequence: vec![FuzzerSequenceStep {

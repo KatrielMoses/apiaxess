@@ -414,6 +414,7 @@ mod tests {
             response_body: None,
             scope: ScopeDisposition::InScope,
             provenance: "test".to_owned(),
+            origin: apiaxess_workbench_store::FlowOrigin::Capture,
         }
     }
 

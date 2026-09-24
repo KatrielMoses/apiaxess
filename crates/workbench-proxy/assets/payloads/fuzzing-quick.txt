@@ -1,0 +1,33 @@
+# APIaxess quick fuzzing strings — a small, general-purpose probe set.
+# Lines beginning with '#' and blank lines are ignored on load.
+''
+""
+`
+\
+/
+../
+..\
+%00
+%0a
+%0d
+{{7*7}}
+${7*7}
+${{7*7}}
+<x>
+-1
+0
+2147483648
+-2147483649
+9999999999999999999
+true
+false
+null
+undefined
+NaN
+Infinity
+,
+;
+|
+&
+$(id)
+`id`

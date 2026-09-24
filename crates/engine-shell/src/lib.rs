@@ -53,12 +53,13 @@ use apiaxess_session::{
 };
 use apiaxess_workbench_proxy::{
     BackendHealth, BrowserKind, BrowserTrustController, BrowserTrustStatus, FuzzerWorkbench,
-    LiveWorkbench, ResendSender, ResendWorkbench, SessionCa,
+    LiveWorkbench, OriginTaggingSender, ResendSender, ResendWorkbench, SessionCa,
 };
 use apiaxess_workbench_store::TrafficStore;
 use apiaxess_workbench_store::{
-    FuzzerAttackType, FuzzerConfig, FuzzerMatchFilter, FuzzerPositionLocation,
-    PayloadPosition, PayloadSet, ResendRequest,
+    DelayPolicy, FlowOrigin, FuzzerAttackType, FuzzerConfig, FuzzerMatchFilter,
+    FuzzerPositionLocation, GrepConfig, PayloadPosition, PayloadSet, PayloadSource, RedirectPolicy,
+    ResendRequest, RetryPolicy,
 };
 use serde::Serialize;
 
@@ -684,12 +685,23 @@ impl Engine {
             }],
             payload_sets: vec![PayloadSet {
                 name: wordlist.to_owned(),
-                values,
+                source: PayloadSource::SimpleList { values },
+                processors: Vec::new(),
+                url_encode_chars: None,
             }],
             attack_type: FuzzerAttackType::Sniper,
             match_filter: FuzzerMatchFilter::default(),
+            grep: GrepConfig::default(),
             concurrency: 1,
-            rate_per_second: estimate.rate_per_second,
+            // Discovery paces via a fixed rate and keeps the ffuf-compatible
+            // defaults (no-follow redirects, no retries) so it rides the fast tier.
+            delay: DelayPolicy::Fixed {
+                rate_per_second: estimate.rate_per_second,
+            },
+            retry: RetryPolicy::default(),
+            redirect: RedirectPolicy::default(),
+            connection_close: false,
+            update_content_length: true,
             max_results: estimate.request_count,
             auth_preflight: None,
             sequence: Vec::new(),
@@ -939,9 +951,20 @@ impl Engine {
     }
 
     /// Attaches the running routed proxy as the resend's send transport.
+    ///
+    /// Both tools send through the same proxy, which records every request as a
+    /// flow. Each workbench gets an [`OriginTaggingSender`] so its traffic is
+    /// tagged at the single write choke-point ([`FlowOrigin::Resend`] /
+    /// [`FlowOrigin::Fuzz`]) and thereby excluded from the Live list and the
+    /// fused API surface, while still recorded for the Resend history / Fuzz
+    /// results views.
     pub fn attach_resend_sender(&self, sender: Arc<dyn ResendSender>) {
-        self.resend.attach_sender(Arc::clone(&sender));
-        self.fuzzer.attach_sender(sender);
+        self.resend.attach_sender(Arc::new(OriginTaggingSender::new(
+            Arc::clone(&sender),
+            FlowOrigin::Resend,
+        )));
+        self.fuzzer
+            .attach_sender(Arc::new(OriginTaggingSender::new(sender, FlowOrigin::Fuzz)));
     }
 
     /// Applies the active session's advisory scope to every workbench sender.
@@ -1604,7 +1627,18 @@ impl Engine {
                 "a dedicated browser is already running for this session",
             ));
         }
-        let target = self.web_target_origin()?;
+        // A declared web target is optional: if none is set the browser opens on
+        // the APIaxess capture landing page (a brief in-browser primer) so the
+        // operator can type any URL, and everything they browse is admitted for
+        // capture (not discarded as out-of-scope). With a web session active it
+        // opens on that target and keeps the target scope. The landing page is
+        // written into the disposable profile below, once its path is known.
+        let (mut target, open_landing) = if let Ok(origin) = self.web_target_origin() {
+            (origin, false)
+        } else {
+            self.live_workbench().set_admit_all_observed(true);
+            (String::new(), true)
+        };
         let proxy = self
             .proxy_address
             .read()
@@ -1631,6 +1665,11 @@ impl Engine {
                 false,
             ),
         };
+        // Now that the profile directory exists, materialize the landing page and
+        // point the (otherwise empty) target at it.
+        if open_landing {
+            target = write_capture_landing_page(&profile).unwrap_or_else(|_| "about:blank".to_owned());
+        }
         let binary = match browser {
             BrowserKind::Firefox => {
                 executable.unwrap_or_else(|| default_browser_executable(browser))
@@ -2169,6 +2208,70 @@ fn device_provisioner() -> apiaxess_sandbox::device_provision::DeviceProvisioner
         Arc::new(apiaxess_external_tools::ProcessToolRunner),
         runtime.adb_executable.display().to_string(),
     )
+}
+
+/// The `APIaxess` capture landing page — a brief in-browser primer shown when the
+/// browser is launched without a declared target. Self-contained (inline CSS),
+/// dark-branded, and deliberately short: what this browser is, that its traffic
+/// is captured, and where to view it.
+const CAPTURE_LANDING_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>APIaxess capture browser</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:#0d0d0d;color:#f0f0f0;font:16px/1.6 -apple-system,Segoe UI,Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:32px}
+.card{width:min(640px,100%)}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:24px}
+.brand .mark{color:#2d7ff9;font-size:22px;line-height:1}
+.brand .name{font-weight:700;letter-spacing:.03em;font-size:20px}
+.brand .tag{margin-left:auto;font-size:12px;color:#b0b0b0;border:1px solid #262626;border-radius:4px;padding:3px 8px}
+h1{font-size:26px;margin:0 0 8px}
+.lede{color:#b0b0b0;margin:0 0 28px}
+ol{margin:0;padding:0;list-style:none;counter-reset:step}
+li{position:relative;padding:14px 0 14px 44px;border-top:1px solid #1a1a1a;counter-increment:step}
+li::before{content:counter(step);position:absolute;left:0;top:12px;width:28px;height:28px;border-radius:50%;background:#1a1a1a;color:#2d7ff9;font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center}
+li b{color:#f0f0f0}
+.hint{margin-top:24px;font-size:13px;color:#8a8a8a}
+kbd{background:#1a1a1a;border:1px solid #3d3d3d;border-radius:4px;padding:1px 6px;font-size:12px;font-family:ui-monospace,Consolas,monospace}
+</style></head>
+<body><main class="card">
+<div class="brand"><span class="mark">&#9670;</span><span class="name">APIaxess</span><span class="tag">Capture browser</span></div>
+<h1>You're browsing through APIaxess</h1>
+<p class="lede">Every request this browser makes &mdash; including HTTPS &mdash; is intercepted and recorded for analysis. The blue marker in the corner of every page is how you know a page was opened here.</p>
+<ol>
+<li><b>Browse anything.</b> Type any URL in the address bar above, or paste a link. No target needs to be declared first.</li>
+<li><b>Traffic is captured automatically.</b> Requests flow through the APIaxess proxy and appear as they happen &mdash; nothing else to switch on.</li>
+<li><b>Review it in the app.</b> Switch to APIaxess &rarr; <b>Workbench</b> &rarr; <b>Live&nbsp;traffic</b> to inspect requests and responses.</li>
+<li><b>Act on a request.</b> Right&#8209;click any captured request to <b>Resend</b> or <b>Fuzz</b> it, or add its domain to scope.</li>
+</ol>
+<p class="hint">Tip: this is a disposable session &mdash; profile data is discarded when the browser is stopped. Captured flows stay in your APIaxess session.</p>
+</main></body></html>
+"#;
+
+/// Writes the capture landing page into the disposable profile and returns a
+/// `file://` URL pointing at it.
+fn write_capture_landing_page(profile: &Path) -> std::io::Result<String> {
+    let path = profile.join("apiaxess-welcome.html");
+    fs::write(&path, CAPTURE_LANDING_HTML)?;
+    Ok(file_url(&path))
+}
+
+/// Builds a `file://` URL from an absolute path: forward slashes, and the few
+/// characters that must not appear raw in a URL percent-encoded.
+fn file_url(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::from("file:///");
+    for ch in text.trim_start_matches('/').chars() {
+        match ch {
+            ' ' => encoded.push_str("%20"),
+            '#' => encoded.push_str("%23"),
+            '?' => encoded.push_str("%3F"),
+            '%' => encoded.push_str("%25"),
+            _ => encoded.push(ch),
+        }
+    }
+    encoded
 }
 
 fn disposable_browser_profile() -> Result<PathBuf, apiaxess_diagnostics::Diagnostic> {

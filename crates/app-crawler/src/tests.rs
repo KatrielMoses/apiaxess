@@ -12,7 +12,7 @@ use std::time::Duration;
 use apiaxess_diagnostics::Diagnostic;
 use apiaxess_sandbox::{SandboxCommandOutput, SandboxControl};
 use apiaxess_session::ScopeDisposition;
-use apiaxess_workbench_store::{FlowCapture, FlowRedactor, TrafficStore};
+use apiaxess_workbench_store::{FlowCapture, FlowOrigin, FlowRedactor, TrafficStore};
 use chrono::Utc;
 
 use super::*;
@@ -367,6 +367,7 @@ fn crawls_pre_auth_then_credential_assisted_post_auth() {
         response_body: None,
         scope: ScopeDisposition::InScope,
         provenance: "test".to_owned(),
+        origin: FlowOrigin::Capture,
     };
     redactor.redact(&mut flow);
     let body = String::from_utf8(flow.request_body.clone().unwrap()).unwrap();
@@ -463,6 +464,7 @@ fn injected_credentials_never_reach_the_store_on_disk() {
         response_body: None,
         scope: ScopeDisposition::InScope,
         provenance: "test".to_owned(),
+        origin: FlowOrigin::Capture,
     };
     store.upsert(&flow).expect("upsert");
 

@@ -12,12 +12,79 @@ use apiaxess_session::{
     ScopeDisposition, Session,
 };
 use apiaxess_workbench_store::{
-    ResendContext, ResendRequest, ResendResponse, ResendRevision, TrafficStore,
+    FlowOrigin, RedirectHop, RedirectMode, RedirectPolicy, ResendContext, ResendRequest,
+    ResendResponse, ResendRevision, RetryPolicy, TrafficStore,
 };
 use getrandom::fill;
 use reqwest::header::{HeaderName, HeaderValue};
 
+use crate::backend::ORIGIN_MARKER_HEADER;
 use crate::{FlowDetail, SessionCa};
+
+/// A host-in-scope predicate supplied by the caller (the fuzzer) so the send
+/// path can resolve `RedirectMode::InScope` without owning the engagement scope.
+pub type ScopePredicate = Arc<dyn Fn(&str, Option<u16>) -> bool + Send + Sync>;
+
+/// Per-send attack settings (WS4): redirects, retries, connection handling.
+/// Defaults reproduce the historical behavior (follow up to 10, no retries).
+#[derive(Clone)]
+pub struct SendOptions {
+    /// Redirect-following policy.
+    pub redirect: RedirectPolicy,
+    /// Retry policy for transient failures/timeouts.
+    pub retry: RetryPolicy,
+    /// Whether to send `Connection: close`.
+    pub connection_close: bool,
+    /// Whether to recompute `Content-Length` (drop the template value).
+    pub update_content_length: bool,
+    /// In-scope predicate for `RedirectMode::InScope`; absent = treat as no-follow.
+    pub in_scope: Option<ScopePredicate>,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        Self {
+            redirect: RedirectPolicy::default(),
+            retry: RetryPolicy::default(),
+            connection_close: false,
+            update_content_length: true,
+            in_scope: None,
+        }
+    }
+}
+
+/// The full outcome of a policy-aware send: the final response (or the failure
+/// diagnostic), the followed redirect chain, and how many retries it took.
+pub struct SendOutcome {
+    /// Final response, when a request completed.
+    pub response: Option<ResendResponse>,
+    /// Failure diagnostic, when the final attempt failed.
+    pub diagnostic: Option<Diagnostic>,
+    /// The redirect hops actually followed (empty when none).
+    pub redirect_chain: Vec<RedirectHop>,
+    /// Retries performed before the recorded outcome.
+    pub retry_count: u32,
+}
+
+impl SendOutcome {
+    /// Wraps a plain send result (no redirects/retries) as an outcome.
+    fn plain(result: Result<ResendResponse, Diagnostic>) -> Self {
+        match result {
+            Ok(response) => Self {
+                response: Some(response),
+                diagnostic: None,
+                redirect_chain: Vec::new(),
+                retry_count: 0,
+            },
+            Err(diagnostic) => Self {
+                response: None,
+                diagnostic: Some(diagnostic),
+                redirect_chain: Vec::new(),
+                retry_count: 0,
+            },
+        }
+    }
+}
 
 /// Result returned after a resend send, including any non-fatal warnings.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -40,6 +107,20 @@ pub trait ResendSender: Send + Sync {
         &self,
         request: ResendRequest,
     ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>>;
+
+    /// Sends one request honoring attack settings (redirects, retries,
+    /// connection handling), returning the full outcome. The default ignores the
+    /// options and performs a single plain send, so test doubles need only
+    /// implement [`ResendSender::send`].
+    fn send_with_options(
+        &self,
+        request: ResendRequest,
+        _options: SendOptions,
+    ) -> crate::backend::BackendFuture<Result<SendOutcome, Diagnostic>> {
+        // `send` returns a 'static future; capture it (not `self`) in the block.
+        let future = self.send(request);
+        Box::pin(async move { Ok(SendOutcome::plain(future.await)) })
+    }
 }
 
 /// HTTP client that sends through an already-running `ProxyHandle` listener.
@@ -65,6 +146,160 @@ impl ResendSender for ProxyResendSender {
         let proxy_addr = self.proxy_addr;
         let ca = self.ca.clone();
         Box::pin(async move { send_through_proxy(proxy_addr, ca, request).await })
+    }
+
+    fn send_with_options(
+        &self,
+        request: ResendRequest,
+        options: SendOptions,
+    ) -> crate::backend::BackendFuture<Result<SendOutcome, Diagnostic>> {
+        let proxy_addr = self.proxy_addr;
+        let ca = self.ca.clone();
+        Box::pin(async move { Ok(send_with_policy(proxy_addr, ca, request, &options).await) })
+    }
+}
+
+/// A [`ResendSender`] decorator that stamps every outgoing request with the
+/// origin marker header. Both the Resend and Fuzz tools send through the same
+/// session proxy, which records every request as a flow; the marker lets the
+/// proxy tag the resulting flow's [`FlowOrigin`] (and strip the marker before
+/// forwarding), so tool-synthesized traffic stays out of the Live list and the
+/// fused API surface while remaining recorded for the Resend history / Fuzz
+/// results views. The marker is added only to the request handed to the
+/// transport; callers keep their own un-marked copy for their records.
+#[derive(Clone)]
+pub struct OriginTaggingSender {
+    inner: Arc<dyn ResendSender>,
+    origin: FlowOrigin,
+}
+
+impl OriginTaggingSender {
+    /// Wraps `inner`, stamping every request it sends with `origin`.
+    #[must_use]
+    pub fn new(inner: Arc<dyn ResendSender>, origin: FlowOrigin) -> Self {
+        Self { inner, origin }
+    }
+}
+
+/// Replaces any inherited origin marker with an authoritative single value so a
+/// re-sent (e.g. redirected) request carries exactly one, correct tag.
+fn stamp_origin(mut request: ResendRequest, origin: FlowOrigin) -> ResendRequest {
+    request
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case(ORIGIN_MARKER_HEADER));
+    request.headers.push((
+        ORIGIN_MARKER_HEADER.to_owned(),
+        origin.as_db_str().to_owned(),
+    ));
+    request
+}
+
+impl ResendSender for OriginTaggingSender {
+    fn send(
+        &self,
+        request: ResendRequest,
+    ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>> {
+        self.inner.send(stamp_origin(request, self.origin))
+    }
+
+    fn send_with_options(
+        &self,
+        request: ResendRequest,
+        options: SendOptions,
+    ) -> crate::backend::BackendFuture<Result<SendOutcome, Diagnostic>> {
+        self.inner
+            .send_with_options(stamp_origin(request, self.origin), options)
+    }
+}
+
+/// Sends a request under the attack settings: retry the redirect-following send
+/// up to `max_retries` on transport failure/timeout, pausing between attempts.
+async fn send_with_policy(
+    proxy_addr: std::net::SocketAddr,
+    ca: SessionCa,
+    request: ResendRequest,
+    options: &SendOptions,
+) -> SendOutcome {
+    let mut retry_count = 0;
+    loop {
+        match send_following_redirects(proxy_addr, ca.clone(), request.clone(), options).await {
+            Ok((response, redirect_chain)) => {
+                return SendOutcome {
+                    response: Some(response),
+                    diagnostic: None,
+                    redirect_chain,
+                    retry_count,
+                };
+            }
+            Err(diagnostic) => {
+                if retry_count < options.retry.max_retries {
+                    retry_count += 1;
+                    if options.retry.pause_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            options.retry.pause_ms,
+                        ))
+                        .await;
+                    }
+                    continue;
+                }
+                return SendOutcome {
+                    response: None,
+                    diagnostic: Some(diagnostic),
+                    redirect_chain: Vec::new(),
+                    retry_count,
+                };
+            }
+        }
+    }
+}
+
+/// Sends once and follows redirects per policy, recording each followed hop.
+/// Returns the final (or first non-followed) response plus the followed chain.
+async fn send_following_redirects(
+    proxy_addr: std::net::SocketAddr,
+    ca: SessionCa,
+    request: ResendRequest,
+    options: &SendOptions,
+) -> Result<(ResendResponse, Vec<RedirectHop>), Diagnostic> {
+    let original_host = request_host(&request.url);
+    let mut current = apply_connection_close(request, options.connection_close);
+    let mut chain = Vec::new();
+    let mut hops: u8 = 0;
+    loop {
+        let response = send_raw(
+            proxy_addr,
+            ca.clone(),
+            current.clone(),
+            options.update_content_length,
+        )
+        .await?;
+        if !is_redirect_status(response.status) {
+            return Ok((response, chain));
+        }
+        let Some(location) = response_header(&response, "location") else {
+            return Ok((response, chain));
+        };
+        let target = resolve_redirect_url(&current.url, &location);
+        let follow = should_follow_redirect(
+            options.redirect,
+            &original_host,
+            &target,
+            options.in_scope.as_ref(),
+        );
+        if !follow || hops >= options.redirect.max_hops {
+            return Ok((response, chain));
+        }
+        chain.push(RedirectHop {
+            status: response.status,
+            location: target.clone(),
+        });
+        hops += 1;
+        current = next_redirect_request(
+            &current,
+            &response,
+            &target,
+            options.redirect.process_cookies,
+        );
     }
 }
 
@@ -155,6 +390,21 @@ impl ResendWorkbench {
             .lock()
             .ok()
             .and_then(|contexts| contexts.get(id).cloned())
+    }
+
+    /// Removes one resend context from the queue and the durable store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a history diagnostic when the durable store cannot be written.
+    pub fn remove(&self, id: &str) -> Result<(), Diagnostic> {
+        if let Ok(mut contexts) = self.contexts.lock() {
+            contexts.remove(id);
+        }
+        if let Some(store) = self.store.read().ok().and_then(|store| store.clone()) {
+            store.remove_resend(id)?;
+        }
+        Ok(())
     }
 
     /// Creates a context from a captured request.
@@ -372,28 +622,58 @@ impl ResendWorkbench {
     }
 }
 
+/// The plain resend path: follows redirects with reqwest's default policy and
+/// recomputes Content-Length — the historical behavior, unchanged.
 async fn send_through_proxy(
     proxy_addr: std::net::SocketAddr,
     ca: SessionCa,
     request: ResendRequest,
+) -> Result<ResendResponse, Diagnostic> {
+    send_core(proxy_addr, ca, request, true, true).await
+}
+
+/// One raw request with no client-side redirect following (the Fuzzer follows
+/// manually, per its policy), honoring the Content-Length toggle.
+async fn send_raw(
+    proxy_addr: std::net::SocketAddr,
+    ca: SessionCa,
+    request: ResendRequest,
+    update_content_length: bool,
+) -> Result<ResendResponse, Diagnostic> {
+    send_core(proxy_addr, ca, request, false, update_content_length).await
+}
+
+async fn send_core(
+    proxy_addr: std::net::SocketAddr,
+    ca: SessionCa,
+    request: ResendRequest,
+    follow_redirects: bool,
+    update_content_length: bool,
 ) -> Result<ResendResponse, Diagnostic> {
     validate_request(&request)?;
     let proxy = reqwest::Proxy::all(format!("http://{proxy_addr}"))
         .map_err(|error| request_diagnostic("proxy", &error.to_string()))?;
     let root = reqwest::Certificate::from_pem(ca.root_certificate_pem().as_bytes())
         .map_err(|error| request_diagnostic("ca", &error.to_string()))?;
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .proxy(proxy)
         .add_root_certificate(root)
-        .http2_adaptive_window(true)
+        .http2_adaptive_window(true);
+    if !follow_redirects {
+        client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = client_builder
         .build()
         .map_err(|error| request_diagnostic("client", &error.to_string()))?;
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .map_err(|error| request_diagnostic("method", &error.to_string()))?;
     let mut builder = client.request(method, &request.url);
     for (name, value) in &request.headers {
-        if name.eq_ignore_ascii_case("content-length") && request.body.is_some() {
-            // Body edits must not reuse the captured length; reqwest recalculates it.
+        if name.eq_ignore_ascii_case("content-length")
+            && request.body.is_some()
+            && update_content_length
+        {
+            // Recompute from the (possibly edited) body; drop the template value.
             continue;
         }
         let name = HeaderName::try_from(name)
@@ -405,10 +685,17 @@ async fn send_through_proxy(
     if let Some(body) = request.body {
         builder = builder.body(body);
     }
-    let response = builder
-        .send()
-        .await
-        .map_err(|error| request_diagnostic("send", &error.to_string()))?;
+    let response = builder.send().await.map_err(|error| {
+        let mut diagnostic = request_diagnostic("send", &error.to_string());
+        if error.is_timeout() {
+            // Marked so the Fuzzer can surface a distinct Timeout column rather
+            // than lumping timeouts in with other transport errors.
+            diagnostic
+                .context
+                .insert("timeout".to_owned(), DiagnosticValue::Boolean(true));
+        }
+        diagnostic
+    })?;
     let status = response.status().as_u16();
     let headers = response
         .headers()
@@ -431,6 +718,164 @@ async fn send_through_proxy(
         body,
         duration_ms: 0,
     })
+}
+
+/// Whether a redirect to `target` should be followed under `policy`.
+fn should_follow_redirect(
+    policy: RedirectPolicy,
+    original_host: &str,
+    target: &str,
+    in_scope: Option<&ScopePredicate>,
+) -> bool {
+    match policy.mode {
+        RedirectMode::Never => false,
+        RedirectMode::Always => true,
+        RedirectMode::OnSite => request_host(target) == original_host,
+        RedirectMode::InScope => {
+            let (host, port) = host_and_port(target);
+            in_scope.is_some_and(|predicate| predicate(&host, port))
+        }
+    }
+}
+
+/// Whether a status is a redirect the fuzzer's policy may follow.
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn response_header(response: &ResendResponse, name: &str) -> Option<String> {
+    response
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+fn request_host(url: &str) -> String {
+    url_target(url).map(|(host, _)| host).unwrap_or_default()
+}
+
+fn host_and_port(url: &str) -> (String, Option<u16>) {
+    url_target(url).unwrap_or_default()
+}
+
+/// Sets `Connection: close`, overriding any existing Connection header.
+fn apply_connection_close(mut request: ResendRequest, close: bool) -> ResendRequest {
+    if close {
+        request
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
+        request
+            .headers
+            .push(("Connection".to_owned(), "close".to_owned()));
+    }
+    request
+}
+
+/// Resolves a redirect `Location` (absolute, protocol-relative, root-relative,
+/// or path-relative) against the current request URL.
+fn resolve_redirect_url(base: &str, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return location.to_owned();
+    }
+    let scheme = if base.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    if let Some(rest) = location.strip_prefix("//") {
+        return format!("{scheme}://{rest}");
+    }
+    let authority = base
+        .split_once("://")
+        .map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""));
+    if location.starts_with('/') {
+        return format!("{scheme}://{authority}{location}");
+    }
+    // Path-relative: resolve against the base's directory.
+    let path = base
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map_or(String::from("/"), |(_, path)| format!("/{path}"));
+    let directory = path.rsplit_once('/').map_or("/", |(head, _)| head);
+    format!("{scheme}://{authority}{directory}/{location}")
+}
+
+/// Builds the next request in a redirect chain, honoring HTTP method semantics
+/// (307/308 preserve method+body; 301/302/303 become GET) and, when enabled,
+/// carrying cookies forward.
+fn next_redirect_request(
+    current: &ResendRequest,
+    response: &ResendResponse,
+    target: &str,
+    process_cookies: bool,
+) -> ResendRequest {
+    let keep_method = matches!(response.status, 307 | 308);
+    let method = if keep_method {
+        current.method.clone()
+    } else {
+        "GET".to_owned()
+    };
+    let body = if keep_method {
+        current.body.clone()
+    } else {
+        None
+    };
+    let mut headers: Vec<(String, String)> = current
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case("host")
+                && !name.eq_ignore_ascii_case("content-length")
+                && (keep_method || !name.eq_ignore_ascii_case("content-type"))
+        })
+        .cloned()
+        .collect();
+    if process_cookies {
+        let cookies = merged_cookies(current, response);
+        if !cookies.is_empty() {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+            headers.push(("Cookie".to_owned(), cookies));
+        }
+    }
+    ResendRequest {
+        method,
+        url: target.to_owned(),
+        headers,
+        body,
+    }
+}
+
+/// Merges the current request's cookies with the response's `Set-Cookie`s,
+/// later values overriding earlier ones by name.
+fn merged_cookies(current: &ResendRequest, response: &ResendResponse) -> String {
+    let mut jar: Vec<String> = Vec::new();
+    let mut push_pair = |pair: &str| {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            return;
+        }
+        let name = pair.split('=').next().unwrap_or("");
+        jar.retain(|existing| existing.split('=').next().unwrap_or("") != name);
+        jar.push(pair.to_owned());
+    };
+    if let Some((_, existing)) = current
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+    {
+        for pair in existing.split(';') {
+            push_pair(pair);
+        }
+    }
+    for (name, value) in &response.headers {
+        if name.eq_ignore_ascii_case("set-cookie") {
+            if let Some(pair) = value.split(';').next() {
+                push_pair(pair);
+            }
+        }
+    }
+    jar.join("; ")
 }
 
 fn validate_request(request: &ResendRequest) -> Result<(), Diagnostic> {
@@ -510,10 +955,236 @@ fn transport_unavailable() -> Diagnostic {
 mod tests {
     use super::*;
     use crate::FlowSummary;
+    use apiaxess_workbench_store::RedirectMode;
     use std::{
         env,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn policy(mode: RedirectMode) -> RedirectPolicy {
+        RedirectPolicy {
+            mode,
+            process_cookies: false,
+            max_hops: 10,
+        }
+    }
+
+    #[test]
+    fn redirect_status_recognized() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(is_redirect_status(status), "{status}");
+        }
+        for status in [200, 204, 304, 400, 500] {
+            assert!(!is_redirect_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn resolve_redirect_url_forms() {
+        let base = "https://api.example.test/a/b?x=1";
+        assert_eq!(
+            resolve_redirect_url(base, "https://other.test/z"),
+            "https://other.test/z"
+        );
+        assert_eq!(
+            resolve_redirect_url(base, "//cdn.test/z"),
+            "https://cdn.test/z"
+        );
+        assert_eq!(
+            resolve_redirect_url(base, "/login"),
+            "https://api.example.test/login"
+        );
+        assert_eq!(
+            resolve_redirect_url(base, "next"),
+            "https://api.example.test/a/next"
+        );
+    }
+
+    #[test]
+    fn follow_decision_honors_mode() {
+        let host = "api.example.test";
+        let same = "https://api.example.test/next";
+        let other = "https://evil.test/next";
+        assert!(!should_follow_redirect(
+            policy(RedirectMode::Never),
+            host,
+            same,
+            None
+        ));
+        assert!(should_follow_redirect(
+            policy(RedirectMode::Always),
+            host,
+            other,
+            None
+        ));
+        assert!(should_follow_redirect(
+            policy(RedirectMode::OnSite),
+            host,
+            same,
+            None
+        ));
+        assert!(!should_follow_redirect(
+            policy(RedirectMode::OnSite),
+            host,
+            other,
+            None
+        ));
+        // In-scope uses the caller predicate; absent predicate never follows.
+        assert!(!should_follow_redirect(
+            policy(RedirectMode::InScope),
+            host,
+            same,
+            None
+        ));
+        let in_scope: ScopePredicate = Arc::new(|h: &str, _p| h == "api.example.test");
+        assert!(should_follow_redirect(
+            policy(RedirectMode::InScope),
+            host,
+            same,
+            Some(&in_scope)
+        ));
+        assert!(!should_follow_redirect(
+            policy(RedirectMode::InScope),
+            host,
+            other,
+            Some(&in_scope)
+        ));
+    }
+
+    #[test]
+    fn redirect_request_method_and_body_semantics() {
+        let current = ResendRequest {
+            method: "POST".to_owned(),
+            url: "https://api.example.test/a".to_owned(),
+            headers: vec![
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("Cookie".to_owned(), "s=1".to_owned()),
+            ],
+            body: Some(b"{}".to_vec()),
+        };
+        let response303 = ResendResponse {
+            status: 303,
+            headers: vec![("set-cookie".to_owned(), "s=2; Path=/".to_owned())],
+            body: None,
+            duration_ms: 0,
+        };
+        // 303 -> GET, body dropped, cookies carried and overridden by Set-Cookie.
+        let next =
+            next_redirect_request(&current, &response303, "https://api.example.test/b", true);
+        assert_eq!(next.method, "GET");
+        assert!(next.body.is_none());
+        let cookie = next
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            .map(|(_, value)| value.clone());
+        assert_eq!(cookie.as_deref(), Some("s=2"));
+        // 307 preserves method + body.
+        let response307 = ResendResponse {
+            status: 307,
+            headers: Vec::new(),
+            body: None,
+            duration_ms: 0,
+        };
+        let kept =
+            next_redirect_request(&current, &response307, "https://api.example.test/b", false);
+        assert_eq!(kept.method, "POST");
+        assert_eq!(kept.body.as_deref(), Some(b"{}".as_ref()));
+    }
+
+    #[test]
+    fn connection_close_overrides_existing_header() {
+        let request = ResendRequest {
+            method: "GET".to_owned(),
+            url: "https://api.example.test/".to_owned(),
+            headers: vec![("Connection".to_owned(), "keep-alive".to_owned())],
+            body: None,
+        };
+        let closed = apply_connection_close(request, true);
+        let values: Vec<&str> = closed
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(values, vec!["close"]);
+    }
+
+    #[test]
+    fn stamp_origin_sets_single_authoritative_marker() {
+        // A fresh request gets exactly one marker with the tool's origin value.
+        let stamped = stamp_origin(request(), FlowOrigin::Fuzz);
+        let markers: Vec<&str> = stamped
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(ORIGIN_MARKER_HEADER))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(markers, vec!["fuzz"]);
+
+        // A re-sent request that already carries a (possibly stale) marker ends up
+        // with a single, correct value rather than an accumulating list.
+        let mut inherited = request();
+        inherited
+            .headers
+            .push((ORIGIN_MARKER_HEADER.to_owned(), "capture".to_owned()));
+        let restamped = stamp_origin(inherited, FlowOrigin::Resend);
+        let markers: Vec<&str> = restamped
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(ORIGIN_MARKER_HEADER))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(markers, vec!["resend"]);
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingSender {
+        seen: Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    impl ResendSender for CapturingSender {
+        fn send(
+            &self,
+            request: ResendRequest,
+        ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>> {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(request.headers.clone());
+            }
+            Box::pin(async {
+                Ok(ResendResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: None,
+                    duration_ms: 0,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_tagging_sender_marks_every_send_path() {
+        let inner = Arc::new(CapturingSender::default());
+        let tagging = OriginTaggingSender::new(
+            Arc::clone(&inner) as Arc<dyn ResendSender>,
+            FlowOrigin::Fuzz,
+        );
+        tagging.send(request()).await.expect("send");
+        tagging
+            .send_with_options(request(), SendOptions::default())
+            .await
+            .expect("send_with_options");
+        let seen = inner.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        for headers in seen.iter() {
+            let markers: Vec<&str> = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(ORIGIN_MARKER_HEADER))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(markers, vec!["fuzz"]);
+        }
+    }
 
     #[derive(Debug)]
     struct MockSender;
@@ -603,15 +1274,14 @@ mod tests {
                 duration_ms: Some(3),
                 content_type: None,
                 size: Some(2),
+                origin: FlowOrigin::Capture,
             },
             request_headers: Vec::new(),
             response_headers: Vec::new(),
             request_body: None,
             response_body: None,
         };
-        let context = resend
-            .create_from_flow(&flow)
-            .expect("flow enters resend");
+        let context = resend.create_from_flow(&flow).expect("flow enters resend");
         assert_eq!(
             context.current.url,
             "http://api.example.test:8080/items?id=7"

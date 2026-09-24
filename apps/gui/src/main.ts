@@ -22,6 +22,14 @@ import { initShell } from "./ui/shell";
 import { initTheme } from "./ui/theme";
 import { type CredentialDialogField, choiceDialog, confirmDialog, credentialDialog, promptDialog } from "./ui/overlay";
 import { toast } from "./ui/toast";
+import {
+  FUZZ_MARK,
+  type ParsedTemplate,
+  countTemplatePositions,
+  parseFuzzTemplate,
+  rawRequestText,
+  stripFuzzMarks,
+} from "./fuzz/template";
 
 /* ==================================================================== *
  * Engine contracts. These mirror the local API's response shapes and are
@@ -31,19 +39,64 @@ import { toast } from "./ui/toast";
 interface SystemStatus { readonly apiVersion: string; readonly service: string; readonly state: "ready"; }
 interface WorkbenchSession { readonly authToken: string; readonly interceptEnabled: boolean; }
 interface WorkbenchHealth { readonly proxyRunning: boolean; readonly backend?: { readonly hudsuckerAvailable: boolean }; }
-interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; }
+interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; readonly origin?: string | null; }
 interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; }
-interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
+export interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
 interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; }
 interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: Diagnostic | null; scope: string; }
 interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; }
 interface ResendSendResult { context: ResendContext; revision: ResendRevision; diagnostics: (Diagnostic | null)[]; }
-interface FuzzerResult { ordinal: number; payloads: string[]; response?: { status: number; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: Diagnostic | null; }
-type FuzzerLocation = "url" | "header" | "body";
+interface FuzzerResult { ordinal: number; payloads: string[]; request: ResendRequest; response?: { status: number; headers: readonly [string, string][]; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: Diagnostic | null; timeout?: boolean; comment?: string | null; grepMatchCounts?: number[]; grepExtracts?: (string | null)[]; reflectedCount?: number | null; redirectChain?: RedirectHop[]; retryCount?: number; }
+export type FuzzerLocation = "url" | "header" | "body";
 interface FuzzerPosition { location: FuzzerLocation; headerName?: string | null; start: number; end: number; setIndex: number; }
-interface FuzzerPayloadSet { name: string; values: string[]; }
+type CaseMode = "lower" | "upper" | "propercase" | "toggle";
+interface CharacterRule { from: string; to: string; }
+interface IteratorSlot { items: string[]; separator: string; }
+type NullCount = "continuous" | { fixed: number };
+type PayloadSource =
+  | { type: "simpleList"; values: string[] }
+  | { type: "runtimeFile"; path: string }
+  | { type: "customIterator"; slots: IteratorSlot[] }
+  | { type: "characterSubstitution"; base: string[]; rules: CharacterRule[] }
+  | { type: "caseModification"; base: string[]; modes: CaseMode[] }
+  | { type: "recursiveGrep"; seed: string[] }
+  | { type: "illegalUnicode"; base: string[]; target: string }
+  | { type: "characterBlocks"; item: string; min: number; max: number; step: number }
+  | { type: "numbers"; from: number; to: number; step: number; order: "sequential" | "random"; radix: "dec" | "hex"; minIntegerDigits: number; maxFractionDigits: number }
+  | { type: "dates"; from: string; to: string; stepDays: number; format: string }
+  | { type: "bruteForcer"; charset: string; minLen: number; maxLen: number }
+  | { type: "nullPayloads"; count: NullCount }
+  | { type: "characterFrobber"; base: string[] }
+  | { type: "bitFlipper"; base: string[]; format: "literal" | "asciiHex" }
+  | { type: "usernameGenerator"; names: string[] }
+  | { type: "ecbBlockShuffler"; base: string[]; blockSize: number }
+  | { type: "copyOtherPayload"; sourcePosition: number };
+type PayloadProcessor =
+  | { type: "addPrefix"; text: string }
+  | { type: "addSuffix"; text: string }
+  | { type: "matchReplace"; pattern: string; replacement: string }
+  | { type: "substring"; from: number; length?: number | null }
+  | { type: "reverseSubstring"; from: number; length?: number | null }
+  | { type: "modifyCase"; mode: CaseMode }
+  | { type: "encode"; scheme: "url" | "urlAll" | "html" | "base64" | "asciiHex" }
+  | { type: "decode"; scheme: "url" | "html" | "base64" | "asciiHex" }
+  | { type: "hash"; algorithm: "md5" | "sha1" | "sha256" | "sha512"; output: "hex" | "base64" }
+  | { type: "addRawPayload" }
+  | { type: "skipIfMatchesRegex"; pattern: string };
+interface FuzzerPayloadSet { name: string; source: PayloadSource; processors: PayloadProcessor[]; urlEncodeChars?: string | null; }
+interface PayloadListInfo { id: string; label: string; category: string; count: number; }
 interface FuzzerMatchFilter { statuses: number[]; minSize?: number | null; maxSize?: number | null; contains?: string | null; regex?: string | null; }
-interface FuzzerConfig { baseRequest: ResendRequest; positions: FuzzerPosition[]; payloadSets: FuzzerPayloadSet[]; attackType: string; matchFilter: FuzzerMatchFilter; concurrency: number; ratePerSecond: number; maxResults: number; authPreflight?: ResendRequest | null; sequence?: unknown[]; }
+interface GrepMatchRule { name: string; pattern: string; isRegex: boolean; caseSensitive: boolean; excludeHeaders: boolean; }
+type ExtractLocator = { type: "betweenDelimiters"; start: string; end: string } | { type: "regex"; pattern: string; group: number } | { type: "offset"; start: number; length: number };
+interface GrepExtractRule { name: string; locator: ExtractLocator; maxLength: number; firstOnly: boolean; }
+interface GrepReflectedConfig { enabled: boolean; caseSensitive: boolean; excludeHeaders: boolean; matchPreUrlEncoded: boolean; }
+interface GrepConfig { matchRules: GrepMatchRule[]; extractRules: GrepExtractRule[]; reflected: GrepReflectedConfig; }
+type RedirectMode = "never" | "onSite" | "inScope" | "always";
+interface RedirectPolicy { mode: RedirectMode; processCookies: boolean; maxHops: number; }
+interface RetryPolicy { maxRetries: number; pauseMs: number; }
+type DelayPolicy = { type: "fixed"; ratePerSecond: number } | { type: "interval"; ms: number } | { type: "random"; minMs: number; maxMs: number };
+interface RedirectHop { status: number; location: string; }
+interface FuzzerConfig { baseRequest: ResendRequest; positions: FuzzerPosition[]; payloadSets: FuzzerPayloadSet[]; attackType: string; matchFilter: FuzzerMatchFilter; grep: GrepConfig; concurrency: number; delay: DelayPolicy; retry: RetryPolicy; redirect: RedirectPolicy; connectionClose: boolean; updateContentLength: boolean; maxResults: number; authPreflight?: ResendRequest | null; sequence?: unknown[]; }
 interface FuzzerJob { id: string; tier: "ffuf" | "native"; state: string; config: FuzzerConfig; results: FuzzerResult[]; diagnostics: (Diagnostic | null)[]; }
 interface CredentialPromptMsg { readonly id: number; readonly package: string; readonly screenSummary: string; readonly reason: string; readonly fields: readonly CredentialDialogField[]; }
 interface LiveUpdate { readonly flows: readonly FlowSummary[]; readonly diagnostics: readonly Diagnostic[]; readonly prompts?: readonly CredentialPromptMsg[]; }
@@ -172,6 +225,22 @@ const androidScreen = document.querySelector<HTMLElement>("#android-screen");
 
 const flows = new Map<number, FlowSummary>();
 const pending = new Set<number>();
+
+/**
+ * The Live traffic list shows observed capture traffic only. Resend/Fuzz tools
+ * send through the same session proxy and are recorded as flows (tagged at the
+ * write choke-point), but folding them into the Live list clutters it and their
+ * synthesized requests must never read as observed traffic. Legacy flows with no
+ * origin tag load as capture. `ingestFlow` is the single gate every flow source
+ * passes through, so both the list and the flow-count badge stay capture-only.
+ */
+function isCaptureFlow(flow: FlowSummary): boolean {
+  return flow.origin == null || flow.origin === "capture";
+}
+
+function ingestFlow(flow: FlowSummary): void {
+  if (isCaptureFlow(flow)) flows.set(flow.id, flow);
+}
 const diagnostics = new DiagnosticsLog();
 let selectedFlow: FlowDetail | null = null;
 let control: WebSocket | null = null;
@@ -179,7 +248,22 @@ let telemetry: WebSocket | null = null;
 let reconnectTimer: number | undefined;
 let reconnectDelay = 1000;
 let selectedResend: ResendContext | null = null;
+/** Which sent revision the Response pane is showing; null = the latest. */
+let selectedResendRevision: number | null = null;
 let selectedFuzzer: FuzzerJob | null = null;
+/** The raw request with `§` payload markers, edited while a Fuzz draft is being
+ *  configured. Compiled into base request + positions when the attack starts. */
+let fuzzTemplate = "";
+/** Result-table sort + the ordinal of the row opened in the detail pane. */
+let fuzzResultSort: { key: string; dir: 1 | -1 } = { key: "ordinal", dir: 1 };
+let selectedFuzzResult: number | null = null;
+/** When the current attack started, for the live sent-per-second readout. */
+let fuzzStartedAt = 0;
+/** Post-run display filter over the loaded results (client-side, no re-run). */
+let fuzzDisplayFilter: { search: string; status: string; onlyMatched: boolean } = { search: "", status: "", onlyMatched: false };
+/** Bundled "Add from list" payload lists, fetched once from the engine. */
+let bundledPayloadLists: PayloadListInfo[] = [];
+let bundledListsRequested = false;
 let discoveryJob: FuzzerJob | null = null;
 /** Resend queue (Repeater): every request sent here, newest first. */
 const resendContexts = new Map<string, ResendContext>();
@@ -190,6 +274,11 @@ let activeWorkbenchTab: "live" | "resend" | "fuzz" = "live";
  * send-to-resend/fuzzer actions can resolve a clicked row by index. */
 let lastSurfaceEndpoints: readonly SurfaceEndpoint[] = [];
 let lastDiscoveryEstimate: DiscoveryEstimate | null = null;
+/** The request body the cached estimate was computed for. When it matches the
+ *  current selection we can open the run confirmation instantly instead of
+ *  waiting on a fresh estimate round-trip. */
+let lastDiscoveryEstimateKey: string | null = null;
+let discoveryEstimateDebounce: number | undefined;
 let fuzzerPoll: number | undefined;
 let pipelinePoll: number | undefined;
 let discoveryPoll: number | undefined;
@@ -293,6 +382,19 @@ function statusClass(status: number | null | undefined): string {
   return status === null || status === undefined ? "" : String(Math.floor(status / 100));
 }
 
+/** Percent-decodes a URL or path for readable display in list rows ONLY. The
+ *  stored request/response and every resend/fuzz payload keep their original
+ *  encoding — this is presentation, never data. Malformed encodings fall back
+ *  to the raw string. */
+function decodeForDisplay(value: string): string {
+  if (!value.includes("%")) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function renderFlows(): void {
   if (flowList === null) return;
   if (flows.size === 0) {
@@ -313,7 +415,9 @@ function renderFlows(): void {
     item.type = "button";
     item.style.gridTemplateColumns = "3.5rem minmax(0, 1fr) 3rem";
     const method = (flow.method ?? "").toUpperCase();
-    item.innerHTML = `<span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method === "" ? "—" : method)}</span><span class="list-row__target"><b>${escapeHtml(flow.host ?? "unknown")}</b>${escapeHtml(flow.path ?? "")}</span><span class="list-row__status" data-class="${statusClass(flow.status)}">${flow.status ?? "…"}</span>`;
+    item.dataset.method = method;
+    item.dataset.statusClass = statusClass(flow.status);
+    item.innerHTML = `<span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method === "" ? "—" : method)}</span><span class="list-row__target"><b>${escapeHtml(flow.host ?? "unknown")}</b>${escapeHtml(decodeForDisplay(flow.path ?? ""))}</span><span class="list-row__status" data-class="${statusClass(flow.status)}">${flow.status ?? "…"}</span>`;
     item.addEventListener("click", () => void selectFlow(flow.id));
     item.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -321,6 +425,7 @@ function renderFlows(): void {
     });
     flowList.append(item);
   });
+  applyFlowSearch();
   updateWorkbenchCounts();
 }
 
@@ -396,7 +501,7 @@ function renderQueue(): void {
     const remaining = heldSecondsRemaining(flowId);
     const countdown = remaining === null ? "" : remaining === 0 ? " · forwarding…" : ` · ${remaining}s`;
     const tone = remaining !== null && remaining <= 5 ? "badge--danger" : "badge--caution";
-    item.innerHTML = `<span class="list-row__target"><b>${escapeHtml(method === "" ? "REQUEST" : method)}</b> ${escapeHtml(flow?.host ?? "")}${escapeHtml(flow?.path ?? "")}</span><span class="badge ${tone}">held #${flowId}${countdown}</span>`;
+    item.innerHTML = `<span class="list-row__target"><b>${escapeHtml(method === "" ? "REQUEST" : method)}</b> ${escapeHtml(flow?.host ?? "")}${escapeHtml(decodeForDisplay(flow?.path ?? ""))}</span><span class="badge ${tone}">held #${flowId}${countdown}</span>`;
     item.addEventListener("click", () => void selectFlow(flowId));
     queueList.append(item);
   });
@@ -513,25 +618,39 @@ function revealDrawer(panel: HTMLElement | null): void {
 
 async function openFuzzer(flowId: number): Promise<void> {
   if (selectedFlow === null || selectedFlow.summary.id !== flowId) return;
+  const request: ResendRequest = { method: selectedFlow.summary.method ?? "GET", url: selectedFlow.summary.url ?? "", headers: [...selectedFlow.requestHeaders], body: selectedFlow.requestBody ?? null };
+  seedFuzzDraft(request);
+  renderFuzzList();
+  showWorkbenchTab("fuzz");
+}
+
+/** Seeds a fresh Fuzz draft from a request: an unmarked template plus sane
+ *  defaults. The operator marks positions in the template before starting. */
+function seedFuzzDraft(request: ResendRequest): void {
+  // Drop proxy-injected artifacts so the operator fuzzes the real request.
+  const seeded: ResendRequest = { ...request, headers: stripProxyArtifactHeaders(request.headers) };
   selectedFuzzer = {
-    id: "", tier: "ffuf", state: "draft",
+    id: "", tier: "native", state: "draft",
     config: {
-      baseRequest: { method: selectedFlow.summary.method ?? "GET", url: selectedFlow.summary.url ?? "", headers: [...selectedFlow.requestHeaders], body: selectedFlow.requestBody ?? null },
-      positions: [{ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }],
-      payloadSets: [{ name: "set 1", values: [] }],
+      baseRequest: seeded,
+      positions: [],
+      payloadSets: [newPayloadSet(0)],
       attackType: "sniper",
-      // Real defaults: a bounded status/size/content filter so a "matched" row
-      // means the response actually matched, not merely "a response arrived".
+      // A bounded status/size/content filter, so a "matched" row means the
+      // response actually matched — not merely that a response arrived.
       matchFilter: { statuses: [], minSize: null, maxSize: null, contains: null, regex: null },
+      grep: newGrepConfig(),
       // Sane throughput against a real target: modest parallelism, throttled.
-      concurrency: 5, ratePerSecond: 10, maxResults: 100, authPreflight: null, sequence: [],
+      concurrency: 5, delay: newDelayPolicy(), retry: newRetryPolicy(), redirect: newRedirectPolicy(),
+      connectionClose: false, updateContentLength: true, maxResults: 500, authPreflight: null, sequence: [],
     },
     results: [], diagnostics: [],
   };
+  fuzzTemplate = rawRequestText(seeded);
+  selectedFuzzResult = null;
+  fuzzResultSort = { key: "ordinal", dir: 1 };
   currentFuzzDraft = selectedFuzzer;
   renderFuzzer();
-  renderFuzzList();
-  showWorkbenchTab("fuzz");
 }
 
 /** Config is only editable before the job is created; the backend snapshots it. */
@@ -539,96 +658,555 @@ function fuzzerConfigLocked(): boolean {
   return selectedFuzzer !== null && selectedFuzzer.id !== "";
 }
 
-/** Text of the field a payload position substitutes into, for live preview. */
-function positionFieldText(config: FuzzerConfig, position: FuzzerPosition): string {
-  if (position.location === "url") return config.baseRequest.url;
-  if (position.location === "body") return bytesToText(config.baseRequest.body);
-  const name = (position.headerName ?? "").toLowerCase();
-  return config.baseRequest.headers.find(([header]) => header.toLowerCase() === name)?.[1] ?? "";
+/** Proxy-injected hop-by-hop headers that should never appear in the request the
+ *  operator fuzzes; stripped when seeding a draft from a captured flow. */
+function stripProxyArtifactHeaders(headers: readonly [string, string][]): [string, string][] {
+  const drop = new Set(["proxy-connection", "proxy-authorization", "proxy-authenticate"]);
+  return headers.filter(([name]) => !drop.has(name.toLowerCase())).map(([name, value]) => [name, value]);
 }
 
-/** Snapshots the current form inputs back into the draft config. */
+/** The absolute base URL's scheme, for reconstructing the URL from the raw
+ *  template's request-line path + `Host` header at launch time. */
+function fuzzTemplateScheme(): string {
+  const url = selectedFuzzer?.config.baseRequest.url ?? "";
+  const sep = url.indexOf("://");
+  return sep === -1 ? "http" : url.slice(0, sep);
+}
+
+/** Inserts a `§…§` pair at the caret (Burp "Add §"), or wraps the selection when
+ *  text is selected — so a position can be created where there's no literal text. */
+function markFuzzSelection(): void {
+  const area = fuzzerPanel?.querySelector<HTMLTextAreaElement>("#fuzz-template");
+  if (area === null || area === undefined) return;
+  const start = area.selectionStart;
+  const end = area.selectionEnd;
+  readFuzzerForm();
+  fuzzTemplate = `${fuzzTemplate.slice(0, start)}${FUZZ_MARK}${fuzzTemplate.slice(start, end)}${FUZZ_MARK}${fuzzTemplate.slice(end)}`;
+  renderFuzzer();
+  // Restore the caret between the inserted pair (or after the wrapped value).
+  window.requestAnimationFrame(() => {
+    const next = fuzzerPanel?.querySelector<HTMLTextAreaElement>("#fuzz-template");
+    if (next !== null && next !== undefined) {
+      const caret = start === end ? start + FUZZ_MARK.length : end + FUZZ_MARK.length * 2;
+      next.focus();
+      next.setSelectionRange(caret, caret);
+    }
+  });
+}
+
+/** Auto-marks the obvious injection points: query-string and urlencoded-body
+ *  parameter values. Replaces any existing markers. */
+function autoMarkFuzz(): void {
+  readFuzzerForm();
+  const base = stripFuzzMarks(fuzzTemplate).replace(/\r\n/g, "\n");
+  const markParams = (segment: string): string =>
+    segment.replace(/([?&][^=&\s]+=)([^&#\s]*)/g, (_match, key: string, value: string) => (value === "" ? `${key}` : `${key}${FUZZ_MARK}${value}${FUZZ_MARK}`));
+  const sep = base.indexOf("\n\n");
+  const head = sep === -1 ? base : base.slice(0, sep);
+  const bodyRaw = sep === -1 ? "" : base.slice(sep + 2);
+  const lines = head.split("\n");
+  lines[0] = markParams(lines[0]);
+  const headMarked = lines.join("\n");
+  const bodyMarked = /^[^=\s&]+=/.test(bodyRaw.trim())
+    ? bodyRaw.replace(/([^=&\n]+=)([^&\n]*)/g, (_match, key: string, value: string) => (value === "" ? `${key}` : `${key}${FUZZ_MARK}${value}${FUZZ_MARK}`))
+    : bodyRaw;
+  fuzzTemplate = sep === -1 ? headMarked : `${headMarked}\n\n${bodyMarked}`;
+  if (countTemplatePositions(fuzzTemplate) === 0) toast("No obvious parameters found — select a value and click Add §.", "info");
+  renderFuzzer();
+}
+
+/** Removes payload markers: only those inside the selection when text is
+ *  selected, otherwise all of them (Burp's clear-within-selection). */
+function clearFuzzMarks(): void {
+  const area = fuzzerPanel?.querySelector<HTMLTextAreaElement>("#fuzz-template");
+  const start = area?.selectionStart ?? 0;
+  const end = area?.selectionEnd ?? 0;
+  readFuzzerForm();
+  if (start !== end) {
+    fuzzTemplate = `${fuzzTemplate.slice(0, start)}${stripFuzzMarks(fuzzTemplate.slice(start, end))}${fuzzTemplate.slice(end)}`;
+  } else {
+    fuzzTemplate = stripFuzzMarks(fuzzTemplate);
+  }
+  renderFuzzer();
+}
+
+/** The 17 payload source types, in menu order, with their labels. */
+const PAYLOAD_SOURCE_TYPES: readonly (readonly [string, string])[] = [
+  ["simpleList", "Simple list"],
+  ["runtimeFile", "Runtime file"],
+  ["customIterator", "Custom iterator"],
+  ["characterSubstitution", "Character substitution"],
+  ["caseModification", "Case modification"],
+  ["recursiveGrep", "Recursive grep"],
+  ["illegalUnicode", "Illegal Unicode"],
+  ["characterBlocks", "Character blocks"],
+  ["numbers", "Numbers"],
+  ["dates", "Dates"],
+  ["bruteForcer", "Brute forcer"],
+  ["nullPayloads", "Null payloads"],
+  ["characterFrobber", "Character frobber"],
+  ["bitFlipper", "Bit flipper"],
+  ["usernameGenerator", "Username generator"],
+  ["ecbBlockShuffler", "ECB block shuffler"],
+  ["copyOtherPayload", "Copy other payload"],
+];
+/** The 11 processing steps, in menu order, with their labels. */
+const PAYLOAD_PROCESSOR_TYPES: readonly (readonly [string, string])[] = [
+  ["addPrefix", "Add prefix"],
+  ["addSuffix", "Add suffix"],
+  ["matchReplace", "Match / replace"],
+  ["substring", "Substring"],
+  ["reverseSubstring", "Reverse substring"],
+  ["modifyCase", "Modify case"],
+  ["encode", "Encode"],
+  ["decode", "Decode"],
+  ["hash", "Hash"],
+  ["addRawPayload", "Add raw payload"],
+  ["skipIfMatchesRegex", "Skip if matches regex"],
+];
+const CASE_MODES: readonly (readonly [CaseMode, string])[] = [
+  ["lower", "lower"],
+  ["upper", "UPPER"],
+  ["propercase", "Propercase"],
+  ["toggle", "tOGGLE"],
+];
+
+/** A fresh, empty simple-list payload set. */
+function newPayloadSet(index: number): FuzzerPayloadSet {
+  return { name: `Payload set ${index + 1}`, source: { type: "simpleList", values: [] }, processors: [], urlEncodeChars: null };
+}
+
+/** An empty grep config (no match/extract rules, reflected off). */
+function newGrepConfig(): GrepConfig {
+  return { matchRules: [], extractRules: [], reflected: { enabled: false, caseSensitive: false, excludeHeaders: false, matchPreUrlEncoded: false } };
+}
+function newGrepMatchRule(index: number): GrepMatchRule {
+  return { name: `Match ${index + 1}`, pattern: "", isRegex: false, caseSensitive: false, excludeHeaders: false };
+}
+function newGrepExtractRule(index: number): GrepExtractRule {
+  return { name: `Extract ${index + 1}`, locator: { type: "betweenDelimiters", start: "", end: "" }, maxLength: 100, firstOnly: true };
+}
+function defaultExtractLocator(type: string): ExtractLocator {
+  if (type === "regex") return { type, pattern: "", group: 1 };
+  if (type === "offset") return { type, start: 0, length: 16 };
+  return { type: "betweenDelimiters", start: "", end: "" };
+}
+/** Ensures a job loaded from an older backend has a grep block to edit. */
+function ensureGrep(config: FuzzerConfig): GrepConfig {
+  if (config.grep === undefined || config.grep === null) config.grep = newGrepConfig();
+  return config.grep;
+}
+
+function newRedirectPolicy(): RedirectPolicy { return { mode: "never", processCookies: false, maxHops: 10 }; }
+function newRetryPolicy(): RetryPolicy { return { maxRetries: 0, pauseMs: 0 }; }
+function newDelayPolicy(): DelayPolicy { return { type: "fixed", ratePerSecond: 10 }; }
+/** Ensures a job loaded from an older backend has WS4 attack settings to edit. */
+function ensureAttackSettings(config: FuzzerConfig): void {
+  if (config.delay === undefined || config.delay === null) config.delay = newDelayPolicy();
+  if (config.retry === undefined || config.retry === null) config.retry = newRetryPolicy();
+  if (config.redirect === undefined || config.redirect === null) config.redirect = newRedirectPolicy();
+  if (config.connectionClose === undefined || config.connectionClose === null) config.connectionClose = false;
+  if (config.updateContentLength === undefined || config.updateContentLength === null) config.updateContentLength = true;
+}
+
+/** How many payload sets an attack type needs: one for Sniper/Battering ram,
+ *  one per position for Pitchfork/Cluster bomb. */
+function requiredSetCount(attackType: string, positionCount: number): number {
+  return attackType === "pitchfork" || attackType === "clusterbomb" ? Math.max(1, positionCount) : 1;
+}
+
+/** Grows/shrinks the draft's payload sets to match what the attack type needs. */
+function reconcilePayloadSets(config: FuzzerConfig, attackType: string, positionCount: number): void {
+  const need = requiredSetCount(attackType, positionCount);
+  while (config.payloadSets.length < need) config.payloadSets.push(newPayloadSet(config.payloadSets.length));
+  if (config.payloadSets.length > need) config.payloadSets.length = need;
+}
+
+const COUNT_HUGE = Number.MAX_SAFE_INTEGER;
+function charLen(text: string): number { return [...text].length; }
+function overlongCount(target: string): number {
+  const code = target.codePointAt(0) ?? 0;
+  return (code <= 0x7ff ? 1 : 0) + (code <= 0xffff ? 1 : 0) + 1;
+}
+function numbersCount(from: number, to: number, step: number): number {
+  if (step === 0) return 1;
+  const steps = (to - from) / step;
+  return steps < 0 ? 0 : Math.floor(steps) + 1;
+}
+function datesCount(from: string, to: string, stepDays: number): number {
+  const start = Date.parse(`${from}T00:00:00Z`); const end = Date.parse(`${to}T00:00:00Z`);
+  if (Number.isNaN(start) || Number.isNaN(end)) return 0;
+  const step = stepDays === 0 ? 1 : stepDays;
+  const span = Math.round((end - start) / 86_400_000);
+  if (Math.sign(span) !== Math.sign(step) && span !== 0) return 0;
+  return Math.floor(span / step) + 1;
+}
+function bruteCount(alphabet: number, minLen: number, maxLen: number): number {
+  let total = 0;
+  for (let n = minLen; n <= maxLen; n += 1) {
+    total += n === 0 ? 1 : alphabet ** n;
+    if (!Number.isFinite(total) || total > COUNT_HUGE) return COUNT_HUGE;
+  }
+  return total;
+}
+function factorialCount(n: number): number { let acc = 1; for (let k = 2; k <= n; k += 1) { acc *= k; if (acc > COUNT_HUGE) return COUNT_HUGE; } return acc; }
+/** Client mirror of the Rust `set_cardinality` — the pre-skip value count. */
+function payloadSetCount(set: FuzzerPayloadSet): number {
+  const s = set.source;
+  switch (s.type) {
+    case "simpleList": return s.values.length;
+    case "runtimeFile": return 0; // counted server-side at run (streamed)
+    case "customIterator": return s.slots.reduce((product, slot) => product * slot.items.length, 1);
+    case "characterSubstitution": return s.base.length;
+    case "recursiveGrep": return s.seed.length;
+    case "caseModification": return s.base.length * s.modes.length;
+    case "illegalUnicode": return s.base.length * overlongCount(s.target);
+    case "characterBlocks": { const step = Math.max(1, s.step); return s.min > s.max ? 0 : Math.floor((s.max - s.min) / step) + 1; }
+    case "numbers": return numbersCount(s.from, s.to, s.step);
+    case "dates": return datesCount(s.from, s.to, s.stepDays);
+    case "bruteForcer": return bruteCount(charLen(s.charset), s.minLen, s.maxLen);
+    case "nullPayloads": return s.count === "continuous" ? COUNT_HUGE : s.count.fixed;
+    case "characterFrobber": return s.base.reduce((sum, value) => sum + charLen(value), 0);
+    case "bitFlipper": return s.base.reduce((sum, value) => sum + bitFlipByteLen(value, s.format) * 8, 0);
+    case "usernameGenerator": return s.names.reduce((sum, name) => sum + usernameSchemes(name).length, 0);
+    case "ecbBlockShuffler": { const size = Math.max(1, s.blockSize); return s.base.reduce((sum, value) => sum + factorialCount(Math.ceil(utf8Len(value) / size)), 0); }
+    case "copyOtherPayload": return 0;
+  }
+}
+function utf8Len(text: string): number { return new TextEncoder().encode(text).length; }
+function bitFlipByteLen(value: string, format: "literal" | "asciiHex"): number {
+  if (format === "literal") return utf8Len(value);
+  const hex = value.replace(/\s+/gu, "");
+  return hex.length % 2 === 0 ? hex.length / 2 : 0;
+}
+/** Client mirror of the Rust username scheme generator, for the count preview. */
+function usernameSchemes(name: string): string[] {
+  const local = (name.split("@")[0] ?? name).trim();
+  const parts = local.split(/[\s._]+/u).filter((part) => part !== "").map((part) => part.toLowerCase());
+  const schemes: string[] = [];
+  const push = (candidate: string): void => { if (candidate !== "" && !schemes.includes(candidate)) schemes.push(candidate); };
+  if (parts.length === 1) { push(parts[0]); return schemes; }
+  if (parts.length >= 2) {
+    const first = parts[0]; const last = parts[parts.length - 1];
+    const fi = first.slice(0, 1); const li = last.slice(0, 1);
+    push(first); push(last); push(`${first}${last}`); push(`${first}.${last}`); push(`${first}_${last}`);
+    push(`${fi}${last}`); push(`${fi}.${last}`); push(`${first}${li}`); push(`${last}${first}`); push(`${last}.${first}`);
+  }
+  return schemes;
+}
+/** Whether a set will generate no values (used to guard an empty launch). */
+function payloadSetIsEmpty(set: FuzzerPayloadSet): boolean {
+  const s = set.source;
+  if (s.type === "simpleList") return s.values.length === 0;
+  if (s.type === "customIterator") return s.slots.length === 0 || s.slots.some((slot) => slot.items.length === 0);
+  if (s.type === "characterSubstitution" || s.type === "caseModification" || s.type === "illegalUnicode" || s.type === "characterFrobber" || s.type === "bitFlipper" || s.type === "ecbBlockShuffler") return s.base.length === 0;
+  if (s.type === "recursiveGrep") return s.seed.length === 0;
+  if (s.type === "usernameGenerator") return s.names.length === 0;
+  if (s.type === "characterBlocks") return s.item === "" && false;
+  return false; // generated sources (numbers, dates, brute, null, file, copy) are not "empty"
+}
+/** The pre-run request estimate mirroring the Rust `expected_request_count`. */
+function estimateRequestCount(attackType: string, positionCount: number, sets: readonly FuzzerPayloadSet[]): number {
+  if (positionCount === 0) return 0;
+  const counts = sets.map(payloadSetCount);
+  if (attackType === "battering_ram") return counts[0] ?? 0;
+  if (attackType === "pitchfork") { const active = counts.slice(0, positionCount); return active.length === 0 ? 0 : Math.min(...active); }
+  if (attackType === "clusterbomb") { return counts.slice(0, positionCount).reduce((product, size) => Math.min(COUNT_HUGE, product * size), 1); }
+  return positionCount * (counts[0] ?? 0); // sniper: one set, per position
+}
+
+/** Human-readable request-count preview text, capping enormous estimates. */
+function fuzzPreviewText(positionCount: number, expected: number): string {
+  const count = expected >= COUNT_HUGE ? "a very large number of" : expected.toLocaleString();
+  const suffix = expected >= COUNT_HUGE ? " (capped at max results)" : "";
+  return `${positionCount} position${positionCount === 1 ? "" : "s"} · will send ${count} request${expected === 1 ? "" : "s"}${suffix}`;
+}
+
+/** Splits a textarea's lines into trimmed, non-empty values (drops '#' comments). */
+function readLines(text: string): string[] {
+  return text.split("\n").map((value) => value.trim()).filter((value) => value !== "" && !value.startsWith("#"));
+}
+/** Reads a numeric input value with a fallback. */
+function readNum(selector: string, fallback: number): number {
+  const raw = Number(fuzzerPanel?.querySelector<HTMLInputElement>(selector)?.value);
+  return Number.isFinite(raw) ? raw : fallback;
+}
+function readStr(selector: string): string {
+  return fuzzerPanel?.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(selector)?.value ?? "";
+}
+
+/** Reconstructs one payload set's source from its rendered inputs. */
+function readPayloadSource(index: number): PayloadSource {
+  const type = readStr(`[data-source-type="${index}"]`) || "simpleList";
+  const list = (field: string): string[] => readLines(readStr(`[data-src-list="${index}:${field}"]`));
+  switch (type) {
+    case "runtimeFile": return { type, path: readStr(`[data-src="${index}:path"]`).trim() };
+    case "customIterator": {
+      const slots: IteratorSlot[] = [];
+      fuzzerPanel?.querySelectorAll<HTMLTextAreaElement>(`[data-slot-items^="${index}:"]`).forEach((area) => {
+        const slot = Number(area.dataset.slotItems?.split(":")[1]);
+        slots[slot] = { items: readLines(area.value), separator: readStr(`[data-slot-sep="${index}:${slot}"]`) };
+      });
+      return { type, slots: slots.filter((slot) => slot !== undefined) };
+    }
+    case "characterSubstitution": {
+      const rules: CharacterRule[] = readStr(`[data-src="${index}:rules"]`).split("\n")
+        .map((line) => line.trim()).filter((line) => line.includes(">"))
+        .map((line) => { const [from, to] = line.split(">"); return { from: [...(from ?? "")][0] ?? "", to: [...(to ?? "")][0] ?? "" }; })
+        .filter((rule) => rule.from !== "");
+      return { type, base: list("base"), rules };
+    }
+    case "caseModification": {
+      const modes = CASE_MODES.map(([mode]) => mode).filter((mode) => (fuzzerPanel?.querySelector<HTMLInputElement>(`[data-mode="${index}:${mode}"]`)?.checked ?? false));
+      return { type, base: list("base"), modes: modes.length === 0 ? ["lower"] : modes };
+    }
+    case "recursiveGrep": return { type, seed: list("seed") };
+    case "illegalUnicode": return { type, base: list("base"), target: [...readStr(`[data-src="${index}:target"]`)][0] ?? "." };
+    case "characterBlocks": return { type, item: readStr(`[data-src="${index}:item"]`), min: Math.max(0, Math.floor(readNum(`[data-src="${index}:min"]`, 1))), max: Math.max(0, Math.floor(readNum(`[data-src="${index}:max"]`, 8))), step: Math.max(1, Math.floor(readNum(`[data-src="${index}:step"]`, 1))) };
+    case "numbers": return { type, from: readNum(`[data-src="${index}:from"]`, 0), to: readNum(`[data-src="${index}:to"]`, 100), step: readNum(`[data-src="${index}:step"]`, 1) || 1, order: (readStr(`[data-src="${index}:order"]`) as "sequential" | "random") || "sequential", radix: (readStr(`[data-src="${index}:radix"]`) as "dec" | "hex") || "dec", minIntegerDigits: Math.max(1, Math.floor(readNum(`[data-src="${index}:minIntegerDigits"]`, 1))), maxFractionDigits: Math.max(0, Math.floor(readNum(`[data-src="${index}:maxFractionDigits"]`, 0))) };
+    case "dates": return { type, from: readStr(`[data-src="${index}:from"]`) || "2020-01-01", to: readStr(`[data-src="${index}:to"]`) || "2020-12-31", stepDays: Math.floor(readNum(`[data-src="${index}:stepDays"]`, 1)) || 1, format: readStr(`[data-src="${index}:format"]`) || "%Y-%m-%d" };
+    case "bruteForcer": return { type, charset: readStr(`[data-src="${index}:charset"]`) || "abc", minLen: Math.max(0, Math.floor(readNum(`[data-src="${index}:minLen"]`, 1))), maxLen: Math.max(0, Math.floor(readNum(`[data-src="${index}:maxLen"]`, 3))) };
+    case "nullPayloads": { const mode = readStr(`[data-src="${index}:mode"]`); return { type, count: mode === "continuous" ? "continuous" : { fixed: Math.max(1, Math.floor(readNum(`[data-src="${index}:fixed"]`, 10))) } }; }
+    case "characterFrobber": return { type, base: list("base") };
+    case "bitFlipper": return { type, base: list("base"), format: (readStr(`[data-src="${index}:format"]`) as "literal" | "asciiHex") || "literal" };
+    case "usernameGenerator": return { type, names: list("names") };
+    case "ecbBlockShuffler": return { type, base: list("base"), blockSize: Math.max(1, Math.floor(readNum(`[data-src="${index}:blockSize"]`, 16))) };
+    case "copyOtherPayload": return { type, sourcePosition: Math.max(0, Math.floor(readNum(`[data-src="${index}:sourcePosition"]`, 0))) };
+    default: return { type: "simpleList", values: list("values") };
+  }
+}
+
+/** Reconstructs one payload set's ordered processing pipeline from its inputs. */
+function readProcessors(index: number): PayloadProcessor[] {
+  const found = fuzzerPanel?.querySelectorAll<HTMLElement>(`[data-proc-row="${index}"]`);
+  const rows = found === undefined ? [] : Array.from(found);
+  return rows.map((row) => {
+    const type = row.querySelector<HTMLSelectElement>("[data-proc-type]")?.value ?? "addPrefix";
+    const field = (name: string): string => row.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-proc-field="${name}"]`)?.value ?? "";
+    switch (type) {
+      case "addSuffix": return { type, text: field("text") };
+      case "matchReplace": return { type, pattern: field("pattern"), replacement: field("replacement") };
+      case "substring": { const length = field("length").trim(); return { type, from: Math.max(0, Math.floor(Number(field("from")) || 0)), length: length === "" ? null : Math.max(0, Math.floor(Number(length))) }; }
+      case "reverseSubstring": { const length = field("length").trim(); return { type, from: Math.max(0, Math.floor(Number(field("from")) || 0)), length: length === "" ? null : Math.max(0, Math.floor(Number(length))) }; }
+      case "modifyCase": return { type, mode: (field("mode") as CaseMode) || "lower" };
+      case "encode": return { type, scheme: (field("scheme") as "url" | "urlAll" | "html" | "base64" | "asciiHex") || "url" };
+      case "decode": return { type, scheme: (field("scheme") as "url" | "html" | "base64" | "asciiHex") || "url" };
+      case "hash": return { type, algorithm: (field("algorithm") as "md5" | "sha1" | "sha256" | "sha512") || "sha256", output: (field("output") as "hex" | "base64") || "hex" };
+      case "addRawPayload": return { type };
+      case "skipIfMatchesRegex": return { type, pattern: field("pattern") };
+      default: return { type: "addPrefix", text: field("text") };
+    }
+  });
+}
+
+/** Snapshots the current draft form (template, attack type, payload sources +
+ *  pipelines, filter, throughput) back into the config. Positions are compiled
+ *  from the template only when the attack starts. */
 function readFuzzerForm(): void {
   if (selectedFuzzer === null || fuzzerConfigLocked() || fuzzerPanel === null) return;
   const config = selectedFuzzer.config;
-
-  const sets: FuzzerPayloadSet[] = [];
-  fuzzerPanel.querySelectorAll<HTMLElement>("[data-set-row]").forEach((row) => {
-    const j = row.dataset.setRow ?? "0";
-    const name = valueOfFuzzer(`#set-name-${j}`).trim() || `set ${Number(j) + 1}`;
-    const values = valueOfFuzzer(`#set-values-${j}`).split("\n").map((value) => value.trim()).filter(Boolean);
-    sets.push({ name, values });
-  });
-  if (sets.length > 0) config.payloadSets = sets;
-
-  const positions: FuzzerPosition[] = [];
-  fuzzerPanel.querySelectorAll<HTMLElement>("[data-position-row]").forEach((row) => {
-    const i = row.dataset.positionRow ?? "0";
-    const location = (valueOfFuzzer(`#pos-location-${i}`) || "url") as FuzzerLocation;
-    const headerName = location === "header" ? (valueOfFuzzer(`#pos-header-${i}`).trim() || null) : null;
-    const start = Math.max(0, Math.floor(Number(valueOfFuzzer(`#pos-start-${i}`)) || 0));
-    const end = Math.max(start, Math.floor(Number(valueOfFuzzer(`#pos-end-${i}`)) || 0));
-    let setIndex = Math.floor(Number(valueOfFuzzer(`#pos-set-${i}`)) || 0);
-    if (setIndex >= config.payloadSets.length) setIndex = Math.max(0, config.payloadSets.length - 1);
-    positions.push({ location, headerName, start, end, setIndex });
-  });
-  if (positions.length > 0) config.positions = positions;
-
+  const templateArea = fuzzerPanel.querySelector<HTMLTextAreaElement>("#fuzz-template");
+  if (templateArea !== null) fuzzTemplate = templateArea.value;
   config.attackType = valueOfFuzzer("#fuzzer-type") || "sniper";
+  reconcilePayloadSets(config, config.attackType, countTemplatePositions(fuzzTemplate));
+  config.payloadSets.forEach((set, index) => {
+    set.source = readPayloadSource(index);
+    set.processors = readProcessors(index);
+    const urlEncode = readStr(`[data-url-encode="${index}"]`);
+    set.urlEncodeChars = urlEncode === "" ? null : urlEncode;
+  });
   config.maxResults = Math.max(1, Math.floor(Number(valueOfFuzzer("#fuzzer-max")) || 100));
   config.concurrency = Math.max(1, Math.floor(Number(valueOfFuzzer("#fuzzer-concurrency")) || 1));
-  config.ratePerSecond = Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-rate")) || 0));
-
+  config.delay = readDelayPolicy();
+  config.retry = {
+    maxRetries: Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-retries")) || 0)),
+    pauseMs: Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-retry-pause")) || 0)),
+  };
+  config.redirect = {
+    mode: (valueOfFuzzer("#fuzzer-redirect-mode") as RedirectMode) || "never",
+    processCookies: (fuzzerPanel?.querySelector<HTMLInputElement>("#fuzzer-redirect-cookies")?.checked ?? false),
+    maxHops: Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-redirect-hops")) || 10)),
+  };
+  config.connectionClose = fuzzerPanel?.querySelector<HTMLInputElement>("#fuzzer-connection-close")?.checked ?? false;
+  config.updateContentLength = fuzzerPanel?.querySelector<HTMLInputElement>("#fuzzer-update-cl")?.checked ?? true;
   const statuses = valueOfFuzzer("#match-statuses").split(",").map((value) => Number(value.trim())).filter((value) => Number.isFinite(value) && value > 0);
   const parseSize = (raw: string): number | null => { const trimmed = raw.trim(); if (trimmed === "") return null; const n = Number(trimmed); return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null; };
   const contains = valueOfFuzzer("#match-contains");
   const regex = valueOfFuzzer("#match-regex").trim();
   config.matchFilter = { statuses, minSize: parseSize(valueOfFuzzer("#match-min")), maxSize: parseSize(valueOfFuzzer("#match-max")), contains: contains === "" ? null : contains, regex: regex === "" ? null : regex };
-
-  const seqRaw = valueOfFuzzer("#fuzzer-sequence").trim();
-  if (seqRaw === "") { config.sequence = []; }
-  else { try { const parsed: unknown = JSON.parse(seqRaw); if (Array.isArray(parsed)) config.sequence = parsed; } catch { /* validated on launch */ } }
+  config.grep = readGrepConfig();
+  config.sequence = [];
 }
 
-function addFuzzerPosition(): void { if (selectedFuzzer === null) return; readFuzzerForm(); selectedFuzzer.config.positions.push({ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }); renderFuzzer(); }
-function removeFuzzerPosition(index: number): void { if (selectedFuzzer === null) return; readFuzzerForm(); selectedFuzzer.config.positions.splice(index, 1); if (selectedFuzzer.config.positions.length === 0) selectedFuzzer.config.positions.push({ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }); renderFuzzer(); }
-function addFuzzerSet(): void { if (selectedFuzzer === null) return; readFuzzerForm(); selectedFuzzer.config.payloadSets.push({ name: `set ${selectedFuzzer.config.payloadSets.length + 1}`, values: [] }); renderFuzzer(); }
-function removeFuzzerSet(index: number): void { if (selectedFuzzer === null) return; readFuzzerForm(); const config = selectedFuzzer.config; config.payloadSets.splice(index, 1); if (config.payloadSets.length === 0) config.payloadSets.push({ name: "set 1", values: [] }); config.positions.forEach((position) => { if (position.setIndex >= config.payloadSets.length) position.setIndex = config.payloadSets.length - 1; }); renderFuzzer(); }
-
-function renderFuzzerPositionRow(config: FuzzerConfig, position: FuzzerPosition, index: number, locked: boolean): string {
-  const disabled = locked ? "disabled" : "";
-  const opt = (value: string, label: string, selected: boolean): string => `<option value="${value}"${selected ? " selected" : ""}>${label}</option>`;
-  const setOptions = config.payloadSets.map((set, j) => opt(String(j), escapeHtml(`${j + 1} · ${set.name}`), j === position.setIndex)).join("");
-  const preview = position.end > position.start ? positionFieldText(config, position).slice(position.start, position.end) : "";
-  const previewHtml = position.end > position.start
-    ? `replaces <code class="t-mono">${escapeHtml(preview === "" ? "(range is outside the field)" : preview)}</code>`
-    : `<span class="t-subtle">set Start/End to mark the bytes to replace</span>`;
-  return `<div class="stack stack--tight" data-position-row="${index}" style="border:1px solid var(--border);border-radius:var(--radius-2);padding:var(--space-3)">
-  <div class="split-4">
-    <div class="field"><label class="field__label" for="pos-location-${index}">Location</label><select class="select" id="pos-location-${index}" ${disabled}>${opt("url", "URL", position.location === "url")}${opt("header", "Header", position.location === "header")}${opt("body", "Body", position.location === "body")}</select></div>
-    <div class="field"${position.location === "header" ? "" : ' hidden'} data-pos-header><label class="field__label" for="pos-header-${index}">Header name</label><input class="input input--mono" id="pos-header-${index}" type="text" value="${escapeHtml(position.headerName ?? "")}" ${disabled} /></div>
-    <div class="field"><label class="field__label" for="pos-start-${index}">Start</label><input class="input input--mono" id="pos-start-${index}" type="number" min="0" value="${position.start}" ${disabled} /></div>
-    <div class="field"><label class="field__label" for="pos-end-${index}">End</label><input class="input input--mono" id="pos-end-${index}" type="number" min="0" value="${position.end}" ${disabled} /></div>
-  </div>
-  <div class="row">
-    <div class="field"><label class="field__label" for="pos-set-${index}">Payload set</label><select class="select" id="pos-set-${index}" ${disabled}>${setOptions}</select></div>
-    <span class="spacer"></span>
-    ${locked ? "" : `<button class="btn btn--sm btn--quiet" type="button" data-remove-pos="${index}">${icon("close", { size: 12 })}<span>Remove position</span></button>`}
-  </div>
-  <p class="field__hint">${previewHtml}</p>
-</div>`;
+/** Reconstructs the delay policy from the attack-settings inputs. */
+function readDelayPolicy(): DelayPolicy {
+  const mode = valueOfFuzzer("#fuzzer-delay-mode") || "fixed";
+  if (mode === "interval") return { type: "interval", ms: Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-delay-ms")) || 0)) };
+  if (mode === "random") return { type: "random", minMs: Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-delay-min")) || 0)), maxMs: Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-delay-max")) || 0)) };
+  return { type: "fixed", ratePerSecond: Math.max(0, Math.floor(Number(valueOfFuzzer("#fuzzer-rate")) || 0)) };
 }
 
-function renderFuzzerSetRow(set: FuzzerPayloadSet, index: number, locked: boolean): string {
-  const disabled = locked ? "disabled" : "";
-  return `<div class="stack stack--tight" data-set-row="${index}">
-  <div class="row">
-    <div class="field field--inline"><label class="field__label" for="set-name-${index}">Set ${index + 1}</label><input class="input input--mono" id="set-name-${index}" type="text" value="${escapeHtml(set.name)}" ${disabled} /></div>
-    <span class="spacer"></span>
-    ${locked ? "" : `<button class="btn btn--sm btn--quiet" type="button" data-remove-set="${index}">${icon("close", { size: 12 })}<span>Remove set</span></button>`}
-  </div>
-  <textarea class="textarea" id="set-values-${index}" spellcheck="false" placeholder="one payload per line" ${disabled}>${escapeHtml(set.values.join("\n"))}</textarea>
-</div>`;
+/** Reconstructs the grep block from its rendered inputs. */
+function readGrepConfig(): GrepConfig {
+  const bool = (selector: string): boolean => fuzzerPanel?.querySelector<HTMLInputElement>(selector)?.checked ?? false;
+  const matchRows = fuzzerPanel === null ? [] : Array.from(fuzzerPanel.querySelectorAll<HTMLElement>("[data-grep-match-row]"));
+  const matchRules: GrepMatchRule[] = matchRows.map((row) => ({
+    name: row.querySelector<HTMLInputElement>("[data-gm-name]")?.value.trim() || "Match",
+    pattern: row.querySelector<HTMLInputElement>("[data-gm-pattern]")?.value ?? "",
+    isRegex: row.querySelector<HTMLInputElement>("[data-gm-regex]")?.checked ?? false,
+    caseSensitive: row.querySelector<HTMLInputElement>("[data-gm-case]")?.checked ?? false,
+    excludeHeaders: row.querySelector<HTMLInputElement>("[data-gm-nohdr]")?.checked ?? false,
+  }));
+  const extractRows = fuzzerPanel === null ? [] : Array.from(fuzzerPanel.querySelectorAll<HTMLElement>("[data-grep-extract-row]"));
+  const extractRules: GrepExtractRule[] = extractRows.map((row) => {
+    const type = row.querySelector<HTMLSelectElement>("[data-ge-type]")?.value ?? "betweenDelimiters";
+    const field = (name: string): string => row.querySelector<HTMLInputElement>(`[data-ge-field="${name}"]`)?.value ?? "";
+    let locator: ExtractLocator;
+    if (type === "regex") locator = { type, pattern: field("pattern"), group: Math.max(0, Math.floor(Number(field("group")) || 0)) };
+    else if (type === "offset") locator = { type, start: Math.max(0, Math.floor(Number(field("start")) || 0)), length: Math.max(0, Math.floor(Number(field("length")) || 0)) };
+    else locator = { type: "betweenDelimiters", start: field("start"), end: field("end") };
+    return {
+      name: row.querySelector<HTMLInputElement>("[data-ge-name]")?.value.trim() || "Extract",
+      locator,
+      maxLength: Math.max(0, Math.floor(Number(row.querySelector<HTMLInputElement>("[data-ge-maxlen]")?.value) || 0)),
+      firstOnly: row.querySelector<HTMLInputElement>("[data-ge-first]")?.checked ?? true,
+    };
+  });
+  return {
+    matchRules,
+    extractRules,
+    reflected: {
+      enabled: bool("#grep-reflected"),
+      caseSensitive: bool("#grep-reflected-case"),
+      excludeHeaders: bool("#grep-reflected-nohdr"),
+      matchPreUrlEncoded: bool("#grep-reflected-preenc"),
+    },
+  };
+}
+
+/** Appends an uploaded wordlist file into a simple-list payload set. */
+function loadPayloadFile(index: number, file: File): void {
+  const reader = new FileReader();
+  reader.onload = (): void => {
+    if (selectedFuzzer === null) return;
+    readFuzzerForm();
+    const text = typeof reader.result === "string" ? reader.result : "";
+    const values = text.split(/\r?\n/u).map((value) => value.trim()).filter((value) => value !== "" && !value.startsWith("#"));
+    const set = selectedFuzzer.config.payloadSets[index];
+    if (set !== undefined && set.source.type === "simpleList") {
+      set.source.values = [...set.source.values, ...values];
+    }
+    renderFuzzer();
+    toast(`Loaded ${values.length.toLocaleString()} payloads from ${file.name}`, "success");
+  };
+  reader.readAsText(file);
+}
+
+/** A sensible default for a newly-added processing rule. */
+function defaultProcessor(type: string): PayloadProcessor {
+  switch (type) {
+    case "addSuffix": return { type, text: "" };
+    case "matchReplace": return { type, pattern: "", replacement: "" };
+    case "substring": return { type, from: 0, length: null };
+    case "reverseSubstring": return { type, from: 0, length: null };
+    case "modifyCase": return { type, mode: "lower" };
+    case "encode": return { type, scheme: "url" };
+    case "decode": return { type, scheme: "url" };
+    case "hash": return { type, algorithm: "sha256", output: "hex" };
+    case "addRawPayload": return { type };
+    case "skipIfMatchesRegex": return { type, pattern: "" };
+    default: return { type: "addPrefix", text: "" };
+  }
+}
+
+/** Snapshots the form, mutates one payload set, and re-renders the editor. */
+function mutateSet(index: number, mutate: (set: FuzzerPayloadSet) => void): void {
+  if (selectedFuzzer === null) return;
+  readFuzzerForm();
+  const set = selectedFuzzer.config.payloadSets[index];
+  if (set !== undefined) mutate(set);
+  renderFuzzer();
+}
+
+/** Applies an action to the payload set + processor row that raised the event. */
+function procAction(event: Event, mutate: (set: FuzzerPayloadSet, position: number) => void): void {
+  const row = (event.currentTarget as HTMLElement).closest<HTMLElement>("[data-proc-row]");
+  if (row === null) return;
+  mutateSet(Number(row.dataset.procRow), (set) => mutate(set, Number(row.dataset.procIndex)));
+}
+
+/** Appends clipboard lines into a simple-list payload set. */
+async function pasteIntoList(index: number): Promise<void> {
+  try {
+    const text = await navigator.clipboard.readText();
+    const values = text.split(/\r?\n/u).map((value) => value.trim()).filter((value) => value !== "" && !value.startsWith("#"));
+    mutateSet(index, (set) => { if (set.source.type === "simpleList") set.source.values = [...set.source.values, ...values]; });
+    toast(`Pasted ${values.length.toLocaleString()} payloads`, "success");
+  } catch { toast("Clipboard paste is unavailable here", "danger"); }
+}
+
+/** Appends a bundled payload list's values into a simple-list payload set. */
+async function addFromList(index: number): Promise<void> {
+  const pick = fuzzerPanel?.querySelector<HTMLSelectElement>(`[data-list-pick="${index}"]`)?.value ?? "";
+  if (pick === "") return;
+  try {
+    const response = await fetch(`/api/v1/workbench/fuzzer/payload-lists/${encodeURIComponent(pick)}`);
+    await requireOk(response, "payload list load failed");
+    const values = (await response.json()) as string[];
+    mutateSet(index, (set) => { if (set.source.type === "simpleList") set.source.values = [...set.source.values, ...values]; });
+    toast(`Added ${values.length.toLocaleString()} payloads from ${pick}`, "success");
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The payload list could not be loaded.", why: "", fix: "Try again, or load a file instead." });
+  }
+}
+
+/** Fetches the bundled "Add from list" payload lists once, then re-renders. */
+function ensureBundledLists(): void {
+  if (bundledListsRequested) return;
+  bundledListsRequested = true;
+  void (async () => {
+    try {
+      const response = await fetch("/api/v1/workbench/fuzzer/payload-lists");
+      if (response.ok) {
+        bundledPayloadLists = (await response.json()) as PayloadListInfo[];
+        if (selectedFuzzer !== null && !fuzzerConfigLocked()) renderFuzzer();
+      }
+    } catch { /* the picker keeps its loading state; Load file still works */ }
+  })();
+}
+
+/** Attaches all payload-editor handlers after the draft editor is (re)rendered. */
+function wireFuzzPayloadEditor(panel: HTMLElement): void {
+  ensureBundledLists();
+  const structural = (): void => { readFuzzerForm(); renderFuzzer(); };
+  panel.querySelectorAll<HTMLSelectElement>("[data-source-type], [data-proc-type]").forEach((el) => el.addEventListener("change", structural));
+  panel.querySelectorAll<HTMLButtonElement>("[data-add-proc-btn]").forEach((btn) => btn.addEventListener("click", () => {
+    const index = Number(btn.dataset.addProcBtn);
+    const type = panel.querySelector<HTMLSelectElement>(`[data-add-proc="${index}"]`)?.value ?? "addPrefix";
+    mutateSet(index, (set) => set.processors.push(defaultProcessor(type)));
+  }));
+  panel.querySelectorAll<HTMLButtonElement>("[data-proc-remove]").forEach((btn) => btn.addEventListener("click", (event) => procAction(event, (set, position) => { set.processors.splice(position, 1); })));
+  panel.querySelectorAll<HTMLButtonElement>("[data-proc-up]").forEach((btn) => btn.addEventListener("click", (event) => procAction(event, (set, position) => { if (position > 0) { [set.processors[position - 1], set.processors[position]] = [set.processors[position], set.processors[position - 1]]; } })));
+  panel.querySelectorAll<HTMLButtonElement>("[data-proc-down]").forEach((btn) => btn.addEventListener("click", (event) => procAction(event, (set, position) => { if (position < set.processors.length - 1) { [set.processors[position + 1], set.processors[position]] = [set.processors[position], set.processors[position + 1]]; } })));
+  panel.querySelectorAll<HTMLButtonElement>("[data-slot-add]").forEach((btn) => btn.addEventListener("click", () => mutateSet(Number(btn.dataset.slotAdd), (set) => { if (set.source.type === "customIterator") set.source.slots.push({ items: [], separator: "" }); })));
+  panel.querySelectorAll<HTMLButtonElement>("[data-slot-remove]").forEach((btn) => btn.addEventListener("click", () => {
+    const [index, slot] = (btn.dataset.slotRemove ?? "").split(":").map(Number);
+    mutateSet(index, (set) => { if (set.source.type === "customIterator") set.source.slots.splice(slot, 1); });
+  }));
+  panel.querySelectorAll<HTMLButtonElement>("[data-load-set]").forEach((btn) => btn.addEventListener("click", () => panel.querySelector<HTMLInputElement>(`[data-load-file="${btn.dataset.loadSet}"]`)?.click()));
+  panel.querySelectorAll<HTMLInputElement>("[data-load-file]").forEach((input) => input.addEventListener("change", (event) => {
+    const file = (event.target as HTMLInputElement).files?.[0];
+    if (file !== undefined) loadPayloadFile(Number(input.dataset.loadFile), file);
+    (event.target as HTMLInputElement).value = "";
+  }));
+  panel.querySelectorAll<HTMLButtonElement>("[data-list-clear]").forEach((btn) => btn.addEventListener("click", () => mutateSet(Number(btn.dataset.listClear), (set) => { if (set.source.type === "simpleList") set.source.values = []; })));
+  panel.querySelectorAll<HTMLButtonElement>("[data-list-dedupe]").forEach((btn) => btn.addEventListener("click", () => mutateSet(Number(btn.dataset.listDedupe), (set) => { if (set.source.type === "simpleList") set.source.values = [...new Set(set.source.values)]; })));
+  panel.querySelectorAll<HTMLButtonElement>("[data-list-paste]").forEach((btn) => btn.addEventListener("click", () => void pasteIntoList(Number(btn.dataset.listPaste))));
+  panel.querySelectorAll<HTMLButtonElement>("[data-list-add]").forEach((btn) => btn.addEventListener("click", () => void addFromList(Number(btn.dataset.listAdd))));
+  panel.querySelectorAll<HTMLElement>("[data-src], [data-src-list], [data-slot-items], [data-slot-sep], [data-url-encode], [data-mode], [data-proc-field]").forEach((el) => {
+    el.addEventListener("input", () => updateFuzzPreview());
+    el.addEventListener("change", () => updateFuzzPreview());
+  });
 }
 
 /** Resting state for the shared dock's Resend tab when no request is loaded. */
@@ -655,128 +1233,598 @@ function seedFuzzerEmpty(): void {
   });
 }
 
+const FUZZ_ATTACK_HINTS: Record<string, string> = {
+  sniper: "Sniper — one payload set, injected into each position in turn. Requests = positions × payloads.",
+  battering_ram: "Battering ram — one payload set, the same value placed into every position at once. Requests = payloads.",
+  pitchfork: "Pitchfork — one payload set per position, stepped together in parallel. Requests = the shortest set.",
+  clusterbomb: "Cluster bomb — one payload set per position, every combination. Requests = the product of set sizes.",
+};
+
 function renderFuzzer(): void {
   if (fuzzerPanel === null || selectedFuzzer === null) return;
   fuzzerPanel.hidden = false;
   const config = selectedFuzzer.config;
   const locked = fuzzerConfigLocked();
+  const state = selectedFuzzer.state;
   const disabled = locked ? "disabled" : "";
-  const filter = config.matchFilter;
-  const sequence = Array.isArray(config.sequence) ? config.sequence : [];
-  const launchLabel = locked && selectedFuzzer.state === "paused" ? "Resume" : locked ? "Start" : "Create attack";
-  const sequencePlaceholder = escapeHtml('[{"name":"login","request":{"method":"POST","url":"https://target/login","headers":[]},"extractors":[]}]');
   const opt = (value: string, label: string, selected: boolean): string => `<option value="${value}"${selected ? " selected" : ""}>${label}</option>`;
-  const attackHint = config.positions.length <= 1 || config.payloadSets.length <= 1
-    ? "With a single position and set, all attack types are equivalent. Add positions/sets for Clusterbomb (every combination) or Pitchfork (paired by row)."
-    : config.attackType === "clusterbomb" ? "Clusterbomb: every combination across sets."
-    : config.attackType === "pitchfork" ? "Pitchfork: values paired by row across sets (shortest set wins)."
-    : "Sniper: one position at a time using its set.";
+
+  const editor = locked ? renderFuzzerLockedSummary(selectedFuzzer) : renderFuzzerDraftEditor(config, opt);
+  const controls = renderFuzzerControls(selectedFuzzer, locked);
+  const stateBadge = `<span class="badge ${state === "running" ? "badge--accent" : state === "failed" ? "badge--danger" : state === "completed" ? "badge--success" : ""}">${escapeHtml(state)}</span>`;
 
   fuzzerPanel.innerHTML = `<div class="panel__header">
-  <div class="panel__heading">${icon("discovery", { size: 16 })}<h2>Fuzzer · ${escapeHtml(selectedFuzzer.id === "" ? "new attack" : selectedFuzzer.id.slice(-8))}</h2></div>
-  <div class="row">
-    <span class="badge">${escapeHtml(selectedFuzzer.tier)}</span>
-    <span class="badge ${selectedFuzzer.state === "running" ? "badge--accent" : selectedFuzzer.state === "failed" ? "badge--danger" : ""}">${escapeHtml(selectedFuzzer.state)}</span>
-    <button class="btn btn--quiet btn--icon" type="button" data-close-fuzzer><span class="visually-hidden">Close Fuzzer</span>${icon("close", { size: 16 })}</button>
-  </div>
+  <div class="panel__heading">${icon("discovery", { size: 16 })}<h2>Fuzz · ${escapeHtml(selectedFuzzer.id === "" ? "new attack" : selectedFuzzer.id.slice(-8))}</h2></div>
+  <div class="row">${stateBadge}<button class="btn btn--quiet btn--icon" type="button" data-close-fuzzer><span class="visually-hidden">Close Fuzz</span>${icon("close", { size: 16 })}</button></div>
 </div>
 <div class="panel__body stack">
-  <div class="stack stack--tight">
-    <p class="section-label">Base request</p>
-    <pre class="code">${escapeHtml(`${config.baseRequest.method} ${config.baseRequest.url}\n${formatHeaders(config.baseRequest.headers)}${bytesToText(config.baseRequest.body) === "" ? "" : `\n\n${bytesToText(config.baseRequest.body)}`}`)}</pre>
-    <p class="field__hint">Positions are byte offsets into this request. Offsets are 0-based; End is exclusive.</p>
-  </div>
-
-  <div class="split-2">
-    <div class="field">
-      <label class="field__label" for="fuzzer-type">Attack type</label>
-      <select class="select" id="fuzzer-type" ${disabled}>${opt("sniper", "Sniper", config.attackType === "sniper")}${opt("clusterbomb", "Clusterbomb", config.attackType === "clusterbomb")}${opt("pitchfork", "Pitchfork", config.attackType === "pitchfork")}</select>
-      <p class="field__hint">${escapeHtml(attackHint)}</p>
-    </div>
-    <div class="split-3">
-      <div class="field"><label class="field__label" for="fuzzer-concurrency">Concurrency</label><input class="input input--mono" id="fuzzer-concurrency" type="number" min="1" value="${config.concurrency}" ${disabled} /></div>
-      <div class="field"><label class="field__label" for="fuzzer-rate">Rate/s</label><input class="input input--mono" id="fuzzer-rate" type="number" min="0" value="${config.ratePerSecond}" ${disabled} /><p class="field__hint">0 = unlimited</p></div>
-      <div class="field"><label class="field__label" for="fuzzer-max">Max results</label><input class="input input--mono" id="fuzzer-max" type="number" min="1" value="${config.maxResults}" ${disabled} /></div>
-    </div>
-  </div>
-
-  <div class="stack stack--tight">
-    <div class="row"><p class="section-label">Payload positions</p><span class="spacer"></span>${locked ? "" : `<button class="btn btn--sm" type="button" data-add-pos>${icon("plus", { size: 12 })}<span>Add position</span></button>`}</div>
-    ${config.positions.map((position, index) => renderFuzzerPositionRow(config, position, index, locked)).join("")}
-  </div>
-
-  <div class="stack stack--tight">
-    <div class="row"><p class="section-label">Payload sets</p><span class="spacer"></span>${locked ? "" : `<button class="btn btn--sm" type="button" data-add-set>${icon("plus", { size: 12 })}<span>Add set</span></button>`}</div>
-    ${config.payloadSets.map((set, index) => renderFuzzerSetRow(set, index, locked)).join("")}
-  </div>
-
-  <div class="stack stack--tight">
-    <p class="section-label">Match filter</p>
-    <p class="field__hint">A response is "matched" only when it satisfies these rules. Leave all blank to keep every response.</p>
-    <div class="split-2">
-      <div class="field"><label class="field__label" for="match-statuses">Status codes (comma-separated)</label><input class="input input--mono" id="match-statuses" type="text" value="${escapeHtml(filter.statuses.join(", "))}" placeholder="200, 301, 401" ${disabled} /></div>
-      <div class="split-2">
-        <div class="field"><label class="field__label" for="match-min">Min size</label><input class="input input--mono" id="match-min" type="number" min="0" value="${filter.minSize ?? ""}" ${disabled} /></div>
-        <div class="field"><label class="field__label" for="match-max">Max size</label><input class="input input--mono" id="match-max" type="number" min="0" value="${filter.maxSize ?? ""}" ${disabled} /></div>
-      </div>
-    </div>
-    <div class="split-2">
-      <div class="field"><label class="field__label" for="match-contains">Body contains</label><input class="input input--mono" id="match-contains" type="text" value="${escapeHtml(filter.contains ?? "")}" ${disabled} /></div>
-      <div class="field"><label class="field__label" for="match-regex">Body regex</label><input class="input input--mono" id="match-regex" type="text" value="${escapeHtml(filter.regex ?? "")}" ${disabled} /></div>
-    </div>
-  </div>
-
-  <div class="field">
-    <label class="field__label" for="fuzzer-sequence">Native token-chain sequence (JSON, optional)</label>
-    <textarea class="textarea" id="fuzzer-sequence" spellcheck="false" placeholder="${sequencePlaceholder}" ${disabled}>${escapeHtml(sequence.length === 0 ? "" : JSON.stringify(sequence, null, 2))}</textarea>
-    <p class="field__hint">Stateful native attacks: each step may extract <code class="t-mono">{{variable}}</code> values for later requests.</p>
-  </div>
-
-  <div class="row">
-    ${selectedFuzzer.state === "running" ? "" : `<button class="btn btn--primary" id="fuzzer-launch" type="button">${icon("play", { size: 14 })}<span>${escapeHtml(launchLabel)}</span></button>`}
-    <button class="btn" id="fuzzer-pause" type="button">${icon("pause", { size: 14 })}<span>Pause</span></button>
-    <button class="btn btn--danger" id="fuzzer-stop" type="button">${icon("stop", { size: 14 })}<span>Stop</span></button>
-  </div>
-
-  <div id="fuzzer-results">${renderFuzzerResults(selectedFuzzer.results)}</div>
+  ${editor}
+  ${controls}
+  <div id="fuzzer-results">${renderFuzzerResults(selectedFuzzer)}</div>
 </div>`;
 
+  // Draft-editor wiring.
+  fuzzerPanel.querySelector("[data-fuzz-mark]")?.addEventListener("click", () => markFuzzSelection());
+  fuzzerPanel.querySelector("[data-fuzz-auto]")?.addEventListener("click", () => autoMarkFuzz());
+  fuzzerPanel.querySelector("[data-fuzz-clear]")?.addEventListener("click", () => clearFuzzMarks());
+  fuzzerPanel.querySelector<HTMLSelectElement>("#fuzzer-type")?.addEventListener("change", () => { readFuzzerForm(); renderFuzzer(); });
+  // Delay-mode swaps the relevant fields, so re-render on change.
+  fuzzerPanel.querySelector<HTMLSelectElement>("#fuzzer-delay-mode")?.addEventListener("change", () => { readFuzzerForm(); renderFuzzer(); });
+  fuzzerPanel.querySelector<HTMLTextAreaElement>("#fuzz-template")?.addEventListener("input", () => updateFuzzPreview());
+  wireFuzzPayloadEditor(fuzzerPanel);
+  wireGrepSettings(fuzzerPanel);
+
+  // Run controls.
   fuzzerPanel.querySelector("#fuzzer-launch")?.addEventListener("click", () => void launchFuzzer());
   fuzzerPanel.querySelector("#fuzzer-pause")?.addEventListener("click", () => void pauseFuzzer());
   fuzzerPanel.querySelector("#fuzzer-stop")?.addEventListener("click", () => void stopFuzzer());
-  fuzzerPanel.querySelector("[data-add-pos]")?.addEventListener("click", () => addFuzzerPosition());
-  fuzzerPanel.querySelector("[data-add-set]")?.addEventListener("click", () => addFuzzerSet());
-  fuzzerPanel.querySelectorAll<HTMLButtonElement>("[data-remove-pos]").forEach((button) => button.addEventListener("click", () => removeFuzzerPosition(Number(button.dataset.removePos))));
-  fuzzerPanel.querySelectorAll<HTMLButtonElement>("[data-remove-set]").forEach((button) => button.addEventListener("click", () => removeFuzzerSet(Number(button.dataset.removeSet))));
-  // A location change toggles the header-name field and refreshes the preview.
-  fuzzerPanel.querySelectorAll<HTMLSelectElement>('[id^="pos-location-"]').forEach((select) => select.addEventListener("change", () => { readFuzzerForm(); renderFuzzer(); }));
-  // Offset edits refresh their row's live preview without a full rebuild.
-  fuzzerPanel.querySelectorAll<HTMLInputElement>('[id^="pos-start-"], [id^="pos-end-"]').forEach((input) => input.addEventListener("change", () => { readFuzzerForm(); renderFuzzer(); }));
   fuzzerPanel.querySelector("[data-close-fuzzer]")?.addEventListener("click", () => {
     if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
     selectedFuzzer = null;
     seedFuzzerEmpty();
   });
+
+  // Results table wiring (sort headers, row-select, display filter, comments).
+  wireFuzzResults(fuzzerPanel);
 }
 
-function renderFuzzerResults(results: readonly FuzzerResult[]): string {
+/** Wires the results grid: sortable headers, row selection, the display-filter
+ *  bar, and inline comment editing. Used for both the initial render and the
+ *  incremental results re-render. */
+function wireFuzzResults(container: HTMLElement): void {
+  container.querySelectorAll<HTMLElement>("[data-sort]").forEach((header) => header.addEventListener("click", () => {
+    const key = header.dataset.sort ?? "ordinal";
+    fuzzResultSort = fuzzResultSort.key === key ? { key, dir: fuzzResultSort.dir === 1 ? -1 : 1 } : { key, dir: 1 };
+    renderFuzzerResultsInto();
+  }));
+  container.querySelectorAll<HTMLElement>("[data-result-row]").forEach((row) => row.addEventListener("click", (event) => {
+    // A click inside the inline comment field must not toggle the row detail.
+    if ((event.target as HTMLElement).closest(".fuzz-comment") !== null) return;
+    const ordinal = Number(row.dataset.resultRow);
+    selectedFuzzResult = selectedFuzzResult === ordinal ? null : ordinal;
+    renderFuzzerResultsInto();
+  }));
+  const search = container.querySelector<HTMLInputElement>("#fuzz-filter-search");
+  search?.addEventListener("input", () => { fuzzDisplayFilter.search = search.value; renderFuzzerResultsInto(); refocusFuzzFilter("#fuzz-filter-search"); });
+  const statusFilter = container.querySelector<HTMLInputElement>("#fuzz-filter-status");
+  statusFilter?.addEventListener("input", () => { fuzzDisplayFilter.status = statusFilter.value; renderFuzzerResultsInto(); refocusFuzzFilter("#fuzz-filter-status"); });
+  const onlyMatched = container.querySelector<HTMLInputElement>("#fuzz-filter-matched");
+  onlyMatched?.addEventListener("change", () => { fuzzDisplayFilter.onlyMatched = onlyMatched.checked; renderFuzzerResultsInto(); });
+  container.querySelectorAll<HTMLInputElement>(".fuzz-comment").forEach((input) => {
+    input.addEventListener("click", (event) => event.stopPropagation());
+    input.addEventListener("change", () => void setFuzzComment(Number(input.dataset.commentOrdinal), input.value));
+  });
+}
+
+/** A `<select>` of options, marking the current value selected. */
+function selectOptions(options: readonly (readonly [string, string])[], current: string): string {
+  return options.map(([value, label]) => `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`).join("");
+}
+
+/** A plain list textarea for a source's `base`/`seed`/`names` field. */
+function listField(index: number, field: string, label: string, values: readonly string[], placeholder: string): string {
+  return `<div class="field"><label class="field__label">${escapeHtml(label)}</label><textarea class="textarea" data-src-list="${index}:${field}" spellcheck="false" placeholder="${escapeHtml(placeholder)}">${escapeHtml(values.join("\n"))}</textarea></div>`;
+}
+function numField(index: number, field: string, label: string, value: number, min?: number): string {
+  return `<div class="field"><label class="field__label">${escapeHtml(label)}</label><input class="input input--mono" type="number"${min === undefined ? "" : ` min="${min}"`} data-src="${index}:${field}" value="${value}" /></div>`;
+}
+function strField(index: number, field: string, label: string, value: string, placeholder = ""): string {
+  return `<div class="field"><label class="field__label">${escapeHtml(label)}</label><input class="input input--mono" type="text" data-src="${index}:${field}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" /></div>`;
+}
+
+/** The management buttons for a simple-list source. */
+function listButtons(index: number): string {
+  const listOptions = bundledPayloadLists.length === 0
+    ? '<option value="">(loading lists…)</option>'
+    : bundledPayloadLists.map((info) => `<option value="${escapeHtml(info.id)}">${escapeHtml(info.label)} (${info.count})</option>`).join("");
+  return `<div class="row fuzz-list-actions">
+    <button class="btn btn--sm btn--quiet" type="button" data-load-set="${index}">${icon("upload", { size: 12 })}<span>Load file</span></button>
+    <input type="file" accept=".txt,.md,text/plain" data-load-file="${index}" hidden />
+    <button class="btn btn--sm btn--quiet" type="button" data-list-paste="${index}">Paste</button>
+    <button class="btn btn--sm btn--quiet" type="button" data-list-dedupe="${index}">Deduplicate</button>
+    <button class="btn btn--sm btn--quiet" type="button" data-list-clear="${index}">Clear</button>
+    <span class="spacer"></span>
+    <select class="select select--sm" data-list-pick="${index}">${listOptions}</select>
+    <button class="btn btn--sm" type="button" data-list-add="${index}">Add from list</button>
+  </div>`;
+}
+
+/** The type-specific settings form for one payload set's source. */
+function renderSourceSettings(set: FuzzerPayloadSet, index: number): string {
+  const s = set.source;
+  switch (s.type) {
+    case "simpleList":
+      return `${listButtons(index)}<textarea class="textarea" data-src-list="${index}:values" spellcheck="false" placeholder="one payload per line">${escapeHtml(s.values.join("\n"))}</textarea>`;
+    case "runtimeFile":
+      return `${strField(index, "path", "File path", s.path, "/absolute/path/to/wordlist.txt")}<p class="field__hint t-subtle">Streamed line-by-line at run time on the engine host.</p>`;
+    case "customIterator": {
+      const slots = s.slots.length === 0 ? [{ items: [], separator: "" }] : s.slots;
+      const rows = slots.map((slot, si) => `<div class="split-2 fuzz-slot">
+        <div class="field"><label class="field__label">Slot ${si + 1} items</label><textarea class="textarea" data-slot-items="${index}:${si}" spellcheck="false" placeholder="one item per line">${escapeHtml(slot.items.join("\n"))}</textarea></div>
+        <div class="field"><label class="field__label">Separator before slot ${si + 1}</label><input class="input input--mono" type="text" data-slot-sep="${index}:${si}" value="${escapeHtml(slot.separator)}" />${si === slots.length - 1 && slots.length > 1 ? `<button class="btn btn--sm btn--quiet" type="button" data-slot-remove="${index}:${si}">Remove slot</button>` : ""}</div>
+      </div>`).join("");
+      return `${rows}${slots.length < 8 ? `<div class="row"><button class="btn btn--sm btn--quiet" type="button" data-slot-add="${index}">${icon("plus", { size: 12 })}<span>Add slot</span></button></div>` : ""}`;
+    }
+    case "characterSubstitution":
+      return `${listField(index, "base", "Base values", s.base, "one value per line")}<div class="field"><label class="field__label">Substitution rules (one <code class="t-mono">from&gt;to</code> per line)</label><textarea class="textarea input--mono" data-src="${index}:rules" spellcheck="false" placeholder="e&gt;3&#10;a&gt;4">${escapeHtml(s.rules.map((rule) => `${rule.from}>${rule.to}`).join("\n"))}</textarea></div>`;
+    case "caseModification":
+      return `${listField(index, "base", "Base values", s.base, "one value per line")}<div class="field"><label class="field__label">Case modes</label><div class="row fuzz-modes">${CASE_MODES.map(([mode, label]) => `<label class="check"><input type="checkbox" data-mode="${index}:${mode}"${s.modes.includes(mode) ? " checked" : ""} /> ${escapeHtml(label)}</label>`).join("")}</div></div>`;
+    case "recursiveGrep":
+      return `${listField(index, "seed", "Seed values", s.seed, "initial values")}<p class="field__hint t-danger">Recursive grep requires a configured extract item (Grep-Extract) — the attack is rejected until one is set.</p>`;
+    case "illegalUnicode":
+      return `${listField(index, "base", "Base values", s.base, "one value per line")}${strField(index, "target", "Target character", s.target, ".")}`;
+    case "characterBlocks":
+      return `${strField(index, "item", "Item", s.item, "A")}<div class="split-3">${numField(index, "min", "Min blocks", s.min, 0)}${numField(index, "max", "Max blocks", s.max, 0)}${numField(index, "step", "Step", s.step, 1)}</div>`;
+    case "numbers":
+      return `<div class="split-3">${numField(index, "from", "From", s.from)}${numField(index, "to", "To", s.to)}${numField(index, "step", "Step", s.step)}</div>
+        <div class="split-2"><div class="field"><label class="field__label">Order</label><select class="select" data-src="${index}:order">${selectOptions([["sequential", "Sequential"], ["random", "Random"]], s.order)}</select></div><div class="field"><label class="field__label">Radix</label><select class="select" data-src="${index}:radix">${selectOptions([["dec", "Decimal"], ["hex", "Hex"]], s.radix)}</select></div></div>
+        <div class="split-2">${numField(index, "minIntegerDigits", "Min integer digits", s.minIntegerDigits, 1)}${numField(index, "maxFractionDigits", "Max fraction digits", s.maxFractionDigits, 0)}</div>`;
+    case "dates":
+      return `<div class="split-2"><div class="field"><label class="field__label">From</label><input class="input input--mono" type="date" data-src="${index}:from" value="${escapeHtml(s.from)}" /></div><div class="field"><label class="field__label">To</label><input class="input input--mono" type="date" data-src="${index}:to" value="${escapeHtml(s.to)}" /></div></div><div class="split-2">${numField(index, "stepDays", "Step (days)", s.stepDays)}${strField(index, "format", "Format", s.format, "%Y-%m-%d")}</div>`;
+    case "bruteForcer":
+      return `${strField(index, "charset", "Character set", s.charset, "abcdef0123456789")}<div class="split-2">${numField(index, "minLen", "Min length", s.minLen, 0)}${numField(index, "maxLen", "Max length", s.maxLen, 0)}</div>`;
+    case "nullPayloads": {
+      const mode = s.count === "continuous" ? "continuous" : "fixed";
+      const fixed = s.count === "continuous" ? 10 : s.count.fixed;
+      return `<div class="split-2"><div class="field"><label class="field__label">Count</label><select class="select" data-src="${index}:mode">${selectOptions([["fixed", "Fixed"], ["continuous", "Continuous (capped at max results)"]], mode)}</select></div>${numField(index, "fixed", "How many", fixed, 1)}</div>`;
+    }
+    case "characterFrobber":
+      return listField(index, "base", "Base values", s.base, "one value per line");
+    case "bitFlipper":
+      return `${listField(index, "base", "Base values", s.base, "one value per line")}<div class="field"><label class="field__label">Format</label><select class="select" data-src="${index}:format">${selectOptions([["literal", "Literal text"], ["asciiHex", "ASCII-hex bytes"]], s.format)}</select></div>`;
+    case "usernameGenerator":
+      return listField(index, "names", "Names or emails", s.names, "John Smith&#10;jane.doe@example.test");
+    case "ecbBlockShuffler":
+      return `${listField(index, "base", "Base values", s.base, "one value per line")}${numField(index, "blockSize", "Block size (bytes)", s.blockSize, 1)}`;
+    case "copyOtherPayload":
+      return `${numField(index, "sourcePosition", "Mirror position #", s.sourcePosition, 0)}<p class="field__hint t-subtle">Pitchfork / Cluster bomb only — mirrors the payload of the position with this index.</p>`;
+  }
+}
+
+/** One processing-pipeline rule row. */
+function renderProcessorRow(processor: PayloadProcessor, index: number, position: number): string {
+  const p = processor;
+  const scalar = (field: string, value: string, placeholder = ""): string => `<input class="input input--mono input--sm" type="text" data-proc-field="${field}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" />`;
+  const num = (field: string, value: number | null | undefined, placeholder = ""): string => `<input class="input input--mono input--sm" type="number" min="0" data-proc-field="${field}" value="${value ?? ""}" placeholder="${escapeHtml(placeholder)}" />`;
+  const sel = (field: string, options: readonly (readonly [string, string])[], value: string): string => `<select class="select select--sm" data-proc-field="${field}">${selectOptions(options, value)}</select>`;
+  let fields = "";
+  switch (p.type) {
+    case "addPrefix": case "addSuffix": fields = scalar("text", p.text, "text"); break;
+    case "matchReplace": fields = `${scalar("pattern", p.pattern, "regex")}${scalar("replacement", p.replacement, "replacement")}`; break;
+    case "substring": case "reverseSubstring": fields = `${num("from", p.from, "from")}${num("length", p.length, "length (optional)")}`; break;
+    case "modifyCase": fields = sel("mode", CASE_MODES, p.mode); break;
+    case "encode": fields = sel("scheme", [["url", "URL"], ["urlAll", "URL (all)"], ["html", "HTML"], ["base64", "Base64"], ["asciiHex", "ASCII-hex"]], p.scheme); break;
+    case "decode": fields = sel("scheme", [["url", "URL"], ["html", "HTML"], ["base64", "Base64"], ["asciiHex", "ASCII-hex"]], p.scheme); break;
+    case "hash": fields = `${sel("algorithm", [["md5", "MD5"], ["sha1", "SHA-1"], ["sha256", "SHA-256"], ["sha512", "SHA-512"]], p.algorithm)}${sel("output", [["hex", "Hex"], ["base64", "Base64"]], p.output)}`; break;
+    case "addRawPayload": fields = '<span class="t-subtle t-small">appends the original payload</span>'; break;
+    case "skipIfMatchesRegex": fields = scalar("pattern", p.pattern, "regex"); break;
+  }
+  return `<div class="row proc-row" data-proc-row="${index}" data-proc-index="${position}">
+    <select class="select select--sm" data-proc-type>${selectOptions(PAYLOAD_PROCESSOR_TYPES, p.type)}</select>
+    ${fields}
+    <span class="spacer"></span>
+    <button class="btn btn--sm btn--quiet" type="button" data-proc-up title="Move up">↑</button>
+    <button class="btn btn--sm btn--quiet" type="button" data-proc-down title="Move down">↓</button>
+    <button class="btn btn--sm btn--quiet" type="button" data-proc-remove title="Remove">✕</button>
+  </div>`;
+}
+
+/** The full per-set editor: type, settings, processing pipeline, URL-encode. */
+function renderPayloadSetBlock(set: FuzzerPayloadSet, index: number, perPosition: boolean): string {
+  const count = payloadSetCount(set);
+  const countText = set.source.type === "runtimeFile" ? "streamed at run" : `${count >= COUNT_HUGE ? "≈ huge" : count.toLocaleString()} value${count === 1 ? "" : "s"}`;
+  const rows = set.processors.map((processor, position) => renderProcessorRow(processor, index, position)).join("");
+  return `<div class="stack stack--tight fuzz-set" data-set-block="${index}">
+    <div class="row"><label class="field__label">${perPosition ? `Position ${index + 1}` : "Payload set"}</label><span class="spacer"></span><span class="t-subtle t-small">${countText}</span></div>
+    <div class="field"><label class="field__label">Payload type</label><select class="select" data-source-type="${index}">${selectOptions(PAYLOAD_SOURCE_TYPES, set.source.type)}</select></div>
+    ${renderSourceSettings(set, index)}
+    <div class="stack stack--tight fuzz-processing">
+      <div class="row"><p class="section-label">Payload processing</p><span class="spacer"></span><select class="select select--sm" data-add-proc="${index}">${selectOptions(PAYLOAD_PROCESSOR_TYPES, "addPrefix")}</select><button class="btn btn--sm" type="button" data-add-proc-btn="${index}">${icon("plus", { size: 12 })}<span>Add rule</span></button></div>
+      ${rows === "" ? '<p class="field__hint t-subtle">No processing rules — payloads are sent as generated.</p>' : rows}
+      <div class="field"><label class="field__label">URL-encode these characters</label><input class="input input--mono" type="text" data-url-encode="${index}" value="${escapeHtml(set.urlEncodeChars ?? "")}" placeholder="e.g. &amp;=+/ (blank to skip)" /></div>
+    </div>
+  </div>`;
+}
+
+/** The grep settings: match rules (count columns), extract rules (value
+ *  columns), and reflected-payload detection. Additive — never filters. */
+function renderGrepSettings(config: FuzzerConfig): string {
+  const grep = ensureGrep(config);
+  const matchRows = grep.matchRules.map((rule, index) => `<div class="row grep-row" data-grep-match-row="${index}">
+    <input class="input input--sm" data-gm-name value="${escapeHtml(rule.name)}" placeholder="name" />
+    <input class="input input--mono input--sm" data-gm-pattern value="${escapeHtml(rule.pattern)}" placeholder="expression" />
+    <label class="check check--sm"><input type="checkbox" data-gm-regex ${rule.isRegex ? "checked" : ""} /> regex</label>
+    <label class="check check--sm"><input type="checkbox" data-gm-case ${rule.caseSensitive ? "checked" : ""} /> case</label>
+    <label class="check check--sm"><input type="checkbox" data-gm-nohdr ${rule.excludeHeaders ? "checked" : ""} /> body only</label>
+    <span class="spacer"></span>
+    <button class="btn btn--sm btn--quiet" type="button" data-grep-match-remove="${index}" title="Remove">✕</button>
+  </div>`).join("");
+  const extractRows = grep.extractRules.map((rule, index) => {
+    const loc = rule.locator;
+    let fields: string;
+    if (loc.type === "regex") fields = `<input class="input input--mono input--sm" data-ge-field="pattern" value="${escapeHtml(loc.pattern)}" placeholder="regex" /><input class="input input--mono input--sm grep-num" type="number" min="0" data-ge-field="group" value="${loc.group}" title="capture group" />`;
+    else if (loc.type === "offset") fields = `<input class="input input--mono input--sm grep-num" type="number" min="0" data-ge-field="start" value="${loc.start}" title="start" /><input class="input input--mono input--sm grep-num" type="number" min="0" data-ge-field="length" value="${loc.length}" title="length" />`;
+    else fields = `<input class="input input--mono input--sm" data-ge-field="start" value="${escapeHtml(loc.start)}" placeholder="start delim" /><input class="input input--mono input--sm" data-ge-field="end" value="${escapeHtml(loc.end)}" placeholder="end delim" />`;
+    return `<div class="row grep-row" data-grep-extract-row="${index}">
+      <input class="input input--sm" data-ge-name value="${escapeHtml(rule.name)}" placeholder="name" />
+      <select class="select select--sm" data-ge-type>${selectOptions([["betweenDelimiters", "Between"], ["regex", "Regex"], ["offset", "Offset"]], loc.type)}</select>
+      ${fields}
+      <input class="input input--mono input--sm grep-num" type="number" min="0" data-ge-maxlen value="${rule.maxLength}" title="max length (0 = unlimited)" />
+      <label class="check check--sm"><input type="checkbox" data-ge-first ${rule.firstOnly ? "checked" : ""} /> first only</label>
+      <span class="spacer"></span>
+      <button class="btn btn--sm btn--quiet" type="button" data-grep-extract-remove="${index}" title="Remove">✕</button>
+    </div>`;
+  }).join("");
+  const r = grep.reflected;
+  return `<div class="stack stack--tight">
+    <div class="row"><p class="section-label">Grep · match</p><span class="spacer"></span><button class="btn btn--sm btn--quiet" type="button" data-grep-match-add>${icon("plus", { size: 12 })}<span>Add match</span></button></div>
+    <p class="field__hint">Each rule adds an occurrence-count column to the results. Flagging only — it never filters.</p>
+    ${matchRows}
+    <div class="row"><p class="section-label">Grep · extract</p><span class="spacer"></span><button class="btn btn--sm btn--quiet" type="button" data-grep-extract-add>${icon("plus", { size: 12 })}<span>Add extract</span></button></div>
+    <p class="field__hint">Each rule adds a value column, extracted from the response body.</p>
+    ${extractRows}
+    <div class="row"><p class="section-label">Grep · payloads (reflected)</p></div>
+    <div class="row grep-row">
+      <label class="check check--sm"><input type="checkbox" id="grep-reflected" ${r.enabled ? "checked" : ""} /> flag reflected payloads</label>
+      <label class="check check--sm"><input type="checkbox" id="grep-reflected-case" ${r.caseSensitive ? "checked" : ""} /> case</label>
+      <label class="check check--sm"><input type="checkbox" id="grep-reflected-nohdr" ${r.excludeHeaders ? "checked" : ""} /> body only</label>
+      <label class="check check--sm"><input type="checkbox" id="grep-reflected-preenc" ${r.matchPreUrlEncoded ? "checked" : ""} /> also pre-URL-encoded</label>
+    </div>
+  </div>`;
+}
+
+/** Snapshots the form, mutates the grep block, and re-renders the editor. */
+function mutateGrep(mutate: (grep: GrepConfig) => void): void {
+  if (selectedFuzzer === null) return;
+  readFuzzerForm();
+  mutate(ensureGrep(selectedFuzzer.config));
+  renderFuzzer();
+}
+
+/** Wires the grep settings controls (structural add/remove/type changes). */
+function wireGrepSettings(panel: HTMLElement): void {
+  panel.querySelector<HTMLButtonElement>("[data-grep-match-add]")?.addEventListener("click", () => mutateGrep((grep) => grep.matchRules.push(newGrepMatchRule(grep.matchRules.length))));
+  panel.querySelector<HTMLButtonElement>("[data-grep-extract-add]")?.addEventListener("click", () => mutateGrep((grep) => grep.extractRules.push(newGrepExtractRule(grep.extractRules.length))));
+  panel.querySelectorAll<HTMLButtonElement>("[data-grep-match-remove]").forEach((btn) => btn.addEventListener("click", () => mutateGrep((grep) => { grep.matchRules.splice(Number(btn.dataset.grepMatchRemove), 1); })));
+  panel.querySelectorAll<HTMLButtonElement>("[data-grep-extract-remove]").forEach((btn) => btn.addEventListener("click", () => mutateGrep((grep) => { grep.extractRules.splice(Number(btn.dataset.grepExtractRemove), 1); })));
+  panel.querySelectorAll<HTMLElement>("[data-grep-extract-row]").forEach((row) => {
+    const index = Number(row.dataset.grepExtractRow);
+    row.querySelector<HTMLSelectElement>("[data-ge-type]")?.addEventListener("change", (event) => {
+      const type = (event.target as HTMLSelectElement).value;
+      mutateGrep((grep) => { if (grep.extractRules[index] !== undefined) grep.extractRules[index].locator = defaultExtractLocator(type); });
+    });
+  });
+}
+
+/** The draft configuration editor: template + markers, attack type, payloads,
+ *  match filter, throughput. */
+function renderFuzzerDraftEditor(config: FuzzerConfig, opt: (value: string, label: string, selected: boolean) => string): string {
+  const filter = config.matchFilter;
+  const positionCount = countTemplatePositions(fuzzTemplate);
+  const expected = estimateRequestCount(config.attackType, positionCount, config.payloadSets);
+  const perPosition = config.attackType === "pitchfork" || config.attackType === "clusterbomb";
+  const setBlocks = config.payloadSets.map((set, index) => renderPayloadSetBlock(set, index, perPosition)).join("");
+
+  return `<div class="stack stack--tight fuzzer-base-block">
+    <div class="row"><p class="section-label">Request template</p><span class="spacer"></span>
+      <button class="btn btn--sm" type="button" data-fuzz-mark>${icon("plus", { size: 12 })}<span>Add §</span></button>
+      <button class="btn btn--sm btn--quiet" type="button" data-fuzz-auto>Auto §</button>
+      <button class="btn btn--sm btn--quiet" type="button" data-fuzz-clear>Clear §</button>
+    </div>
+    <textarea class="textarea fuzzer-base" id="fuzz-template" spellcheck="false">${escapeHtml(fuzzTemplate)}</textarea>
+    <p class="field__hint">Wrap each value to fuzz in <code class="t-mono">§…§</code> markers — select text and click <b>Add §</b> (or place the caret to add an empty pair), or <b>Auto §</b> to mark query/body parameters. <span id="fuzz-preview" class="${expected > 10000 ? "t-danger" : "t-subtle"}">${escapeHtml(fuzzPreviewText(positionCount, expected))}</span></p>
+  </div>
+
+  <div class="field">
+    <label class="field__label" for="fuzzer-type">Attack type</label>
+    <select class="select" id="fuzzer-type">${opt("sniper", "Sniper", config.attackType === "sniper")}${opt("battering_ram", "Battering ram", config.attackType === "battering_ram")}${opt("pitchfork", "Pitchfork", config.attackType === "pitchfork")}${opt("clusterbomb", "Cluster bomb", config.attackType === "clusterbomb")}</select>
+    <p class="field__hint">${escapeHtml(FUZZ_ATTACK_HINTS[config.attackType] ?? FUZZ_ATTACK_HINTS.sniper)}</p>
+  </div>
+
+  <div class="stack stack--tight">
+    <p class="section-label">Payloads</p>
+    ${perPosition && positionCount === 0 ? '<p class="field__hint t-subtle">Mark at least one position above to supply payloads.</p>' : setBlocks}
+  </div>
+
+  <div class="stack stack--tight">
+    <p class="section-label">Match filter</p>
+    <p class="field__hint">A response is flagged as a match only when it satisfies these rules. Leave all blank to keep every response.</p>
+    <div class="split-2">
+      <div class="field"><label class="field__label" for="match-statuses">Status codes (comma-separated)</label><input class="input input--mono" id="match-statuses" type="text" value="${escapeHtml(filter.statuses.join(", "))}" placeholder="200, 301, 401" /></div>
+      <div class="split-2">
+        <div class="field"><label class="field__label" for="match-min">Min length</label><input class="input input--mono" id="match-min" type="number" min="0" value="${filter.minSize ?? ""}" /></div>
+        <div class="field"><label class="field__label" for="match-max">Max length</label><input class="input input--mono" id="match-max" type="number" min="0" value="${filter.maxSize ?? ""}" /></div>
+      </div>
+    </div>
+    <div class="split-2">
+      <div class="field"><label class="field__label" for="match-contains">Body contains</label><input class="input input--mono" id="match-contains" type="text" value="${escapeHtml(filter.contains ?? "")}" /></div>
+      <div class="field"><label class="field__label" for="match-regex">Body regex</label><input class="input input--mono" id="match-regex" type="text" value="${escapeHtml(filter.regex ?? "")}" /></div>
+    </div>
+  </div>
+
+  ${renderGrepSettings(config)}
+
+  ${renderAttackSettings(config)}`;
+}
+
+/** The Resource pool / Attack settings panel: concurrency, delay variant,
+ *  retries, redirect policy, connection handling, and Content-Length toggle. */
+function renderAttackSettings(config: FuzzerConfig): string {
+  ensureAttackSettings(config);
+  const delay = config.delay;
+  const delayFields = delay.type === "interval"
+    ? `<div class="field"><label class="field__label" for="fuzzer-delay-ms">Gap (ms)</label><input class="input input--mono" id="fuzzer-delay-ms" type="number" min="0" value="${delay.ms}" /></div>`
+    : delay.type === "random"
+      ? `<div class="split-2"><div class="field"><label class="field__label" for="fuzzer-delay-min">Min (ms)</label><input class="input input--mono" id="fuzzer-delay-min" type="number" min="0" value="${delay.minMs}" /></div><div class="field"><label class="field__label" for="fuzzer-delay-max">Max (ms)</label><input class="input input--mono" id="fuzzer-delay-max" type="number" min="0" value="${delay.maxMs}" /></div></div>`
+      : `<div class="field"><label class="field__label" for="fuzzer-rate">Rate/s</label><input class="input input--mono" id="fuzzer-rate" type="number" min="0" value="${delay.ratePerSecond}" /><p class="field__hint">0 = unlimited</p></div>`;
+  const redirect = config.redirect;
+  return `<div class="stack stack--tight">
+    <p class="section-label">Resource pool &amp; attack settings</p>
+    <div class="split-3">
+      <div class="field"><label class="field__label" for="fuzzer-concurrency">Concurrency</label><input class="input input--mono" id="fuzzer-concurrency" type="number" min="1" value="${config.concurrency}" /></div>
+      <div class="field"><label class="field__label" for="fuzzer-max">Max results</label><input class="input input--mono" id="fuzzer-max" type="number" min="1" value="${config.maxResults}" /></div>
+      <div class="field"><label class="field__label" for="fuzzer-delay-mode">Delay</label><select class="select" id="fuzzer-delay-mode">${selectOptions([["fixed", "Fixed rate"], ["interval", "Interval"], ["random", "Random"]], delay.type)}</select></div>
+    </div>
+    <div class="split-2">${delayFields}
+      <div class="split-2">
+        <div class="field"><label class="field__label" for="fuzzer-retries">Retries</label><input class="input input--mono" id="fuzzer-retries" type="number" min="0" value="${config.retry.maxRetries}" /></div>
+        <div class="field"><label class="field__label" for="fuzzer-retry-pause">Retry pause (ms)</label><input class="input input--mono" id="fuzzer-retry-pause" type="number" min="0" value="${config.retry.pauseMs}" /></div>
+      </div>
+    </div>
+    <div class="split-3">
+      <div class="field"><label class="field__label" for="fuzzer-redirect-mode">Redirects</label><select class="select" id="fuzzer-redirect-mode">${selectOptions([["never", "Never"], ["onSite", "On-site"], ["inScope", "In-scope"], ["always", "Always"]], redirect.mode)}</select></div>
+      <div class="field"><label class="field__label" for="fuzzer-redirect-hops">Max hops</label><input class="input input--mono" id="fuzzer-redirect-hops" type="number" min="0" value="${redirect.maxHops}" /></div>
+      <div class="field"><label class="field__label">&nbsp;</label><label class="check check--sm"><input type="checkbox" id="fuzzer-redirect-cookies" ${redirect.processCookies ? "checked" : ""} /> process cookies</label></div>
+    </div>
+    <div class="row fuzz-list-actions">
+      <label class="check check--sm"><input type="checkbox" id="fuzzer-connection-close" ${config.connectionClose ? "checked" : ""} /> Connection: close</label>
+      <label class="check check--sm"><input type="checkbox" id="fuzzer-update-cl" ${config.updateContentLength ? "checked" : ""} /> update Content-Length</label>
+    </div>
+  </div>`;
+}
+
+/** Read-only summary + progress for a created (running/finished) attack. */
+function renderFuzzerLockedSummary(job: FuzzerJob): string {
+  const config = job.config;
+  const expected = estimateRequestCount(config.attackType, config.positions.length, config.payloadSets);
+  const sent = job.results.length;
+  const matched = job.results.filter((result) => result.matched).length;
+  const percent = expected > 0 ? Math.min(100, Math.round((sent / expected) * 100)) : 0;
+  const elapsed = fuzzStartedAt > 0 ? (Date.now() - fuzzStartedAt) / 1000 : 0;
+  const rate = job.state === "running" && elapsed > 0.5 ? `${(sent / elapsed).toFixed(1)}/s` : "";
+  const tone = job.state === "completed" ? " progress--success" : job.state === "failed" ? " progress--failed" : job.state === "running" ? " progress--running" : "";
+  const totalText = expected >= COUNT_HUGE ? "≈ huge" : expected.toLocaleString();
+  const label = `${config.attackType.replace("_", " ")} · ${config.positions.length} position${config.positions.length === 1 ? "" : "s"} · ~${totalText} requests`;
+  return `<div class="stack stack--tight">
+    <p class="section-label">Attack</p>
+    <p class="t-small t-subtle">${escapeHtml(label)}</p>
+    <pre class="code fuzzer-base--compact">${escapeHtml(rawRequestText(config.baseRequest))}</pre>
+    <div class="progress${tone}" role="progressbar" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100">
+      <div class="progress__meta"><span>Sent ${sent.toLocaleString()}${expected > 0 ? ` of ~${expected.toLocaleString()}` : ""} · ${matched} matched${rate === "" ? "" : ` · ${rate}`}</span><span class="progress__value">${percent}%</span></div>
+      <div class="progress__track"><div class="progress__fill" style="width:${percent}%"></div></div>
+    </div>
+  </div>`;
+}
+
+/** Start / pause / resume / stop, appropriate to the current state. */
+function renderFuzzerControls(job: FuzzerJob, locked: boolean): string {
+  const state = job.state;
+  if (!locked) {
+    return `<div class="row"><button class="btn btn--primary" id="fuzzer-launch" type="button">${icon("play", { size: 14 })}<span>Start attack</span></button></div>`;
+  }
+  if (state === "running") {
+    return `<div class="row"><button class="btn" id="fuzzer-pause" type="button">${icon("pause", { size: 14 })}<span>Pause</span></button><button class="btn btn--danger" id="fuzzer-stop" type="button">${icon("stop", { size: 14 })}<span>Stop</span></button></div>`;
+  }
+  if (state === "paused") {
+    return `<div class="row"><button class="btn btn--primary" id="fuzzer-launch" type="button">${icon("play", { size: 14 })}<span>Resume</span></button><button class="btn btn--danger" id="fuzzer-stop" type="button">${icon("stop", { size: 14 })}<span>Stop</span></button></div>`;
+  }
+  return ""; // completed / stopped / failed — the results stand on their own
+}
+
+/** Re-renders only the results region (sort/row-select) without disturbing the
+ *  draft editor above it. */
+function renderFuzzerResultsInto(): void {
+  const region = fuzzerPanel?.querySelector<HTMLElement>("#fuzzer-results");
+  if (region === null || region === undefined || selectedFuzzer === null) return;
+  region.innerHTML = renderFuzzerResults(selectedFuzzer);
+  wireFuzzResults(region);
+}
+
+/** Restores focus (cursor at end) to a filter input after a results re-render. */
+function refocusFuzzFilter(selector: string): void {
+  const input = fuzzerPanel?.querySelector<HTMLInputElement>(selector);
+  if (input !== null && input !== undefined) {
+    input.focus();
+    const end = input.value.length;
+    input.setSelectionRange(end, end);
+  }
+}
+
+/** Persists a result comment via the engine, updating the local model in place. */
+async function setFuzzComment(ordinal: number, comment: string): Promise<void> {
+  if (selectedFuzzer === null || selectedFuzzer.id === "") return;
+  const result = selectedFuzzer.results.find((candidate) => candidate.ordinal === ordinal);
+  if (result !== undefined) result.comment = comment === "" ? null : comment;
+  try {
+    const response = await fetch(`/api/v1/workbench/fuzzer/${encodeURIComponent(selectedFuzzer.id)}/results/${ordinal}/comment`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ comment: comment === "" ? null : comment }),
+    });
+    await requireOk(response, "comment save failed");
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The comment could not be saved.", why: "", fix: "Try again." });
+  }
+}
+
+/** Live-updates the request-count preview as the template or payloads change. */
+function updateFuzzPreview(): void {
+  if (selectedFuzzer === null || fuzzerPanel === null || fuzzerConfigLocked()) return;
+  readFuzzerForm();
+  const positionCount = countTemplatePositions(fuzzTemplate);
+  const expected = estimateRequestCount(selectedFuzzer.config.attackType, positionCount, selectedFuzzer.config.payloadSets);
+  const preview = fuzzerPanel.querySelector<HTMLElement>("#fuzz-preview");
+  if (preview !== null) {
+    preview.textContent = fuzzPreviewText(positionCount, expected);
+    preview.className = expected > 10000 ? "t-danger" : "t-subtle";
+  }
+}
+
+function renderFuzzerResults(job: FuzzerJob): string {
+  const results = job.results;
   if (results.length === 0) {
     return stateBlock({
       icon: "discovery",
-      title: "No results yet",
-      body: "Mark a URL, body, or header range, supply payloads, then start the attack.",
+      title: job.state === "running" ? "Waiting for the first response…" : "No results yet",
+      body: fuzzerConfigLocked() ? "Requests will stream in as they complete." : "Mark positions, supply payloads, then start the attack.",
       compact: true,
     });
   }
   const matchedCount = results.filter((result) => result.matched).length;
-  const rows = [...results]
-    .sort((a, b) => Number(b.matched) - Number(a.matched) || a.ordinal - b.ordinal)
-    .map((result) => {
-      const status = result.response?.status;
-      return `<tr class="${result.matched ? "is-match" : ""}"><td>${result.ordinal}</td><td>${escapeHtml(result.payloads.join(" / "))}</td><td><span class="list-row__status" data-class="${statusClass(status)}">${status ?? escapeHtml(result.diagnostic?.id ?? "failed")}</span></td><td>${result.response?.body?.length ?? "—"}</td><td>${result.response?.durationMs ?? "—"}</td><td>${result.matched ? '<span class="badge badge--success">match</span>' : result.filtered ? '<span class="t-subtle">filtered</span>' : ""}</td></tr>`;
-    })
-    .join("");
-  return `<div class="stack stack--tight"><p class="section-label">Results · ${results.length} · ${matchedCount} matched</p><div class="discovery-results"><table class="data-table"><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Time</th><th>Match</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+  const grep = job.config.grep ?? newGrepConfig();
+  const payloadCols = fuzzPayloadColumnCount(job);
+  const anyError = results.some((result) => result.diagnostic !== null && result.diagnostic !== undefined);
+  const arrow = (key: string): string => (fuzzResultSort.key === key ? (fuzzResultSort.dir === 1 ? " ▲" : " ▼") : "");
+  const visible = results.filter(fuzzResultMatchesFilter).sort((a, b) => {
+    const av = fuzzSortComparable(a, fuzzResultSort.key);
+    const bv = fuzzSortComparable(b, fuzzResultSort.key);
+    const cmp = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv));
+    return cmp * fuzzResultSort.dir || a.ordinal - b.ordinal;
+  });
+  // Dynamic header set: base + per-set payloads + status/length/time (+error) +
+  // timeout + one column per grep match/extract rule (+reflected) + match + comment.
+  const headers = [`<th data-sort="ordinal">#${arrow("ordinal")}</th>`];
+  for (let i = 0; i < payloadCols; i += 1) headers.push(`<th data-sort="payload:${i}">${payloadCols === 1 ? "Payload" : `Payload ${i + 1}`}${arrow(`payload:${i}`)}</th>`);
+  headers.push(`<th data-sort="status">Status${arrow("status")}</th>`, `<th data-sort="length">Length${arrow("length")}</th>`, `<th data-sort="time">Time${arrow("time")}</th>`);
+  if (anyError) headers.push(`<th data-sort="error">Error${arrow("error")}</th>`);
+  headers.push(`<th data-sort="timeout">Timeout${arrow("timeout")}</th>`);
+  grep.matchRules.forEach((rule, i) => headers.push(`<th data-sort="match:${i}" title="grep match count">${escapeHtml(rule.name)}${arrow(`match:${i}`)}</th>`));
+  grep.extractRules.forEach((rule, i) => headers.push(`<th data-sort="extract:${i}" title="grep extract">${escapeHtml(rule.name)}${arrow(`extract:${i}`)}</th>`));
+  if (grep.reflected.enabled) headers.push(`<th data-sort="reflected">Reflected${arrow("reflected")}</th>`);
+  const anyRedirects = results.some((result) => (result.redirectChain?.length ?? 0) > 0);
+  if (anyRedirects) headers.push(`<th data-sort="redirects">Redirects${arrow("redirects")}</th>`);
+  headers.push(`<th>Match</th>`, `<th>Comment</th>`);
+  const rows = visible.map((result) => {
+    const status = result.response?.status;
+    const selected = selectedFuzzResult === result.ordinal ? " is-selected" : "";
+    const cells = [`<td>${result.ordinal}</td>`];
+    for (let i = 0; i < payloadCols; i += 1) cells.push(`<td class="t-mono">${escapeHtml(result.payloads[i] ?? "")}</td>`);
+    cells.push(`<td><span class="list-row__status" data-class="${statusClass(status)}">${status ?? escapeHtml(result.diagnostic?.id ?? "failed")}</span></td>`);
+    cells.push(`<td class="t-numeric">${fuzzResponseLength(result) ?? "—"}</td>`);
+    cells.push(`<td class="t-numeric">${result.response?.durationMs ?? "—"}</td>`);
+    if (anyError) cells.push(`<td class="t-small t-subtle">${result.diagnostic === null || result.diagnostic === undefined ? "" : escapeHtml(result.diagnostic.id)}</td>`);
+    cells.push(`<td>${result.timeout === true ? '<span class="badge badge--caution">timeout</span>' : ""}</td>`);
+    grep.matchRules.forEach((_, i) => { const count = result.grepMatchCounts?.[i] ?? 0; cells.push(`<td class="t-numeric${count > 0 ? " t-strong" : " t-subtle"}">${count}</td>`); });
+    grep.extractRules.forEach((_, i) => cells.push(`<td class="t-mono t-small">${escapeHtml(result.grepExtracts?.[i] ?? "")}</td>`));
+    if (grep.reflected.enabled) { const count = result.reflectedCount ?? 0; cells.push(`<td class="t-numeric${count > 0 ? " t-strong" : " t-subtle"}">${count}</td>`); }
+    if (anyRedirects) { const hops = result.redirectChain?.length ?? 0; cells.push(`<td class="t-numeric${hops > 0 ? " t-strong" : " t-subtle"}">${hops}</td>`); }
+    cells.push(`<td>${result.matched ? '<span class="badge badge--success">match</span>' : result.filtered ? '<span class="t-subtle">filtered</span>' : ""}</td>`);
+    cells.push(`<td><input class="input input--sm fuzz-comment" data-comment-ordinal="${result.ordinal}" value="${escapeHtml(result.comment ?? "")}" placeholder="…" /></td>`);
+    return `<tr class="fuzz-row${result.matched ? " is-match" : ""}${selected}" data-result-row="${result.ordinal}">${cells.join("")}</tr>`;
+  }).join("");
+  const filterBar = `<div class="row fuzz-filter">
+    <input class="input input--sm" id="fuzz-filter-search" value="${escapeHtml(fuzzDisplayFilter.search)}" placeholder="Filter results…" />
+    <input class="input input--sm grep-num" id="fuzz-filter-status" value="${escapeHtml(fuzzDisplayFilter.status)}" placeholder="status" />
+    <label class="check check--sm"><input type="checkbox" id="fuzz-filter-matched" ${fuzzDisplayFilter.onlyMatched ? "checked" : ""} /> only matched</label>
+    <span class="spacer"></span><span class="t-subtle t-small">${visible.length.toLocaleString()} of ${results.length.toLocaleString()}</span>
+  </div>`;
+  const detail = renderFuzzResultDetail(results);
+  return `<div class="stack stack--tight"><p class="section-label">Results · ${results.length} · ${matchedCount} matched</p>
+${filterBar}
+<div class="discovery-results"><table class="data-table data-table--clickable"><thead><tr>${headers.join("")}</tr></thead><tbody>${rows}</tbody></table></div>
+${detail}</div>`;
+}
+
+/** The number of per-set payload columns to render. */
+function fuzzPayloadColumnCount(job: FuzzerJob): number {
+  const perPosition = job.config.attackType === "pitchfork" || job.config.attackType === "clusterbomb";
+  const widest = job.results.reduce((max, result) => Math.max(max, result.payloads.length), 1);
+  return Math.max(widest, perPosition ? job.config.positions.length : 1);
+}
+
+/** The comparable value for a result under a (possibly dynamic) sort key. */
+/** The response length for a result: the body length when present, else the
+ *  reported Content-Length (ffuf-tier rows carry length here, not a body). */
+function fuzzResponseLength(result: FuzzerResult): number | null {
+  const response = result.response;
+  if (response === null || response === undefined) return null;
+  if (response.body !== null && response.body !== undefined) return response.body.length;
+  const header = response.headers.find(([name]) => name.toLowerCase() === "content-length")?.[1];
+  const value = header === undefined ? Number.NaN : Number(header);
+  return Number.isFinite(value) ? value : null;
+}
+
+function fuzzSortComparable(result: FuzzerResult, key: string): number | string {
+  if (key === "status") return result.response?.status ?? -1;
+  if (key === "length") return fuzzResponseLength(result) ?? -1;
+  if (key === "time") return result.response?.durationMs ?? -1;
+  if (key === "error") return result.diagnostic?.id ?? "";
+  if (key === "timeout") return result.timeout === true ? 1 : 0;
+  if (key === "reflected") return result.reflectedCount ?? -1;
+  if (key === "redirects") return result.redirectChain?.length ?? -1;
+  if (key === "retries") return result.retryCount ?? 0;
+  if (key.startsWith("payload:")) return result.payloads[Number(key.slice("payload:".length))] ?? "";
+  if (key.startsWith("match:")) return result.grepMatchCounts?.[Number(key.slice("match:".length))] ?? -1;
+  if (key.startsWith("extract:")) return result.grepExtracts?.[Number(key.slice("extract:".length))] ?? "";
+  return result.ordinal;
+}
+
+/** Whether a result passes the current client-side display filter. */
+function fuzzResultMatchesFilter(result: FuzzerResult): boolean {
+  const filter = fuzzDisplayFilter;
+  if (filter.onlyMatched && !result.matched) return false;
+  if (filter.status.trim() !== "" && String(result.response?.status ?? "") !== filter.status.trim()) return false;
+  if (filter.search.trim() !== "") {
+    const haystack = [result.payloads.join(" "), result.comment ?? "", String(result.response?.status ?? ""), ...(result.grepExtracts ?? []).map((value) => value ?? "")].join(" ").toLowerCase();
+    if (!haystack.includes(filter.search.trim().toLowerCase())) return false;
+  }
+  return true;
+}
+
+/** The request/response inspector for the selected result row. */
+function renderFuzzResultDetail(results: readonly FuzzerResult[]): string {
+  if (selectedFuzzResult === null) return "";
+  const result = results.find((candidate) => candidate.ordinal === selectedFuzzResult);
+  if (result === undefined) return "";
+  const responseText = result.response
+    ? `${result.response.status}\n${formatHeaders(result.response.headers)}${bytesToText(result.response.body) === "" ? "" : `\n\n${bytesToText(result.response.body)}`}`
+    : result.diagnostic?.what ?? "No response was received.";
+  // The ffuf fast-path does not capture the full response — it reports only status
+  // and size, which we surface as a synthesized Content-Length. Label it honestly
+  // as reconstructed rather than presenting it as a full captured response. The
+  // native tier captures the real response, so its label stays plain.
+  const ffufTier = selectedFuzzer?.tier === "ffuf";
+  const responseLabel = ffufTier
+    ? `Response <span class="t-subtle t-small">(reconstructed from ffuf · status + size; body not captured)</span>`
+    : "Response";
+  const chain = result.redirectChain ?? [];
+  const chainBlock = chain.length === 0
+    ? ""
+    : `<div class="stack stack--tight fuzz-redirect-chain"><p class="section-label">Redirect chain · ${chain.length} hop${chain.length === 1 ? "" : "s"}${(result.retryCount ?? 0) > 0 ? ` · ${result.retryCount} retr${result.retryCount === 1 ? "y" : "ies"}` : ""}</p>${chain.map((hop) => `<p class="t-small t-mono">${hop.status} → ${escapeHtml(hop.location)}</p>`).join("")}</div>`;
+  return `<div class="stack stack--tight">${chainBlock}<div class="reqres fuzz-detail">
+  <div class="reqres__col"><p class="section-label">Request · #${result.ordinal} <span class="t-subtle t-small">(as sent)</span></p><pre class="code">${escapeHtml(rawRequestText(result.request, { recomputeContentLength: selectedFuzzer?.config.updateContentLength ?? true }))}</pre></div>
+  <div class="reqres__col"><p class="section-label">${responseLabel}</p><pre class="code">${escapeHtml(responseText)}</pre></div>
+</div></div>`;
 }
 
 async function launchFuzzer(): Promise<void> {
@@ -785,16 +1833,27 @@ async function launchFuzzer(): Promise<void> {
     if (selectedFuzzer.id === "") {
       readFuzzerForm();
       const config = selectedFuzzer.config;
-      // Validate the token-chain sequence JSON before committing the job.
-      const seqRaw = valueOfFuzzer("#fuzzer-sequence").trim();
-      if (seqRaw !== "") { try { const parsed: unknown = JSON.parse(seqRaw); if (!Array.isArray(parsed)) throw new Error("sequence must be a JSON array"); config.sequence = parsed; } catch (error) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "The token-chain sequence is invalid JSON.", why: String(error), fix: "Enter a JSON array of named request steps and retry." }); return; } }
-      if (config.positions.length === 0) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "The attack has no payload positions.", why: "At least one marked position is required to substitute payloads.", fix: "Add a position and mark the bytes to replace, then start the attack." }); return; }
-      if (config.payloadSets.every((set) => set.values.length === 0) && config.sequence?.length === 0) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "No payloads were supplied.", why: "Every payload set is empty, so there is nothing to send.", fix: "Enter at least one payload value, one per line." }); return; }
+      // Compile the §-marked raw request into a base request + payload positions;
+      // the scheme comes from the captured flow's origin so the URL round-trips.
+      const parsed = parseFuzzTemplate(fuzzTemplate, fuzzTemplateScheme());
+      if (parsed.error !== undefined) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "The request template markers are invalid.", why: parsed.error, fix: "Fix the § markers so each position is a matched pair, then start." }); return; }
+      if (parsed.positions.length === 0) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "The attack has no payload positions.", why: "No § markers are set, so there is nothing to fuzz.", fix: "Select a value in the request and click Add § (or Auto), then start." }); return; }
+      config.baseRequest = { method: parsed.method, url: parsed.url, headers: parsed.headers, body: parsed.body };
+      // Map positions to payload sets: Sniper/Battering ram share one set;
+      // Pitchfork/Cluster bomb take one set per position, in order.
+      const perPosition = config.attackType === "pitchfork" || config.attackType === "clusterbomb";
+      config.positions = parsed.positions.map((position, index) => ({ ...position, setIndex: perPosition ? index : 0 }));
+      reconcilePayloadSets(config, config.attackType, config.positions.length);
+      const usedSets = perPosition ? config.payloadSets.slice(0, config.positions.length) : config.payloadSets.slice(0, 1);
+      if (usedSets.every(payloadSetIsEmpty)) { showDiagnostic({ id: "proxy.fuzzer-config-invalid", what: "No payloads were supplied.", why: "Every payload set is empty, so there is nothing to send.", fix: "Enter payload values (or configure a generated source), then start." }); return; }
+      config.sequence = [];
       const created = await fetch("/api/v1/workbench/fuzzer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(config) });
       await requireOk(created, "fuzzer configuration failed");
       selectedFuzzer = (await created.json()) as FuzzerJob;
     }
     const action = selectedFuzzer.state === "paused" ? "resume" : "start";
+    fuzzStartedAt = Date.now();
+    selectedFuzzResult = null;
     const started = await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(selectedFuzzer.id) + "/" + action, { method: "POST" });
     await requireOk(started, "fuzzer " + action + " failed");
     selectedFuzzer = (await started.json()) as FuzzerJob;
@@ -828,6 +1887,10 @@ async function stopFuzzer(): Promise<void> {
   try {
     await requireOk(await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(selectedFuzzer.id) + "/stop", { method: "POST" }), "fuzzer stop failed");
     await refreshFuzzer();
+    // Stop marks the job Stopped immediately, but the in-flight batch keeps
+    // completing and recording for a moment; refresh once more so the "Sent"
+    // count reconciles to what actually reached the target.
+    window.setTimeout(() => void refreshFuzzer(), 900);
   } catch (error) {
     reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer job could not stop.", why: "", fix: "Check the active session and retry." });
   }
@@ -867,113 +1930,183 @@ async function createResend(flowId: number): Promise<void> {
 function renderResend(): void {
   if (resendPanel === null || selectedResend === null) return;
   resendPanel.hidden = false;
+  selectedResendRevision = null;
   resendPanel.innerHTML = `<div class="panel__header">
   <div class="panel__heading">${icon("send", { size: 16 })}<h2>Resend · ${escapeHtml(selectedResend.id.slice(-8))}</h2></div>
   <div class="row">
-    <span class="panel__hint">append-only history</span>
     <button class="btn btn--quiet btn--icon" type="button" data-close-resend><span class="visually-hidden">Close Resend</span>${icon("close", { size: 16 })}</button>
   </div>
 </div>
-<div class="panel__body stack">
-  <div class="split-2">
-    <div class="field">
-      <label class="field__label" for="resend-method">Method</label>
-      <input class="input input--mono" id="resend-method" value="${escapeHtml(selectedResend.current.method)}" />
+<div class="resend-split" data-resend-split>
+  <div class="resend-split__pane resend-req">
+    <div class="reqline">
+      <input class="input input--mono reqline__method" id="resend-method" aria-label="Method" value="${escapeHtml(selectedResend.current.method)}" />
+      <input class="input input--mono reqline__url" id="resend-url" aria-label="URL" value="${escapeHtml(selectedResend.current.url)}" />
     </div>
-    <div class="field">
-      <label class="field__label" for="resend-url">URL</label>
-      <input class="input input--mono" id="resend-url" value="${escapeHtml(selectedResend.current.url)}" />
-    </div>
-  </div>
-  <div class="split-2">
-    <div class="field">
-      <label class="field__label" for="resend-headers">Headers</label>
-      <textarea class="textarea" id="resend-headers" spellcheck="false">${escapeHtml(formatHeaders(selectedResend.current.headers))}</textarea>
-    </div>
-    <div class="field">
-      <label class="field__label" for="resend-body">Body</label>
-      <textarea class="textarea textarea--wrap" id="resend-body" spellcheck="false">${escapeHtml(bytesToText(selectedResend.current.body))}</textarea>
+    <label class="field__label" for="resend-raw">Request — headers, then a blank line, then body</label>
+    <textarea class="textarea resend-raw" id="resend-raw" spellcheck="false">${escapeHtml(composeRawRequest(selectedResend.current.headers, selectedResend.current.body))}</textarea>
+    <div class="row">
+      <button class="btn btn--primary" id="resend-send" type="button">${icon("send", { size: 14 })}<span>Send request</span></button>
     </div>
   </div>
-  <div class="row">
-    <button class="btn btn--primary" id="resend-send" type="button">${icon("send", { size: 14 })}<span>Send request</span></button>
-  </div>
-  <div id="resend-response">${renderResendHistory(selectedResend.history)}</div>
+  <div class="resend-split__gutter" data-resend-gutter role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize request and response"></div>
+  <div class="resend-split__pane resend-res" id="resend-res-pane"></div>
 </div>`;
   resendPanel.querySelector("#resend-send")?.addEventListener("click", () => void sendResend());
-  resendPanel.querySelectorAll<HTMLButtonElement>("[data-derive]").forEach((button) => button.addEventListener("click", () => void deriveResend(Number(button.dataset.derive))));
   resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); });
+  mountResendResponse();
+  initResendSplitter();
 }
 
-function renderResendHistory(history: readonly ResendRevision[]): string {
+/** Combines headers and body into one raw editor: header lines, a blank line,
+ *  then the body — the shape sendResend parses back. */
+function composeRawRequest(headers: readonly [string, string][], body: number[] | null | undefined): string {
+  const headerText = formatHeaders(headers);
+  const bodyText = bytesToText(body);
+  return bodyText === "" ? headerText : `${headerText}\n\n${bodyText}`;
+}
+
+/** Splits the raw editor back into headers text and body text on the first
+ *  blank line (CRLF-tolerant). */
+function splitRawRequest(raw: string): { headerText: string; bodyText: string } {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const sep = normalized.indexOf("\n\n");
+  return sep === -1
+    ? { headerText: normalized, bodyText: "" }
+    : { headerText: normalized.slice(0, sep), bodyText: normalized.slice(sep + 2) };
+}
+
+/** Drag-resize the Request | Response split inside the Resend panel (30–70%),
+ *  double-click to reset. Mirrors the Live-traffic list|detail behaviour. */
+function initResendSplitter(): void {
+  const split = resendPanel?.querySelector<HTMLElement>("[data-resend-split]");
+  const gutter = resendPanel?.querySelector<HTMLElement>("[data-resend-gutter]");
+  if (split === null || split === undefined || gutter === null || gutter === undefined) return;
+  const setRatio = (ratio: number): void => {
+    const clamped = Math.max(0.3, Math.min(0.7, ratio));
+    split.style.setProperty("--resend-req", `${(clamped * 100).toFixed(1)}%`);
+  };
+  gutter.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    gutter.setPointerCapture(event.pointerId);
+    const move = (e: PointerEvent): void => {
+      const rect = split.getBoundingClientRect();
+      setRatio((e.clientX - rect.left) / rect.width);
+    };
+    const up = (): void => {
+      gutter.releasePointerCapture(event.pointerId);
+      gutter.removeEventListener("pointermove", move);
+      gutter.removeEventListener("pointerup", up);
+    };
+    gutter.addEventListener("pointermove", move);
+    gutter.addEventListener("pointerup", up);
+  });
+  gutter.addEventListener("dblclick", () => split.style.setProperty("--resend-req", "50%"));
+}
+
+/** Combines a response's headers and body into one read-only view, mirroring the
+ *  request editor's "headers, blank line, body" shape. */
+function composeRawResponse(response: ResendResponse): string {
+  const headerText = formatHeaders(response.headers);
+  const bodyText = bytesToText(response.body);
+  return bodyText === "" ? headerText : `${headerText}\n\n${bodyText}`;
+}
+
+/** Builds the Response pane so it mirrors the Request pane: an endpoint + status
+ *  line, then the response (headers/body) in a full-height read-only editor. A
+ *  dropdown beside "Response" traverses prior sends; the latest is shown by
+ *  default. No inline history list. */
+function resendResponsePaneHtml(ctx: ResendContext): string {
+  const history = ctx.history;
+  const picker = history.length > 1
+    ? `<select class="input input--sm" id="resend-response-pick" aria-label="Response revision">${
+        [...history].reverse().map((entry) => {
+          const latest = history[history.length - 1].revision;
+          const shown = selectedResendRevision ?? latest;
+          const st = entry.response?.status ?? "failed";
+          return `<option value="${entry.revision}"${entry.revision === shown ? " selected" : ""}>#${entry.revision} · ${escapeHtml(String(st))} · ${escapeHtml(formatTime(entry.sentAt))}</option>`;
+        }).join("")
+      }</select>`
+    : "";
+  const head = `<div class="resend-res__head"><p class="section-label">Response</p>${picker}</div>`;
   if (history.length === 0) {
-    return stateBlock({
-      icon: "clock",
-      title: "No sends yet",
-      body: "Edit the request and send it through the active session proxy. Every send is kept as an immutable revision.",
-      compact: true,
-    });
+    return `${head}<div class="resend-res__empty">${stateBlock({ icon: "clock", title: "No sends yet", body: "Send the request; the latest response appears here.", compact: true })}</div>`;
   }
-  const entries = [...history].reverse().map((entry) => {
-    const status = entry.response?.status;
-    const response = entry.response ?? null;
-    const note = response === null
-      ? entry.diagnostic?.what ?? "No response"
-      : `${response.durationMs} ms · ${formatBytes(response.body?.length ?? 0)}`;
-    return `<article class="history__entry">
-<div class="history__head">
-  <span class="history__revision">#${entry.revision}</span>
-  <span class="list-row__status" data-class="${statusClass(status)}">${status ?? escapeHtml(entry.diagnostic?.id ?? "failed")}</span>
-  <span class="badge">${escapeHtml(entry.scope)}</span>
-  <span class="spacer"></span>
-  <span class="t-small t-subtle">${escapeHtml(formatTime(entry.sentAt))}</span>
-  <button class="btn btn--sm" type="button" data-derive="${entry.revision}">Derive</button>
+  const revision = selectedResendRevision ?? history[history.length - 1].revision;
+  const entry = history.find((candidate) => candidate.revision === revision) ?? history[history.length - 1];
+  const status = entry.response?.status;
+  const statusLabel = status ?? escapeHtml(entry.diagnostic?.id ?? "failed");
+  const endpoint = `${entry.request.method.toUpperCase()} ${entry.request.url}`;
+  const meta = entry.response
+    ? `${entry.response.durationMs} ms · ${formatBytes(entry.response.body?.length ?? 0)} · ${escapeHtml(entry.scope)}`
+    : escapeHtml(entry.scope);
+  const bodyText = entry.response
+    ? composeRawResponse(entry.response)
+    : entry.diagnostic?.what ?? "No response was received.";
+  return `${head}
+<div class="reqline">
+  <span class="resend-res__status list-row__status" data-class="${statusClass(status)}">${statusLabel}</span>
+  <input class="input input--mono reqline__url" id="resend-response-endpoint" readonly value="${escapeHtml(endpoint)}" aria-label="Response endpoint" />
 </div>
-<pre class="code">${escapeHtml(formatHeaders(entry.response?.headers ?? []))}</pre>
-<p class="t-small t-subtle">${escapeHtml(note)}</p>
-</article>`;
-  }).join("");
-  return `<div class="stack stack--tight"><p class="section-label">History · ${history.length}</p><div class="history">${entries}</div></div>`;
+<label class="field__label">Response — headers, then a blank line, then body · ${escapeHtml(meta)}</label>
+<textarea class="textarea resend-raw" id="resend-response-body" readonly spellcheck="false">${escapeHtml(bodyText)}</textarea>`;
+}
+
+/** Renders (or re-renders) just the Response pane, preserving the request editor
+ *  and split ratio, and wires the history dropdown. */
+function mountResendResponse(): void {
+  const pane = resendPanel?.querySelector<HTMLElement>("#resend-res-pane");
+  if (pane === null || pane === undefined || selectedResend === null) return;
+  pane.innerHTML = resendResponsePaneHtml(selectedResend);
+  pane.querySelector<HTMLSelectElement>("#resend-response-pick")?.addEventListener("change", (event) => {
+    selectedResendRevision = Number((event.target as HTMLSelectElement).value);
+    mountResendResponse();
+  });
+}
+
+/** Shows a processing state in the Response pane while a send is in flight. */
+function showResendResponseLoading(): void {
+  const pane = resendPanel?.querySelector<HTMLElement>("#resend-res-pane");
+  if (pane === null || pane === undefined) return;
+  pane.innerHTML = `<div class="resend-res__head"><p class="section-label">Response</p></div>
+<div class="state state--compact"><span class="state__icon">${icon("refresh", { size: 26, className: "spinner" })}</span><p class="state__body">Sending request…</p></div>`;
 }
 
 async function sendResend(): Promise<void> {
   const resend = selectedResend;
   if (resend === null) return;
   const resendId = resend.id;
-  const request: ResendRequest = { method: valueOf("#resend-method"), url: valueOf("#resend-url"), headers: parseHeaders(valueOf("#resend-headers")), body: [...new TextEncoder().encode(valueOf("#resend-body"))] };
+  const { headerText, bodyText } = splitRawRequest(valueOf("#resend-raw"));
+  const request: ResendRequest = { method: valueOf("#resend-method"), url: valueOf("#resend-url"), headers: parseHeaders(headerText), body: [...new TextEncoder().encode(bodyText)] };
+  const sendButton = resendPanel?.querySelector<HTMLButtonElement>("#resend-send") ?? null;
+  showResendResponseLoading();
   try {
-    const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
-    await requireOk(update, "resend edit failed");
-    const sent = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId) + "/send", { method: "POST" });
-    await requireOk(sent, "resend send failed");
-    const result = (await sent.json()) as Partial<ResendSendResult>;
-    let context = result.context;
-    if (context === null || context === undefined || typeof context.id !== "string") {
-      const refreshed = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId));
-      await requireOk(refreshed, "resend history refresh failed");
-      context = (await refreshed.json()) as ResendContext;
-    }
-    if (context === null || typeof context.id !== "string") throw new Error("resend response did not include a valid context");
-    selectedResend = context;
-    resendContexts.set(context.id, context);
-    (result.diagnostics ?? []).forEach(showDiagnostic);
-    showDiagnostic(result.revision?.diagnostic);
-    renderResend();
+    await withBusy(sendButton, "Sending…", async () => {
+      const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
+      await requireOk(update, "resend edit failed");
+      const sent = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId) + "/send", { method: "POST" });
+      await requireOk(sent, "resend send failed");
+      const result = (await sent.json()) as Partial<ResendSendResult>;
+      let context = result.context;
+      if (context === null || context === undefined || typeof context.id !== "string") {
+        const refreshed = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId));
+        await requireOk(refreshed, "resend history refresh failed");
+        context = (await refreshed.json()) as ResendContext;
+      }
+      if (context === null || typeof context.id !== "string") throw new Error("resend response did not include a valid context");
+      selectedResend = context;
+      resendContexts.set(context.id, context);
+      (result.diagnostics ?? []).forEach(showDiagnostic);
+      showDiagnostic(result.revision?.diagnostic);
+    });
+    // Re-mount only the Response pane so the request editor and split ratio the
+    // operator set are preserved; show the just-arrived (latest) revision.
+    selectedResendRevision = null;
+    mountResendResponse();
     renderResendList();
   } catch (error) {
+    mountResendResponse();
     reportUnexpected(error, { id: "proxy.resend-request-failed", what: "The resend send failed.", why: "", fix: "Review the request and confirm the session proxy is running." });
-  }
-}
-
-async function deriveResend(revision: number): Promise<void> {
-  if (selectedResend === null) return;
-  try {
-    const response = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(selectedResend.id) + "/derive/" + revision, { method: "POST" });
-    await requireOk(response, "resend derivation failed");
-    selectedResend = (await response.json()) as ResendContext;
-    renderResend();
-  } catch (error) {
-    reportUnexpected(error, { id: "proxy.resend-request-failed", what: "The resend request could not be derived.", why: "", fix: "Check the selected revision and session store, then retry." });
   }
 }
 
@@ -1360,38 +2493,41 @@ async function sendEndpointToResend(index: number): Promise<void> {
     const response = await fetch("/api/v1/workbench/resend", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ request: endpointRequest(endpoint) }) });
     await requireOk(response, "resend context unavailable");
     registerResend((await response.json()) as ResendContext);
+    // Stay on the surface; pre-render the (hidden) Resend panel so it is ready,
+    // and flag the addition on the Workbench so the operator sees where it went
+    // without a jarring, slow view switch.
     renderResend();
-    showView("workbench");
-    showWorkbenchTab("resend");
-    toast(`Sent ${endpoint.method.toUpperCase()} ${endpoint.pathTemplate} to Resend`, "success");
+    notifyWorkbenchAddition("resend", `${endpoint.method.toUpperCase()} ${endpoint.pathTemplate}`);
   } catch (error) {
     reportUnexpected(error, { id: "proxy.resend-history-failed", what: "The endpoint could not be sent to Resend.", why: "", fix: "Confirm a session is active, then retry." });
   }
+}
+
+/** Toasts and pulses the Workbench rail + the tool's tab badge so a send-to-tool
+ *  from another view is visibly acknowledged where it landed. */
+function notifyWorkbenchAddition(tool: "resend" | "fuzz", label: string): void {
+  const toolName = tool === "resend" ? "Resend" : "Fuzz";
+  toast(`Added ${label} to Workbench › ${toolName}`, "success");
+  pulseElement(document.querySelector('.rail__cell[data-nav="workbench"]'));
+  pulseElement(document.getElementById(tool === "resend" ? "resend-tab-count" : "fuzz-tab-count"));
+}
+
+/** Restarts a brief attention pulse on an element. */
+function pulseElement(element: Element | null): void {
+  if (element === null) return;
+  element.classList.remove("is-pulsing");
+  void (element as HTMLElement).offsetWidth;
+  element.classList.add("is-pulsing");
+  window.setTimeout(() => element.classList.remove("is-pulsing"), 1200);
 }
 
 /** Opens the Fuzzer in the workbench seeded from a surface endpoint. */
 function sendEndpointToFuzzer(index: number): void {
   const endpoint = lastSurfaceEndpoints[index];
   if (endpoint === undefined) return;
-  const request = endpointRequest(endpoint);
-  selectedFuzzer = {
-    id: "", tier: "ffuf", state: "draft",
-    config: {
-      baseRequest: request,
-      positions: [{ location: "url", headerName: null, start: 0, end: 0, setIndex: 0 }],
-      payloadSets: [{ name: "set 1", values: [] }],
-      attackType: "sniper",
-      matchFilter: { statuses: [], minSize: null, maxSize: null, contains: null, regex: null },
-      concurrency: 5, ratePerSecond: 10, maxResults: 100, authPreflight: null, sequence: [],
-    },
-    results: [], diagnostics: [],
-  };
-  currentFuzzDraft = selectedFuzzer;
-  renderFuzzer();
+  seedFuzzDraft(endpointRequest(endpoint));
   renderFuzzList();
-  showView("workbench");
-  showWorkbenchTab("fuzz");
-  toast(`Loaded ${endpoint.method.toUpperCase()} ${endpoint.pathTemplate} into Fuzz`, "success");
+  notifyWorkbenchAddition("fuzz", `${endpoint.method.toUpperCase()} ${endpoint.pathTemplate}`);
 }
 
 /* ==================================================================== *
@@ -1426,7 +2562,122 @@ function requestRowLabel(method: string, url: string): string {
     /* relative/template url — show as-is */
   }
   const m = method.toUpperCase() || "GET";
-  return `<span class="qrow__method" data-method="${escapeHtml(m)}">${escapeHtml(m)}</span><span class="qrow__target"><b>${escapeHtml(host)}</b>${escapeHtml(path)}</span>`;
+  return `<span class="qrow__method" data-method="${escapeHtml(m)}">${escapeHtml(m)}</span><span class="qrow__target"><b>${escapeHtml(host)}</b>${escapeHtml(decodeForDisplay(path))}</span>`;
+}
+
+/** The endpoint of a request — path (+query), decoded, without the origin. Used
+ *  for the compact queue rows and their hover title. */
+function endpointOf(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return decodeForDisplay(parsed.pathname + parsed.search) || "/";
+  } catch {
+    return decodeForDisplay(url);
+  }
+}
+
+/* Client-side, human-friendly names for queued Resend/Fuzz items, so the
+ * operator can label rows they want to remember. Persisted locally — the
+ * backend request/response are never touched. */
+const QUEUE_NAMES_KEY = "apiaxess.queue-names";
+function loadQueueNames(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(QUEUE_NAMES_KEY);
+    return raw === null ? {} : (JSON.parse(raw) as Record<string, string>);
+  } catch {
+    return {};
+  }
+}
+function queueName(id: string): string | undefined {
+  const name = loadQueueNames()[id];
+  return name !== undefined && name.trim() !== "" ? name : undefined;
+}
+function setQueueName(id: string, name: string): void {
+  const all = loadQueueNames();
+  if (name.trim() === "") delete all[id];
+  else all[id] = name.trim();
+  try {
+    localStorage.setItem(QUEUE_NAMES_KEY, JSON.stringify(all));
+  } catch {
+    /* naming is a convenience; ignore quota/availability failures */
+  }
+}
+
+/* Per-tool collapse state for the queue rail, persisted locally. */
+const QUEUE_COLLAPSE_KEY = "apiaxess.queue-collapsed";
+function collapsedTools(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(QUEUE_COLLAPSE_KEY);
+    return raw === null ? {} : (JSON.parse(raw) as Record<string, boolean>);
+  } catch {
+    return {};
+  }
+}
+function applyQueueCollapse(tool: string): void {
+  const collapsed = collapsedTools()[tool] === true;
+  document.querySelector<HTMLElement>(`.wb-split[data-wbsplit="${tool}"]`)?.classList.toggle("is-list-collapsed", collapsed);
+  const button = document.querySelector<HTMLElement>(`[data-wb-collapse="${tool}"]`);
+  if (button !== null) {
+    button.title = collapsed ? "Expand queue" : "Collapse queue";
+    button.setAttribute("aria-label", collapsed ? "Expand queue" : "Collapse queue");
+  }
+}
+function toggleQueueCollapse(tool: string): void {
+  const all = collapsedTools();
+  all[tool] = all[tool] !== true;
+  try {
+    localStorage.setItem(QUEUE_COLLAPSE_KEY, JSON.stringify(all));
+  } catch {
+    /* convenience only */
+  }
+  applyQueueCollapse(tool);
+}
+
+/** A compact queue row: method chip + the endpoint (or the custom name), a
+ *  status cell, and a hover-revealed rename control. The full endpoint is the
+ *  hover title so a renamed row still shows what it points at. */
+function queueRowHtml(opts: { id: string; attr: string; method: string; url: string; status: string; active: boolean }): string {
+  const endpoint = endpointOf(opts.url);
+  const custom = queueName(opts.id);
+  const shown = custom ?? endpoint;
+  const m = opts.method.toUpperCase() || "GET";
+  const title = custom === undefined ? `${m} ${endpoint}` : `${custom} — ${m} ${endpoint}`;
+  return `<div class="qrow${opts.active ? " is-active" : ""}" data-${opts.attr}-row="${escapeHtml(opts.id)}" title="${escapeHtml(title)}">
+<button class="qrow__open" type="button" data-${opts.attr}="${escapeHtml(opts.id)}">
+<span class="qrow__method" data-method="${escapeHtml(m)}">${escapeHtml(m)}</span>
+<span class="qrow__name">${escapeHtml(shown)}</span>
+<span class="qrow__status">${escapeHtml(opts.status)}</span>
+</button>
+<button class="qrow__rename" type="button" data-${opts.attr}-rename="${escapeHtml(opts.id)}" title="Rename this item" aria-label="Rename this item">${icon("edit", { size: 14 })}</button>
+<button class="qrow__delete" type="button" data-${opts.attr}-delete="${escapeHtml(opts.id)}" title="Remove from queue" aria-label="Remove from queue">${icon("close", { size: 14 })}</button>
+</div>`;
+}
+
+/** Turns a queue row's name into an inline text field, committing on Enter/blur
+ *  and cancelling on Escape. */
+function beginQueueRename(rowId: string, attr: string, onDone: () => void): void {
+  const row = document.querySelector<HTMLElement>(`[data-${attr}-row="${CSS.escape(rowId)}"]`);
+  const nameEl = row?.querySelector<HTMLElement>(".qrow__name");
+  if (row === null || nameEl === null || nameEl === undefined) return;
+  const input = document.createElement("input");
+  input.className = "qrow__rename-input";
+  input.value = queueName(rowId) ?? nameEl.textContent ?? "";
+  input.setAttribute("aria-label", "Item name");
+  let committed = false;
+  const commit = (save: boolean): void => {
+    if (committed) return;
+    committed = true;
+    if (save) setQueueName(rowId, input.value);
+    onDone();
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); commit(true); }
+    else if (event.key === "Escape") { event.preventDefault(); commit(false); }
+  });
+  input.addEventListener("blur", () => commit(true));
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
 }
 
 function registerResend(ctx: ResendContext): void {
@@ -1451,8 +2702,7 @@ function renderResendList(): void {
   list.innerHTML = items
     .map((ctx) => {
       const last = ctx.history[ctx.history.length - 1]?.response?.status;
-      const active = selectedResend?.id === ctx.id;
-      return `<button class="qrow${active ? " is-active" : ""}" type="button" data-resend-id="${escapeHtml(ctx.id)}">${requestRowLabel(ctx.current.method, ctx.current.url)}<span class="qrow__status">${last === undefined ? "—" : last}</span></button>`;
+      return queueRowHtml({ id: ctx.id, attr: "resend-id", method: ctx.current.method, url: ctx.current.url, status: last === undefined ? "—" : String(last), active: selectedResend?.id === ctx.id });
     })
     .join("");
   list.querySelectorAll<HTMLElement>("[data-resend-id]").forEach((row) => {
@@ -1465,6 +2715,42 @@ function renderResendList(): void {
       }
     });
   });
+  list.querySelectorAll<HTMLElement>("[data-resend-id-rename]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = button.dataset.resendIdRename ?? "";
+      beginQueueRename(id, "resend-id", () => renderResendList());
+    });
+  });
+  list.querySelectorAll<HTMLElement>("[data-resend-id-delete]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void deleteResendContext(button.dataset.resendIdDelete ?? "");
+    });
+  });
+  list.querySelectorAll<HTMLElement>("[data-resend-id-row]").forEach((row) => {
+    row.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      const ctx = resendContexts.get(row.dataset.resendIdRow ?? "");
+      if (ctx !== undefined) showHostScopeMenu(event.clientX, event.clientY, ctx.current.url);
+    });
+  });
+}
+
+/** Removes a resend context from the queue (and the durable store). If it was
+ *  the open one, the editor resets to the empty state. */
+async function deleteResendContext(id: string): Promise<void> {
+  if (id === "") return;
+  try {
+    const response = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(id), { method: "DELETE" });
+    if (!response.ok && response.status !== 404) { await requireOk(response, "could not remove the resend item"); return; }
+    resendContexts.delete(id);
+    setQueueName(id, "");
+    if (selectedResend?.id === id) { selectedResend = null; seedResendEmpty(); }
+    renderResendList();
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.resend-history-failed", what: "Could not remove the resend item.", why: "", fix: "Retry; if it persists, reload the session." });
+  }
 }
 
 async function refreshResendList(): Promise<void> {
@@ -1510,7 +2796,7 @@ function renderFuzzList(): void {
       const active = key === "draft" ? selectedFuzzer?.id === "" : selectedFuzzer?.id === job.id;
       const req = job.config.baseRequest;
       const state = key === "draft" ? "draft" : job.state;
-      return `<button class="qrow${active ? " is-active" : ""}" type="button" data-fuzz-key="${escapeHtml(key)}">${requestRowLabel(req.method, req.url)}<span class="qrow__status">${escapeHtml(state)}</span></button>`;
+      return queueRowHtml({ id: key, attr: "fuzz-key", method: req.method, url: req.url, status: state, active });
     })
     .join("");
   list.querySelectorAll<HTMLElement>("[data-fuzz-key]").forEach((row) => {
@@ -1524,6 +2810,53 @@ function renderFuzzList(): void {
       }
     });
   });
+  list.querySelectorAll<HTMLElement>("[data-fuzz-key-rename]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const key = button.dataset.fuzzKeyRename ?? "";
+      beginQueueRename(key, "fuzz-key", () => renderFuzzList());
+    });
+  });
+  list.querySelectorAll<HTMLElement>("[data-fuzz-key-delete]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void deleteFuzzJob(button.dataset.fuzzKeyDelete ?? "");
+    });
+  });
+  list.querySelectorAll<HTMLElement>("[data-fuzz-key-row]").forEach((row) => {
+    row.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      const key = row.dataset.fuzzKeyRow ?? "";
+      const job = key === "draft" ? currentFuzzDraft : fuzzerJobsList.get(key);
+      if (job !== null && job !== undefined) showHostScopeMenu(event.clientX, event.clientY, job.config.baseRequest.url);
+    });
+  });
+}
+
+/** Removes a fuzz attack from the queue. A not-yet-created draft is dropped
+ *  locally; a persisted job is deleted on the backend too. */
+async function deleteFuzzJob(key: string): Promise<void> {
+  if (key === "") return;
+  if (key === "draft") {
+    currentFuzzDraft = null;
+    if (selectedFuzzer?.id === "") { selectedFuzzer = null; seedFuzzerEmpty(); }
+    renderFuzzList();
+    return;
+  }
+  try {
+    const response = await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(key), { method: "DELETE" });
+    if (!response.ok && response.status !== 404) { await requireOk(response, "could not remove the fuzz attack"); return; }
+    fuzzerJobsList.delete(key);
+    setQueueName(key, "");
+    if (selectedFuzzer?.id === key) {
+      if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
+      selectedFuzzer = null;
+      seedFuzzerEmpty();
+    }
+    renderFuzzList();
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.fuzzer-persistence-failed", what: "Could not remove the fuzz attack.", why: "", fix: "Retry; if it persists, reload the session." });
+  }
 }
 
 async function refreshFuzzList(): Promise<void> {
@@ -1540,11 +2873,17 @@ async function refreshFuzzList(): Promise<void> {
   }
 }
 
-/** Filters the Live-traffic list to rows matching the search box. */
+/** Filters the Live-traffic list by the search box, the method dropdown, and the
+ *  response-status dropdown. All three combine (AND). */
 function applyFlowSearch(): void {
   const query = (document.querySelector<HTMLInputElement>("#flow-search")?.value ?? "").trim().toLowerCase();
+  const method = (document.querySelector<HTMLSelectElement>("#flow-filter-method")?.value ?? "").toUpperCase();
+  const statusClassFilter = document.querySelector<HTMLSelectElement>("#flow-filter-status")?.value ?? "";
   document.querySelectorAll<HTMLElement>("#flow-list .list-row").forEach((row) => {
-    row.hidden = query !== "" && !row.textContent?.toLowerCase().includes(query);
+    const matchesText = query === "" || (row.textContent?.toLowerCase().includes(query) ?? false);
+    const matchesMethod = method === "" || row.dataset.method === method;
+    const matchesStatus = statusClassFilter === "" || row.dataset.statusClass === statusClassFilter;
+    row.hidden = !(matchesText && matchesMethod && matchesStatus);
   });
 }
 
@@ -1553,19 +2892,107 @@ function initWorkbenchTools(): void {
     tab.addEventListener("click", () => showWorkbenchTab((tab.dataset.wbtab as "live" | "resend" | "fuzz") ?? "live"));
   });
   document.querySelector<HTMLInputElement>("#flow-search")?.addEventListener("input", applyFlowSearch);
+  document.querySelector<HTMLSelectElement>("#flow-filter-method")?.addEventListener("change", applyFlowSearch);
+  document.querySelector<HTMLSelectElement>("#flow-filter-status")?.addEventListener("change", applyFlowSearch);
+  document.querySelectorAll<HTMLElement>("[data-wb-collapse]").forEach((button) => {
+    button.addEventListener("click", () => toggleQueueCollapse(button.dataset.wbCollapse ?? ""));
+  });
+  applyQueueCollapse("resend");
+  applyQueueCollapse("fuzz");
   initWorkbenchSplitters();
   renderResendList();
   renderFuzzList();
 }
 
 /** Right-click menu on a Live-traffic row: Resend or Fuzz that request. */
+/** The registrable domain to add to scope: `a.b.example.com` → `example.com`.
+ *  A small compound-suffix table keeps common two-part TLDs (co.uk, com.au…)
+ *  from collapsing to the public suffix. Presentation-grade, not a full PSL. */
+function registrableDomain(host: string): string {
+  const labels = host.toLowerCase().replace(/\.$/, "").split(".").filter((label) => label !== "");
+  if (labels.length <= 2) return labels.join(".");
+  const twoPartTlds = new Set(["co.uk", "org.uk", "gov.uk", "ac.uk", "co.in", "co.jp", "com.au", "com.br", "co.nz", "co.za", "com.cn", "com.mx", "com.sg", "com.hk"]);
+  const lastTwo = labels.slice(-2).join(".");
+  return twoPartTlds.has(lastTwo) ? labels.slice(-3).join(".") : lastTwo;
+}
+
+/** True for IP literals (IPv4/IPv6) and `localhost`. These must be scoped as an
+ *  exact host — applying registrable-domain truncation to an address mangles it
+ *  (e.g. `127.0.0.1` → `0.1`), producing a wrong, useless scope rule. */
+function isIpOrLocalhost(host: string): boolean {
+  const h = host.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (h === "localhost") return true;
+  if (h.includes(":")) return true; // IPv6 literal
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(h); // IPv4 dotted quad
+}
+
+interface ScopeTarget { readonly label: string; readonly kind: "exact" | "domain_suffix"; readonly value: string }
+
+/** The scope target for a captured host: an exact rule (verbatim, normalized
+ *  host) for IPs/localhost, otherwise a DomainSuffix rule for the registrable
+ *  domain. Returns `null` when there is no usable host. The `label` is the exact
+ *  value being added, so the menu reads truthfully ("Add 127.0.0.1 to scope"). */
+function scopeTargetForHost(host: string): ScopeTarget | null {
+  const trimmed = host.trim();
+  if (trimmed === "") return null;
+  if (isIpOrLocalhost(trimmed)) {
+    const value = trimmed.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+    return { label: value, kind: "exact", value };
+  }
+  const domain = registrableDomain(trimmed);
+  if (domain === "") return null;
+  return { label: domain, kind: "domain_suffix", value: domain };
+}
+
+/** Host component of a URL (or the string itself when it isn't a full URL). */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+interface ScopeRule { id: string; host: { kind: string; domain?: string; host?: string }; ports: number[] }
+
+/** Adds a domain (and its subdomains) to the active session scope as a
+ *  DomainSuffix allow rule, so its traffic is treated as in-scope. Adds the
+ *  registrable domain, never the specific endpoint. */
+async function addHostToScope(host: string): Promise<void> {
+  const target = scopeTargetForHost(host);
+  if (target === null) return;
+  try {
+    const current = await fetch("/api/v1/session/scope");
+    if (!current.ok) {
+      showDiagnostic({ id: "web.scope-unavailable", what: "There is no active scope to add to.", why: "A session scope is declared when you start a web session or run an APK analysis.", fix: "Start a web session first, then add hosts to its scope." });
+      return;
+    }
+    const scope = await current.json() as { allowed_targets?: ScopeRule[] };
+    const rules = scope.allowed_targets ?? [];
+    const already = rules.some((rule) => (rule.host.kind === "domain_suffix" && rule.host.domain === target.value) || (rule.host.kind === "exact" && rule.host.host === target.value));
+    if (already) { toast(`${target.label} is already in scope`, "info"); return; }
+    const hostMatch = target.kind === "exact" ? { kind: "exact", host: target.value } : { kind: "domain_suffix", domain: target.value };
+    rules.push({ id: `manual:${target.value}`, host: hostMatch, ports: [] });
+    scope.allowed_targets = rules;
+    const put = await fetch("/api/v1/session/scope", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(scope) });
+    await requireOk(put, "scope update failed");
+    toast(`Added ${target.label} to scope`, "success");
+    await refreshSession();
+  } catch (error) {
+    reportUnexpected(error, { id: "web.scope-add-failed", what: "Could not add the host to scope.", why: "", fix: "Confirm a session is active, then retry." });
+  }
+}
+
 function showFlowMenu(x: number, y: number, flowId: number): void {
   document.querySelector(".context-menu")?.remove();
   const menu = document.createElement("div");
   menu.className = "context-menu";
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
-  menu.innerHTML = `<button class="context-menu__item" type="button" data-flow-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" data-flow-fuzz>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>`;
+  const host = flows.get(flowId)?.host ?? "";
+  const scopeLabel = host === "" ? "" : (scopeTargetForHost(host)?.label ?? "");
+  const scopeItem = scopeLabel === "" ? "" : `<button class="context-menu__item" type="button" data-flow-scope>${icon("shield", { size: 14 })}<span>Add ${escapeHtml(scopeLabel)} to scope</span></button>`;
+  menu.innerHTML = `<button class="context-menu__item" type="button" data-flow-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" data-flow-fuzz>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>${scopeItem}`;
   const close = (): void => {
     menu.remove();
     document.removeEventListener("click", close);
@@ -1581,6 +3008,44 @@ function showFlowMenu(x: number, y: number, flowId: number): void {
   menu.querySelector("[data-flow-fuzz]")?.addEventListener("click", () => {
     close();
     void selectFlow(flowId).then(() => openFuzzer(flowId));
+  });
+  menu.querySelector("[data-flow-scope]")?.addEventListener("click", () => {
+    close();
+    void addHostToScope(host);
+  });
+  document.body.append(menu);
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${Math.max(4, window.innerWidth - rect.width - 4)}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${Math.max(4, window.innerHeight - rect.height - 4)}px`;
+  setTimeout(() => {
+    document.addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+  }, 0);
+}
+
+/** A one-item context menu offering to add a URL's registrable domain to scope.
+ *  Used on Resend/Fuzz queue rows, where scope violations surface. */
+function showHostScopeMenu(x: number, y: number, url: string): void {
+  const host = hostOf(url);
+  const scopeLabel = host === "" ? "" : (scopeTargetForHost(host)?.label ?? "");
+  if (scopeLabel === "") return;
+  document.querySelector(".context-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.className = "context-menu";
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.innerHTML = `<button class="context-menu__item" type="button" data-scope-add>${icon("shield", { size: 14 })}<span>Add ${escapeHtml(scopeLabel)} to scope</span></button>`;
+  const close = (): void => {
+    menu.remove();
+    document.removeEventListener("click", close);
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (event: KeyboardEvent): void => {
+    if (event.key === "Escape") close();
+  };
+  menu.querySelector("[data-scope-add]")?.addEventListener("click", () => {
+    close();
+    void addHostToScope(host);
   });
   document.body.append(menu);
   const rect = menu.getBoundingClientRect();
@@ -1922,7 +3387,7 @@ function connect(session: WorkbenchSession): void {
   };
   telemetry.onmessage = (event) => {
     const update = JSON.parse(event.data) as LiveUpdate;
-    update.flows.forEach((flow) => flows.set(flow.id, flow));
+    update.flows.forEach((flow) => ingestFlow(flow));
     update.diagnostics.forEach(showDiagnostic);
     (update.prompts ?? []).forEach((prompt) => void handleCredentialPrompt(prompt));
     renderFlows();
@@ -2029,6 +3494,13 @@ async function startWebSession(): Promise<void> {
 
 function renderBrowserState(status: BrowserLaunchStatus | null, stopped = false): void {
   latestBrowser = status;
+  // The capture browser is driven from the two top-of-page actions now: show
+  // Launch when nothing is running, Stop while it is.
+  const running = status !== null && status.running;
+  const launchBtn = document.querySelector<HTMLButtonElement>("#capture-launch");
+  const stopBtn = document.querySelector<HTMLButtonElement>("#capture-stop");
+  if (launchBtn !== null) launchBtn.hidden = running;
+  if (stopBtn !== null) stopBtn.hidden = !running;
   if (browserState !== null) {
     if (stopped) {
       browserState.className = "notice";
@@ -2150,7 +3622,7 @@ async function importHar(file: File): Promise<void> {
     // Fold the imported flows into the live list immediately.
     try {
       const flowsResponse = await fetch("/api/v1/workbench/flows");
-      if (flowsResponse.ok) { ((await flowsResponse.json()) as FlowSummary[]).forEach((flow) => flows.set(flow.id, flow)); renderFlows(); }
+      if (flowsResponse.ok) { ((await flowsResponse.json()) as FlowSummary[]).forEach((flow) => ingestFlow(flow)); renderFlows(); }
     } catch { /* the telemetry stream also carries new flows */ }
   } catch (error) {
     reportUnexpected(error, { id: "proxy.har-import-failed", what: "The HAR file could not be imported.", why: "", fix: "Confirm the file is a valid HAR export and that a session is active, then retry." });
@@ -2224,6 +3696,7 @@ async function populateWordlists(): Promise<void> {
   discoveryWordlist.innerHTML = built + custom;
   discoveryWordlist.value = customWordlist !== null ? "custom" : previous !== "" && Array.from(discoveryWordlist.options).some((o) => o.value === previous) ? previous : "common";
   updateWordlistHint();
+  prefetchDiscoveryEstimate();
 }
 
 function updateWordlistHint(): void {
@@ -2253,8 +3726,9 @@ function loadCustomWordlist(file: File): void {
   reader.readAsText(file);
 }
 
-function renderDiscoveryEstimate(estimate: DiscoveryEstimate): void {
+function renderDiscoveryEstimate(estimate: DiscoveryEstimate, key: string): void {
   lastDiscoveryEstimate = estimate;
+  lastDiscoveryEstimateKey = key;
   if (discoveryEstimateView === null) return;
   discoveryEstimateView.innerHTML = `<div class="discovery-estimate">
 <div class="discovery-estimate__item"><span class="metric__label">Target</span><span class="t-mono t-small">${escapeHtml(estimate.target)}</span></div>
@@ -2262,28 +3736,57 @@ function renderDiscoveryEstimate(estimate: DiscoveryEstimate): void {
 <div class="discovery-estimate__item"><span class="metric__label">Rate</span><span class="discovery-estimate__value">${estimate.ratePerSecond}/s</span></div>
 <div class="discovery-estimate__item"><span class="metric__label">Duration</span><span class="discovery-estimate__value">${escapeHtml(estimate.estimatedLabel)}</span></div>
 </div>`;
+  if (discoveryStatus !== null) discoveryStatus.textContent = `${estimate.requestCount.toLocaleString()} requests · ${estimate.estimatedLabel} at ${estimate.ratePerSecond}/s`;
 }
 
 async function estimateDiscovery(): Promise<void> {
   const button = document.querySelector<HTMLButtonElement>("#discovery-estimate");
+  const key = discoveryRequestBody();
   const response = await withBusy(button, "Estimating…", () =>
-    fetch("/api/v1/discovery/estimate", { method: "POST", headers: { "content-type": "application/json" }, body: discoveryRequestBody() }),
+    fetch("/api/v1/discovery/estimate", { method: "POST", headers: { "content-type": "application/json" }, body: key }),
   );
   try {
     await requireOk(response, "discovery estimate unavailable");
     const estimate = await response.json() as DiscoveryEstimate;
-    renderDiscoveryEstimate(estimate);
-    if (discoveryStatus !== null) discoveryStatus.textContent = `${estimate.requestCount} requests · ${estimate.estimatedLabel} at ${estimate.ratePerSecond}/s`;
+    renderDiscoveryEstimate(estimate, key);
   } catch (error) {
     reportUnexpected(error, { id: "web.discovery-estimate-failed", what: "Discovery estimate unavailable.", why: "", fix: "Check the active web session and selected wordlist." });
   }
 }
 
+/** Silently refreshes the estimate cache in the background so the run
+ *  confirmation opens instantly. Failures are swallowed — the explicit Estimate
+ *  button and runDiscovery's own fallback surface any real error. */
+function prefetchDiscoveryEstimate(): void {
+  if (discoveryEstimateDebounce !== undefined) window.clearTimeout(discoveryEstimateDebounce);
+  discoveryEstimateDebounce = window.setTimeout(() => {
+    const key = discoveryRequestBody();
+    if (key === lastDiscoveryEstimateKey) return;
+    void fetch("/api/v1/discovery/estimate", { method: "POST", headers: { "content-type": "application/json" }, body: key })
+      .then(async (response) => {
+        if (!response.ok) return;
+        const estimate = await response.json() as DiscoveryEstimate;
+        renderDiscoveryEstimate(estimate, key);
+      })
+      .catch(() => { /* best-effort warm cache */ });
+  }, 150);
+}
+
 async function runDiscovery(): Promise<void> {
-  const estimateResponse = await fetch("/api/v1/discovery/estimate", { method: "POST", headers: { "content-type": "application/json" }, body: discoveryRequestBody() });
-  if (!estimateResponse.ok) { await requireOk(estimateResponse, "discovery estimate unavailable"); return; }
-  const estimate = await estimateResponse.json() as DiscoveryEstimate;
-  renderDiscoveryEstimate(estimate);
+  const key = discoveryRequestBody();
+  // Snappy confirm: use the warm cache when it matches the current selection so
+  // the dialog opens immediately. Only fetch (with the run button busy) when we
+  // have nothing valid cached.
+  let estimate = key === lastDiscoveryEstimateKey ? lastDiscoveryEstimate : null;
+  if (estimate === null) {
+    const runButton = document.querySelector<HTMLButtonElement>("#discovery-run");
+    const estimateResponse = await withBusy(runButton, "Preparing…", () =>
+      fetch("/api/v1/discovery/estimate", { method: "POST", headers: { "content-type": "application/json" }, body: key }),
+    );
+    if (!estimateResponse.ok) { await requireOk(estimateResponse, "discovery estimate unavailable"); return; }
+    estimate = await estimateResponse.json() as DiscoveryEstimate;
+    renderDiscoveryEstimate(estimate, key);
+  }
 
   // Same gate as before, in the product's own voice: nothing is probed until
   // the operator confirms the scale of what is about to be sent.
@@ -2719,7 +4222,8 @@ document.querySelector<HTMLInputElement>("#discovery-upload")?.addEventListener(
   if (file !== undefined) loadCustomWordlist(file);
   (event.target as HTMLInputElement).value = "";
 });
-discoveryWordlist?.addEventListener("change", updateWordlistHint);
+discoveryWordlist?.addEventListener("change", () => { updateWordlistHint(); prefetchDiscoveryEstimate(); });
+discoveryKind?.addEventListener("change", () => prefetchDiscoveryEstimate());
 document.querySelector("#web-fuse")?.addEventListener("click", () => void fuseWebTraffic());
 document.querySelector("#web-export")?.addEventListener("click", () => showView("export"));
 document.querySelector("#apk-run")?.addEventListener("click", () => void startPipeline());
@@ -3115,7 +4619,7 @@ async function boot(): Promise<void> {
     if (!health.proxyRunning) showDiagnostic({ id: "proxy.backend-start-failed", what: "The session proxy health is not ready.", why: "The local API has no completed backend health snapshot.", fix: "Restart the active session and inspect the resulting diagnostic." });
     if (interceptToggle !== null) interceptToggle.checked = session.interceptEnabled;
     const initial = (await (await fetch("/api/v1/workbench/flows")).json()) as FlowSummary[];
-    initial.forEach((flow) => flows.set(flow.id, flow));
+    initial.forEach((flow) => ingestFlow(flow));
     flowsLoaded = true;
     renderFlows();
     renderCaptureHealth();

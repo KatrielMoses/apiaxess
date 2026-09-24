@@ -174,6 +174,13 @@ mkdir -p "$share/tools/ffuf"
 cp -r "$ffuf_dir/." "$share/tools/ffuf/"
 chmod 0755 "$share/tools/ffuf/ffuf"
 
+# --- Bundled Fuzz payload lists ("Add from list") ---
+# Curated .txt lists installed at share/apiaxess/payloads for
+# crates/workbench-proxy/src/payload_lists.rs. The engine also embeds these, so
+# this copy is for operator inspection/extension (override: APIAXESS_PAYLOADS).
+mkdir -p "$share/payloads"
+cp "$repository_root/crates/workbench-proxy/assets/payloads/"*.txt "$share/payloads/"
+
 # --- Bundled Chromium (verified official snapshot) ---
 chromium_dir="$target_root/chromium-runtime"
 pwsh -File "$assets/fetch-chromium.ps1" -Platform linux_x64 -OutputDirectory "$chromium_dir" -CacheDirectory "$cache_root"

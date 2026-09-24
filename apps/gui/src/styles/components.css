@@ -433,6 +433,14 @@
   font-size: var(--text-body);
 }
 
+/* Compact, content-width control for toolbar dropdowns. */
+.input--sm {
+  width: auto;
+  min-height: var(--control-height-sm, 1.9rem);
+  padding: 0.2rem var(--space-3);
+  font-size: var(--text-small);
+}
+
 /* Checkbox / affirmation control */
 .check {
   display: inline-flex;

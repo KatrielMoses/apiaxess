@@ -143,6 +143,14 @@ fn response_body_complete(response: &[u8]) -> bool {
     response.len() >= separator + 4 + content_length
 }
 
+/// Injected at document-start on every page so that anyone looking at the
+/// capture browser can tell, at a glance, that `APIaxess` opened it and is
+/// recording — a persistent brand marker (a top accent rule + a corner pill),
+/// mirroring how tools like Burp brand their bundled browser. The marker is
+/// inert (`pointer-events:none`) and idempotent so it never interferes with the
+/// page under test.
+const CAPTURE_WATERMARK_JS: &str = r#"(function(){if(window.__apiaxessMarker)return;window.__apiaxessMarker=true;function mount(){try{var root=document.documentElement;if(!root)return;if(document.getElementById('apiaxess-capture-marker'))return;var bar=document.createElement('div');bar.id='apiaxess-capture-marker';bar.style.cssText='position:fixed;top:0;left:0;right:0;height:3px;background:#2d7ff9;z-index:2147483647;pointer-events:none;';var pill=document.createElement('div');pill.id='apiaxess-capture-pill';pill.style.cssText='position:fixed;bottom:12px;right:12px;display:flex;align-items:center;gap:6px;padding:5px 10px;background:#0d0d0d;color:#f0f0f0;font:600 12px/1 -apple-system,Segoe UI,Roboto,Arial,sans-serif;border:1px solid #2d7ff9;border-radius:4px;z-index:2147483647;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.45);opacity:.92;letter-spacing:.02em;';pill.innerHTML='<span style=\"color:#2d7ff9;font-size:13px;line-height:1;\">◆</span> APIaxess capture';root.appendChild(bar);root.appendChild(pill);}catch(e){}}mount();if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',mount);}window.addEventListener('load',mount);})();"#;
+
 fn navigate(websocket_url: &str, target: &str) -> Result<(), String> {
     let mut request = websocket_url
         .into_client_request()
@@ -153,14 +161,32 @@ fn navigate(websocket_url: &str, target: &str) -> Result<(), String> {
     request.headers_mut().remove("origin");
     let (mut socket, _) = connect(request)
         .map_err(|error| format!("could not establish the CDP websocket: {error}"))?;
-    let command = json!({
-        "id": 1,
-        "method": "Page.navigate",
-        "params": { "url": target },
-    });
-    socket
-        .send(Message::Text(command.to_string().into()))
-        .map_err(|error| format!("could not issue CDP navigation: {error}"))?;
+    // Order matters: enable the Page domain and register the brand marker as a
+    // document-start script BEFORE navigating, so the very first document the
+    // navigation creates already carries the watermark. Every later navigation
+    // re-runs it too.
+    for command in [
+        json!({ "id": 1, "method": "Page.enable" }),
+        json!({
+            "id": 2,
+            "method": "Page.addScriptToEvaluateOnNewDocument",
+            "params": { "source": CAPTURE_WATERMARK_JS },
+        }),
+        json!({
+            "id": 3,
+            "method": "Page.navigate",
+            "params": { "url": target },
+        }),
+    ] {
+        socket
+            .send(Message::Text(command.to_string().into()))
+            .map_err(|error| format!("could not issue CDP command: {error}"))?;
+    }
+    // The frames are flushed to the OS by `send`; a brief settle lets Chromium's
+    // websocket reader consume all three (the document-start script must be
+    // registered before the navigation it applies to) before we close the
+    // control channel.
+    thread::sleep(Duration::from_millis(200));
     socket
         .close(None)
         .map_err(|error| format!("could not close the CDP websocket: {error}"))?;

@@ -433,6 +433,22 @@ if (-not (Test-Path -LiteralPath $ffufBinary -PathType Leaf)) {
 Copy-Item -LiteralPath $ffufRuntimeDirectory -Destination (Join-Path $stageTools "ffuf") -Recurse -Force
 $ffufSbom = Get-Content -LiteralPath (Join-Path $ffufRuntimeDirectory "ffuf-sbom.json") -Raw | ConvertFrom-Json
 
+# --- Bundled Fuzz payload lists ("Add from list") ---
+# Curated .txt lists staged at payloads\ for crates/workbench-proxy/src/payload_lists.rs.
+# The engine also embeds these, so this copy is for operator inspection/extension;
+# an operator may override with APIAXESS_PAYLOADS pointing at their own directory.
+$payloadsSource = Join-Path $repositoryRoot "crates\workbench-proxy\assets\payloads"
+$stagePayloads = Join-Path $stageRoot "payloads"
+New-Item -ItemType Directory -Path $stagePayloads -Force | Out-Null
+# Enumerate then copy: a wildcard baked into -LiteralPath is treated as a literal
+# filename (no glob expansion), so copy the matched files explicitly. Fail loud if
+# the curated lists vanished, mirroring the ffuf/frida missing-runtime checks.
+$payloadFiles = Get-ChildItem -LiteralPath $payloadsSource -Filter "*.txt" -File
+if ($payloadFiles.Count -eq 0) {
+    throw "No bundled payload lists (*.txt) found at $payloadsSource."
+}
+$payloadFiles | Copy-Item -Destination $stagePayloads -Force
+
 # --- Bundled Frida host components (only the frida-embedded variant) ---
 # Not resolved from a runtime install path (the devkit is a build/link input and
 # the device-side server ships inside the analysis-runtime image), but staged for

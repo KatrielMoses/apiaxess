@@ -18,7 +18,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::{BodyDirection, FlowEvent, FlowObserver, InterceptController};
-use apiaxess_workbench_store::{FlowCapture, TrafficStore};
+use apiaxess_workbench_store::{FlowCapture, FlowOrigin, TrafficStore};
 
 const TELEMETRY_CAPACITY: usize = 256;
 const MAX_LIVE_FLOWS: usize = 1_000;
@@ -57,6 +57,11 @@ pub struct FlowSummary {
     /// Observed body size from protocol metadata, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// How this flow entered the store. The Live list shows `capture` by default
+    /// and hides Resend/Fuzz-synthesized traffic; always serialized so the GUI
+    /// can filter and a future "show attack traffic" toggle can opt in.
+    #[serde(default)]
+    pub origin: FlowOrigin,
 }
 
 /// Full in-memory flow detail fetched after selecting a live flow.
@@ -453,6 +458,7 @@ impl FlowObserver for LiveWorkbench {
                 uri,
                 headers,
                 version,
+                origin,
                 ..
             } => {
                 let (host, path) = split_uri(&uri);
@@ -467,6 +473,7 @@ impl FlowObserver for LiveWorkbench {
                     duration_ms: None,
                     content_type: None,
                     size: None,
+                    origin,
                 };
                 let detail = FlowDetail {
                     summary: summary.clone(),
@@ -511,6 +518,7 @@ impl FlowObserver for LiveWorkbench {
                     content_type: header_value(&headers, "content-type"),
                     size: header_value(&headers, "content-length")
                         .and_then(|value| value.parse().ok()),
+                    origin: FlowOrigin::Capture,
                 };
                 if let Ok(mut flows) = self.flows.lock() {
                     if let Some(flow) = flows.get_mut(&flow_id) {
@@ -593,6 +601,7 @@ impl LiveWorkbench {
             response_body: record.detail.response_body.clone(),
             scope,
             provenance,
+            origin: record.detail.summary.origin,
         };
         if let Err(diagnostic) = store.upsert(&capture) {
             self.publish_diagnostic(diagnostic);
@@ -667,6 +676,7 @@ fn flow_summary_from_store(flow: apiaxess_workbench_store::FlowSummary) -> FlowS
         duration_ms: flow.duration_ms,
         content_type: flow.content_type,
         size: flow.response_size,
+        origin: flow.origin,
     }
 }
 
@@ -686,6 +696,7 @@ fn flow_detail_from_capture(flow: FlowCapture) -> FlowDetail {
                     .then(|| value.clone())
             }),
             size: flow.response_body.as_ref().map(|body| body.len() as u64),
+            origin: flow.origin,
         },
         request_headers: flow.request_headers,
         response_headers: flow.response_headers,
@@ -740,6 +751,7 @@ mod tests {
             uri: "https://api.example.test/v1/items?x=1".to_owned(),
             version: "HTTP/2".to_owned(),
             headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            origin: FlowOrigin::Capture,
         });
         first.observe(FlowEvent::BodyChunk {
             flow_id: 9,
