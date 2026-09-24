@@ -31,6 +31,7 @@ import {
 } from "./fuzz/template";
 import { parseRawRequest, rawRequestText, splitRawRequest as splitRawRequestParts, splitUrl, syncContentLength, urlOrigin } from "./http/request-editor";
 import { prettyBody } from "./http/body-view";
+import { curlCommand, findAll, hexDump, inspectRequest, type InspectorItem, isBinaryBody, requestMethod, setRequestMethod, showNonPrintables, urlEncode } from "./http/message-tools";
 
 /* ==================================================================== *
  * Engine contracts. These mirror the local API's response shapes and are
@@ -1236,13 +1237,15 @@ function seedResendEmpty(): void {
   if (resendPanel === null) return;
   resendPanel.hidden = false;
   renderedResendId = null;
+  const newButton = `<div class="row resend-empty__actions"><button class="btn btn--sm" type="button" data-resend-new-inline>${icon("plus", { size: 14 })}<span>New request</span></button></div>`;
   if (resendContexts.size === 0) {
-    resendPanel.innerHTML = stateBlock({
+    resendPanel.innerHTML = `${stateBlock({
       icon: "refresh",
       title: "No request loaded",
-      body: "Send a flow here from the traffic table or the API surface, then edit and resend it.",
+      body: "Send a flow here from the traffic table or the API surface, or write one from scratch.",
       compact: true,
-    });
+    })}${newButton}`;
+    resendPanel.querySelector("[data-resend-new-inline]")?.addEventListener("click", () => void newResendRequest());
     return;
   }
   const count = resendContexts.size;
@@ -1980,24 +1983,29 @@ function renderResend(): void {
   resendPanel.innerHTML = `<div class="panel__header">
   <div class="panel__heading">${icon("send", { size: 16 })}<h2 title="${escapeHtml(ctx.current.url)}">${escapeHtml(resendTitle(ctx))}</h2></div>
   <div class="row">
+    <button class="btn btn--sm btn--quiet" type="button" data-resend-copy-curl title="Copy the editor's request as a curl command (bash/zsh)">${icon("copy", { size: 14 })}<span>Copy curl</span></button>
+    <button class="btn btn--sm btn--quiet" type="button" data-resend-copy-url title="Copy the editor's request URL">${icon("copy", { size: 14 })}<span>Copy URL</span></button>
     <button class="btn btn--quiet btn--icon" type="button" data-close-resend><span class="visually-hidden">Close Resend</span>${icon("close", { size: 16 })}</button>
   </div>
 </div>
 <div class="resend-split" data-resend-split>
   <div class="resend-split__pane resend-req">
     <div class="reqline">
-      <input class="input input--mono reqline__url" id="resend-target" aria-label="Target — scheme://host:port the connection goes to" title="Target — where the connection goes. The Host header below is sent exactly as written." spellcheck="false" value="${escapeHtml(target)}" />
+      <input class="input input--mono reqline__url" id="resend-target" aria-label="Target — scheme://host:port the connection goes to" title="Target — where the connection goes. The Host header below is sent exactly as written." placeholder="https://api.example.com" spellcheck="false" value="${escapeHtml(target)}" />
     </div>
-    <div class="resend-req__head"><p class="section-label">Request</p>${viewToggleHtml("req", resendRequestView)}</div>
-    <textarea class="textarea resend-raw" id="resend-raw" aria-label="Raw HTTP request" spellcheck="false"${resendRequestView === "pretty" ? " hidden" : ""}>${escapeHtml(rawText)}</textarea>
-    <pre class="code resend-pretty" id="resend-req-pretty" aria-label="Request (pretty, read-only)"${resendRequestView === "pretty" ? "" : " hidden"}></pre>
+    <div class="resend-req__head"><p class="section-label">Request</p>${methodChipHtml(requestMethod(rawText))}${viewToggleHtml("req", resendRequestView)}${messageToolsHtml("req")}</div>
+    ${findBarHtml("req")}
+    <textarea class="textarea resend-raw${resendWrap("req") ? "" : " is-nowrap"}" id="resend-raw" aria-label="Raw HTTP request" spellcheck="false" wrap="${resendWrap("req") ? "soft" : "off"}" hidden>${escapeHtml(rawText)}</textarea>
+    <pre class="code resend-pretty${resendWrap("req") ? "" : " is-nowrap"}" id="resend-req-pretty" aria-label="Request (read-only view)" hidden></pre>
     <p class="t-small resend-parse-error" id="resend-parse-error" role="alert" hidden></p>
     <div class="row resend-actions">
       <button class="btn btn--primary" id="resend-send" type="button" title="Send request (Ctrl+Enter)" aria-keyshortcuts="Control+Enter">${icon("send", { size: 14 })}<span>Send request</span></button>
       <button class="btn btn--sm" id="resend-cancel" type="button" title="Stop waiting for this send; it is kept in History as cancelled" hidden>Cancel</button>
       <label class="check check--sm" title="Off: a 3xx is shown as-is and you follow it with Follow redirection. On: each redirect is followed one hop at a time (up to ${RESEND_MAX_AUTO_HOPS}), every hop kept in History."><input type="checkbox" id="resend-autofollow"${resendAutoFollow() ? " checked" : ""} /> Follow redirects automatically</label>
       <label class="resend-timeout t-small" title="How long a send waits for a response before it is recorded as timed out">Timeout <select class="input input--sm" id="resend-timeout" aria-label="Send timeout">${RESEND_TIMEOUT_CHOICES.map((secs) => `<option value="${secs}"${secs === resendTimeoutSecs() ? " selected" : ""}>${secs} s</option>`).join("")}</select></label>
+      <button class="btn btn--sm btn--quiet" type="button" id="resend-urlencode" title="URL-encode the text selected in the Raw request (Ctrl+U)" aria-keyshortcuts="Control+U">URL-encode selection</button>
     </div>
+    <details class="resend-inspector" id="resend-inspector"${resendInspectorOpen() ? " open" : ""}><summary class="t-small" id="resend-inspector-summary">Inspector</summary><div class="resend-inspector__body" id="resend-inspector-body"></div></details>
   </div>
   <div class="resend-split__gutter" data-resend-gutter role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize request and response"></div>
   <div class="resend-split__pane resend-res" id="resend-res-pane"></div>
@@ -2013,8 +2021,29 @@ function renderResend(): void {
       raw.setSelectionRange(next, next);
     }
     rememberResendDraft(ctx.id);
+    scheduleResendInspector();
+    syncMethodChip();
+  });
+  raw?.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "u") { event.preventDefault(); urlEncodeResendSelection(); }
   });
   resendPanel.querySelector("#resend-target")?.addEventListener("input", () => rememberResendDraft(ctx.id));
+  resendPanel.querySelector<HTMLSelectElement>("#resend-method")?.addEventListener("change", (event) => {
+    const method = (event.target as HTMLSelectElement).value;
+    if (raw === null || method === "") return;
+    const swapped = setRequestMethod(raw.value, method);
+    raw.value = swapped.text;
+    raw.dispatchEvent(new Event("input"));
+    applyResendRequestView();
+  });
+  resendPanel.querySelector("#resend-urlencode")?.addEventListener("click", () => urlEncodeResendSelection());
+  resendPanel.querySelector("[data-resend-copy-curl]")?.addEventListener("click", () => void copyResendRequest("curl"));
+  resendPanel.querySelector("[data-resend-copy-url]")?.addEventListener("click", () => void copyResendRequest("url"));
+  resendPanel.querySelector<HTMLDetailsElement>("#resend-inspector")?.addEventListener("toggle", (event) => {
+    setResendInspectorOpen((event.target as HTMLDetailsElement).open);
+  });
+  const reqPane = resendPanel.querySelector<HTMLElement>(".resend-req");
+  if (reqPane !== null) wireMessageTools(reqPane, "req", () => applyResendRequestView());
   // Ctrl+Enter (⌘+Enter) sends from anywhere in the request editor.
   resendPanel.querySelector(".resend-req")?.addEventListener("keydown", (event) => {
     const key = event as KeyboardEvent;
@@ -2039,6 +2068,7 @@ function renderResend(): void {
   });
   resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); renderResendList(); });
   applyResendRequestView();
+  renderResendInspector();
   if (resendInFlight.has(ctx.id)) {
     setResendSendBusy(true);
     showResendResponseLoading();
@@ -2048,22 +2078,326 @@ function renderResend(): void {
   initResendSplitter();
 }
 
+/* ---- RS5: message tools (find / wrap / non-printables), Inspector, copy,
+ * method switch, URL-encode. The raw request text is the only source of truth;
+ * every helper reads it or edits it. */
+
+const STANDARD_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+/** Method chip: switching it rewrites the request line's method token. */
+function methodChipHtml(current: string): string {
+  const upper = current.toUpperCase();
+  const options = STANDARD_METHODS.includes(upper) || upper === "" ? STANDARD_METHODS : [upper, ...STANDARD_METHODS];
+  return `<select class="input input--sm input--mono resend-method" id="resend-method" aria-label="Method — rewrites the request line" title="Method — rewrites the request line's method">${options.map((m) => `<option value="${m}"${m === upper ? " selected" : ""}>${m}</option>`).join("")}</select>`;
+}
+
+/** Keeps the method chip showing the request line's method as it is edited. */
+function syncMethodChip(): void {
+  const chip = resendPanel?.querySelector<HTMLSelectElement>("#resend-method");
+  if (chip === null || chip === undefined) return;
+  const method = requestMethod(valueOf("#resend-raw")).toUpperCase();
+  if (chip.value === method) return;
+  if (!Array.from(chip.options).some((option) => option.value === method) && method !== "") chip.insertAdjacentHTML("afterbegin", `<option value="${escapeHtml(method)}">${escapeHtml(method)}</option>`);
+  chip.value = method;
+}
+
+type MessageSide = "req" | "res";
+const RESEND_MSG_PREFS_KEY = "apiaxess.resend.messagePrefs";
+function messagePrefs(): Record<string, boolean> {
+  try { return JSON.parse(localStorage.getItem(RESEND_MSG_PREFS_KEY) ?? "{}") as Record<string, boolean>; } catch { return {}; }
+}
+function setMessagePref(key: string, on: boolean): void {
+  const all = messagePrefs();
+  all[key] = on;
+  try { localStorage.setItem(RESEND_MSG_PREFS_KEY, JSON.stringify(all)); } catch { /* a preference; ignore storage failures */ }
+}
+/** Word wrap (on by default, so one-line JSON never scrolls sideways). */
+function resendWrap(side: MessageSide): boolean { return messagePrefs()[`wrap.${side}`] !== false; }
+/** Visible non-printables (off by default). */
+function resendNonPrintables(side: MessageSide): boolean { return messagePrefs()[`np.${side}`] === true; }
+function resendInspectorOpen(): boolean { return messagePrefs().inspector === true; }
+function setResendInspectorOpen(open: boolean): void { setMessagePref("inspector", open); }
+
+function messageToolsHtml(side: MessageSide): string {
+  const np = side === "req"
+    ? "Show non-printable characters (tab, control bytes). Display only — turn off to edit."
+    : "Show non-printable characters (CR, tab, control bytes)";
+  return `<div class="msgtools" role="group" aria-label="${side === "req" ? "Request" : "Response"} message tools">
+  <button class="btn btn--sm btn--quiet btn--icon" type="button" data-msg-find title="Find in message (Ctrl+F)" aria-label="Find in message">${icon("search", { size: 14 })}</button>
+  <button class="btn btn--sm btn--quiet" type="button" data-msg-wrap aria-pressed="${resendWrap(side)}" title="Wrap long lines">Wrap</button>
+  <button class="btn btn--sm btn--quiet" type="button" data-msg-np aria-pressed="${resendNonPrintables(side)}" title="${np}" aria-label="Show non-printable characters">¶</button>
+</div>`;
+}
+
+/** Find state per message, kept across re-renders of the History pane. */
+const findState: Record<MessageSide, { open: boolean; query: string; index: number }> = {
+  req: { open: false, query: "", index: 0 },
+  res: { open: false, query: "", index: 0 },
+};
+
+function findBarHtml(side: MessageSide): string {
+  const state = findState[side];
+  return `<div class="findbar" data-findbar="${side}"${state.open ? "" : " hidden"}>
+  <input class="input input--sm input--mono findbar__input" type="search" data-find-input placeholder="Find in message" aria-label="Find in message" value="${escapeHtml(state.query)}" />
+  <span class="t-small t-subtle findbar__count" data-find-count aria-live="polite"></span>
+  <button class="btn btn--sm btn--quiet btn--icon" type="button" data-find-step="-1" title="Previous match (Shift+Enter)" aria-label="Previous match">‹</button>
+  <button class="btn btn--sm btn--quiet btn--icon" type="button" data-find-step="1" title="Next match (Enter)" aria-label="Next match">›</button>
+  <button class="btn btn--sm btn--quiet btn--icon" type="button" data-find-close title="Close (Esc)" aria-label="Close find">${icon("close", { size: 12 })}</button>
+</div>`;
+}
+
+/** The element a message's find runs over: the raw request textarea when it
+ *  is the visible editor, else the read-only view / response body. */
+function findTarget(side: MessageSide): HTMLTextAreaElement | HTMLElement | null {
+  if (side === "res") return resendPanel?.querySelector<HTMLElement>("#resend-response-body") ?? null;
+  const raw = resendPanel?.querySelector<HTMLTextAreaElement>("#resend-raw");
+  if (raw !== null && raw !== undefined && !raw.hidden) return raw;
+  return resendPanel?.querySelector<HTMLElement>("#resend-req-pretty") ?? null;
+}
+
+/** Wires a message's tool buttons and find bar inside `root`. `rerender`
+ *  redraws the message after a wrap / non-printables toggle. */
+function wireMessageTools(root: HTMLElement, side: MessageSide, rerender: () => void): void {
+  const bar = root.querySelector<HTMLElement>(`[data-findbar="${side}"]`);
+  const input = bar?.querySelector<HTMLInputElement>("[data-find-input]");
+  const open = (): void => {
+    if (bar === null || bar === undefined || input === null || input === undefined) return;
+    findState[side].open = true;
+    bar.hidden = false;
+    const selected = window.getSelection()?.toString() ?? "";
+    if (selected !== "" && !selected.includes("\n") && selected.length < 200) { input.value = selected; findState[side].query = selected; findState[side].index = 0; }
+    input.focus();
+    input.select();
+    runFind(side, 0);
+  };
+  root.querySelector("[data-msg-find]")?.addEventListener("click", open);
+  root.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") { event.preventDefault(); open(); }
+  });
+  input?.addEventListener("input", () => { findState[side].query = input.value; findState[side].index = 0; runFind(side, 0); });
+  input?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); runFind(side, event.shiftKey ? -1 : 1); }
+    else if (event.key === "Escape") { event.preventDefault(); closeFind(side); }
+  });
+  bar?.querySelectorAll<HTMLButtonElement>("[data-find-step]").forEach((button) => {
+    button.addEventListener("click", () => runFind(side, Number(button.dataset.findStep) as 1 | -1));
+  });
+  bar?.querySelector("[data-find-close]")?.addEventListener("click", () => closeFind(side));
+  root.querySelector("[data-msg-wrap]")?.addEventListener("click", () => { setMessagePref(`wrap.${side}`, !resendWrap(side)); rerender(); });
+  root.querySelector("[data-msg-np]")?.addEventListener("click", () => { setMessagePref(`np.${side}`, !resendNonPrintables(side)); rerender(); });
+  if (findState[side].open && findState[side].query !== "") runFind(side, 0, false);
+}
+
+function closeFind(side: MessageSide): void {
+  findState[side].open = false;
+  const bar = resendPanel?.querySelector<HTMLElement>(`[data-findbar="${side}"]`);
+  if (bar !== null && bar !== undefined) bar.hidden = true;
+  const target = findTarget(side);
+  if (target !== null && !(target instanceof HTMLTextAreaElement)) target.querySelectorAll("mark.findhit").forEach((mark) => mark.replaceWith(mark.textContent ?? ""));
+  target?.normalize();
+  if (target instanceof HTMLTextAreaElement) target.focus();
+}
+
+/** Finds `query` over the whole message (scrolled-off text included), moves
+ *  to the next/previous match, highlights it, and scrolls it into view. */
+function runFind(side: MessageSide, step: 0 | 1 | -1, focusMatch = true): void {
+  const state = findState[side];
+  const target = findTarget(side);
+  const count = resendPanel?.querySelector<HTMLElement>(`[data-findbar="${side}"] [data-find-count]`);
+  if (target === null) return;
+  const isTextarea = target instanceof HTMLTextAreaElement;
+  const text = isTextarea ? target.value : target.textContent ?? "";
+  const hits = findAll(text, state.query);
+  if (hits.length === 0) {
+    if (count !== null && count !== undefined) count.textContent = state.query === "" ? "" : "No matches";
+    if (!isTextarea) paintFindHits(target, text, [], -1, 0);
+    return;
+  }
+  state.index = ((step === 0 ? Math.min(state.index, hits.length - 1) : state.index + step) + hits.length) % hits.length;
+  const start = hits[state.index];
+  // The line number anchors the match even where an unfocused selection is faint.
+  const line = isTextarea ? ` · line ${text.slice(0, start).split("\n").length}` : "";
+  if (count !== null && count !== undefined) count.textContent = `${state.index + 1} of ${hits.length}${line}`;
+  const end = start + state.query.length;
+  if (isTextarea) {
+    target.setSelectionRange(start, end, "forward");
+    scrollTextareaTo(target, start);
+    if (focusMatch && step !== 0) {
+      // Show the selection, then hand focus back so Enter keeps stepping.
+      const input = resendPanel?.querySelector<HTMLInputElement>(`[data-findbar="${side}"] [data-find-input]`);
+      target.focus({ preventScroll: true });
+      input?.focus({ preventScroll: true });
+    }
+  } else {
+    paintFindHits(target, text, hits, state.index, state.query.length);
+  }
+}
+
+/** Redraws a read-only message with every match marked and the current one
+ *  scrolled into view. */
+function paintFindHits(target: HTMLElement, text: string, hits: number[], current: number, length: number): void {
+  let html = "";
+  let cursor = 0;
+  hits.forEach((hit, i) => {
+    html += escapeHtml(text.slice(cursor, hit));
+    html += `<mark class="findhit${i === current ? " is-current" : ""}">${escapeHtml(text.slice(hit, hit + length))}</mark>`;
+    cursor = hit + length;
+  });
+  html += escapeHtml(text.slice(cursor));
+  target.innerHTML = html;
+  const mark = target.querySelector<HTMLElement>("mark.is-current");
+  if (mark !== null) {
+    const top = mark.offsetTop - target.offsetTop;
+    target.scrollTop = Math.max(0, top - target.clientHeight / 2);
+    target.scrollLeft = Math.max(0, mark.offsetLeft - target.offsetLeft - target.clientWidth / 2);
+  }
+}
+
+/** Scrolls a textarea so character `offset` is in view, measuring with an
+ *  off-screen mirror that has the same box, font, and wrapping. */
+function scrollTextareaTo(textarea: HTMLTextAreaElement, offset: number): void {
+  const style = getComputedStyle(textarea);
+  const mirror = document.createElement("div");
+  const copy = ["fontFamily", "fontSize", "fontWeight", "lineHeight", "letterSpacing", "tabSize", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "overflowWrap", "wordBreak"] as const;
+  copy.forEach((prop) => { mirror.style[prop] = style[prop]; });
+  mirror.style.position = "absolute";
+  mirror.style.visibility = "hidden";
+  mirror.style.left = "-99999px";
+  mirror.style.top = "0";
+  mirror.style.boxSizing = "border-box";
+  mirror.style.width = `${textarea.clientWidth}px`;
+  mirror.style.whiteSpace = textarea.wrap === "off" ? "pre" : "pre-wrap";
+  mirror.textContent = textarea.value.slice(0, offset);
+  const marker = document.createElement("span");
+  marker.textContent = "\u200b";
+  mirror.append(marker);
+  document.body.append(mirror);
+  const top = marker.offsetTop;
+  const left = marker.offsetLeft;
+  mirror.remove();
+  textarea.scrollTop = Math.max(0, top - textarea.clientHeight / 2);
+  textarea.scrollLeft = textarea.wrap === "off" ? Math.max(0, left - textarea.clientWidth / 2) : 0;
+}
+
+/** URL-encodes the Raw request's selected text in place (undoable). */
+function urlEncodeResendSelection(): void {
+  const raw = resendPanel?.querySelector<HTMLTextAreaElement>("#resend-raw");
+  if (raw === null || raw === undefined || raw.hidden) { toast("Switch the request to Raw to URL-encode a selection.", "info"); return; }
+  const { selectionStart: start, selectionEnd: end } = raw;
+  if (start === end) { toast("Select text in the Raw request to URL-encode it.", "info"); return; }
+  const encoded = urlEncode(raw.value.slice(start, end));
+  raw.focus();
+  // insertText keeps the edit on the textarea's undo stack.
+  if (!document.execCommand("insertText", false, encoded)) {
+    raw.setRangeText(encoded, start, end, "select");
+    raw.dispatchEvent(new Event("input"));
+  }
+  raw.setSelectionRange(start, start + encoded.length);
+}
+
+/** Copies the editor's request (what Send would send) as curl, or its URL. */
+async function copyResendRequest(what: "curl" | "url"): Promise<void> {
+  const parsed = parseRawRequest(valueOf("#resend-raw"), valueOf("#resend-target").trim());
+  if (parsed.error !== undefined) { toast(`Cannot copy: ${parsed.error}`, "danger"); return; }
+  const text = what === "url" ? parsed.url : curlCommand({ method: parsed.method, url: parsed.url, headers: parsed.headers, body: parsed.body });
+  if (await copyText(text)) toast(what === "url" ? "URL copied." : "curl command copied (bash/zsh quoting).", "success");
+  else toast("The clipboard is not available here.", "danger");
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const scratch = document.createElement("textarea");
+    scratch.value = text;
+    scratch.style.position = "fixed";
+    scratch.style.opacity = "0";
+    document.body.append(scratch);
+    scratch.select();
+    const ok = document.execCommand("copy");
+    scratch.remove();
+    return ok;
+  }
+}
+
+/* Inspector: a read-mostly structured view of the raw request. Rows point at
+ * their text; clicking one selects that value in the Raw editor to edit. */
+let resendInspectorFrame: number | undefined;
+function scheduleResendInspector(): void {
+  if (resendInspectorFrame !== undefined) return;
+  resendInspectorFrame = window.requestAnimationFrame(() => { resendInspectorFrame = undefined; renderResendInspector(); });
+}
+
+function renderResendInspector(): void {
+  const body = resendPanel?.querySelector<HTMLElement>("#resend-inspector-body");
+  const summary = resendPanel?.querySelector<HTMLElement>("#resend-inspector-summary");
+  if (body === null || body === undefined || summary === null || summary === undefined) return;
+  const inspected = inspectRequest(valueOf("#resend-raw").replace(/\r\n/g, "\n"));
+  const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+  const bodyLabel = inspected.bodyKind === "form" ? "form" : "JSON";
+  summary.textContent = `Inspector · ${plural(inspected.query.length, "query param", "query params")} · ${plural(inspected.cookies.length, "cookie", "cookies")} · ${plural(inspected.headers.length, "header", "headers")}${inspected.bodyKind === null ? "" : ` · ${plural(inspected.body.length, `${bodyLabel} field`, `${bodyLabel} fields`)}`}`;
+  const section = (title: string, items: InspectorItem[]): string => {
+    if (items.length === 0) return "";
+    const rows = items.map((item) => {
+      const name = item.decodedName ?? item.name;
+      const value = item.decodedValue ?? item.value;
+      const rawNote = item.decodedName !== undefined || item.decodedValue !== undefined ? ` title="As written: ${escapeHtml(`${item.name}=${item.value}`)}"` : "";
+      return `<tr data-insp-start="${item.start}" data-insp-end="${item.end}" tabindex="0"${rawNote}><td>${escapeHtml(name)}</td><td>${escapeHtml(value)}${item.decodedValue !== undefined ? ` <span class="t-subtle">(decoded)</span>` : ""}</td></tr>`;
+    }).join("");
+    return `<table class="insp-table"><caption>${escapeHtml(title)} <span class="t-subtle">${items.length}</span></caption><tbody>${rows}</tbody></table>`;
+  };
+  const html = section("Query parameters", inspected.query)
+    + section("Cookies", inspected.cookies)
+    + section("Request headers", inspected.headers)
+    + (inspected.bodyKind === null ? "" : section(inspected.bodyKind === "form" ? "Body parameters (form)" : "Body fields (JSON, top level)", inspected.body));
+  body.innerHTML = html === "" ? `<p class="t-small t-subtle">Nothing to inspect yet — the request has no query, cookies, or headers.</p>` : `${html}<p class="t-small t-subtle insp-hint">Read-only view of the Raw request. Click a row to select its value in the editor.</p>`;
+  body.querySelectorAll<HTMLElement>("[data-insp-start]").forEach((row) => {
+    const select = (): void => selectInResendRaw(Number(row.dataset.inspStart), Number(row.dataset.inspEnd));
+    row.addEventListener("click", select);
+    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } });
+  });
+}
+
+/** Selects a range of the Raw request for editing, switching out of the
+ *  read-only views first. */
+function selectInResendRaw(start: number, end: number): void {
+  if (resendRequestView !== "raw" || resendNonPrintables("req")) {
+    resendRequestView = "raw";
+    setMessagePref("np.req", false);
+    resendPanel?.querySelector('.resend-req [data-msg-np]')?.setAttribute("aria-pressed", "false");
+    applyResendRequestView();
+  }
+  const raw = resendPanel?.querySelector<HTMLTextAreaElement>("#resend-raw");
+  if (raw === null || raw === undefined) return;
+  raw.focus({ preventScroll: true });
+  raw.setSelectionRange(start, end);
+  scrollTextareaTo(raw, start);
+}
+
 /** Pretty | Raw view for the Resend request/response bodies. Pretty is a view
  *  only; the raw buffer is always what is sent. */
 type BodyView = "pretty" | "raw";
+/** The response also has a Hex view (lossless for binary bodies). */
+type ResponseView = BodyView | "hex";
 let resendRequestView: BodyView = "raw";
-let resendResponseView: BodyView = "pretty";
+let resendResponseView: ResponseView = "pretty";
+/** Binary revisions (`ctxId:revision`) the operator switched to a text view;
+ *  every other binary response opens in Hex. */
+const resendBinaryAsText = new Set<string>();
 
-function viewToggleHtml(which: "req" | "res", mode: BodyView): string {
-  const button = (value: BodyView, label: string): string =>
-    `<button class="btn btn--sm btn--quiet" type="button" data-view-mode="${value}" aria-pressed="${mode === value}">${label}</button>`;
-  return `<div class="viewtoggle" role="group" aria-label="${which === "req" ? "Request" : "Response"} view" data-view-toggle="${which}">${button("pretty", "Pretty")}${button("raw", "Raw")}</div>`;
+function viewToggleHtml(which: "req" | "res", mode: ResponseView): string {
+  const button = (value: ResponseView, label: string, title: string): string =>
+    `<button class="btn btn--sm btn--quiet" type="button" data-view-mode="${value}" aria-pressed="${mode === value}" title="${title}">${label}</button>`;
+  const hex = which === "res" ? button("hex", "Hex", "Byte-exact hex dump of the body") : "";
+  return `<div class="viewtoggle" role="group" aria-label="${which === "req" ? "Request" : "Response"} view" data-view-toggle="${which}">${button("pretty", "Pretty", "JSON bodies formatted (display only)")}${button("raw", "Raw", "The message as text")}${hex}</div>`;
 }
 
 /** A readable label for a Resend item: its name, else METHOD + path. */
 function resendTitle(ctx: ResendContext): string {
   const named = ctx.name?.trim();
   if (named !== undefined && named !== "") return named;
+  if (ctx.current.url === NEW_REQUEST_PLACEHOLDER_URL) return "New request";
   const { authority, pathAndQuery } = splitUrl(ctx.current.url);
   const path = pathAndQuery.length > 60 ? `${pathAndQuery.slice(0, 57)}…` : pathAndQuery;
   return `${(ctx.current.method || "GET").toUpperCase()} ${path}${authority === "" ? "" : ` · ${authority}`}`;
@@ -2078,15 +2412,30 @@ function applyResendRequestView(): void {
   resendPanel?.querySelectorAll<HTMLButtonElement>('[data-view-toggle="req"] [data-view-mode]').forEach((button) => {
     button.setAttribute("aria-pressed", String(button.dataset.viewMode === resendRequestView));
   });
-  if (resendRequestView === "pretty") {
-    const parts = splitRawRequestParts(raw.value);
-    const head = raw.value.replace(/\r\n/g, "\n").split("\n\n")[0];
-    const body = prettyBody(parts.headers, parts.body);
-    pretty.textContent = parts.body === "" ? head : `${head}\n\n${body.text}`;
-    pretty.title = "Display only — switch to Raw to edit. What is sent is always the Raw request.";
+  const wrap = resendWrap("req");
+  raw.wrap = wrap ? "soft" : "off";
+  raw.classList.toggle("is-nowrap", !wrap);
+  pretty.classList.toggle("is-nowrap", !wrap);
+  resendPanel?.querySelector('.resend-req [data-msg-wrap]')?.setAttribute("aria-pressed", String(wrap));
+  const nonPrintables = resendNonPrintables("req");
+  resendPanel?.querySelector('.resend-req [data-msg-np]')?.setAttribute("aria-pressed", String(nonPrintables));
+  const readOnly = resendRequestView === "pretty" || nonPrintables;
+  if (readOnly) {
+    let text = raw.value;
+    if (resendRequestView === "pretty") {
+      const parts = splitRawRequestParts(raw.value);
+      const head = raw.value.replace(/\r\n/g, "\n").split("\n\n")[0];
+      const body = prettyBody(parts.headers, parts.body);
+      text = parts.body === "" ? head : `${head}\n\n${body.text}`;
+    }
+    pretty.textContent = nonPrintables ? showNonPrintables(text) : text;
+    pretty.title = nonPrintables
+      ? "Display only, with non-printable characters shown — turn off ¶ to edit. What is sent is always the Raw request."
+      : "Display only — switch to Raw to edit. What is sent is always the Raw request.";
   }
-  raw.hidden = resendRequestView === "pretty";
-  pretty.hidden = resendRequestView !== "pretty";
+  raw.hidden = readOnly;
+  pretty.hidden = !readOnly;
+  if (findState.req.open && findState.req.query !== "") runFind("req", 0, false);
 }
 
 /** Reflects whether the visible item has a send in flight on its Send button;
@@ -2294,12 +2643,27 @@ function responseStatusLine(response: ResendResponse): string {
 
 /** A response as one read-only view: status line, headers, blank line, body —
  *  the body pretty-printed when `view` is Pretty and it is JSON. */
-function composeRawResponse(response: ResendResponse, view: BodyView): string {
+function composeRawResponse(response: ResendResponse, view: ResponseView, nonPrintables = false): string {
   const headerText = response.headers.map(([name, value]) => `${name}: ${value}`).join("\n");
-  const rawBody = bytesToText(response.body);
-  const bodyText = view === "pretty" ? prettyBody(response.headers, rawBody).text : rawBody;
   const head = headerText === "" ? responseStatusLine(response) : `${responseStatusLine(response)}\n${headerText}`;
+  if (view === "hex") {
+    const bytes = response.body ?? [];
+    return bytes.length === 0 ? head : `${head}\n\n${hexDump(bytes)}`;
+  }
+  const rawBody = bytesToText(response.body);
+  const formatted = view === "pretty" ? prettyBody(response.headers, rawBody).text : rawBody;
+  const bodyText = nonPrintables ? showNonPrintables(formatted) : formatted;
   return bodyText === "" ? head : `${head}\n\n${bodyText}`;
+}
+
+/** The view a revision's response opens in: Hex for binary bodies unless the
+ *  operator picked a text view for that revision. */
+function effectiveResponseView(ctx: ResendContext, entry: ResendRevision): ResponseView {
+  const response = entry.response;
+  if (response === null || response === undefined) return resendResponseView;
+  const binary = isBinaryBody(response.headers, response.body);
+  if (binary && resendResponseView !== "hex" && !resendBinaryAsText.has(`${ctx.id}:${entry.revision}`)) return "hex";
+  return resendResponseView;
 }
 
 /** The History pane: the selected revision as a pair — the exact request that
@@ -2330,14 +2694,16 @@ function resendResponsePaneHtml(ctx: ResendContext): string {
   <select class="input input--sm" id="resend-response-pick" aria-label="Revision">${options}</select>
   <button class="btn btn--sm btn--quiet btn--icon" type="button" data-hist-step="1" aria-label="Next revision" title="Next revision"${index >= history.length - 1 ? " disabled" : ""}>›</button>
 </div>`;
-  const head = `<div class="resend-res__head"><p class="section-label">History</p>${nav}${entry.response ? viewToggleHtml("res", resendResponseView) : ""}</div>`;
+  const view = effectiveResponseView(ctx, entry);
+  const binary = entry.response ? isBinaryBody(entry.response.headers, entry.response.body) : false;
+  const head = `<div class="resend-res__head"><p class="section-label">History</p>${nav}${entry.response ? `${viewToggleHtml("res", view)}${messageToolsHtml("res")}` : ""}</div>${entry.response ? findBarHtml("res") : ""}`;
   const status = entry.response?.status;
   const statusLabel = entry.response ? escapeHtml(responseStatusLine(entry.response)) : escapeHtml(revisionFailureLabel(entry));
   const endpoint = `${entry.request.method.toUpperCase()} ${entry.request.url}`;
   const meta = entry.response
-    ? `${entry.response.durationMs} ms · ${formatBytes(entry.response.body?.length ?? 0)} · ${humanScope(entry.scope)}`
+    ? `${entry.response.durationMs} ms · ${formatBytes(entry.response.body?.length ?? 0)}${binary ? " · binary" : ""} · ${humanScope(entry.scope)}`
     : humanScope(entry.scope);
-  const bodyText = entry.response ? composeRawResponse(entry.response, resendResponseView) : "";
+  const bodyText = entry.response ? composeRawResponse(entry.response, view, resendNonPrintables("res")) : "";
   const location = redirectLocation(entry);
   const follow = location === null
     ? ""
@@ -2351,8 +2717,8 @@ function resendResponsePaneHtml(ctx: ResendContext): string {
 ${redirectChainHtml(ctx, entry)}
 <details class="resend-sent"><summary class="t-small">Request sent · #${entry.revision}</summary><pre class="code resend-sent__raw" id="resend-sent-request">${escapeHtml(rawRequestText(entry.request, { recomputeContentLength: true }))}</pre></details>
 ${entry.response
-    ? `<label class="field__label" for="resend-response-body">Response · ${escapeHtml(meta)}</label>
-<textarea class="textarea resend-raw" id="resend-response-body" readonly spellcheck="false">${escapeHtml(bodyText)}</textarea>`
+    ? `<p class="field__label" id="resend-response-label">Response · ${escapeHtml(meta)}</p>
+<pre class="code resend-body${view === "hex" ? " is-hex is-nowrap" : resendWrap("res") ? "" : " is-nowrap"}" id="resend-response-body" tabindex="0" role="textbox" aria-readonly="true" aria-multiline="true" aria-labelledby="resend-response-label">${escapeHtml(bodyText)}</pre>`
     : `<p class="field__label">No HTTP response · ${escapeHtml(meta)}</p>${resendFailureHtml(entry.diagnostic ?? { id: "proxy.resend-request-failed", what: "No response was received.", why: "The send failed without a recorded reason.", fix: "Resend; if it persists, check the session proxy." }, `Revision #${entry.revision} — the request was attempted; no response was received.`)}`}
 ${follow}`;
 }
@@ -2428,12 +2794,20 @@ function mountResendResponse(): void {
   if (pane === null || pane === undefined || selectedResend === null) return;
   const ctx = selectedResend;
   pane.innerHTML = resendResponsePaneHtml(ctx);
+  const shownEntry = ctx.history.find((candidate) => candidate.revision === (selectedResendRevision ?? ctx.history.at(-1)?.revision));
   pane.querySelectorAll<HTMLButtonElement>('[data-view-toggle="res"] [data-view-mode]').forEach((button) => {
     button.addEventListener("click", () => {
-      resendResponseView = button.dataset.viewMode === "raw" ? "raw" : "pretty";
+      const mode = button.dataset.viewMode;
+      resendResponseView = mode === "raw" ? "raw" : mode === "hex" ? "hex" : "pretty";
+      if (shownEntry !== undefined) {
+        const key = `${ctx.id}:${shownEntry.revision}`;
+        if (resendResponseView === "hex") resendBinaryAsText.delete(key);
+        else resendBinaryAsText.add(key);
+      }
       mountResendResponse();
     });
   });
+  wireMessageTools(pane, "res", () => mountResendResponse());
   pane.querySelector<HTMLSelectElement>("#resend-response-pick")?.addEventListener("change", (event) => {
     resendFailures.delete(ctx.id);
     selectedResendRevision = Number((event.target as HTMLSelectElement).value);
@@ -3243,7 +3617,7 @@ function renderResendList(): void {
   }
   if (selectedResend === null && renderedResendId === null) seedResendEmpty();
   if (items.length === 0) {
-    list.innerHTML = stateBlock({ icon: "send", title: "Resend queue is empty", body: "Right-click a request in Live traffic or the API surface and choose Resend.", compact: true });
+    list.innerHTML = stateBlock({ icon: "send", title: "Resend queue is empty", body: "Right-click a request in Live traffic or the API surface and choose Resend, or use New.", compact: true });
     return;
   }
   list.innerHTML = items
@@ -3324,6 +3698,28 @@ async function refreshResendList(): Promise<void> {
     void migrateLocalResendNames(contexts);
   } catch {
     /* the list is a convenience; the detail pane still holds the selection */
+  }
+}
+
+/** Placeholder target for a hand-crafted request until the operator sets one:
+ *  `.invalid` never resolves, so an accidental send fails honestly (DNS). */
+const NEW_REQUEST_PLACEHOLDER_URL = "http://new-request.invalid/";
+
+/** Creates a blank, editable Resend item (not tied to a captured flow) and
+ *  opens it with the Target empty and focused. */
+async function newResendRequest(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/workbench/resend", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ request: { method: "GET", url: NEW_REQUEST_PLACEHOLDER_URL, headers: [] } }) });
+    await requireOk(response, "resend context unavailable");
+    const ctx = (await response.json()) as ResendContext;
+    resendDrafts.set(ctx.id, { raw: "GET / HTTP/1.1\nHost: ", target: "" });
+    registerResend(ctx);
+    showView("workbench");
+    showWorkbenchTab("resend");
+    renderResend();
+    resendPanel?.querySelector<HTMLInputElement>("#resend-target")?.focus();
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.resend-history-failed", what: "A new request could not be created.", why: "", fix: "Confirm a session is active, then retry." });
   }
 }
 
@@ -3489,6 +3885,7 @@ function initWorkbenchTools(): void {
   document.querySelectorAll<HTMLElement>("[data-wb-collapse]").forEach((button) => {
     button.addEventListener("click", () => toggleQueueCollapse(button.dataset.wbCollapse ?? ""));
   });
+  document.querySelector("[data-resend-new]")?.addEventListener("click", () => void newResendRequest());
   applyQueueCollapse("resend");
   applyQueueCollapse("fuzz");
   NARROW_WORKBENCH.addEventListener("change", () => {
