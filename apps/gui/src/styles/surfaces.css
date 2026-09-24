@@ -893,10 +893,6 @@
 .resend-res__head .section-label {
   margin: 0;
 }
-.resend-res__head #resend-response-pick {
-  margin-left: auto;
-  max-width: 60%;
-}
 .resend-res__status {
   flex: 0 0 auto;
   display: inline-flex;
@@ -936,8 +932,54 @@
 .resend-res__head .viewtoggle {
   margin-left: auto;
 }
-.resend-res__head .viewtoggle + #resend-response-pick {
+/* History pane: ‹ #n › stepping, the revision's own sent request, and the
+   redirect chain a followed hop belongs to. */
+.resend-hist-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.resend-hist-nav #resend-response-pick {
+  max-width: 16rem;
+}
+.resend-res__head .resend-hist-nav {
+  margin-left: auto;
+}
+.resend-res__head .resend-hist-nav + .viewtoggle {
   margin-left: 0;
+}
+.resend-sent summary {
+  cursor: pointer;
+  color: var(--color-text-muted);
+}
+.resend-sent__raw {
+  max-height: 14rem;
+  margin: var(--space-2) 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.resend-chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
+}
+.resend-chain__step {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.resend-chain__arrow {
+  color: var(--color-text-subtle);
+}
+.resend-follow {
+  align-items: center;
+  gap: var(--space-3);
 }
 .resend-pretty {
   flex: 1;

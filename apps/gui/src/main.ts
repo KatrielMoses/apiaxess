@@ -44,7 +44,7 @@ interface FlowSummary { readonly id: number; readonly method?: string | null; re
 interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; }
 export interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
 interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; httpVersion?: string | null; reason?: string | null; }
-interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: Diagnostic | null; scope: string; }
+interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: Diagnostic | null; scope: string; redirectChain?: RedirectHop[]; followedFrom?: number | null; }
 interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; }
 interface ResendSendResult { context: ResendContext; revision: ResendRevision; diagnostics: (Diagnostic | null)[]; }
 interface FuzzerResult { ordinal: number; payloads: string[]; request: ResendRequest; response?: { status: number; headers: readonly [string, string][]; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: Diagnostic | null; timeout?: boolean; comment?: string | null; grepMatchCounts?: number[]; grepExtracts?: (string | null)[]; reflectedCount?: number | null; redirectChain?: RedirectHop[]; retryCount?: number; }
@@ -1954,6 +1954,7 @@ function renderResend(): void {
     <p class="t-small resend-parse-error" id="resend-parse-error" role="alert" hidden></p>
     <div class="row">
       <button class="btn btn--primary" id="resend-send" type="button">${icon("send", { size: 14 })}<span>Send request</span></button>
+      <label class="check check--sm" title="Off: a 3xx is shown as-is and you follow it with Follow redirection. On: each redirect is followed one hop at a time (up to ${RESEND_MAX_AUTO_HOPS}), every hop kept in History."><input type="checkbox" id="resend-autofollow"${resendAutoFollow() ? " checked" : ""} /> Follow redirects automatically</label>
     </div>
   </div>
   <div class="resend-split__gutter" data-resend-gutter role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize request and response"></div>
@@ -1976,6 +1977,9 @@ function renderResend(): void {
     });
   });
   resendPanel.querySelector("#resend-send")?.addEventListener("click", () => void sendResend());
+  resendPanel.querySelector<HTMLInputElement>("#resend-autofollow")?.addEventListener("change", (event) => {
+    setResendAutoFollow((event.target as HTMLInputElement).checked);
+  });
   resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); });
   applyResendRequestView();
   if (resendInFlight.has(ctx.id)) {
@@ -2087,28 +2091,30 @@ function composeRawResponse(response: ResendResponse, view: BodyView): string {
   return bodyText === "" ? head : `${head}\n\n${bodyText}`;
 }
 
-/** Builds the Response pane so it mirrors the Request pane: an endpoint + status
- *  line, then the response in a full-height read-only view with Pretty | Raw. A
- *  dropdown beside "Response" traverses prior sends; the latest is shown by
- *  default. No inline history list. */
+/** The History pane: the selected revision as a pair — the exact request that
+ *  was sent and the response it got — read-only, beside the editable draft.
+ *  `‹`/`›` step through revisions; the dropdown jumps. A past request can be
+ *  restored into the draft; a 3xx can be followed one hop at a time. */
 function resendResponsePaneHtml(ctx: ResendContext): string {
   const history = ctx.history;
-  const picker = history.length > 1
-    ? `<select class="input input--sm" id="resend-response-pick" aria-label="Response revision">${
-        [...history].reverse().map((entry) => {
-          const latest = history[history.length - 1].revision;
-          const shown = selectedResendRevision ?? latest;
-          const st = entry.response?.status ?? "failed";
-          return `<option value="${entry.revision}"${entry.revision === shown ? " selected" : ""}>#${entry.revision} · ${escapeHtml(String(st))} · ${escapeHtml(formatTime(entry.sentAt))}</option>`;
-        }).join("")
-      }</select>`
-    : "";
   if (history.length === 0) {
-    return `<div class="resend-res__head"><p class="section-label">Response</p></div><div class="resend-res__empty">${stateBlock({ icon: "clock", title: "No sends yet", body: "Send the request; the latest response appears here.", compact: true })}</div>`;
+    return `<div class="resend-res__head"><p class="section-label">History</p></div><div class="resend-res__empty">${stateBlock({ icon: "clock", title: "No sends yet", body: "Send the request; each send is kept here as a request/response pair.", compact: true })}</div>`;
   }
-  const revision = selectedResendRevision ?? history[history.length - 1].revision;
-  const entry = history.find((candidate) => candidate.revision === revision) ?? history[history.length - 1];
-  const head = `<div class="resend-res__head"><p class="section-label">Response</p>${entry.response ? viewToggleHtml("res", resendResponseView) : ""}${picker}</div>`;
+  const latest = history[history.length - 1].revision;
+  const shown = selectedResendRevision ?? latest;
+  const index = Math.max(0, history.findIndex((candidate) => candidate.revision === shown));
+  const entry = history[index] ?? history[history.length - 1];
+  const options = [...history].reverse().map((candidate) => {
+    const st = candidate.response?.status ?? "failed";
+    const hop = candidate.followedFrom !== null && candidate.followedFrom !== undefined ? ` · ↪ from #${candidate.followedFrom}` : "";
+    return `<option value="${candidate.revision}"${candidate.revision === entry.revision ? " selected" : ""}>#${candidate.revision} · ${escapeHtml(String(st))}${hop} · ${escapeHtml(formatTime(candidate.sentAt))}</option>`;
+  }).join("");
+  const nav = `<div class="resend-hist-nav">
+  <button class="btn btn--sm btn--quiet btn--icon" type="button" data-hist-step="-1" aria-label="Previous revision" title="Previous revision"${index <= 0 ? " disabled" : ""}>‹</button>
+  <select class="input input--sm" id="resend-response-pick" aria-label="Revision">${options}</select>
+  <button class="btn btn--sm btn--quiet btn--icon" type="button" data-hist-step="1" aria-label="Next revision" title="Next revision"${index >= history.length - 1 ? " disabled" : ""}>›</button>
+</div>`;
+  const head = `<div class="resend-res__head"><p class="section-label">History</p>${nav}${entry.response ? viewToggleHtml("res", resendResponseView) : ""}</div>`;
   const status = entry.response?.status;
   const statusLabel = entry.response ? escapeHtml(responseStatusLine(entry.response)) : escapeHtml(entry.diagnostic?.id ?? "failed");
   const endpoint = `${entry.request.method.toUpperCase()} ${entry.request.url}`;
@@ -2118,21 +2124,72 @@ function resendResponsePaneHtml(ctx: ResendContext): string {
   const bodyText = entry.response
     ? composeRawResponse(entry.response, resendResponseView)
     : entry.diagnostic?.what ?? "No response was received.";
+  const location = redirectLocation(entry);
+  const follow = location === null
+    ? ""
+    : `<div class="row resend-follow"><button class="btn btn--sm" type="button" id="resend-follow" title="Send one request to ${escapeHtml(location)}">Follow redirection → ${escapeHtml(shortUrl(location, entry.request.url))}</button><span class="t-small t-subtle">Not followed automatically. Cookies are carried to the next hop.</span></div>`;
   return `${head}
 <div class="reqline">
   <span class="resend-res__status list-row__status" data-class="${statusClass(status)}">${statusLabel}</span>
-  <input class="input input--mono reqline__url" id="resend-response-endpoint" readonly value="${escapeHtml(endpoint)}" aria-label="Response endpoint" />
+  <input class="input input--mono reqline__url" id="resend-response-endpoint" readonly value="${escapeHtml(endpoint)}" aria-label="Revision endpoint" />
+  <button class="btn btn--sm btn--quiet" type="button" id="resend-restore" title="Load revision #${entry.revision}'s request into the editor to edit and resend">Restore to editor</button>
 </div>
+${redirectChainHtml(ctx, entry)}
+<details class="resend-sent"><summary class="t-small">Request sent · #${entry.revision}</summary><pre class="code resend-sent__raw" id="resend-sent-request">${escapeHtml(rawRequestText(entry.request, { recomputeContentLength: true }))}</pre></details>
 <label class="field__label" for="resend-response-body">Response · ${escapeHtml(meta)}</label>
-<textarea class="textarea resend-raw" id="resend-response-body" readonly spellcheck="false">${escapeHtml(bodyText)}</textarea>`;
+<textarea class="textarea resend-raw" id="resend-response-body" readonly spellcheck="false">${escapeHtml(bodyText)}</textarea>
+${follow}`;
 }
 
-/** Renders (or re-renders) just the Response pane, preserving the request editor
- *  and split ratio, and wires the history dropdown. */
+/** Most redirect hops auto-follow takes before stopping (like the old default). */
+const RESEND_MAX_AUTO_HOPS = 10;
+const RESEND_AUTOFOLLOW_KEY = "apiaxess.resend.autoFollow";
+
+function resendAutoFollow(): boolean {
+  try { return localStorage.getItem(RESEND_AUTOFOLLOW_KEY) === "1"; } catch { return false; }
+}
+function setResendAutoFollow(on: boolean): void {
+  try { localStorage.setItem(RESEND_AUTOFOLLOW_KEY, on ? "1" : "0"); } catch { /* a preference; ignore storage failures */ }
+}
+
+/** The absolute `Location` a revision's 3xx points to, or null. */
+function redirectLocation(entry: ResendRevision): string | null {
+  const response = entry.response;
+  if (response === null || response === undefined || response.status < 300 || response.status > 399 || response.status === 304) return null;
+  const location = response.headers.find(([name]) => name.toLowerCase() === "location")?.[1];
+  if (location === undefined || location.trim() === "") return null;
+  try { return new URL(location.trim(), entry.request.url).toString(); } catch { return null; }
+}
+
+/** A URL relative to `base` when it stays on the same origin (path only). */
+function shortUrl(url: string, base: string): string {
+  return urlOrigin(url) === urlOrigin(base) ? splitUrl(url).pathAndQuery : url;
+}
+
+/** `302 /redirect → 302 /a → 200 /final` for a revision reached by following. */
+function redirectChainHtml(ctx: ResendContext, entry: ResendRevision): string {
+  const chain = entry.redirectChain ?? [];
+  if (chain.length === 0) return "";
+  let root = entry;
+  for (let guard = 0; guard < ctx.history.length && root.followedFrom !== null && root.followedFrom !== undefined; guard += 1) {
+    const parent = ctx.history.find((candidate) => candidate.revision === root.followedFrom);
+    if (parent === undefined) break;
+    root = parent;
+  }
+  const steps = chain.map((hop, i) => ({ status: String(hop.status), url: i === 0 ? root.request.url : chain[i - 1].location }));
+  steps.push({ status: entry.response ? String(entry.response.status) : "failed", url: entry.request.url });
+  const origin = root.request.url;
+  const items = steps.map((step) => `<span class="resend-chain__step"><span class="list-row__status" data-class="${statusClass(Number(step.status) || null)}">${escapeHtml(step.status)}</span> ${escapeHtml(shortUrl(step.url, origin))}</span>`);
+  return `<p class="resend-chain t-small" aria-label="Redirect chain">${items.join('<span class="resend-chain__arrow" aria-hidden="true">→</span>')}</p>`;
+}
+
+/** Renders (or re-renders) just the History pane, preserving the request editor
+ *  and split ratio, and wires its controls. */
 function mountResendResponse(): void {
   const pane = resendPanel?.querySelector<HTMLElement>("#resend-res-pane");
   if (pane === null || pane === undefined || selectedResend === null) return;
-  pane.innerHTML = resendResponsePaneHtml(selectedResend);
+  const ctx = selectedResend;
+  pane.innerHTML = resendResponsePaneHtml(ctx);
   pane.querySelectorAll<HTMLButtonElement>('[data-view-toggle="res"] [data-view-mode]').forEach((button) => {
     button.addEventListener("click", () => {
       resendResponseView = button.dataset.viewMode === "raw" ? "raw" : "pretty";
@@ -2143,6 +2200,49 @@ function mountResendResponse(): void {
     selectedResendRevision = Number((event.target as HTMLSelectElement).value);
     mountResendResponse();
   });
+  pane.querySelectorAll<HTMLButtonElement>("[data-hist-step]").forEach((button) => {
+    button.addEventListener("click", () => stepResendRevision(Number(button.dataset.histStep)));
+  });
+  const shown = selectedResendRevision ?? ctx.history.at(-1)?.revision;
+  pane.querySelector("#resend-restore")?.addEventListener("click", () => { if (shown !== undefined) void restoreResendRevision(shown); });
+  pane.querySelector("#resend-follow")?.addEventListener("click", () => { if (shown !== undefined) void followResendRedirect(shown); });
+}
+
+/** Steps the History view one revision back (-1) or forward (+1). */
+function stepResendRevision(delta: number): void {
+  const history = selectedResend?.history ?? [];
+  if (history.length === 0) return;
+  const shown = selectedResendRevision ?? history[history.length - 1].revision;
+  const index = history.findIndex((candidate) => candidate.revision === shown);
+  const next = history[Math.max(0, Math.min(history.length - 1, index + delta))];
+  selectedResendRevision = next.revision;
+  mountResendResponse();
+}
+
+/** Loads a past revision's request into the editable draft via the engine's
+ *  derive endpoint. Unsent edits in the editor are only replaced on confirm. */
+async function restoreResendRevision(revision: number): Promise<void> {
+  const ctx = selectedResend;
+  if (ctx === null || resendInFlight.has(ctx.id)) return;
+  const pristine = rawRequestText(ctx.current, { recomputeContentLength: true });
+  const edited = valueOf("#resend-raw").replace(/\r\n/g, "\n") !== pristine || valueOf("#resend-target").trim() !== urlOrigin(ctx.current.url);
+  if (edited && !(await confirmDialog({ eyebrow: "Resend", title: `Restore revision #${revision}?`, message: "The editor has unsent edits. Restoring replaces them with the request from that revision.", confirmLabel: "Restore" }))) return;
+  try {
+    const response = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(ctx.id)}/derive/${revision}`, { method: "POST" });
+    await requireOk(response, "resend restore failed");
+    const restored = (await response.json()) as ResendContext;
+    if (restored.id !== ctx.id) throw new Error("restore returned a different item");
+    resendContexts.set(restored.id, restored);
+    if (selectedResend?.id !== restored.id) { renderResendList(); return; }
+    selectedResend = restored;
+    renderResend();
+    selectedResendRevision = revision;
+    mountResendResponse();
+    renderResendList();
+    toast(`Revision #${revision} restored to the editor.`, "info");
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.resend-history-failed", what: "The revision could not be restored.", why: "", fix: "Retry; if it persists, reload the session." });
+  }
 }
 
 /** Shows a processing state in the Response pane while a send is in flight. */
@@ -2180,17 +2280,43 @@ async function sendResend(): Promise<void> {
   const edited: ResendContext = { ...resend, current: request };
   resendContexts.set(resendId, edited);
   selectedResend = edited;
-  const isVisible = (): boolean => selectedResend?.id === resendId;
-  resendInFlight.add(resendId);
-  setResendSendBusy(true);
-  showResendResponseLoading();
-  renderResendList();
-  try {
+  await runResendExchange(resendId, "The resend send failed.", async () => {
     const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
     await requireOk(update, "resend edit failed");
     const sent = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId) + "/send", { method: "POST" });
     await requireOk(sent, "resend send failed");
-    const result = (await sent.json()) as Partial<ResendSendResult>;
+    return sent;
+  });
+}
+
+/** Follows the 3xx on `revision` exactly one hop; the hop becomes a new
+ *  revision (the draft is untouched). */
+async function followResendRedirect(revision: number): Promise<void> {
+  const resendId = selectedResend?.id;
+  if (resendId === undefined || resendInFlight.has(resendId)) return;
+  await runResendExchange(resendId, "The redirect could not be followed.", async () => {
+    const followed = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(resendId)}/follow/${revision}`, { method: "POST" });
+    await requireOk(followed, "resend follow failed");
+    return followed;
+  });
+}
+
+/** One send-or-follow exchange bound to its own item for its whole lifecycle:
+ *  the result always updates that item, but only touches the visible editor
+ *  and History when it is still the selected one. With auto-follow on, a 3xx
+ *  result is followed one hop at a time through this same path. */
+async function runResendExchange(resendId: string, failure: string, issue: () => Promise<Response>): Promise<void> {
+  const isVisible = (): boolean => selectedResend?.id === resendId;
+  resendInFlight.add(resendId);
+  if (isVisible()) {
+    setResendSendBusy(true);
+    showResendResponseLoading();
+  }
+  renderResendList();
+  let followNext: number | null = null;
+  try {
+    const answered = await issue();
+    const result = (await answered.json()) as Partial<ResendSendResult>;
     let context = result.context;
     if (context === null || context === undefined || typeof context.id !== "string") {
       const refreshed = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId));
@@ -2204,14 +2330,20 @@ async function sendResend(): Promise<void> {
     (result.diagnostics ?? []).forEach(showDiagnostic);
     showDiagnostic(result.revision?.diagnostic);
     if (isVisible()) {
-      // Re-mount only the Response pane so the request editor and split ratio
-      // the operator set are preserved; show the just-arrived (latest) revision.
-      selectedResend = context;
+      // Keep the operator's draft: take the history, not the stored current,
+      // when this exchange did not come from the editor.
+      const draft = selectedResend?.current;
+      selectedResend = draft === undefined ? context : { ...context, current: draft };
       selectedResendRevision = null;
       setResendSendBusy(false);
       mountResendResponse();
     }
     renderResendList();
+    const revision = result.revision;
+    if (revision !== undefined && resendAutoFollow() && resendContexts.has(resendId) && redirectLocation(revision) !== null) {
+      if ((revision.redirectChain?.length ?? 0) < RESEND_MAX_AUTO_HOPS) followNext = revision.revision;
+      else toast(`Stopped after ${RESEND_MAX_AUTO_HOPS} redirects; use Follow redirection to continue.`, "info");
+    }
   } catch (error) {
     resendInFlight.delete(resendId);
     if (isVisible()) {
@@ -2219,7 +2351,15 @@ async function sendResend(): Promise<void> {
       mountResendResponse();
     }
     renderResendList();
-    reportUnexpected(error, { id: "proxy.resend-request-failed", what: "The resend send failed.", why: "", fix: "Review the request and confirm the session proxy is running." });
+    reportUnexpected(error, { id: "proxy.resend-request-failed", what: failure, why: "", fix: "Review the request and confirm the session proxy is running." });
+  }
+  if (followNext !== null) {
+    const from = followNext;
+    await runResendExchange(resendId, "The redirect could not be followed.", async () => {
+      const followed = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(resendId)}/follow/${from}`, { method: "POST" });
+      await requireOk(followed, "resend follow failed");
+      return followed;
+    });
   }
 }
 

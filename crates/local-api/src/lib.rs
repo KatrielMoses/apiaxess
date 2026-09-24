@@ -189,6 +189,10 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             axum::routing::post(derive_resend),
         )
         .route(
+            "/api/v1/workbench/resend/{context_id}/follow/{revision}",
+            axum::routing::post(follow_resend),
+        )
+        .route(
             "/api/v1/workbench/fuzzer",
             get(list_fuzzer).post(create_fuzzer),
         )
@@ -1588,6 +1592,47 @@ async fn send_resend(
         .engine
         .resend()
         .send_in_session(&context_id, &mut session)
+        .await
+        .map_err(storage_response)?;
+    runtime.replace_session(session).map_err(session_response)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct FollowQuery {
+    /// Carry cookies (request `Cookie` + response `Set-Cookie`) to the next hop.
+    #[serde(default = "follow_cookies_default")]
+    cookies: bool,
+}
+
+const fn follow_cookies_default() -> bool {
+    true
+}
+
+/// Follows one redirect hop from a past revision's `3xx`, appending the hop as
+/// a new revision (the editable draft is untouched).
+async fn follow_resend(
+    State(state): State<ApiState>,
+    AxumPath((context_id, revision)): AxumPath<(String, u64)>,
+    Query(query): Query<FollowQuery>,
+) -> Result<
+    Json<apiaxess_workbench_proxy::ResendSendResult>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    let runtime = state
+        .engine
+        .session_runtime()
+        .map_err(session_response)?
+        .ok_or_else(|| {
+            session_response(
+                catalogue::PROXY_SESSION_NOT_ACTIVE.instantiate(DiagnosticContext::new()),
+            )
+        })?;
+    let mut session = runtime.session_snapshot().map_err(session_response)?;
+    let result = state
+        .engine
+        .resend()
+        .follow_in_session(&context_id, revision, query.cookies, &mut session)
         .await
         .map_err(storage_response)?;
     runtime.replace_session(session).map_err(session_response)?;

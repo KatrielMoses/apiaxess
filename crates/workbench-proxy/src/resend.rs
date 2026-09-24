@@ -508,22 +508,81 @@ impl ResendWorkbench {
 
     /// Sends the current request and appends the result as one linear revision.
     ///
+    /// One exchange: a `3xx` is recorded as-is (redirects are never followed
+    /// implicitly — see [`ResendWorkbench::follow`]).
+    ///
     /// # Errors
     ///
     /// Returns a history diagnostic when the revision cannot be persisted.
     /// Transport and malformed-request failures are retained in the returned
     /// revision and diagnostics so the failed attempt is never hidden.
     pub async fn send(&self, id: &str) -> Result<ResendSendResult, Diagnostic> {
-        let mut context = self
+        let context = self
             .get(id)
             .ok_or_else(|| request_diagnostic("send", "context not found"))?;
-        validate_request(&context.current)?;
-        let scope = self.classify_scope(&context.current.url);
+        let request = context.current.clone();
+        self.dispatch(context, request, Vec::new(), None).await
+    }
+
+    /// Follows the redirect recorded on `revision`: issues exactly one request
+    /// to its resolved `Location` (method/body per the 3xx semantics, cookies
+    /// carried forward when `process_cookies`) and appends that hop as a new
+    /// revision whose `redirect_chain` extends the followed one. The editable
+    /// draft is untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a request diagnostic when the context or revision is missing or
+    /// the revision's response is not a redirect with a `Location`, or a history
+    /// diagnostic when the new revision cannot be persisted.
+    pub async fn follow(
+        &self,
+        id: &str,
+        revision: u64,
+        process_cookies: bool,
+    ) -> Result<ResendSendResult, Diagnostic> {
+        let context = self
+            .get(id)
+            .ok_or_else(|| request_diagnostic("follow", "context not found"))?;
+        let source = context
+            .history
+            .iter()
+            .find(|entry| entry.revision == revision)
+            .cloned()
+            .ok_or_else(|| request_diagnostic("follow", "history revision not found"))?;
+        let response = source
+            .response
+            .as_ref()
+            .filter(|response| is_redirect_status(response.status))
+            .ok_or_else(|| {
+                request_diagnostic("follow", "that revision's response is not a redirect")
+            })?;
+        let location = response_header(response, "location").ok_or_else(|| {
+            request_diagnostic("follow", "the redirect response has no Location header")
+        })?;
+        let target = resolve_redirect_url(&source.request.url, &location);
+        let request = next_redirect_request(&source.request, response, &target, process_cookies);
+        let mut chain = source.redirect_chain.clone();
+        chain.push(RedirectHop {
+            status: response.status,
+            location: target,
+        });
+        self.dispatch(context, request, chain, Some(revision)).await
+    }
+
+    async fn dispatch(
+        &self,
+        mut context: ResendContext,
+        request: ResendRequest,
+        redirect_chain: Vec<RedirectHop>,
+        followed_from: Option<u64>,
+    ) -> Result<ResendSendResult, Diagnostic> {
+        validate_request(&request)?;
+        let scope = self.classify_scope(&request.url);
         let mut diagnostics = Vec::new();
         if scope == ScopeDisposition::OutsideDeclaredScope {
-            diagnostics.push(outside_scope_diagnostic(&context.current.url));
+            diagnostics.push(outside_scope_diagnostic(&request.url));
         }
-        let request = context.current.clone();
         let started = Instant::now();
         let result = match self.sender.read().ok().and_then(|sender| sender.clone()) {
             Some(sender) => sender.send(request.clone()).await,
@@ -548,6 +607,8 @@ impl ResendWorkbench {
             }),
             diagnostic,
             scope,
+            redirect_chain,
+            followed_from,
         };
         context.history.push(revision.clone());
         self.persist(&context)?;
@@ -571,26 +632,31 @@ impl ResendWorkbench {
         session: &mut Session,
     ) -> Result<ResendSendResult, Diagnostic> {
         let result = self.send(id).await?;
-        let (host, port) = url_target(&result.revision.request.url)
-            .unwrap_or_else(|| ("unknown".to_owned(), None));
-        let target = ActionTarget::Network { host, port };
-        let outcome = if result.revision.diagnostic.is_some() {
-            ActionOutcome::Failed
-        } else {
-            ActionOutcome::Completed
-        };
-        session.record_action(ActionRecordInput {
-            id: format!("resend:{}:{}", id, result.revision.revision),
-            occurred_at: result.revision.sent_at,
-            actor: AuditActor::User,
-            action: ActionDescriptor {
-                kind: "workbench.resend.send".to_owned(),
-                summary: format!("Sent resend revision {}", result.revision.revision),
-            },
-            target,
-            outcome,
-            diagnostics: result.diagnostics.clone(),
-        })?;
+        record_send_action(id, &result, session, "workbench.resend.send", "Sent")?;
+        Ok(result)
+    }
+
+    /// Follows one redirect hop and records it in the session audit trail.
+    ///
+    /// # Errors
+    ///
+    /// As [`ResendWorkbench::follow`], or a session diagnostic if the audit
+    /// record cannot be appended.
+    pub async fn follow_in_session(
+        &self,
+        id: &str,
+        revision: u64,
+        process_cookies: bool,
+        session: &mut Session,
+    ) -> Result<ResendSendResult, Diagnostic> {
+        let result = self.follow(id, revision, process_cookies).await?;
+        record_send_action(
+            id,
+            &result,
+            session,
+            "workbench.resend.follow",
+            "Followed a redirect as",
+        )?;
         Ok(result)
     }
 
@@ -626,25 +692,43 @@ impl ResendWorkbench {
     }
 }
 
-/// The plain resend path: follows redirects (up to 10, like the historical
-/// reqwest default) and recomputes Content-Length. Following is done here, hop
-/// by hop, so every hop is written byte-faithfully with its own header list.
+fn record_send_action(
+    id: &str,
+    result: &ResendSendResult,
+    session: &mut Session,
+    kind: &str,
+    verb: &str,
+) -> Result<(), Diagnostic> {
+    let (host, port) =
+        url_target(&result.revision.request.url).unwrap_or_else(|| ("unknown".to_owned(), None));
+    let outcome = if result.revision.diagnostic.is_some() {
+        ActionOutcome::Failed
+    } else {
+        ActionOutcome::Completed
+    };
+    session.record_action(ActionRecordInput {
+        id: format!("resend:{}:{}", id, result.revision.revision),
+        occurred_at: result.revision.sent_at,
+        actor: AuditActor::User,
+        action: ActionDescriptor {
+            kind: kind.to_owned(),
+            summary: format!("{verb} resend revision {}", result.revision.revision),
+        },
+        target: ActionTarget::Network { host, port },
+        outcome,
+        diagnostics: result.diagnostics.clone(),
+    })?;
+    Ok(())
+}
+
+/// The plain resend path: exactly one exchange with Content-Length recomputed.
+/// A `3xx` comes back as-is; following is explicit, one hop at a time.
 async fn send_through_proxy(
     proxy_addr: std::net::SocketAddr,
     ca: SessionCa,
     request: ResendRequest,
 ) -> Result<ResendResponse, Diagnostic> {
-    let options = SendOptions {
-        redirect: RedirectPolicy {
-            mode: RedirectMode::Always,
-            process_cookies: false,
-            max_hops: 10,
-        },
-        ..SendOptions::default()
-    };
-    send_following_redirects(proxy_addr, ca, request, &options)
-        .await
-        .map(|(response, _)| response)
+    send_core(proxy_addr, ca, request, true).await
 }
 
 /// One raw request with no client-side redirect following (the Fuzzer follows
@@ -921,8 +1005,22 @@ fn next_redirect_request(
     if process_cookies {
         let cookies = merged_cookies(current, response);
         if !cookies.is_empty() {
-            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
-            headers.push(("Cookie".to_owned(), cookies));
+            // Update the authored Cookie header in place (keeping its position
+            // and case); only a request without one gains a new header.
+            match headers
+                .iter()
+                .position(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            {
+                Some(first) => {
+                    headers[first].1 = cookies;
+                    let mut index = 0;
+                    headers.retain(|(name, _)| {
+                        index += 1;
+                        index - 1 == first || !name.eq_ignore_ascii_case("cookie")
+                    });
+                }
+                None => headers.push(("Cookie".to_owned(), cookies)),
+            }
         }
     }
     ResendRequest {
@@ -1299,6 +1397,113 @@ mod tests {
     }
 
     #[derive(Debug)]
+    /// Answers `/start` with a 303 (Location + Set-Cookie) and anything else
+    /// with 200, recording every request it is handed.
+    struct RedirectingSender(Arc<Mutex<Vec<ResendRequest>>>);
+
+    impl ResendSender for RedirectingSender {
+        fn send(
+            &self,
+            request: ResendRequest,
+        ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>> {
+            let redirect = request.url.ends_with("/start");
+            self.0.lock().expect("log").push(request);
+            Box::pin(async move {
+                Ok(if redirect {
+                    ResendResponse {
+                        status: 303,
+                        headers: vec![
+                            ("Location".to_owned(), "/final".to_owned()),
+                            ("Set-Cookie".to_owned(), "sid=abc; Path=/".to_owned()),
+                        ],
+                        body: Some(b"moved".to_vec()),
+                        duration_ms: 0,
+                        http_version: Some("HTTP/1.1".to_owned()),
+                        reason: Some("See Other".to_owned()),
+                    }
+                } else {
+                    ResendResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: None,
+                        duration_ms: 0,
+                        http_version: Some("HTTP/1.1".to_owned()),
+                        reason: Some("OK".to_owned()),
+                    }
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_records_the_raw_redirect_and_follow_issues_exactly_one_hop() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let resend = ResendWorkbench::new();
+        resend.attach_store(store()).expect("attach");
+        resend.attach_sender(Arc::new(RedirectingSender(Arc::clone(&log))));
+        let draft = ResendRequest {
+            method: "POST".to_owned(),
+            url: "http://app.test/start".to_owned(),
+            headers: vec![
+                ("X-Keep".to_owned(), "1".to_owned()),
+                ("Cookie".to_owned(), "a=1".to_owned()),
+                ("Content-Type".to_owned(), "text/plain".to_owned()),
+                ("Accept".to_owned(), "*/*".to_owned()),
+            ],
+            body: Some(b"payload".to_vec()),
+        };
+        let context = resend.create(draft.clone(), None).expect("create");
+
+        // A send is one exchange: the 3xx is the result, nothing is followed.
+        let sent = resend.send(&context.id).await.expect("send");
+        assert_eq!(sent.revision.response.as_ref().map(|r| r.status), Some(303));
+        assert!(sent.revision.redirect_chain.is_empty());
+        assert_eq!(log.lock().expect("log").len(), 1);
+
+        // Follow issues exactly one hop to the resolved Location: 303 → GET with
+        // no body, cookies carried, other headers kept in order.
+        let hop = resend.follow(&context.id, 1, true).await.expect("follow");
+        assert_eq!(log.lock().expect("log").len(), 2);
+        let sent_hop = log.lock().expect("log")[1].clone();
+        assert_eq!(sent_hop.method, "GET");
+        assert_eq!(sent_hop.url, "http://app.test/final");
+        assert_eq!(sent_hop.body, None);
+        assert_eq!(
+            sent_hop.headers,
+            vec![
+                ("X-Keep".to_owned(), "1".to_owned()),
+                ("Cookie".to_owned(), "a=1; sid=abc".to_owned()),
+                ("Accept".to_owned(), "*/*".to_owned()),
+            ],
+            "cookie keeps its authored position"
+        );
+        assert_eq!(hop.revision.revision, 2);
+        assert_eq!(hop.revision.followed_from, Some(1));
+        assert_eq!(
+            hop.revision.redirect_chain,
+            vec![RedirectHop {
+                status: 303,
+                location: "http://app.test/final".to_owned(),
+            }]
+        );
+        assert_eq!(hop.revision.response.as_ref().map(|r| r.status), Some(200));
+        // The editable draft is untouched by following.
+        assert_eq!(hop.context.current, draft);
+
+        // Without cookie processing the Set-Cookie is not carried.
+        resend.follow(&context.id, 1, false).await.expect("follow");
+        let plain_hop = log.lock().expect("log")[2].clone();
+        assert!(
+            plain_hop
+                .headers
+                .contains(&("Cookie".to_owned(), "a=1".to_owned()))
+        );
+
+        // A non-redirect revision cannot be followed.
+        assert!(resend.follow(&context.id, 2, true).await.is_err());
+        assert!(resend.follow(&context.id, 99, true).await.is_err());
+    }
+
     struct MockSender;
 
     impl ResendSender for MockSender {

@@ -220,6 +220,12 @@ pub struct ResendRevision {
     pub diagnostic: Option<Diagnostic>,
     /// Advisory scope classification at send time.
     pub scope: ScopeDisposition,
+    /// Redirect hops followed to reach this request (empty for a direct send).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirect_chain: Vec<RedirectHop>,
+    /// The revision whose 3xx this request followed, when it is a redirect hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followed_from: Option<u64>,
 }
 
 /// Independent resend tab/context with a linear append-only history.
@@ -2156,6 +2162,8 @@ impl TrafficStore {
                 .transpose()?,
             diagnostic: revision.diagnostic.clone(),
             scope: revision.scope,
+            redirect_chain: revision.redirect_chain.clone(),
+            followed_from: revision.followed_from,
         })
     }
 
@@ -2194,6 +2202,8 @@ impl TrafficStore {
                 .transpose()?,
             diagnostic: revision.diagnostic,
             scope: revision.scope,
+            redirect_chain: revision.redirect_chain,
+            followed_from: revision.followed_from,
         })
     }
 
@@ -2367,6 +2377,10 @@ struct StoredResendRevision {
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic: Option<Diagnostic>,
     scope: ScopeDisposition,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    redirect_chain: Vec<RedirectHop>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    followed_from: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3283,6 +3297,11 @@ mod tests {
                 }),
                 diagnostic: None,
                 scope: ScopeDisposition::InScope,
+                redirect_chain: vec![RedirectHop {
+                    status: 302,
+                    location: "https://api.example.test/next".to_owned(),
+                }],
+                followed_from: Some(1),
             }],
         };
         store.upsert_resend(&context).expect("resend persisted");
@@ -3294,6 +3313,14 @@ mod tests {
             store.snapshot().expect("snapshot").resend_contexts.len(),
             1
         );
+    }
+
+    #[test]
+    fn legacy_resend_revision_without_redirect_fields_loads() {
+        let legacy = r#"{"revision":1,"sentAt":"2026-09-01T00:00:00Z","request":{"method":"GET","url":"http://a.test/","headers":[]},"scope":"in_scope"}"#;
+        let revision: ResendRevision = serde_json::from_str(legacy).expect("legacy revision");
+        assert!(revision.redirect_chain.is_empty());
+        assert_eq!(revision.followed_from, None);
     }
 
     #[test]
