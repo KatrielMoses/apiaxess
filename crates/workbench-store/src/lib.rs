@@ -998,6 +998,7 @@ fn migrate_delay(delay: Option<DelayPolicy>, rate_per_second: Option<u32>) -> De
 /// Fuzzer attack configuration persisted with a job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct FuzzerConfig {
     /// Request template before payload substitution.
     pub base_request: ResendRequest,
@@ -1044,6 +1045,10 @@ pub struct FuzzerConfig {
     /// Used by directory discovery; absent (false) for everything else.
     #[serde(default)]
     pub auto_calibrate: bool,
+    /// Engine-internal job (e.g. active discovery) that must not surface as a
+    /// user-visible Fuzz/Resend queue item. Default false for user attacks.
+    #[serde(default)]
+    pub internal: bool,
 }
 
 /// Response comparison features used by the fuzzer UI.
@@ -2035,6 +2040,7 @@ impl TrafficStore {
                 })
                 .collect::<Result<Vec<_>, Diagnostic>>()?,
             auto_calibrate: config.auto_calibrate,
+            internal: config.internal,
         })
     }
 
@@ -2074,6 +2080,7 @@ impl TrafficStore {
                 })
                 .collect::<Result<Vec<_>, Diagnostic>>()?,
             auto_calibrate: config.auto_calibrate,
+            internal: config.internal,
         })
     }
 
@@ -2393,6 +2400,7 @@ struct StoredResendRevision {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 struct StoredFuzzerConfig {
     base_request: StoredResendRequest,
     positions: Vec<PayloadPosition>,
@@ -2422,6 +2430,8 @@ struct StoredFuzzerConfig {
     sequence: Vec<StoredFuzzerSequenceStep>,
     #[serde(default)]
     auto_calibrate: bool,
+    #[serde(default)]
+    internal: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3356,10 +3366,7 @@ mod tests {
             store.resend_contexts().expect("resend loaded"),
             vec![context]
         );
-        assert_eq!(
-            store.snapshot().expect("snapshot").resend_contexts.len(),
-            1
-        );
+        assert_eq!(store.snapshot().expect("snapshot").resend_contexts.len(), 1);
     }
 
     #[test]
@@ -3647,6 +3654,7 @@ mod tests {
                 auth_preflight: None,
                 sequence: Vec::new(),
                 auto_calibrate: false,
+                internal: false,
             },
             results: vec![FuzzerResult {
                 ordinal: 1,

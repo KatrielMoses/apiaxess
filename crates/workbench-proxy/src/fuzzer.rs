@@ -2706,6 +2706,7 @@ mod tests {
             auth_preflight: None,
             sequence: Vec::new(),
             auto_calibrate: false,
+            internal: false,
         }
     }
 

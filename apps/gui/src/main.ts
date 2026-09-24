@@ -303,6 +303,9 @@ let discoveryEstimateDebounce: number | undefined;
 let fuzzerPoll: number | undefined;
 let pipelinePoll: number | undefined;
 let discoveryPoll: number | undefined;
+/** Wall-clock ms when the current discovery run started, for live elapsed
+ *  progress on the ffuf tier (which reports hits, not a sent count). */
+let discoveryStartedAt: number | null = null;
 let browserPoll: number | undefined;
 let flowsLoaded = false;
 let latestHealth: WorkbenchHealth | null = null;
@@ -4832,7 +4835,30 @@ function prefetchDiscoveryEstimate(): void {
   }, 150);
 }
 
+/** Whether a discovery run is currently active (running/paused). */
+function discoveryRunning(): boolean {
+  return discoveryJob !== null && (discoveryJob.state === "running" || discoveryJob.state === "paused");
+}
+
+/** Reflects single-flight in the controls: while a run is active, Run is
+ *  disabled (never start a second concurrent ffuf) and Cancel is enabled; when
+ *  idle, Run is enabled and Cancel is disabled with a reason. */
+function setDiscoveryControls(): void {
+  const run = document.querySelector<HTMLButtonElement>("#discovery-run");
+  const cancel = document.querySelector<HTMLButtonElement>("#discovery-stop");
+  const running = discoveryRunning();
+  if (run !== null) {
+    run.disabled = running;
+    run.title = running ? "A discovery run is already active — cancel it first." : "";
+  }
+  if (cancel !== null) {
+    cancel.disabled = !running;
+    cancel.title = running ? "Stop the active discovery run." : "No discovery run is active.";
+  }
+}
+
 async function runDiscovery(): Promise<void> {
+  if (discoveryRunning()) { toast("A discovery run is already active — cancel it first.", "info"); return; }
   const key = discoveryRequestBody();
   // Snappy confirm: use the warm cache when it matches the current selection so
   // the dialog opens immediately. Only fetch (with the run button busy) when we
@@ -4870,7 +4896,9 @@ async function runDiscovery(): Promise<void> {
     const response = await fetch("/api/v1/discovery/run", { method: "POST", headers: { "content-type": "application/json" }, body: discoveryRequestBody(true) });
     await requireOk(response, "discovery could not start");
     discoveryJob = await response.json() as FuzzerJob;
+    discoveryStartedAt = Date.now();
     renderDiscovery();
+    setDiscoveryControls();
     if (discoveryPoll !== undefined) window.clearInterval(discoveryPoll);
     discoveryPoll = window.setInterval(() => void refreshDiscovery(), 500);
   } catch (error) {
@@ -4907,16 +4935,30 @@ function renderDiscovery(): void {
       const remaining = Math.max(0, candidates - attempts);
       value = running && rate > 0 && candidates > 0 ? `${Math.ceil(remaining / rate)}s remaining` : job.state;
     } else {
-      percent = running ? 0 : 100;
-      tone = running ? " progress--indeterminate progress--running" : outcome;
-      label = `${hits} hit${hits === 1 ? "" : "s"}${candidates > 0 ? ` · ${candidates.toLocaleString()} candidates` : ""}`;
-      value = running
-        ? rate > 0 && candidates > 0
-          ? `~${Math.ceil(candidates / rate)}s`
-          : "running"
-        : job.state;
+      // The ffuf tier reports only hits, not a per-probe count. Drive a live
+      // bar from real elapsed time against the estimated duration, and show an
+      // honest projected sent-count (≈ elapsed × rate) so the panel is never
+      // frozen while the wire streams — without claiming an exact count.
+      const elapsedSec = running && discoveryStartedAt !== null ? Math.max(0, (Date.now() - discoveryStartedAt) / 1000) : 0;
+      const totalSec = rate > 0 && candidates > 0 ? candidates / rate : 0;
+      if (running) {
+        const projected = rate > 0 ? Math.min(candidates || Infinity, Math.floor(elapsedSec * rate)) : 0;
+        percent = totalSec > 0 ? Math.min(99, (elapsedSec / totalSec) * 100) : 0;
+        tone = totalSec > 0 ? " progress--running" : " progress--indeterminate progress--running";
+        const sent = rate > 0 && candidates > 0 ? `≈${projected.toLocaleString()} / ${candidates.toLocaleString()} sent` : `${Math.round(elapsedSec)}s elapsed`;
+        label = `${sent} · ${hits} hit${hits === 1 ? "" : "s"}`;
+        value = totalSec > 0 ? `${rate}/s · ~${Math.max(0, Math.ceil(totalSec - elapsedSec))}s left` : `${rate}/s`;
+      } else {
+        percent = 100;
+        tone = outcome;
+        label = `${hits} hit${hits === 1 ? "" : "s"}${candidates > 0 ? ` · ${candidates.toLocaleString()} candidates` : ""}`;
+        value = job.state;
+      }
     }
-    const progressAttributes = attemptsReported || !running
+    // Announce a value whenever the bar is determinate (any tier with a known
+    // total, or a finished run) — only a totalless running ffuf bar is not.
+    const determinate = !tone.includes("progress--indeterminate");
+    const progressAttributes = determinate
       ? ` aria-valuenow="${Math.round(percent)}" aria-valuemin="0" aria-valuemax="100"`
       : "";
     discoveryProgress.innerHTML = `<div class="progress${tone}" role="progressbar"${progressAttributes}>
@@ -4944,6 +4986,7 @@ function renderDiscoveryIdle(): void {
       compact: true,
     });
   }
+  setDiscoveryControls();
 }
 
 async function refreshDiscovery(): Promise<void> {
@@ -4952,17 +4995,34 @@ async function refreshDiscovery(): Promise<void> {
   if (!response.ok) return;
   discoveryJob = await response.json() as FuzzerJob;
   renderDiscovery();
+  setDiscoveryControls();
   if (["completed", "failed", "stopped"].includes(discoveryJob.state) && discoveryPoll !== undefined) {
     window.clearInterval(discoveryPoll);
     discoveryPoll = undefined;
+    discoveryStartedAt = null;
   }
 }
 
 async function stopDiscovery(): Promise<void> {
-  if (discoveryJob === null) return;
-  await fetch("/api/v1/workbench/fuzzer/" + encodeURIComponent(discoveryJob.id) + "/stop", { method: "POST" });
-  await refreshDiscovery();
-  toast("Discovery cancelled");
+  if (!discoveryRunning()) return;
+  const cancel = document.querySelector<HTMLButtonElement>("#discovery-stop");
+  try {
+    await withBusy(cancel, "Cancelling…", async () => {
+      // The engine kills the underlying ffuf/native process for the active run;
+      // the UI only flips to STOPPED once that has actually happened.
+      const response = await fetch("/api/v1/discovery/cancel", { method: "POST" });
+      await requireOk(response, "discovery could not be cancelled");
+      discoveryJob = await response.json() as FuzzerJob;
+    });
+    renderDiscovery();
+    setDiscoveryControls();
+    if (discoveryPoll !== undefined) { window.clearInterval(discoveryPoll); discoveryPoll = undefined; }
+    discoveryStartedAt = null;
+    toast("Discovery cancelled — probing stopped.", "success");
+  } catch (error) {
+    reportUnexpected(error, { id: "web.discovery-cancel-failed", what: "Discovery could not be cancelled.", why: "", fix: "Retry Cancel; the run may have already finished." });
+    await refreshDiscovery();
+  }
 }
 
 /* ==================================================================== *

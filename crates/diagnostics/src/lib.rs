@@ -802,6 +802,26 @@ pub mod catalogue {
         fix: "Choose one of the bundled wordlists and retry.",
     };
 
+    /// A second discovery run was requested while one is still active.
+    pub const DISCOVERY_ALREADY_ACTIVE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "discovery.already-active",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "A discovery run is already active.",
+        why: "Only one discovery run probes a target at a time, so a second run cannot start while one is in progress.",
+        fix: "Cancel the active run first, then start another.",
+    };
+
+    /// Cancel was requested but no discovery run is active.
+    pub const DISCOVERY_NONE_ACTIVE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "discovery.none-active",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "There is no active discovery run to cancel.",
+        why: "Cancel stops an in-progress discovery run, and none is currently running.",
+        fix: "Start a discovery run before cancelling.",
+    };
+
     /// The per-session CA could not be generated.
     pub const PROXY_CA_GENERATION_FAILED: DiagnosticDefinition = DiagnosticDefinition {
         id: "proxy.ca-generation-failed",
@@ -1167,6 +1187,8 @@ pub mod catalogue {
         PROXY_SESSION_NOT_ACTIVE,
         WEB_TARGET_REQUIRED,
         DISCOVERY_WORDLIST_UNKNOWN,
+        DISCOVERY_ALREADY_ACTIVE,
+        DISCOVERY_NONE_ACTIVE,
         PROXY_CA_GENERATION_FAILED,
         PROXY_CA_EXPORT_FAILED,
         PROXY_UPSTREAM_UNREACHABLE,

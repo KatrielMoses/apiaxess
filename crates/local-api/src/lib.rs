@@ -143,6 +143,10 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         )
         .route("/api/v1/discovery/run", axum::routing::post(discovery_run))
         .route(
+            "/api/v1/discovery/cancel",
+            axum::routing::post(discovery_cancel),
+        )
+        .route(
             "/api/v1/discovery/wordlists",
             axum::routing::get(discovery_wordlists),
         )
@@ -814,6 +818,21 @@ async fn discovery_run(
         .map_err(session_response)
 }
 
+/// Cancels the active discovery run, killing its underlying process. Returns
+/// the stopped job, or a diagnostic when no run is active.
+async fn discovery_cancel(
+    State(state): State<ApiState>,
+) -> Result<
+    Json<apiaxess_workbench_store::FuzzerJob>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    state
+        .engine
+        .cancel_discovery()
+        .map(Json)
+        .map_err(session_response)
+}
+
 /// The bundled wordlist catalogue for the discovery picker (names, kinds, counts).
 async fn discovery_wordlists() -> Json<Vec<apiaxess_engine_shell::WordlistInfo>> {
     Json(apiaxess_engine_shell::bundled_wordlist_catalogue())
@@ -841,6 +860,7 @@ fn session_response(
 ) -> (StatusCode, Json<apiaxess_diagnostics::Diagnostic>) {
     let status = match diagnostic.id.as_ref() {
         "proxy.session-artifact-not-found" => StatusCode::NOT_FOUND,
+        "discovery.already-active" | "discovery.none-active" => StatusCode::CONFLICT,
         "persistence.session-format-unsupported" | "persistence.session-json-invalid" => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -1730,7 +1750,18 @@ async fn derive_resend(
 async fn list_fuzzer(
     State(state): State<ApiState>,
 ) -> Json<Vec<apiaxess_workbench_store::FuzzerJob>> {
-    Json(state.engine.fuzzer().list())
+    // Internal jobs (the active discovery ffuf run) are engine-owned and must
+    // not surface as user-visible Fuzz queue items; the discovery panel reads
+    // its job by id directly.
+    Json(
+        state
+            .engine
+            .fuzzer()
+            .list()
+            .into_iter()
+            .filter(|job| !job.config.internal)
+            .collect(),
+    )
 }
 
 async fn create_fuzzer(

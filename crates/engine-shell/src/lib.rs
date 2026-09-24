@@ -96,6 +96,11 @@ pub struct Engine {
     android_status: Arc<RwLock<AndroidTargetStatus>>,
     /// Guards against a second concurrent launch while one is in flight.
     android_launching: Arc<AtomicBool>,
+    /// The id of the active discovery job (see [`Engine::start_discovery`]),
+    /// while one is running. Single-flighted: a second run is refused until this
+    /// one finishes or is cancelled, so no un-cancellable ffuf orphan is ever
+    /// left probing the target after the UI reports STOPPED.
+    active_discovery: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Outcome of launching the GUI Android target add-on (Phase D1): the booted,
@@ -331,6 +336,7 @@ impl Engine {
             android_stream: Arc::new(std::sync::Mutex::new(None)),
             android_status: Arc::new(RwLock::new(AndroidTargetStatus::default())),
             android_launching: Arc::new(AtomicBool::new(false)),
+            active_discovery: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -634,6 +640,7 @@ impl Engine {
     ///
     /// Returns a diagnostic when the wordlist, session, confirmation, or
     /// discovery request configuration is invalid.
+    #[allow(clippy::too_many_lines)]
     pub fn start_discovery(
         &self,
         kind: DiscoveryKind,
@@ -650,6 +657,14 @@ impl Engine {
                 "active discovery requires confirmation: {} requests against {} (estimated {})",
                 estimate.request_count, estimate.target, estimate.estimated_label
             )));
+        }
+        // Single-flight: refuse a second run while one is active so a re-click
+        // never spawns a concurrent ffuf that outlives the one the UI cancels.
+        if let Some(active) = self.active_discovery_running() {
+            return Err(discovery_diagnostic(
+                apiaxess_diagnostics::catalogue::DISCOVERY_ALREADY_ACTIVE,
+                &format!("active discovery job {active}"),
+            ));
         }
         let runtime = self.session_runtime()?.ok_or_else(|| {
             apiaxess_diagnostics::catalogue::PROXY_SESSION_NOT_ACTIVE
@@ -709,14 +724,9 @@ impl Engine {
             // a WAF/wildcard site that answers every path yields no fake hits.
             // Subdomain discovery is DNS-resolved and needs no calibration.
             auto_calibrate: matches!(kind, DiscoveryKind::Directory),
+            internal: true,
         };
         let job = self.fuzzer.create(config)?;
-        // Keep the discovery template as a durable resend context immediately;
-        // completed hits can then be edited/sent through the same workbench
-        // without a separate export/import step.
-        let _ = self
-            .resend
-            .create(job.config.base_request.clone(), None)?;
         session.record_action(ActionRecordInput {
             id: format!("discovery:confirm:{}", job.id),
             occurred_at: chrono::Utc::now(),
@@ -741,7 +751,52 @@ impl Engine {
         self.fuzzer.launch_in_session(&job.id, &mut session)?;
         runtime.replace_session(session)?;
         runtime.save()?;
+        if let Ok(mut active) = self.active_discovery.lock() {
+            *active = Some(job.id.clone());
+        }
         Ok(job)
+    }
+
+    /// The active discovery job id, if one is currently running or paused. A
+    /// finished/stopped/cleared job returns `None` (and the slot is cleared).
+    fn active_discovery_running(&self) -> Option<String> {
+        let mut active = self.active_discovery.lock().ok()?;
+        let id = active.clone()?;
+        let live = matches!(
+            self.fuzzer.get(&id).map(|job| job.state),
+            Some(
+                apiaxess_workbench_store::FuzzerJobState::Running
+                    | apiaxess_workbench_store::FuzzerJobState::Paused
+            )
+        );
+        if !live {
+            *active = None;
+        }
+        live.then_some(id)
+    }
+
+    /// Cancels the active discovery run: stops the underlying ffuf/native job
+    /// (killing its process) and clears the single-flight slot so a fresh run
+    /// can start. Returns the stopped job, or an error when nothing is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when no discovery run is active or the underlying
+    /// job cannot be stopped.
+    pub fn cancel_discovery(
+        &self,
+    ) -> Result<apiaxess_workbench_store::FuzzerJob, apiaxess_diagnostics::Diagnostic> {
+        let id = self.active_discovery_running().ok_or_else(|| {
+            discovery_diagnostic(
+                apiaxess_diagnostics::catalogue::DISCOVERY_NONE_ACTIVE,
+                "cancel requested with no active run",
+            )
+        })?;
+        let stopped = self.fuzzer.stop(&id)?;
+        if let Ok(mut active) = self.active_discovery.lock() {
+            *active = None;
+        }
+        Ok(stopped)
     }
 
     /// Builds the observation-based web surface from all captured traffic and
@@ -2311,6 +2366,13 @@ fn browser_name(browser: BrowserKind) -> &'static str {
         BrowserKind::Firefox => "Firefox",
         BrowserKind::Chromium => "Chromium",
     }
+}
+
+fn discovery_diagnostic(
+    definition: apiaxess_diagnostics::DiagnosticDefinition,
+    reason: &str,
+) -> apiaxess_diagnostics::Diagnostic {
+    browser_diagnostic(definition, reason)
 }
 
 fn browser_launch_diagnostic(reason: &str) -> apiaxess_diagnostics::Diagnostic {

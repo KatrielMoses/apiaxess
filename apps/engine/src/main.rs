@@ -1653,6 +1653,7 @@ mod tests {
                     extractors: Vec::new(),
                 }],
                 auto_calibrate: false,
+                internal: false,
             })
             .expect("fuzzer configuration");
         let mut audited_session = runtime
