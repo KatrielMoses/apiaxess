@@ -50,7 +50,7 @@ interface ContextDiagnostic extends Diagnostic { readonly context?: Record<strin
 interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: ContextDiagnostic | null; scope: string; redirectChain?: RedirectHop[]; followedFrom?: number | null; }
 interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; name?: string | null; }
 interface ResendSendResult { context: ResendContext; revision: ResendRevision; diagnostics: (Diagnostic | null)[]; }
-interface FuzzerResult { ordinal: number; payloads: string[]; request: ResendRequest; response?: { status: number; headers: readonly [string, string][]; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: Diagnostic | null; timeout?: boolean; comment?: string | null; grepMatchCounts?: number[]; grepExtracts?: (string | null)[]; reflectedCount?: number | null; redirectChain?: RedirectHop[]; retryCount?: number; }
+interface FuzzerResult { ordinal: number; payloads: string[]; request: ResendRequest; response?: { status: number; headers: readonly [string, string][]; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: ContextDiagnostic | null; timeout?: boolean; comment?: string | null; grepMatchCounts?: number[]; grepExtracts?: (string | null)[]; reflectedCount?: number | null; redirectChain?: RedirectHop[]; retryCount?: number; }
 export type FuzzerLocation = "url" | "header" | "body";
 interface FuzzerPosition { location: FuzzerLocation; headerName?: string | null; start: number; end: number; setIndex: number; }
 type CaseMode = "lower" | "upper" | "propercase" | "toggle";
@@ -1295,7 +1295,7 @@ function renderFuzzer(): void {
   const stateBadge = `<span class="badge ${state === "running" ? "badge--accent" : state === "failed" ? "badge--danger" : state === "completed" ? "badge--success" : ""}">${escapeHtml(state)}</span>`;
 
   fuzzerPanel.innerHTML = `<div class="panel__header">
-  <div class="panel__heading">${icon("discovery", { size: 16 })}<h2>Fuzz · ${escapeHtml(selectedFuzzer.id === "" ? "new attack" : selectedFuzzer.id.slice(-8))}</h2></div>
+  <div class="panel__heading">${icon("discovery", { size: 16 })}<h2 title="${escapeHtml(`${config.baseRequest.url}${selectedFuzzer.id === "" ? "" : ` · ${selectedFuzzer.id}`}`)}">${escapeHtml(fuzzTitle(selectedFuzzer))}</h2></div>
   <div class="row">${stateBadge}<button class="btn btn--quiet btn--icon" type="button" data-close-fuzzer><span class="visually-hidden">Close Fuzz</span>${icon("close", { size: 16 })}</button></div>
 </div>
 <div class="panel__body stack">
@@ -1770,10 +1770,14 @@ function renderFuzzerResults(job: FuzzerJob): string {
     const selected = selectedFuzzResult === result.ordinal ? " is-selected" : "";
     const cells = [`<td>${result.ordinal}</td>`];
     for (let i = 0; i < payloadCols; i += 1) cells.push(`<td class="t-mono">${escapeHtml(result.payloads[i] ?? "")}</td>`);
-    cells.push(`<td><span class="list-row__status" data-class="${statusClass(status)}">${status ?? escapeHtml(result.diagnostic?.id ?? "failed")}</span></td>`);
+    const failure = status === undefined ? fuzzFailure(result) : null;
+    cells.push(`<td><span class="list-row__status" data-class="${statusClass(status)}"${failure === null ? "" : ` title="${escapeHtml(failure.detail)}"`}>${status ?? escapeHtml(failure?.label ?? "failed")}</span></td>`);
     cells.push(`<td class="t-numeric">${fuzzResponseLength(result) ?? "—"}</td>`);
     cells.push(`<td class="t-numeric">${result.response?.durationMs ?? "—"}</td>`);
-    if (anyError) cells.push(`<td class="t-small t-subtle">${result.diagnostic === null || result.diagnostic === undefined ? "" : escapeHtml(result.diagnostic.id)}</td>`);
+    if (anyError) {
+      const error = fuzzFailure(result);
+      cells.push(`<td class="t-small t-subtle"${error === null ? "" : ` title="${escapeHtml(error.detail)}"`}>${error === null ? "" : escapeHtml(error.label)}</td>`);
+    }
     cells.push(`<td>${result.timeout === true ? '<span class="badge badge--caution">timeout</span>' : ""}</td>`);
     grep.matchRules.forEach((_, i) => { const count = result.grepMatchCounts?.[i] ?? 0; cells.push(`<td class="t-numeric${count > 0 ? " t-strong" : " t-subtle"}">${count}</td>`); });
     grep.extractRules.forEach((_, i) => cells.push(`<td class="t-mono t-small">${escapeHtml(result.grepExtracts?.[i] ?? "")}</td>`));
@@ -1819,7 +1823,7 @@ function fuzzSortComparable(result: FuzzerResult, key: string): number | string 
   if (key === "status") return result.response?.status ?? -1;
   if (key === "length") return fuzzResponseLength(result) ?? -1;
   if (key === "time") return result.response?.durationMs ?? -1;
-  if (key === "error") return result.diagnostic?.id ?? "";
+  if (key === "error") return fuzzFailure(result)?.label ?? "";
   if (key === "timeout") return result.timeout === true ? 1 : 0;
   if (key === "reflected") return result.reflectedCount ?? -1;
   if (key === "redirects") return result.redirectChain?.length ?? -1;
@@ -1849,7 +1853,7 @@ function renderFuzzResultDetail(results: readonly FuzzerResult[]): string {
   if (result === undefined) return "";
   const responseText = result.response
     ? `${result.response.status}\n${formatHeaders(result.response.headers)}${bytesToText(result.response.body) === "" ? "" : `\n\n${bytesToText(result.response.body)}`}`
-    : result.diagnostic?.what ?? "No response was received.";
+    : "";
   // The ffuf fast-path does not capture the full response — it reports only status
   // and size, which we surface as a synthesized Content-Length. Label it honestly
   // as reconstructed rather than presenting it as a full captured response. The
@@ -1864,8 +1868,36 @@ function renderFuzzResultDetail(results: readonly FuzzerResult[]): string {
     : `<div class="stack stack--tight fuzz-redirect-chain"><p class="section-label">Redirect chain · ${chain.length} hop${chain.length === 1 ? "" : "s"}${(result.retryCount ?? 0) > 0 ? ` · ${result.retryCount} retr${result.retryCount === 1 ? "y" : "ies"}` : ""}</p>${chain.map((hop) => `<p class="t-small t-mono">${hop.status} → ${escapeHtml(hop.location)}</p>`).join("")}</div>`;
   return `<div class="stack stack--tight">${chainBlock}<div class="reqres fuzz-detail">
   <div class="reqres__col"><p class="section-label">Request · #${result.ordinal} <span class="t-subtle t-small">(as sent)</span></p><pre class="code">${escapeHtml(rawRequestText(result.request, { recomputeContentLength: selectedFuzzer?.config.updateContentLength ?? true }))}</pre></div>
-  <div class="reqres__col"><p class="section-label">${responseLabel}</p><pre class="code">${escapeHtml(responseText)}</pre></div>
+  <div class="reqres__col"><p class="section-label">${responseLabel}</p>${result.response
+    ? `<pre class="code">${escapeHtml(responseText)}</pre>`
+    : resendFailureHtml(result.diagnostic ?? { id: "proxy.resend-request-failed", what: "No response was received.", why: "The attempt failed without a recorded reason.", fix: "Retry the attack; if it persists, check the session proxy." }, `#${result.ordinal} — no HTTP response.`)}</div>
 </div></div>`;
+}
+
+/** Short plain-language label for a Fuzz result with no response, plus the
+ *  full what/why for its hover title (the row inspector shows everything). */
+function fuzzFailure(result: FuzzerResult): { label: string; detail: string } | null {
+  const diagnostic = result.diagnostic;
+  if (diagnostic === null || diagnostic === undefined) return null;
+  const text = resendFailureText(diagnostic);
+  return { label: failureLabel(diagnostic), detail: `${text.title} — ${text.why} (${diagnostic.id})` };
+}
+
+/** One or two words for a failed exchange: "refused", "timed out", … */
+function failureLabel(diagnostic: ContextDiagnostic): string {
+  const error = (diagnosticText(diagnostic, "error") ?? "").toLowerCase();
+  if (diagnostic.id === "proxy.resend-timed-out" || diagnosticText(diagnostic, "timeout") === "true" || /timed out|10060/.test(error)) return "timed out";
+  if (diagnostic.id === "proxy.resend-cancelled" || diagnostic.id === "proxy.fuzzer-cancelled") return "cancelled";
+  if (diagnostic.id === "proxy.upstream-unreachable" || diagnostic.id === "proxy.resend-request-failed") {
+    if (/refused|10061|econnrefused/.test(error)) return "refused";
+    if (/dns|no such host|11001|name or service not known|failed to lookup|nodename/.test(error)) return "DNS failed";
+    if (/tls|certificate|handshake/.test(error)) return "TLS failed";
+    if (/reset|10054|forcibly closed|broken pipe|closed before/.test(error)) return "reset";
+    if (/unreachable|10051|10065/.test(error)) return "unreachable";
+    return diagnostic.id === "proxy.upstream-unreachable" ? "no connection" : "send failed";
+  }
+  if (diagnostic.id === "proxy.resend-outside-scope" || diagnostic.id === "proxy.fuzzer-outside-scope") return "out of scope";
+  return "failed";
 }
 
 async function launchFuzzer(): Promise<void> {
@@ -2398,9 +2430,23 @@ function resendTitle(ctx: ResendContext): string {
   const named = ctx.name?.trim();
   if (named !== undefined && named !== "") return named;
   if (ctx.current.url === NEW_REQUEST_PLACEHOLDER_URL) return "New request";
-  const { authority, pathAndQuery } = splitUrl(ctx.current.url);
+  return requestTitle(ctx.current.method, ctx.current.url);
+}
+
+/** `METHOD /path · host` for a Resend or Fuzz title (long paths shortened). */
+function requestTitle(method: string, url: string): string {
+  const { authority, pathAndQuery } = splitUrl(url);
   const path = pathAndQuery.length > 60 ? `${pathAndQuery.slice(0, 57)}…` : pathAndQuery;
-  return `${(ctx.current.method || "GET").toUpperCase()} ${path}${authority === "" ? "" : ` · ${authority}`}`;
+  return `${(method || "GET").toUpperCase()} ${path}${authority === "" ? "" : ` · ${authority}`}`;
+}
+
+/** A readable label for a Fuzz attack, mirroring Resend: its queue name, else
+ *  the base request's `METHOD /path · host`. */
+function fuzzTitle(job: FuzzerJob): string {
+  const named = job.id === "" ? undefined : queueName(job.id);
+  if (named !== undefined) return named;
+  const base = job.config.baseRequest;
+  return base.url.trim() === "" ? "New attack" : requestTitle(base.method, base.url);
 }
 
 /** Shows the request as Raw (the editable buffer) or Pretty (a read-only view

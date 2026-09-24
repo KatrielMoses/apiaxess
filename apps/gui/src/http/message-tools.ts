@@ -29,23 +29,35 @@ export function shellQuote(value: string): string {
   return `$'${escaped}'`;
 }
 
-/** Bytes as a `$'…'` shell string with every non-printable byte escaped, so a
- *  binary body is reproduced exactly. */
-function shellQuoteBytes(bytes: readonly number[]): string {
-  const printable = bytes.every((b) => b >= 0x20 && b < 0x7f);
-  if (printable) return shellQuote(String.fromCharCode(...bytes));
-  const escaped = bytes.map((b) => {
+/** Whether a body can travel as a plain single-quoted argument: printable
+ *  ASCII, tabs and line feeds only. Anything else (non-ASCII, CR, NUL, other
+ *  control bytes) is piped instead — see {@link curlCommand}. */
+function isPlainAsciiBody(bytes: readonly number[]): boolean {
+  return bytes.every((b) => (b >= 0x20 && b < 0x7f) || b === 0x09 || b === 0x0a);
+}
+
+/** A POSIX `printf` format that writes exactly `bytes`: printable ASCII as is,
+ *  `%` and `\` escaped, every other byte as a 3-digit octal escape. */
+function printfFormat(bytes: readonly number[]): string {
+  const format = bytes.map((b) => {
+    if (b === 0x25) return "%%";
     if (b === 0x5c) return "\\\\";
-    if (b === 0x27) return "\\'";
     if (b >= 0x20 && b < 0x7f) return String.fromCharCode(b);
-    return `\\x${b.toString(16).padStart(2, "0")}`;
+    return `\\${b.toString(8).padStart(3, "0")}`;
   }).join("");
-  return `$'${escaped}'`;
+  return shellQuote(format);
 }
 
 /** A runnable curl (bash/zsh) reproducing the request: method, URL, headers in
  *  their written order and case, and the exact body bytes. HTTP/1.1 like the
- *  Resend sender; `--path-as-is` keeps `..`/`.` segments curl would squash. */
+ *  Resend sender; `--path-as-is` keeps `..`/`.` segments curl would squash.
+ *
+ *  Content-Length is left to curl, which counts the bytes it actually sends —
+ *  a pinned value hangs the server whenever a shell or console code page
+ *  changes the body's byte count. A body that is not plain ASCII is piped
+ *  through `printf` (octal escapes) into `--data-binary @-`: shell arguments
+ *  cannot hold NUL bytes and are re-encoded on the way to Windows `curl.exe`,
+ *  but a pipe carries the bytes untouched. */
 export function curlCommand(request: ResendRequest): string {
   const method = (request.method || "GET").toUpperCase();
   const body = request.body ?? [];
@@ -55,16 +67,25 @@ export function curlCommand(request: ResendRequest): string {
   if (method === "HEAD" && body.length === 0) parts.push("--head");
   else if (method !== implied) parts.push("-X", shellQuote(method));
   parts.push(shellQuote(request.url));
+  const has = (header: string): boolean => request.headers.some(([name]) => name.toLowerCase() === header);
   for (const [name, value] of request.headers) {
+    if (name.toLowerCase() === "content-length") continue;
     // An empty value needs curl's `Name;` form; `Name:` alone removes it.
     parts.push("-H", shellQuote(value === "" ? `${name};` : `${name}: ${value}`));
   }
   // curl adds these by default; drop them when the request does not have them.
   for (const implicit of ["User-Agent", "Accept"]) {
-    if (!request.headers.some(([name]) => name.toLowerCase() === implicit.toLowerCase())) parts.push("-H", shellQuote(`${implicit}:`));
+    if (!has(implicit.toLowerCase())) parts.push("-H", shellQuote(`${implicit}:`));
   }
-  if (body.length > 0) parts.push("--data-binary", shellQuoteBytes(body));
-  return parts.join(" ");
+  if (body.length === 0) return parts.join(" ");
+  // --data-binary would otherwise add a form Content-Type the request lacks.
+  if (!has("content-type")) parts.push("-H", shellQuote("Content-Type:"));
+  if (isPlainAsciiBody(body)) {
+    parts.push("--data-binary", shellQuote(String.fromCharCode(...body)));
+    return parts.join(" ");
+  }
+  parts.push("--data-binary", "@-");
+  return `printf ${printfFormat(body)} | ${parts.join(" ")}`;
 }
 
 /* ------------------------------------------------------------------ *

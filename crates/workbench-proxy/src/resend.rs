@@ -269,14 +269,18 @@ async fn send_following_redirects(
     let mut current = apply_connection_close(request, options.connection_close);
     let mut chain = Vec::new();
     let mut hops: u8 = 0;
+    // A followed chain reports its total time: every hop's exchange summed.
+    let mut earlier_hops_ms: u64 = 0;
     loop {
-        let response = send_raw(
+        let mut response = send_raw(
             proxy_addr,
             ca.clone(),
             current.clone(),
             options.update_content_length,
         )
         .await?;
+        response.duration_ms = response.duration_ms.saturating_add(earlier_hops_ms);
+        earlier_hops_ms = response.duration_ms;
         if !is_redirect_status(response.status) {
             return Ok((response, chain));
         }
@@ -687,10 +691,12 @@ impl ResendWorkbench {
             revision: u64::try_from(context.history.len() + 1).unwrap_or(u64::MAX),
             sent_at: chrono::Utc::now(),
             request,
+            // The sender times the exchange itself; only a sender that does not
+            // (duration 0) falls back to this dispatch's wall time.
             response: response.map(|mut response| {
-                response.duration_ms =
-                    u64::try_from(started.elapsed().as_millis().min(u128::from(u64::MAX)))
-                        .unwrap_or(u64::MAX);
+                if response.duration_ms == 0 {
+                    response.duration_ms = elapsed_ms(started);
+                }
                 response
             }),
             diagnostic,
@@ -873,6 +879,9 @@ async fn send_core(
     if let Some(body) = request.body {
         builder = builder.body(body);
     }
+    // The exchange is timed here, once, for every consumer (Resend and the
+    // native Fuzz tier): request out until the whole response body is in.
+    let started = Instant::now();
     let response = builder.send().await.map_err(|error| {
         let mut diagnostic = request_diagnostic("send", &error.to_string());
         if error.is_timeout() {
@@ -928,10 +937,14 @@ async fn send_core(
         status,
         headers,
         body,
-        duration_ms: 0,
+        duration_ms: elapsed_ms(started),
         http_version,
         reason,
     })
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Splits `HTTP/1.1 302 Found` into its version and reason phrase.

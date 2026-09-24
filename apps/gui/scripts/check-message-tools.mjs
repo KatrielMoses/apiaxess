@@ -24,10 +24,13 @@ const encode = (text) => [...new TextEncoder().encode(text)];
   const get = curlCommand({ method: "GET", url: "http://h.test/a?b=1", headers: [["X-B", "2"], ["accept", "*/*"]], body: null });
   // curl's own User-Agent/Accept are suppressed unless the request has them.
   assert.equal(get, "curl --http1.1 'http://h.test/a?b=1' -H 'X-B: 2' -H 'accept: */*' -H 'User-Agent:'");
-  const put = curlCommand({ method: "put", url: "http://h.test/", headers: [["X-Empty", ""]], body: encode("it's") });
-  assert.equal(put, "curl --http1.1 -X 'PUT' 'http://h.test/' -H 'X-Empty;' -H 'User-Agent:' -H 'Accept:' --data-binary 'it'\\''s'");
-  const post = curlCommand({ method: "POST", url: "http://h.test/", headers: [], body: [0x00, 0x41, 0x27, 0xff, 0x0a] });
-  assert.equal(post, "curl --http1.1 'http://h.test/' -H 'User-Agent:' -H 'Accept:' --data-binary $'\\x00A\\'\\xff\\x0a'");
+  // Content-Length is never pinned (curl counts what it sends); a missing
+  // Content-Type stays missing.
+  const put = curlCommand({ method: "put", url: "http://h.test/", headers: [["X-Empty", ""], ["Content-Length", "4"]], body: encode("it's") });
+  assert.equal(put, "curl --http1.1 -X 'PUT' 'http://h.test/' -H 'X-Empty;' -H 'User-Agent:' -H 'Accept:' -H 'Content-Type:' --data-binary 'it'\\''s'");
+  // Non-ASCII / binary bodies are piped byte-exact through printf octal escapes.
+  const post = curlCommand({ method: "POST", url: "http://h.test/", headers: [["Content-Type", "x/y"]], body: [0x00, 0x41, 0x27, 0x25, 0x5c, 0xc3, 0xa9, 0x0a] });
+  assert.equal(post, "printf '\\000A'\\''%%\\\\\\303\\251\\012' | curl --http1.1 'http://h.test/' -H 'Content-Type: x/y' -H 'User-Agent:' -H 'Accept:' --data-binary @-");
   assert.equal(curlCommand({ method: "HEAD", url: "http://h.test/", headers: [["User-Agent", "x"], ["Accept", "*/*"]], body: null }), "curl --http1.1 --head 'http://h.test/' -H 'User-Agent: x' -H 'Accept: */*'");
   assert.match(curlCommand({ method: "GET", url: "http://h.test/a/../b", headers: [], body: null }), /--path-as-is/);
   assert.equal(shellQuote("a\tb"), "$'a\\tb'");
