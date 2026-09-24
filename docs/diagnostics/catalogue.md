@@ -94,6 +94,8 @@ catalogue test.
 | `proxy.resend-history-failed` | persistence | The resend revision could not be saved. |
 | `proxy.resend-outside-scope` | scope | The resend request targets outside the declared engagement scope. |
 | `proxy.resend-transport-unavailable` | transport | The resend has no running session proxy transport. |
+| `proxy.resend-timed-out` | session | The resend got no response before its send timeout. |
+| `proxy.resend-cancelled` | session | The operator cancelled the resend before a response arrived. |
 | `proxy.fuzzer-ffuf-unavailable` | external-tool | The stateless fuzzer engine is unavailable. |
 | `proxy.fuzzer-ffuf-failed` | external-tool | The stateless fuzzer process failed. |
 | `proxy.fuzzer-config-invalid` | session | The fuzzer attack configuration is invalid. |

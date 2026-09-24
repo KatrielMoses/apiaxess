@@ -185,6 +185,14 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             axum::routing::post(send_resend),
         )
         .route(
+            "/api/v1/workbench/resend/{context_id}/cancel",
+            axum::routing::post(cancel_resend),
+        )
+        .route(
+            "/api/v1/workbench/resend/{context_id}/name",
+            axum::routing::put(rename_resend),
+        )
+        .route(
             "/api/v1/workbench/resend/{context_id}/derive/{revision}",
             axum::routing::post(derive_resend),
         )
@@ -1571,9 +1579,24 @@ async fn update_resend(
         .map_err(storage_response)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendQuery {
+    /// Seconds to wait for a response (default 30, clamped to 1–300).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+impl SendQuery {
+    fn timeout(&self) -> Option<std::time::Duration> {
+        self.timeout_secs.map(std::time::Duration::from_secs)
+    }
+}
+
 async fn send_resend(
     State(state): State<ApiState>,
     AxumPath(context_id): AxumPath<String>,
+    Query(query): Query<SendQuery>,
 ) -> Result<
     Json<apiaxess_workbench_proxy::ResendSendResult>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
@@ -1591,7 +1614,7 @@ async fn send_resend(
     let result = state
         .engine
         .resend()
-        .send_in_session(&context_id, &mut session)
+        .send_in_session(&context_id, query.timeout(), &mut session)
         .await
         .map_err(storage_response)?;
     runtime.replace_session(session).map_err(session_response)?;
@@ -1599,10 +1622,14 @@ async fn send_resend(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FollowQuery {
     /// Carry cookies (request `Cookie` + response `Set-Cookie`) to the next hop.
     #[serde(default = "follow_cookies_default")]
     cookies: bool,
+    /// Seconds to wait for a response (default 30, clamped to 1–300).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 const fn follow_cookies_default() -> bool {
@@ -1632,11 +1659,57 @@ async fn follow_resend(
     let result = state
         .engine
         .resend()
-        .follow_in_session(&context_id, revision, query.cookies, &mut session)
+        .follow_in_session(
+            &context_id,
+            revision,
+            query.cookies,
+            query.timeout_secs.map(std::time::Duration::from_secs),
+            &mut session,
+        )
         .await
         .map_err(storage_response)?;
     runtime.replace_session(session).map_err(session_response)?;
     Ok(Json(result))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelOutcome {
+    /// Whether a send was in flight (and is now recorded as cancelled).
+    cancelled: bool,
+}
+
+/// Cancels an item's in-flight send or follow; the pending send request then
+/// returns with a cancelled revision.
+async fn cancel_resend(
+    State(state): State<ApiState>,
+    AxumPath(context_id): AxumPath<String>,
+) -> Json<CancelOutcome> {
+    Json(CancelOutcome {
+        cancelled: state.engine.resend().cancel(&context_id),
+    })
+}
+
+#[derive(Deserialize)]
+struct RenameResend {
+    /// New name; null or blank clears it.
+    name: Option<String>,
+}
+
+async fn rename_resend(
+    State(state): State<ApiState>,
+    AxumPath(context_id): AxumPath<String>,
+    Json(input): Json<RenameResend>,
+) -> Result<
+    Json<apiaxess_workbench_store::ResendContext>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    state
+        .engine
+        .resend()
+        .set_name(&context_id, input.name.as_deref())
+        .map(Json)
+        .map_err(storage_response)
 }
 
 async fn derive_resend(

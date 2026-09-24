@@ -27,8 +27,8 @@ use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::SessionCa;
 use crate::raw_http::{
-    UPSTREAM_HEADERS_MARKER, UPSTREAM_STATUS_MARKER, WIRE_HEADERS_MARKER, decode_header_list,
-    encode_header_list,
+    UPSTREAM_ERROR_MARKER, UPSTREAM_HEADERS_MARKER, UPSTREAM_STATUS_MARKER, WIRE_HEADERS_MARKER,
+    decode_header_list, encode_header_list,
 };
 use apiaxess_workbench_store::FlowOrigin;
 
@@ -931,7 +931,9 @@ impl ObserveHandler {
     ) -> Response<Body> {
         let body = match http_body_util::BodyExt::collect(body).await {
             Ok(collected) => collected.to_bytes(),
-            Err(error) => return self.upstream_failure(ctx, format!("read request body: {error}")),
+            Err(error) => {
+                return self.raw_upstream_failure(ctx, format!("read request body: {error}"));
+            }
         };
         let raw = match crate::raw_http::exchange(
             tls,
@@ -943,7 +945,7 @@ impl ObserveHandler {
         .await
         {
             Ok(raw) => raw,
-            Err(error) => return self.upstream_failure(ctx, error),
+            Err(error) => return self.raw_upstream_failure(ctx, error),
         };
         let status_line = raw.status_line();
         let header_list = encode_header_list(&raw.headers);
@@ -957,7 +959,8 @@ impl ObserveHandler {
             }
         }
         let Ok(response) = builder.body(Body::from(bytes::Bytes::from(raw.body))) else {
-            return self.upstream_failure(ctx, format!("unrepresentable status {}", raw.status));
+            return self
+                .raw_upstream_failure(ctx, format!("unrepresentable status {}", raw.status));
         };
         let mut response = self.handle_response(ctx, response).await;
         for (marker, value) in [
@@ -967,6 +970,30 @@ impl ObserveHandler {
             if let Ok(value) = hudsucker::hyper::header::HeaderValue::try_from(value) {
                 response.headers_mut().insert(marker, value);
             }
+        }
+        response
+    }
+
+    /// [`Self::upstream_failure`] for a workbench send: the 502 also carries
+    /// the failure in a private marker so the sender reports a transport
+    /// failure rather than a server response. Workbench sends only, so an
+    /// observed client never sees the marker.
+    fn raw_upstream_failure(&self, ctx: &HttpContext, chain: String) -> Response<Body> {
+        let marker = hudsucker::hyper::header::HeaderValue::try_from(
+            chain
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_graphic() || c == ' ' {
+                        c
+                    } else {
+                        '?'
+                    }
+                })
+                .collect::<String>(),
+        );
+        let mut response = self.upstream_failure(ctx, chain);
+        if let Ok(marker) = marker {
+            response.headers_mut().insert(UPSTREAM_ERROR_MARKER, marker);
         }
         response
     }

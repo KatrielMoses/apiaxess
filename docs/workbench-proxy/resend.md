@@ -33,6 +33,23 @@ The local API exposes:
 - `GET /api/v1/workbench/resend` and
   `GET /api/v1/workbench/resend/<id>` to list/read contexts.
 - `PUT /api/v1/workbench/resend/<id>` to replace the current edit.
-- `POST /api/v1/workbench/resend/<id>/send` to append a send revision.
+- `POST /api/v1/workbench/resend/<id>/send[?timeoutSecs=n]` to append a send
+  revision. The send waits at most `timeoutSecs` (default 30, clamped to
+  1–300) and is then recorded with `proxy.resend-timed-out`.
+- `POST /api/v1/workbench/resend/<id>/follow/<revision>[?cookies=false&timeoutSecs=n]`
+  to follow one redirect hop as a new revision.
+- `POST /api/v1/workbench/resend/<id>/cancel` to stop an in-flight send or
+  follow. The pending send returns with a `proxy.resend-cancelled` revision.
+  Dropping the exchange closes the proxy connection, which closes the
+  upstream connection too.
+- `PUT /api/v1/workbench/resend/<id>/name` with `{ "name": "…" }` (null or
+  blank clears) to set the item's name. Names are stored with the context and
+  travel with the session export.
 - `POST /api/v1/workbench/resend/<id>/derive/<revision>` to edit from
   history.
+
+When the upstream exchange fails (connection refused, DNS, TLS, the proxy's
+own timeout), the proxy's synthetic `502` carries a private
+`x-apiaxess-upstream-error` marker. The sender reports it as
+`proxy.upstream-unreachable` with the `target` and the underlying `error`, so a
+transport failure is never recorded as a server response.

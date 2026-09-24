@@ -44,8 +44,10 @@ interface FlowSummary { readonly id: number; readonly method?: string | null; re
 interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; }
 export interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
 interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; httpVersion?: string | null; reason?: string | null; }
-interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: Diagnostic | null; scope: string; redirectChain?: RedirectHop[]; followedFrom?: number | null; }
-interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; }
+/** A diagnostic with the engine's typed context (`{ type, value }` per key). */
+interface ContextDiagnostic extends Diagnostic { readonly context?: Record<string, { readonly type: string; readonly value: unknown }>; }
+interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: ContextDiagnostic | null; scope: string; redirectChain?: RedirectHop[]; followedFrom?: number | null; }
+interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; name?: string | null; }
 interface ResendSendResult { context: ResendContext; revision: ResendRevision; diagnostics: (Diagnostic | null)[]; }
 interface FuzzerResult { ordinal: number; payloads: string[]; request: ResendRequest; response?: { status: number; headers: readonly [string, string][]; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: Diagnostic | null; timeout?: boolean; comment?: string | null; grepMatchCounts?: number[]; grepExtracts?: (string | null)[]; reflectedCount?: number | null; redirectChain?: RedirectHop[]; retryCount?: number; }
 export type FuzzerLocation = "url" | "header" | "body";
@@ -142,7 +144,10 @@ interface AndroidTargetStatus {
   readonly diagnostics: readonly Diagnostic[];
 }
 
-class ApiRequestError extends Error {}
+/** A request the engine answered with a diagnostic (already recorded). */
+class ApiRequestError extends Error {
+  constructor(message: string, readonly diagnostic?: ContextDiagnostic) { super(message); }
+}
 
 /* ==================================================================== *
  * Element references
@@ -272,6 +277,16 @@ const resendContexts = new Map<string, ResendContext>();
  *  its whole lifecycle; a completion only touches the visible editor when that
  *  id is still the selected item. */
 const resendInFlight = new Set<string>();
+/** When each in-flight send started (ms), for the elapsed timer. */
+const resendStartedAt = new Map<string, number>();
+/** Aborts each in-flight send's HTTP request — the fallback when the engine
+ *  cannot cancel it (or does not answer). */
+const resendAborts = new Map<string, AbortController>();
+/** Unsent editor contents per item, so switching items never drops typing. */
+const resendDrafts = new Map<string, { raw: string; target: string }>();
+/** Why the item's last send attempt never produced a revision (rejected
+ *  request, engine error). Shown inline instead of a stale response. */
+const resendFailures = new Map<string, ContextDiagnostic>();
 /** Fuzz queue (Intruder): manually-created attacks only (discovery excluded). */
 const fuzzerJobsList = new Map<string, FuzzerJob>();
 let activeWorkbenchTab: "live" | "resend" | "fuzz" = "live";
@@ -346,7 +361,7 @@ async function requireOk(response: Response, fallback: string): Promise<Response
   }
   if (diagnostic !== undefined) {
     showDiagnostic(diagnostic);
-    throw new ApiRequestError(diagnostic.id + ": " + diagnostic.what);
+    throw new ApiRequestError(diagnostic.id + ": " + diagnostic.what, diagnostic);
   }
   throw new Error(fallback + " (" + response.status + ")");
 }
@@ -1214,15 +1229,33 @@ function wireFuzzPayloadEditor(panel: HTMLElement): void {
   });
 }
 
-/** Resting state for the shared dock's Resend tab when no request is loaded. */
+/** Resting state for the Resend editor when no item is open. With items in
+ *  the queue it points there (and can reopen a collapsed queue) rather than
+ *  implying the queue is empty. */
 function seedResendEmpty(): void {
   if (resendPanel === null) return;
   resendPanel.hidden = false;
-  resendPanel.innerHTML = stateBlock({
-    icon: "refresh",
-    title: "No request loaded",
-    body: "Send a flow here from the traffic table or the API surface, then edit and resend it.",
+  renderedResendId = null;
+  if (resendContexts.size === 0) {
+    resendPanel.innerHTML = stateBlock({
+      icon: "refresh",
+      title: "No request loaded",
+      body: "Send a flow here from the traffic table or the API surface, then edit and resend it.",
+      compact: true,
+    });
+    return;
+  }
+  const count = resendContexts.size;
+  const collapsed = queueCollapsed("resend");
+  resendPanel.innerHTML = `${stateBlock({
+    icon: "send",
+    title: "Pick a request from the queue",
+    body: `${count} ${count === 1 ? "item is" : "items are"} in the Resend queue${collapsed ? " (collapsed)" : ""}. Select one to edit and send it.`,
     compact: true,
+  })}${collapsed ? `<div class="row resend-empty__actions"><button class="btn btn--sm" type="button" data-resend-show-queue>Show queue</button></div>` : ""}`;
+  resendPanel.querySelector("[data-resend-show-queue]")?.addEventListener("click", () => {
+    toggleQueueCollapse("resend");
+    seedResendEmpty();
   });
 }
 
@@ -1932,11 +1965,18 @@ async function createResend(flowId: number): Promise<void> {
   }
 }
 
+/** The item whose editor is currently mounted (null when none). */
+let renderedResendId: string | null = null;
+
 function renderResend(): void {
   if (resendPanel === null || selectedResend === null) return;
   const ctx = selectedResend;
   resendPanel.hidden = false;
   selectedResendRevision = null;
+  renderedResendId = ctx.id;
+  const draft = resendDrafts.get(ctx.id);
+  const target = draft?.target ?? urlOrigin(ctx.current.url);
+  const rawText = draft?.raw ?? rawRequestText(ctx.current, { recomputeContentLength: true });
   resendPanel.innerHTML = `<div class="panel__header">
   <div class="panel__heading">${icon("send", { size: 16 })}<h2 title="${escapeHtml(ctx.current.url)}">${escapeHtml(resendTitle(ctx))}</h2></div>
   <div class="row">
@@ -1946,15 +1986,17 @@ function renderResend(): void {
 <div class="resend-split" data-resend-split>
   <div class="resend-split__pane resend-req">
     <div class="reqline">
-      <input class="input input--mono reqline__url" id="resend-target" aria-label="Target — scheme://host:port the connection goes to" title="Target — where the connection goes. The Host header below is sent exactly as written." spellcheck="false" value="${escapeHtml(urlOrigin(ctx.current.url))}" />
+      <input class="input input--mono reqline__url" id="resend-target" aria-label="Target — scheme://host:port the connection goes to" title="Target — where the connection goes. The Host header below is sent exactly as written." spellcheck="false" value="${escapeHtml(target)}" />
     </div>
     <div class="resend-req__head"><p class="section-label">Request</p>${viewToggleHtml("req", resendRequestView)}</div>
-    <textarea class="textarea resend-raw" id="resend-raw" aria-label="Raw HTTP request" spellcheck="false"${resendRequestView === "pretty" ? " hidden" : ""}>${escapeHtml(rawRequestText(ctx.current, { recomputeContentLength: true }))}</textarea>
+    <textarea class="textarea resend-raw" id="resend-raw" aria-label="Raw HTTP request" spellcheck="false"${resendRequestView === "pretty" ? " hidden" : ""}>${escapeHtml(rawText)}</textarea>
     <pre class="code resend-pretty" id="resend-req-pretty" aria-label="Request (pretty, read-only)"${resendRequestView === "pretty" ? "" : " hidden"}></pre>
     <p class="t-small resend-parse-error" id="resend-parse-error" role="alert" hidden></p>
-    <div class="row">
-      <button class="btn btn--primary" id="resend-send" type="button">${icon("send", { size: 14 })}<span>Send request</span></button>
+    <div class="row resend-actions">
+      <button class="btn btn--primary" id="resend-send" type="button" title="Send request (Ctrl+Enter)" aria-keyshortcuts="Control+Enter">${icon("send", { size: 14 })}<span>Send request</span></button>
+      <button class="btn btn--sm" id="resend-cancel" type="button" title="Stop waiting for this send; it is kept in History as cancelled" hidden>Cancel</button>
       <label class="check check--sm" title="Off: a 3xx is shown as-is and you follow it with Follow redirection. On: each redirect is followed one hop at a time (up to ${RESEND_MAX_AUTO_HOPS}), every hop kept in History."><input type="checkbox" id="resend-autofollow"${resendAutoFollow() ? " checked" : ""} /> Follow redirects automatically</label>
+      <label class="resend-timeout t-small" title="How long a send waits for a response before it is recorded as timed out">Timeout <select class="input input--sm" id="resend-timeout" aria-label="Send timeout">${RESEND_TIMEOUT_CHOICES.map((secs) => `<option value="${secs}"${secs === resendTimeoutSecs() ? " selected" : ""}>${secs} s</option>`).join("")}</select></label>
     </div>
   </div>
   <div class="resend-split__gutter" data-resend-gutter role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize request and response"></div>
@@ -1964,11 +2006,26 @@ function renderResend(): void {
   raw?.addEventListener("input", () => {
     // Keep Content-Length showing what will be sent while the body is edited.
     const synced = syncContentLength(raw.value);
-    if (synced === null) return;
-    const caret = raw.selectionStart;
-    raw.value = synced.text;
-    const next = caret > synced.at ? caret + synced.delta : caret;
-    raw.setSelectionRange(next, next);
+    if (synced !== null) {
+      const caret = raw.selectionStart;
+      raw.value = synced.text;
+      const next = caret > synced.at ? caret + synced.delta : caret;
+      raw.setSelectionRange(next, next);
+    }
+    rememberResendDraft(ctx.id);
+  });
+  resendPanel.querySelector("#resend-target")?.addEventListener("input", () => rememberResendDraft(ctx.id));
+  // Ctrl+Enter (⌘+Enter) sends from anywhere in the request editor.
+  resendPanel.querySelector(".resend-req")?.addEventListener("keydown", (event) => {
+    const key = event as KeyboardEvent;
+    if (key.key === "Enter" && (key.ctrlKey || key.metaKey)) {
+      key.preventDefault();
+      void sendResend();
+    }
+  });
+  resendPanel.querySelector("#resend-cancel")?.addEventListener("click", () => void cancelResend(ctx.id));
+  resendPanel.querySelector<HTMLSelectElement>("#resend-timeout")?.addEventListener("change", (event) => {
+    setResendTimeoutSecs(Number((event.target as HTMLSelectElement).value));
   });
   resendPanel.querySelectorAll<HTMLButtonElement>('[data-view-toggle="req"] [data-view-mode]').forEach((button) => {
     button.addEventListener("click", () => {
@@ -1980,7 +2037,7 @@ function renderResend(): void {
   resendPanel.querySelector<HTMLInputElement>("#resend-autofollow")?.addEventListener("change", (event) => {
     setResendAutoFollow((event.target as HTMLInputElement).checked);
   });
-  resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); });
+  resendPanel.querySelector("[data-close-resend]")?.addEventListener("click", () => { selectedResend = null; seedResendEmpty(); renderResendList(); });
   applyResendRequestView();
   if (resendInFlight.has(ctx.id)) {
     setResendSendBusy(true);
@@ -2003,10 +2060,10 @@ function viewToggleHtml(which: "req" | "res", mode: BodyView): string {
   return `<div class="viewtoggle" role="group" aria-label="${which === "req" ? "Request" : "Response"} view" data-view-toggle="${which}">${button("pretty", "Pretty")}${button("raw", "Raw")}</div>`;
 }
 
-/** A readable label for a Resend item: its queue name, else METHOD + path. */
+/** A readable label for a Resend item: its name, else METHOD + path. */
 function resendTitle(ctx: ResendContext): string {
-  const named = queueName(ctx.id);
-  if (named !== undefined) return named;
+  const named = ctx.name?.trim();
+  if (named !== undefined && named !== "") return named;
   const { authority, pathAndQuery } = splitUrl(ctx.current.url);
   const path = pathAndQuery.length > 60 ? `${pathAndQuery.slice(0, 57)}…` : pathAndQuery;
   return `${(ctx.current.method || "GET").toUpperCase()} ${path}${authority === "" ? "" : ` · ${authority}`}`;
@@ -2041,8 +2098,162 @@ function setResendSendBusy(busy: boolean): void {
   if (busy) button.setAttribute("aria-busy", "true");
   else button.removeAttribute("aria-busy");
   button.innerHTML = busy
-    ? `${icon("refresh", { size: 16, className: "spinner" })}<span>Sending…</span>`
+    ? `${icon("refresh", { size: 16, className: "spinner" })}<span>Sending… <span data-resend-elapsed></span></span>`
     : `${icon("send", { size: 14 })}<span>Send request</span>`;
+  const cancel = resendPanel?.querySelector<HTMLButtonElement>("#resend-cancel");
+  if (cancel !== null && cancel !== undefined) {
+    cancel.hidden = !busy;
+    cancel.disabled = false;
+    cancel.textContent = "Cancel";
+  }
+  tickResendElapsed();
+}
+
+/** Seconds since the visible item's send started, in every elapsed slot. */
+function tickResendElapsed(): void {
+  const started = selectedResend === null ? undefined : resendStartedAt.get(selectedResend.id);
+  const text = started === undefined ? "" : `${Math.floor((Date.now() - started) / 1000)}s`;
+  resendPanel?.querySelectorAll<HTMLElement>("[data-resend-elapsed]").forEach((slot) => { slot.textContent = text; });
+}
+
+let resendElapsedTimer: number | undefined;
+function syncResendElapsedTimer(): void {
+  if (resendInFlight.size > 0 && resendElapsedTimer === undefined) resendElapsedTimer = window.setInterval(tickResendElapsed, 500);
+  else if (resendInFlight.size === 0 && resendElapsedTimer !== undefined) { window.clearInterval(resendElapsedTimer); resendElapsedTimer = undefined; }
+}
+
+/** Keeps (or, when it matches the item again, forgets) the editor's unsent
+ *  contents for `id`. */
+function rememberResendDraft(id: string): void {
+  const ctx = resendContexts.get(id) ?? (selectedResend?.id === id ? selectedResend : null);
+  if (ctx === null || renderedResendId !== id) return;
+  const raw = valueOf("#resend-raw").replace(/\r\n/g, "\n");
+  const target = valueOf("#resend-target").trim();
+  const pristine = raw === rawRequestText(ctx.current, { recomputeContentLength: true }) && target === urlOrigin(ctx.current.url);
+  const had = resendDrafts.has(id);
+  if (pristine) resendDrafts.delete(id);
+  else resendDrafts.set(id, { raw, target });
+  if (had !== !pristine) renderResendList();
+}
+
+/** Asks the engine to cancel the item's in-flight send (recorded as a
+ *  cancelled revision). If the engine has nothing to cancel or does not
+ *  answer promptly, the HTTP request is aborted so the item is freed anyway. */
+async function cancelResend(id: string): Promise<void> {
+  if (!resendInFlight.has(id)) return;
+  const button = resendPanel?.querySelector<HTMLButtonElement>("#resend-cancel");
+  if (button !== null && button !== undefined && selectedResend?.id === id) { button.disabled = true; button.textContent = "Cancelling…"; }
+  let cancelled = false;
+  try {
+    const response = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+    if (response.ok) cancelled = ((await response.json()) as { cancelled?: boolean }).cancelled === true;
+  } catch { /* fall through to the local abort */ }
+  if (!cancelled) { resendAborts.get(id)?.abort(); return; }
+  window.setTimeout(() => { if (resendInFlight.has(id)) resendAborts.get(id)?.abort(); }, 3000);
+}
+
+/** Send-timeout choices (seconds) and the remembered pick. */
+const RESEND_TIMEOUT_CHOICES = [10, 30, 60, 120, 300];
+const RESEND_TIMEOUT_KEY = "apiaxess.resend.timeoutSecs";
+function resendTimeoutSecs(): number {
+  try {
+    const stored = Number(localStorage.getItem(RESEND_TIMEOUT_KEY));
+    return RESEND_TIMEOUT_CHOICES.includes(stored) ? stored : 30;
+  } catch { return 30; }
+}
+function setResendTimeoutSecs(secs: number): void {
+  try { localStorage.setItem(RESEND_TIMEOUT_KEY, String(secs)); } catch { /* a preference; ignore storage failures */ }
+}
+
+const SCOPE_LABELS: Record<string, string> = {
+  in_scope: "In scope",
+  outside_declared_scope: "Out of scope",
+  undetermined: "Scope undetermined",
+  not_applicable: "No scope declared",
+};
+/** Human label for a scope disposition. */
+function humanScope(scope: string): string {
+  return SCOPE_LABELS[scope] ?? scope.replace(/_/g, " ");
+}
+
+/** One string value from a diagnostic's typed context. */
+function diagnosticText(diagnostic: ContextDiagnostic, key: string): string | undefined {
+  const entry = diagnostic.context?.[key];
+  if (entry === undefined || entry.value === null || entry.value === undefined) return undefined;
+  return String(entry.value);
+}
+
+/** Plain-language reading of a low-level connect/TLS error chain. */
+function transportCause(error: string): string {
+  const lower = error.toLowerCase();
+  if (/refused|10061|econnrefused/.test(lower)) return "The connection was refused — nothing is listening at that address and port.";
+  if (/timed out|10060/.test(lower)) return "The target did not answer in time.";
+  if (/dns|no such host|11001|name or service not known|failed to lookup|nodename/.test(lower)) return "The host name could not be resolved (DNS).";
+  if (/tls|certificate|handshake|alert/.test(lower)) return "The TLS handshake with the target failed.";
+  if (/reset|10054|forcibly closed|broken pipe/.test(lower)) return "The target closed the connection before answering.";
+  if (/unreachable|10051|10065/.test(lower)) return "The network or host is unreachable from this machine.";
+  return "The exchange with the target failed before any HTTP response arrived.";
+}
+
+/** What/why/fix for a failed send, specific to the failure where known. */
+function resendFailureText(diagnostic: ContextDiagnostic): { title: string; why: string; detail?: string; fix: string; tone: "danger" | "caution" } {
+  const target = diagnosticText(diagnostic, "target");
+  const error = diagnosticText(diagnostic, "error");
+  switch (diagnostic.id) {
+    case "proxy.upstream-unreachable": {
+      const timedOut = /timed out/i.test(error ?? "");
+      return {
+        title: timedOut ? `No response from ${target ?? "the target"}` : `Could not connect to ${target ?? "the target"}`,
+        why: transportCause(error ?? ""),
+        detail: error,
+        fix: "Verify the target is running and reachable from this machine — address, port, DNS, and routing — then resend.",
+        tone: "danger",
+      };
+    }
+    case "proxy.resend-timed-out":
+      return {
+        title: `No response from ${target ?? "the target"} within ${diagnosticText(diagnostic, "timeout_secs") ?? "the timeout"} s`,
+        why: "The send was abandoned when its timeout ran out. The request may still have reached the target.",
+        fix: "Check that the target is responsive, or raise the Timeout next to Send, then resend.",
+        tone: "danger",
+      };
+    case "proxy.resend-cancelled":
+      return {
+        title: "Send cancelled",
+        why: `You stopped waiting for ${target ?? "the target"}. The request may already have reached it.`,
+        fix: "Resend when ready.",
+        tone: "caution",
+      };
+    case "proxy.resend-request-failed": {
+      const operation = diagnosticText(diagnostic, "operation");
+      const field: Record<string, string> = { method: "The HTTP method", url: "The URL", "header-name": "A header name", "header-value": "A header value", send: "The send", edit: "The edit", "response-body": "The response body" };
+      const subject = operation === undefined ? undefined : field[operation];
+      return {
+        title: subject !== undefined && operation !== "send" && operation !== "response-body" ? `${subject} is not valid` : "The request could not be sent",
+        why: error ?? diagnostic.why,
+        fix: operation === "send" || operation === "response-body" ? "Confirm the session proxy is running and the target is reachable, then resend." : "Correct it in the request editor and send again.",
+        tone: "danger",
+      };
+    }
+    default:
+      return { title: diagnostic.what, why: error ?? diagnostic.why, fix: diagnostic.fix, tone: "danger" };
+  }
+}
+
+/** Inline failure state: clearly "no HTTP response", never a fake status. */
+function resendFailureHtml(diagnostic: ContextDiagnostic, lead: string): string {
+  const text = resendFailureText(diagnostic);
+  const detail = text.detail !== undefined && text.detail !== text.why ? `<p class="t-small t-subtle resend-error__detail"><code>${escapeHtml(text.detail)}</code></p>` : "";
+  return `<div class="notice notice--${text.tone} resend-error" role="alert" data-diagnostic-id="${escapeHtml(diagnostic.id)}">
+  <span class="notice__icon">${icon(text.tone === "caution" ? "info" : "alert", { size: 18 })}</span>
+  <div class="notice__body">
+    <p class="t-small t-subtle">${escapeHtml(lead)}</p>
+    <p><strong>${escapeHtml(text.title)}</strong></p>
+    <p>${escapeHtml(text.why)}</p>
+    ${detail}
+    <p class="t-small"><strong>Fix:</strong> ${escapeHtml(text.fix)}</p>
+  </div>
+</div>`;
 }
 
 /** Drag-resize the Request | Response split inside the Resend panel (30–70%),
@@ -2097,6 +2308,11 @@ function composeRawResponse(response: ResendResponse, view: BodyView): string {
  *  restored into the draft; a 3xx can be followed one hop at a time. */
 function resendResponsePaneHtml(ctx: ResendContext): string {
   const history = ctx.history;
+  const failure = resendFailures.get(ctx.id);
+  if (failure !== undefined) {
+    const back = history.length === 0 ? "" : `<div class="row"><button class="btn btn--sm btn--quiet" type="button" data-resend-dismiss-failure>Show History (${history.length})</button></div>`;
+    return `<div class="resend-res__head"><p class="section-label">Response</p></div>${resendFailureHtml(failure, "Not sent — nothing was added to History.")}${back}`;
+  }
   if (history.length === 0) {
     return `<div class="resend-res__head"><p class="section-label">History</p></div><div class="resend-res__empty">${stateBlock({ icon: "clock", title: "No sends yet", body: "Send the request; each send is kept here as a request/response pair.", compact: true })}</div>`;
   }
@@ -2105,7 +2321,7 @@ function resendResponsePaneHtml(ctx: ResendContext): string {
   const index = Math.max(0, history.findIndex((candidate) => candidate.revision === shown));
   const entry = history[index] ?? history[history.length - 1];
   const options = [...history].reverse().map((candidate) => {
-    const st = candidate.response?.status ?? "failed";
+    const st = candidate.response?.status ?? revisionFailureLabel(candidate);
     const hop = candidate.followedFrom !== null && candidate.followedFrom !== undefined ? ` · ↪ from #${candidate.followedFrom}` : "";
     return `<option value="${candidate.revision}"${candidate.revision === entry.revision ? " selected" : ""}>#${candidate.revision} · ${escapeHtml(String(st))}${hop} · ${escapeHtml(formatTime(candidate.sentAt))}</option>`;
   }).join("");
@@ -2116,18 +2332,16 @@ function resendResponsePaneHtml(ctx: ResendContext): string {
 </div>`;
   const head = `<div class="resend-res__head"><p class="section-label">History</p>${nav}${entry.response ? viewToggleHtml("res", resendResponseView) : ""}</div>`;
   const status = entry.response?.status;
-  const statusLabel = entry.response ? escapeHtml(responseStatusLine(entry.response)) : escapeHtml(entry.diagnostic?.id ?? "failed");
+  const statusLabel = entry.response ? escapeHtml(responseStatusLine(entry.response)) : escapeHtml(revisionFailureLabel(entry));
   const endpoint = `${entry.request.method.toUpperCase()} ${entry.request.url}`;
   const meta = entry.response
-    ? `${entry.response.durationMs} ms · ${formatBytes(entry.response.body?.length ?? 0)} · ${escapeHtml(entry.scope)}`
-    : escapeHtml(entry.scope);
-  const bodyText = entry.response
-    ? composeRawResponse(entry.response, resendResponseView)
-    : entry.diagnostic?.what ?? "No response was received.";
+    ? `${entry.response.durationMs} ms · ${formatBytes(entry.response.body?.length ?? 0)} · ${humanScope(entry.scope)}`
+    : humanScope(entry.scope);
+  const bodyText = entry.response ? composeRawResponse(entry.response, resendResponseView) : "";
   const location = redirectLocation(entry);
   const follow = location === null
     ? ""
-    : `<div class="row resend-follow"><button class="btn btn--sm" type="button" id="resend-follow" title="Send one request to ${escapeHtml(location)}">Follow redirection → ${escapeHtml(shortUrl(location, entry.request.url))}</button><span class="t-small t-subtle">Not followed automatically. Cookies are carried to the next hop.</span></div>`;
+    : `<div class="row resend-follow"><button class="btn btn--sm" type="button" id="resend-follow" title="Send one request to ${escapeHtml(location)}">Follow redirection → ${escapeHtml(shortUrl(location, entry.request.url))}</button><label class="check check--sm" title="On: cookies this response sets (Set-Cookie) are merged into the next hop's Cookie header. Off: the request's Cookie header is sent as-is."><input type="checkbox" id="resend-follow-cookies"${resendFollowCookies() ? " checked" : ""} /> Apply Set-Cookie</label></div>`;
   return `${head}
 <div class="reqline">
   <span class="resend-res__status list-row__status" data-class="${statusClass(status)}">${statusLabel}</span>
@@ -2136,14 +2350,38 @@ function resendResponsePaneHtml(ctx: ResendContext): string {
 </div>
 ${redirectChainHtml(ctx, entry)}
 <details class="resend-sent"><summary class="t-small">Request sent · #${entry.revision}</summary><pre class="code resend-sent__raw" id="resend-sent-request">${escapeHtml(rawRequestText(entry.request, { recomputeContentLength: true }))}</pre></details>
-<label class="field__label" for="resend-response-body">Response · ${escapeHtml(meta)}</label>
-<textarea class="textarea resend-raw" id="resend-response-body" readonly spellcheck="false">${escapeHtml(bodyText)}</textarea>
+${entry.response
+    ? `<label class="field__label" for="resend-response-body">Response · ${escapeHtml(meta)}</label>
+<textarea class="textarea resend-raw" id="resend-response-body" readonly spellcheck="false">${escapeHtml(bodyText)}</textarea>`
+    : `<p class="field__label">No HTTP response · ${escapeHtml(meta)}</p>${resendFailureHtml(entry.diagnostic ?? { id: "proxy.resend-request-failed", what: "No response was received.", why: "The send failed without a recorded reason.", fix: "Resend; if it persists, check the session proxy." }, `Revision #${entry.revision} — the request was attempted; no response was received.`)}`}
 ${follow}`;
+}
+
+/** Short label for a revision with no response (picker + status chip). */
+function revisionFailureLabel(entry: ResendRevision): string {
+  switch (entry.diagnostic?.id) {
+    case "proxy.resend-cancelled": return "cancelled";
+    case "proxy.resend-timed-out": return "timed out";
+    case "proxy.upstream-unreachable": return "no connection";
+    default: return "no response";
+  }
 }
 
 /** Most redirect hops auto-follow takes before stopping (like the old default). */
 const RESEND_MAX_AUTO_HOPS = 10;
 const RESEND_AUTOFOLLOW_KEY = "apiaxess.resend.autoFollow";
+
+const RESEND_FOLLOW_COOKIES_KEY = "apiaxess.resend.followCookies";
+function resendFollowCookies(): boolean {
+  try { return localStorage.getItem(RESEND_FOLLOW_COOKIES_KEY) !== "0"; } catch { return true; }
+}
+function setResendFollowCookies(on: boolean): void {
+  try { localStorage.setItem(RESEND_FOLLOW_COOKIES_KEY, on ? "1" : "0"); } catch { /* a preference; ignore storage failures */ }
+}
+/** Follow endpoint for one hop, with the cookie and timeout preferences. */
+function resendFollowUrl(id: string, revision: number): string {
+  return `/api/v1/workbench/resend/${encodeURIComponent(id)}/follow/${revision}?cookies=${resendFollowCookies()}&timeoutSecs=${resendTimeoutSecs()}`;
+}
 
 function resendAutoFollow(): boolean {
   try { return localStorage.getItem(RESEND_AUTOFOLLOW_KEY) === "1"; } catch { return false; }
@@ -2197,6 +2435,7 @@ function mountResendResponse(): void {
     });
   });
   pane.querySelector<HTMLSelectElement>("#resend-response-pick")?.addEventListener("change", (event) => {
+    resendFailures.delete(ctx.id);
     selectedResendRevision = Number((event.target as HTMLSelectElement).value);
     mountResendResponse();
   });
@@ -2206,6 +2445,8 @@ function mountResendResponse(): void {
   const shown = selectedResendRevision ?? ctx.history.at(-1)?.revision;
   pane.querySelector("#resend-restore")?.addEventListener("click", () => { if (shown !== undefined) void restoreResendRevision(shown); });
   pane.querySelector("#resend-follow")?.addEventListener("click", () => { if (shown !== undefined) void followResendRedirect(shown); });
+  pane.querySelector<HTMLInputElement>("#resend-follow-cookies")?.addEventListener("change", (event) => setResendFollowCookies((event.target as HTMLInputElement).checked));
+  pane.querySelector("[data-resend-dismiss-failure]")?.addEventListener("click", () => { resendFailures.delete(ctx.id); mountResendResponse(); });
 }
 
 /** Steps the History view one revision back (-1) or forward (+1). */
@@ -2233,6 +2474,7 @@ async function restoreResendRevision(revision: number): Promise<void> {
     const restored = (await response.json()) as ResendContext;
     if (restored.id !== ctx.id) throw new Error("restore returned a different item");
     resendContexts.set(restored.id, restored);
+    resendDrafts.delete(restored.id);
     if (selectedResend?.id !== restored.id) { renderResendList(); return; }
     selectedResend = restored;
     renderResend();
@@ -2250,7 +2492,8 @@ function showResendResponseLoading(): void {
   const pane = resendPanel?.querySelector<HTMLElement>("#resend-res-pane");
   if (pane === null || pane === undefined) return;
   pane.innerHTML = `<div class="resend-res__head"><p class="section-label">Response</p></div>
-<div class="state state--compact"><span class="state__icon">${icon("refresh", { size: 26, className: "spinner" })}</span><p class="state__body">Sending request…</p></div>`;
+<div class="state state--compact"><span class="state__icon">${icon("refresh", { size: 26, className: "spinner" })}</span><p class="state__body">Sending request… <span data-resend-elapsed></span></p><p class="state__body t-small t-subtle">Times out after ${resendTimeoutSecs()} s. Cancel stops waiting; the attempt stays in History.</p></div>`;
+  tickResendElapsed();
 }
 
 async function sendResend(): Promise<void> {
@@ -2280,10 +2523,11 @@ async function sendResend(): Promise<void> {
   const edited: ResendContext = { ...resend, current: request };
   resendContexts.set(resendId, edited);
   selectedResend = edited;
-  await runResendExchange(resendId, "The resend send failed.", async () => {
-    const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
+  resendDrafts.delete(resendId);
+  await runResendExchange(resendId, "The resend send failed.", async (signal) => {
+    const update = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(request), signal });
     await requireOk(update, "resend edit failed");
-    const sent = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId) + "/send", { method: "POST" });
+    const sent = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(resendId)}/send?timeoutSecs=${resendTimeoutSecs()}`, { method: "POST", signal });
     await requireOk(sent, "resend send failed");
     return sent;
   });
@@ -2294,8 +2538,8 @@ async function sendResend(): Promise<void> {
 async function followResendRedirect(revision: number): Promise<void> {
   const resendId = selectedResend?.id;
   if (resendId === undefined || resendInFlight.has(resendId)) return;
-  await runResendExchange(resendId, "The redirect could not be followed.", async () => {
-    const followed = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(resendId)}/follow/${revision}`, { method: "POST" });
+  await runResendExchange(resendId, "The redirect could not be followed.", async (signal) => {
+    const followed = await fetch(resendFollowUrl(resendId, revision), { method: "POST", signal });
     await requireOk(followed, "resend follow failed");
     return followed;
   });
@@ -2305,9 +2549,24 @@ async function followResendRedirect(revision: number): Promise<void> {
  *  the result always updates that item, but only touches the visible editor
  *  and History when it is still the selected one. With auto-follow on, a 3xx
  *  result is followed one hop at a time through this same path. */
-async function runResendExchange(resendId: string, failure: string, issue: () => Promise<Response>): Promise<void> {
+async function runResendExchange(resendId: string, failure: string, issue: (signal: AbortSignal) => Promise<Response>): Promise<void> {
   const isVisible = (): boolean => selectedResend?.id === resendId;
+  const abort = new AbortController();
+  // Backstop: the engine enforces the send timeout; if it never answers at
+  // all, stop waiting shortly after so the item is freed.
+  const backstop = window.setTimeout(() => abort.abort(), (resendTimeoutSecs() + 15) * 1000);
   resendInFlight.add(resendId);
+  resendStartedAt.set(resendId, Date.now());
+  resendAborts.set(resendId, abort);
+  resendFailures.delete(resendId);
+  syncResendElapsedTimer();
+  const settle = (): void => {
+    window.clearTimeout(backstop);
+    resendInFlight.delete(resendId);
+    resendStartedAt.delete(resendId);
+    resendAborts.delete(resendId);
+    syncResendElapsedTimer();
+  };
   if (isVisible()) {
     setResendSendBusy(true);
     showResendResponseLoading();
@@ -2315,7 +2574,7 @@ async function runResendExchange(resendId: string, failure: string, issue: () =>
   renderResendList();
   let followNext: number | null = null;
   try {
-    const answered = await issue();
+    const answered = await issue(abort.signal);
     const result = (await answered.json()) as Partial<ResendSendResult>;
     let context = result.context;
     if (context === null || context === undefined || typeof context.id !== "string") {
@@ -2324,7 +2583,7 @@ async function runResendExchange(resendId: string, failure: string, issue: () =>
       context = (await refreshed.json()) as ResendContext;
     }
     if (context === null || typeof context.id !== "string" || context.id !== resendId) throw new Error("resend response did not include this item's context");
-    resendInFlight.delete(resendId);
+    settle();
     // A context removed while its send was in flight stays removed.
     if (resendContexts.has(resendId)) resendContexts.set(resendId, context);
     (result.diagnostics ?? []).forEach(showDiagnostic);
@@ -2345,7 +2604,31 @@ async function runResendExchange(resendId: string, failure: string, issue: () =>
       else toast(`Stopped after ${RESEND_MAX_AUTO_HOPS} redirects; use Follow redirection to continue.`, "info");
     }
   } catch (error) {
-    resendInFlight.delete(resendId);
+    settle();
+    if (abort.signal.aborted) {
+      // Stopped locally: pick up whatever the engine recorded, if anything.
+      try {
+        const refreshed = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(resendId));
+        if (refreshed.ok && resendContexts.has(resendId)) {
+          const context = (await refreshed.json()) as ResendContext;
+          const draft = isVisible() ? selectedResend?.current : undefined;
+          resendContexts.set(resendId, context);
+          if (isVisible()) selectedResend = draft === undefined ? context : { ...context, current: draft };
+        }
+      } catch { /* the item is freed either way */ }
+      if (isVisible()) {
+        selectedResendRevision = null;
+        setResendSendBusy(false);
+        mountResendResponse();
+      }
+      renderResendList();
+      toast("Stopped waiting for the send.", "info");
+      return;
+    }
+    const diagnostic: ContextDiagnostic = error instanceof ApiRequestError && error.diagnostic !== undefined
+      ? error.diagnostic
+      : { id: "proxy.resend-request-failed", what: failure, why: String(error), fix: "Review the request and confirm the session proxy is running." };
+    if (resendContexts.has(resendId)) resendFailures.set(resendId, diagnostic);
     if (isVisible()) {
       setResendSendBusy(false);
       mountResendResponse();
@@ -2355,8 +2638,8 @@ async function runResendExchange(resendId: string, failure: string, issue: () =>
   }
   if (followNext !== null) {
     const from = followNext;
-    await runResendExchange(resendId, "The redirect could not be followed.", async () => {
-      const followed = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(resendId)}/follow/${from}`, { method: "POST" });
+    await runResendExchange(resendId, "The redirect could not be followed.", async (signal) => {
+      const followed = await fetch(resendFollowUrl(resendId, from), { method: "POST", signal });
       await requireOk(followed, "resend follow failed");
       return followed;
     });
@@ -2866,8 +3149,16 @@ function collapsedTools(): Record<string, boolean> {
     return {};
   }
 }
+/** Laptop widths, where an expanded Resend queue squeezes the editor. */
+const NARROW_WORKBENCH = window.matchMedia("(max-width: 1119px)");
+/** Whether a tool's queue is collapsed: the operator's explicit choice, else
+ *  collapsed by default for Resend at laptop widths. */
+function queueCollapsed(tool: string): boolean {
+  const chosen = collapsedTools()[tool];
+  return chosen ?? (tool === "resend" && NARROW_WORKBENCH.matches);
+}
 function applyQueueCollapse(tool: string): void {
-  const collapsed = collapsedTools()[tool] === true;
+  const collapsed = queueCollapsed(tool);
   document.querySelector<HTMLElement>(`.wb-split[data-wbsplit="${tool}"]`)?.classList.toggle("is-list-collapsed", collapsed);
   const button = document.querySelector<HTMLElement>(`[data-wb-collapse="${tool}"]`);
   if (button !== null) {
@@ -2877,7 +3168,7 @@ function applyQueueCollapse(tool: string): void {
 }
 function toggleQueueCollapse(tool: string): void {
   const all = collapsedTools();
-  all[tool] = all[tool] !== true;
+  all[tool] = !queueCollapsed(tool);
   try {
     localStorage.setItem(QUEUE_COLLAPSE_KEY, JSON.stringify(all));
   } catch {
@@ -2889,13 +3180,14 @@ function toggleQueueCollapse(tool: string): void {
 /** A compact queue row: method chip + the endpoint (or the custom name), a
  *  status cell, and a hover-revealed rename control. The full endpoint is the
  *  hover title so a renamed row still shows what it points at. */
-function queueRowHtml(opts: { id: string; attr: string; method: string; url: string; status: string; active: boolean }): string {
+function queueRowHtml(opts: { id: string; attr: string; method: string; url: string; status: string; active: boolean; name?: string | null; draft?: boolean }): string {
   const endpoint = endpointOf(opts.url);
-  const custom = queueName(opts.id);
+  // `name` present = the item carries its own (durable) name; else local label.
+  const custom = opts.name === undefined ? queueName(opts.id) : (opts.name?.trim() || undefined);
   const shown = custom ?? endpoint;
   const m = opts.method.toUpperCase() || "GET";
-  const title = custom === undefined ? `${m} ${endpoint}` : `${custom} — ${m} ${endpoint}`;
-  return `<div class="qrow${opts.active ? " is-active" : ""}" data-${opts.attr}-row="${escapeHtml(opts.id)}" title="${escapeHtml(title)}">
+  const title = `${custom === undefined ? `${m} ${endpoint}` : `${custom} — ${m} ${endpoint}`}${opts.draft === true ? " · unsent edits" : ""}`;
+  return `<div class="qrow${opts.active ? " is-active" : ""}${opts.draft === true ? " has-draft" : ""}" data-${opts.attr}-row="${escapeHtml(opts.id)}" title="${escapeHtml(title)}">
 <button class="qrow__open" type="button" data-${opts.attr}="${escapeHtml(opts.id)}">
 <span class="qrow__method" data-method="${escapeHtml(m)}">${escapeHtml(m)}</span>
 <span class="qrow__name">${escapeHtml(shown)}</span>
@@ -2908,19 +3200,20 @@ function queueRowHtml(opts: { id: string; attr: string; method: string; url: str
 
 /** Turns a queue row's name into an inline text field, committing on Enter/blur
  *  and cancelling on Escape. */
-function beginQueueRename(rowId: string, attr: string, onDone: () => void): void {
+function beginQueueRename(rowId: string, attr: string, onDone: () => void, durable?: { current: string | undefined; save: (name: string) => void }): void {
   const row = document.querySelector<HTMLElement>(`[data-${attr}-row="${CSS.escape(rowId)}"]`);
   const nameEl = row?.querySelector<HTMLElement>(".qrow__name");
   if (row === null || nameEl === null || nameEl === undefined) return;
   const input = document.createElement("input");
   input.className = "qrow__rename-input";
-  input.value = queueName(rowId) ?? nameEl.textContent ?? "";
+  input.value = (durable === undefined ? queueName(rowId) : durable.current) ?? nameEl.textContent ?? "";
   input.setAttribute("aria-label", "Item name");
   let committed = false;
   const commit = (save: boolean): void => {
     if (committed) return;
     committed = true;
-    if (save) setQueueName(rowId, input.value);
+    if (save && durable !== undefined) durable.save(input.value);
+    else if (save) setQueueName(rowId, input.value);
     onDone();
   };
   input.addEventListener("keydown", (event) => {
@@ -2948,6 +3241,7 @@ function renderResendList(): void {
     count.textContent = String(items.length);
     count.hidden = items.length === 0;
   }
+  if (selectedResend === null && renderedResendId === null) seedResendEmpty();
   if (items.length === 0) {
     list.innerHTML = stateBlock({ icon: "send", title: "Resend queue is empty", body: "Right-click a request in Live traffic or the API surface and choose Resend.", compact: true });
     return;
@@ -2955,8 +3249,9 @@ function renderResendList(): void {
   list.innerHTML = items
     .map((ctx) => {
       const last = ctx.history[ctx.history.length - 1]?.response?.status;
-      const status = resendInFlight.has(ctx.id) ? "…" : last === undefined ? "—" : String(last);
-      return queueRowHtml({ id: ctx.id, attr: "resend-id", method: ctx.current.method, url: ctx.current.url, status, active: selectedResend?.id === ctx.id });
+      const failed = ctx.history.length > 0 && last === undefined ? "✕" : "—";
+      const status = resendInFlight.has(ctx.id) ? "…" : last === undefined ? failed : String(last);
+      return queueRowHtml({ id: ctx.id, attr: "resend-id", method: ctx.current.method, url: ctx.current.url, status, active: selectedResend?.id === ctx.id, name: ctx.name ?? null, draft: resendDrafts.has(ctx.id) });
     })
     .join("");
   list.querySelectorAll<HTMLElement>("[data-resend-id]").forEach((row) => {
@@ -2973,7 +3268,7 @@ function renderResendList(): void {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       const id = button.dataset.resendIdRename ?? "";
-      beginQueueRename(id, "resend-id", () => renderResendList());
+      beginQueueRename(id, "resend-id", () => renderResendList(), { current: resendContexts.get(id)?.name ?? undefined, save: (name) => void renameResend(id, name) });
     });
   });
   list.querySelectorAll<HTMLElement>("[data-resend-id-delete]").forEach((button) => {
@@ -2994,14 +3289,24 @@ function renderResendList(): void {
 /** Removes a resend context from the queue (and the durable store). If it was
  *  the open one, the editor resets to the empty state. */
 async function deleteResendContext(id: string): Promise<void> {
-  if (id === "") return;
+  const ctx = resendContexts.get(id);
+  if (id === "" || ctx === undefined) return;
+  const revisions = ctx.history.length;
+  const history = revisions === 0 ? "It has no sends yet." : `Its ${revisions} ${revisions === 1 ? "revision" : "revisions"} of request/response history will be deleted too.`;
+  const drafted = resendDrafts.has(id) ? " Unsent edits in its editor are discarded." : "";
+  const inFlight = resendInFlight.has(id) ? " Its send in flight is cancelled first." : "";
+  if (!(await confirmDialog({ eyebrow: "Resend", title: `Delete “${resendTitle(ctx)}”?`, message: `${history}${drafted}${inFlight} This cannot be undone.`, confirmLabel: "Delete", tone: "danger" }))) return;
   try {
+    if (resendInFlight.has(id)) await cancelResend(id);
     const response = await fetch("/api/v1/workbench/resend/" + encodeURIComponent(id), { method: "DELETE" });
     if (!response.ok && response.status !== 404) { await requireOk(response, "could not remove the resend item"); return; }
     resendContexts.delete(id);
+    resendDrafts.delete(id);
+    resendFailures.delete(id);
     setQueueName(id, "");
     if (selectedResend?.id === id) { selectedResend = null; seedResendEmpty(); }
     renderResendList();
+    toast(revisions === 0 ? "Resend item deleted." : `Resend item and ${revisions} ${revisions === 1 ? "revision" : "revisions"} deleted.`, "success");
   } catch (error) {
     reportUnexpected(error, { id: "proxy.resend-history-failed", what: "Could not remove the resend item.", why: "", fix: "Retry; if it persists, reload the session." });
   }
@@ -3016,8 +3321,41 @@ async function refreshResendList(): Promise<void> {
     contexts.forEach((ctx) => resendContexts.set(ctx.id, ctx));
     if (selectedResend !== null) selectedResend = resendContexts.get(selectedResend.id) ?? selectedResend;
     renderResendList();
+    void migrateLocalResendNames(contexts);
   } catch {
     /* the list is a convenience; the detail pane still holds the selection */
+  }
+}
+
+/** Saves an item's name in the session (durable, exported). Blank clears it. */
+async function renameResend(id: string, name: string): Promise<void> {
+  try {
+    const response = await fetch(`/api/v1/workbench/resend/${encodeURIComponent(id)}/name`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: name.trim() === "" ? null : name.trim() }) });
+    await requireOk(response, "resend rename failed");
+    const renamed = (await response.json()) as ResendContext;
+    const known = resendContexts.get(id);
+    if (known !== undefined) resendContexts.set(id, { ...known, name: renamed.name ?? null });
+    if (selectedResend?.id === id) {
+      selectedResend = { ...selectedResend, name: renamed.name ?? null };
+      const heading = resendPanel?.querySelector<HTMLElement>(".panel__heading h2");
+      if (heading !== null && heading !== undefined) heading.textContent = resendTitle(selectedResend);
+    }
+    setQueueName(id, "");
+    renderResendList();
+  } catch (error) {
+    renderResendList();
+    reportUnexpected(error, { id: "proxy.resend-history-failed", what: "The name could not be saved.", why: "", fix: "Retry; names are limited to 120 characters." });
+  }
+}
+
+/** Earlier builds kept Resend names in this browser only; move any that the
+ *  session does not have yet into the session store. */
+async function migrateLocalResendNames(contexts: ResendContext[]): Promise<void> {
+  for (const ctx of contexts) {
+    const local = queueName(ctx.id);
+    if (local === undefined) continue;
+    if (ctx.name !== undefined && ctx.name !== null && ctx.name !== "") { setQueueName(ctx.id, ""); continue; }
+    await renameResend(ctx.id, local);
   }
 }
 
@@ -3153,6 +3491,10 @@ function initWorkbenchTools(): void {
   });
   applyQueueCollapse("resend");
   applyQueueCollapse("fuzz");
+  NARROW_WORKBENCH.addEventListener("change", () => {
+    applyQueueCollapse("resend");
+    if (selectedResend === null) seedResendEmpty();
+  });
   initWorkbenchSplitters();
   renderResendList();
   renderFuzzList();
@@ -3316,8 +3658,10 @@ function initWorkbenchSplitters(): void {
   document.querySelectorAll<HTMLElement>(".wb-split__gutter").forEach((gutter) => {
     const split = gutter.closest<HTMLElement>(".wb-split");
     if (split === null) return;
+    // The Resend queue is compact rows, so it may go narrower than the others.
+    const min = split.dataset.wbsplit === "resend" ? 0.15 : 0.3;
     const setRatio = (ratio: number): void => {
-      const clamped = Math.max(0.3, Math.min(0.7, ratio));
+      const clamped = Math.max(min, Math.min(0.7, ratio));
       split.style.setProperty("--wb-list", `${(clamped * 100).toFixed(1)}%`);
     };
     gutter.addEventListener("pointerdown", (event) => {
@@ -3335,7 +3679,7 @@ function initWorkbenchSplitters(): void {
       gutter.addEventListener("pointermove", move);
       gutter.addEventListener("pointerup", up);
     });
-    gutter.addEventListener("dblclick", () => setRatio(0.5));
+    gutter.addEventListener("dblclick", () => split.style.removeProperty("--wb-list"));
     gutter.addEventListener("keydown", (event) => {
       const current = parseFloat(getComputedStyle(split).getPropertyValue("--wb-list")) || 50;
       if (event.key === "ArrowLeft") { setRatio((current - 4) / 100); event.preventDefault(); }

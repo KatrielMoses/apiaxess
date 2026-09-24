@@ -21,6 +21,9 @@ pub(crate) const WIRE_HEADERS_MARKER: &str = "x-apiaxess-wire-headers";
 pub(crate) const UPSTREAM_STATUS_MARKER: &str = "x-apiaxess-upstream-status";
 /// Response marker: the upstream header list as received.
 pub(crate) const UPSTREAM_HEADERS_MARKER: &str = "x-apiaxess-upstream-headers";
+/// Response marker: the upstream exchange failed (connect, TLS, timeout); the
+/// value names the failure. Marks the proxy's synthetic 502 as not a response.
+pub(crate) const UPSTREAM_ERROR_MARKER: &str = "x-apiaxess-upstream-error";
 
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const MAX_HEADERS: usize = 256;

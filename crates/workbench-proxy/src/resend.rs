@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, RwLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
@@ -20,8 +20,8 @@ use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::backend::ORIGIN_MARKER_HEADER;
 use crate::raw_http::{
-    UPSTREAM_HEADERS_MARKER, UPSTREAM_STATUS_MARKER, WIRE_HEADERS_MARKER, decode_header_list,
-    encode_header_list,
+    UPSTREAM_ERROR_MARKER, UPSTREAM_HEADERS_MARKER, UPSTREAM_STATUS_MARKER, WIRE_HEADERS_MARKER,
+    decode_header_list, encode_header_list,
 };
 use crate::{FlowDetail, SessionCa};
 
@@ -307,12 +307,23 @@ async fn send_following_redirects(
     }
 }
 
+/// How long a Resend send waits for a response when the caller sets no timeout.
+pub const DEFAULT_RESEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest send timeout a caller may ask for (the proxy's own exchange cap).
+pub const MAX_RESEND_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Longest operator-given item name, in characters.
+const MAX_NAME_CHARS: usize = 120;
+
 /// Session-scoped resend contexts and their persistence bridge.
 pub struct ResendWorkbench {
     store: RwLock<Option<Arc<TrafficStore>>>,
     sender: RwLock<Option<Arc<dyn ResendSender>>>,
     scope: RwLock<Option<EngagementScope>>,
     contexts: Mutex<BTreeMap<String, ResendContext>>,
+    /// Cancel signal for each item's in-flight exchange.
+    in_flight: Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl std::fmt::Debug for ResendWorkbench {
@@ -339,6 +350,7 @@ impl ResendWorkbench {
             sender: RwLock::new(None),
             scope: RwLock::new(None),
             contexts: Mutex::new(BTreeMap::new()),
+            in_flight: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -455,6 +467,7 @@ impl ResendWorkbench {
             created_at: chrono::Utc::now(),
             current: request,
             history: Vec::new(),
+            name: None,
         };
         self.persist(&context)?;
         if let Ok(mut contexts) = self.contexts.lock() {
@@ -506,6 +519,45 @@ impl ResendWorkbench {
         Ok(context)
     }
 
+    /// Sets (or, when blank, clears) the item's operator-given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a request diagnostic when the context is absent or the name is
+    /// too long, or a history diagnostic when it cannot be saved.
+    pub fn set_name(&self, id: &str, name: Option<&str>) -> Result<ResendContext, Diagnostic> {
+        let mut context = self
+            .get(id)
+            .ok_or_else(|| request_diagnostic("rename", "context not found"))?;
+        let name = name.map(str::trim).filter(|name| !name.is_empty());
+        if name.is_some_and(|name| name.chars().count() > MAX_NAME_CHARS) {
+            return Err(request_diagnostic(
+                "rename",
+                &format!("names are limited to {MAX_NAME_CHARS} characters"),
+            ));
+        }
+        context.name = name.map(ToOwned::to_owned);
+        self.persist(&context)?;
+        self.replace_context(context.clone());
+        Ok(context)
+    }
+
+    /// Cancels the item's in-flight send or follow. The exchange stops waiting
+    /// at once and is recorded as a cancelled revision. Returns whether a send
+    /// was in flight.
+    #[must_use]
+    pub fn cancel(&self, id: &str) -> bool {
+        let signal = self
+            .in_flight
+            .lock()
+            .ok()
+            .and_then(|in_flight| in_flight.get(id).cloned());
+        signal.is_some_and(|signal| {
+            signal.notify_one();
+            true
+        })
+    }
+
     /// Sends the current request and appends the result as one linear revision.
     ///
     /// One exchange: a `3xx` is recorded as-is (redirects are never followed
@@ -516,12 +568,17 @@ impl ResendWorkbench {
     /// Returns a history diagnostic when the revision cannot be persisted.
     /// Transport and malformed-request failures are retained in the returned
     /// revision and diagnostics so the failed attempt is never hidden.
-    pub async fn send(&self, id: &str) -> Result<ResendSendResult, Diagnostic> {
+    pub async fn send(
+        &self,
+        id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ResendSendResult, Diagnostic> {
         let context = self
             .get(id)
             .ok_or_else(|| request_diagnostic("send", "context not found"))?;
         let request = context.current.clone();
-        self.dispatch(context, request, Vec::new(), None).await
+        self.dispatch(context, request, Vec::new(), None, timeout)
+            .await
     }
 
     /// Follows the redirect recorded on `revision`: issues exactly one request
@@ -540,6 +597,7 @@ impl ResendWorkbench {
         id: &str,
         revision: u64,
         process_cookies: bool,
+        timeout: Option<Duration>,
     ) -> Result<ResendSendResult, Diagnostic> {
         let context = self
             .get(id)
@@ -567,15 +625,20 @@ impl ResendWorkbench {
             status: response.status,
             location: target,
         });
-        self.dispatch(context, request, chain, Some(revision)).await
+        self.dispatch(context, request, chain, Some(revision), timeout)
+            .await
     }
 
+    /// One exchange, bounded by `timeout` (default [`DEFAULT_RESEND_TIMEOUT`],
+    /// at most [`MAX_RESEND_TIMEOUT`]) and cancellable via
+    /// [`ResendWorkbench::cancel`]. Either way the attempt is recorded.
     async fn dispatch(
         &self,
         mut context: ResendContext,
         request: ResendRequest,
         redirect_chain: Vec<RedirectHop>,
         followed_from: Option<u64>,
+        timeout: Option<Duration>,
     ) -> Result<ResendSendResult, Diagnostic> {
         validate_request(&request)?;
         let scope = self.classify_scope(&request.url);
@@ -583,9 +646,34 @@ impl ResendWorkbench {
         if scope == ScopeDisposition::OutsideDeclaredScope {
             diagnostics.push(outside_scope_diagnostic(&request.url));
         }
+        let timeout = timeout
+            .unwrap_or(DEFAULT_RESEND_TIMEOUT)
+            .clamp(Duration::from_secs(1), MAX_RESEND_TIMEOUT);
         let started = Instant::now();
         let result = match self.sender.read().ok().and_then(|sender| sender.clone()) {
-            Some(sender) => sender.send(request.clone()).await,
+            Some(sender) => {
+                let cancel = Arc::new(tokio::sync::Notify::new());
+                if let Ok(mut in_flight) = self.in_flight.lock() {
+                    in_flight.insert(context.id.clone(), Arc::clone(&cancel));
+                }
+                // Dropping the send future closes its proxy connection, which
+                // stops the proxy's upstream exchange too.
+                let outcome = tokio::select! {
+                    sent = tokio::time::timeout(timeout, sender.send(request.clone())) => {
+                        sent.unwrap_or_else(|_| Err(timed_out_diagnostic(&request.url, timeout)))
+                    }
+                    () = cancel.notified() => Err(cancelled_diagnostic(&request.url)),
+                };
+                if let Ok(mut in_flight) = self.in_flight.lock() {
+                    if in_flight
+                        .get(&context.id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+                    {
+                        in_flight.remove(&context.id);
+                    }
+                }
+                outcome
+            }
             None => Err(transport_unavailable()),
         };
         let (response, diagnostic) = match result {
@@ -611,8 +699,11 @@ impl ResendWorkbench {
             followed_from,
         };
         context.history.push(revision.clone());
-        self.persist(&context)?;
-        self.replace_context(context.clone());
+        // An item deleted while its send was in flight stays deleted.
+        if self.get(&context.id).is_some() {
+            self.persist(&context)?;
+            self.replace_context(context.clone());
+        }
         Ok(ResendSendResult {
             context,
             revision,
@@ -629,9 +720,10 @@ impl ResendWorkbench {
     pub async fn send_in_session(
         &self,
         id: &str,
+        timeout: Option<Duration>,
         session: &mut Session,
     ) -> Result<ResendSendResult, Diagnostic> {
-        let result = self.send(id).await?;
+        let result = self.send(id, timeout).await?;
         record_send_action(id, &result, session, "workbench.resend.send", "Sent")?;
         Ok(result)
     }
@@ -647,9 +739,10 @@ impl ResendWorkbench {
         id: &str,
         revision: u64,
         process_cookies: bool,
+        timeout: Option<Duration>,
         session: &mut Session,
     ) -> Result<ResendSendResult, Diagnostic> {
-        let result = self.follow(id, revision, process_cookies).await?;
+        let result = self.follow(id, revision, process_cookies, timeout).await?;
         record_send_action(
             id,
             &result,
@@ -791,6 +884,16 @@ async fn send_core(
         }
         diagnostic
     })?;
+    // The proxy answers a failed upstream exchange with a synthetic 502 that
+    // names the failure in a private marker. That is a transport failure, not
+    // a server response, so it is reported as one.
+    if let Some(error) = response
+        .headers()
+        .get(UPSTREAM_ERROR_MARKER)
+        .and_then(|value| value.to_str().ok())
+    {
+        return Err(upstream_unreachable_diagnostic(&request.url, error));
+    }
     let status = response.status().as_u16();
     let (http_version, reason) = response
         .headers()
@@ -1151,6 +1254,59 @@ fn outside_scope_diagnostic(url: &str) -> Diagnostic {
     catalogue::PROXY_RESEND_OUTSIDE_SCOPE.instantiate(context)
 }
 
+/// `host:port` of a request URL, for failure messages.
+fn target_label(url: &str) -> String {
+    url.parse::<reqwest::Url>()
+        .ok()
+        .and_then(|parsed| {
+            let host = parsed.host_str()?.to_owned();
+            Some(format!(
+                "{host}:{}",
+                parsed.port_or_known_default().unwrap_or(0)
+            ))
+        })
+        .unwrap_or_else(|| url.to_owned())
+}
+
+fn upstream_unreachable_diagnostic(url: &str, error: &str) -> Diagnostic {
+    let mut context = DiagnosticContext::new();
+    context.insert(
+        "target".to_owned(),
+        DiagnosticValue::String(target_label(url)),
+    );
+    context.insert(
+        "error".to_owned(),
+        DiagnosticValue::String(error.to_owned()),
+    );
+    if error.contains("timed out") {
+        context.insert("timeout".to_owned(), DiagnosticValue::Boolean(true));
+    }
+    catalogue::PROXY_UPSTREAM_UNREACHABLE.instantiate(context)
+}
+
+fn timed_out_diagnostic(url: &str, timeout: Duration) -> Diagnostic {
+    let mut context = DiagnosticContext::new();
+    context.insert(
+        "target".to_owned(),
+        DiagnosticValue::String(target_label(url)),
+    );
+    context.insert(
+        "timeout_secs".to_owned(),
+        DiagnosticValue::Integer(i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX)),
+    );
+    context.insert("timeout".to_owned(), DiagnosticValue::Boolean(true));
+    catalogue::PROXY_RESEND_TIMED_OUT.instantiate(context)
+}
+
+fn cancelled_diagnostic(url: &str) -> Diagnostic {
+    let mut context = DiagnosticContext::new();
+    context.insert(
+        "target".to_owned(),
+        DiagnosticValue::String(target_label(url)),
+    );
+    catalogue::PROXY_RESEND_CANCELLED.instantiate(context)
+}
+
 fn transport_unavailable() -> Diagnostic {
     catalogue::PROXY_RESEND_TRANSPORT_UNAVAILABLE.instantiate(DiagnosticContext::new())
 }
@@ -1455,14 +1611,17 @@ mod tests {
         let context = resend.create(draft.clone(), None).expect("create");
 
         // A send is one exchange: the 3xx is the result, nothing is followed.
-        let sent = resend.send(&context.id).await.expect("send");
+        let sent = resend.send(&context.id, None).await.expect("send");
         assert_eq!(sent.revision.response.as_ref().map(|r| r.status), Some(303));
         assert!(sent.revision.redirect_chain.is_empty());
         assert_eq!(log.lock().expect("log").len(), 1);
 
         // Follow issues exactly one hop to the resolved Location: 303 → GET with
         // no body, cookies carried, other headers kept in order.
-        let hop = resend.follow(&context.id, 1, true).await.expect("follow");
+        let hop = resend
+            .follow(&context.id, 1, true, None)
+            .await
+            .expect("follow");
         assert_eq!(log.lock().expect("log").len(), 2);
         let sent_hop = log.lock().expect("log")[1].clone();
         assert_eq!(sent_hop.method, "GET");
@@ -1491,7 +1650,10 @@ mod tests {
         assert_eq!(hop.context.current, draft);
 
         // Without cookie processing the Set-Cookie is not carried.
-        resend.follow(&context.id, 1, false).await.expect("follow");
+        resend
+            .follow(&context.id, 1, false, None)
+            .await
+            .expect("follow");
         let plain_hop = log.lock().expect("log")[2].clone();
         assert!(
             plain_hop
@@ -1500,8 +1662,8 @@ mod tests {
         );
 
         // A non-redirect revision cannot be followed.
-        assert!(resend.follow(&context.id, 2, true).await.is_err());
-        assert!(resend.follow(&context.id, 99, true).await.is_err());
+        assert!(resend.follow(&context.id, 2, true, None).await.is_err());
+        assert!(resend.follow(&context.id, 99, true, None).await.is_err());
     }
 
     struct MockSender;
@@ -1551,7 +1713,7 @@ mod tests {
         resend.attach_store(Arc::clone(&store)).expect("attach");
         resend.attach_sender(Arc::new(MockSender));
         let context = resend.create(request(), None).expect("create");
-        let result = resend.send(&context.id).await.expect("send");
+        let result = resend.send(&context.id, None).await.expect("send");
         assert_eq!(
             result.revision.response.as_ref().map(|r| r.status),
             Some(200)
@@ -1564,12 +1726,112 @@ mod tests {
         restored.derive(&context.id, 1).expect("derive");
     }
 
+    /// Never answers, like a hung upstream.
+    struct HangingSender;
+
+    impl ResendSender for HangingSender {
+        fn send(
+            &self,
+            _request: ResendRequest,
+        ) -> crate::backend::BackendFuture<Result<ResendResponse, Diagnostic>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_send_times_out_as_a_recorded_revision() {
+        let resend = ResendWorkbench::new();
+        resend.attach_store(store()).expect("attach");
+        resend.attach_sender(Arc::new(HangingSender));
+        let context = resend.create(request(), None).expect("create");
+        let result = resend
+            .send(&context.id, Some(Duration::from_millis(10)))
+            .await
+            .expect("record timeout");
+        let diagnostic = result.revision.diagnostic.expect("timeout diagnostic");
+        assert_eq!(diagnostic.id.as_ref(), "proxy.resend-timed-out");
+        assert_eq!(
+            diagnostic.context.get("timeout_secs"),
+            Some(&DiagnosticValue::Integer(1)),
+            "clamped up to the 1 s floor"
+        );
+        assert!(result.revision.response.is_none());
+        assert!(!resend.cancel(&context.id), "nothing left in flight");
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_an_in_flight_send_and_records_it() {
+        let resend = Arc::new(ResendWorkbench::new());
+        resend.attach_store(store()).expect("attach");
+        resend.attach_sender(Arc::new(HangingSender));
+        let context = resend.create(request(), None).expect("create");
+        assert!(
+            !resend.cancel(&context.id),
+            "idle item has nothing to cancel"
+        );
+        let sending = {
+            let resend = Arc::clone(&resend);
+            let id = context.id.clone();
+            tokio::spawn(async move { resend.send(&id, Some(MAX_RESEND_TIMEOUT)).await })
+        };
+        while !resend.cancel(&context.id) {
+            tokio::task::yield_now().await;
+        }
+        let result = sending.await.expect("join").expect("record cancel");
+        assert_eq!(
+            result.revision.diagnostic.as_ref().map(|d| d.id.as_ref()),
+            Some("proxy.resend-cancelled")
+        );
+        assert_eq!(result.context.history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn names_persist_and_blank_clears() {
+        let store = store();
+        let resend = ResendWorkbench::new();
+        resend.attach_store(Arc::clone(&store)).expect("attach");
+        let context = resend.create(request(), None).expect("create");
+        resend
+            .set_name(&context.id, Some("  Login probe "))
+            .expect("rename");
+        let restored = ResendWorkbench::new();
+        restored.attach_store(Arc::clone(&store)).expect("restore");
+        assert_eq!(
+            restored.get(&context.id).and_then(|c| c.name).as_deref(),
+            Some("Login probe")
+        );
+        assert!(
+            resend
+                .set_name(&context.id, Some(&"x".repeat(121)))
+                .is_err()
+        );
+        let cleared = resend.set_name(&context.id, Some("  ")).expect("clear");
+        assert_eq!(cleared.name, None);
+    }
+
+    #[test]
+    fn upstream_failure_marker_is_a_transport_diagnostic() {
+        let diagnostic = upstream_unreachable_diagnostic(
+            "http://127.0.0.1:9199/x",
+            "connect 127.0.0.1:9199: connection refused",
+        );
+        assert_eq!(diagnostic.id.as_ref(), "proxy.upstream-unreachable");
+        assert_eq!(
+            diagnostic.context.get("target"),
+            Some(&DiagnosticValue::String("127.0.0.1:9199".to_owned()))
+        );
+        assert_eq!(target_label("https://a.test/p"), "a.test:443");
+    }
+
     #[tokio::test]
     async fn missing_transport_is_a_recorded_diagnostic_not_a_direct_fallback() {
         let resend = ResendWorkbench::new();
         resend.attach_store(store()).expect("attach");
         let context = resend.create(request(), None).expect("create");
-        let result = resend.send(&context.id).await.expect("record failure");
+        let result = resend
+            .send(&context.id, None)
+            .await
+            .expect("record failure");
         assert_eq!(
             result.revision.diagnostic.as_ref().map(|d| d.id.as_ref()),
             Some("proxy.resend-transport-unavailable")

@@ -243,6 +243,10 @@ pub struct ResendContext {
     pub current: ResendRequest,
     /// Append-only sends, including failed attempts.
     pub history: Vec<ResendRevision>,
+    /// Operator-given label for the queue and panel title; absent = derived
+    /// from the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Request field where a fuzzer payload is substituted.
@@ -1226,7 +1230,8 @@ impl TrafficStore {
                source_flow_id INTEGER,
                created_at TEXT NOT NULL,
                current_json TEXT NOT NULL,
-               history_json TEXT NOT NULL
+               history_json TEXT NOT NULL,
+               name TEXT
              );
              CREATE TABLE IF NOT EXISTS fuzzer_jobs (
                id TEXT PRIMARY KEY,
@@ -1247,7 +1252,7 @@ impl TrafficStore {
                     &e.to_string(),
                 )
             })?;
-        ensure_flows_columns(&connection, &database)?;
+        ensure_columns(&connection, &database)?;
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(|e| {
@@ -1719,15 +1724,16 @@ impl TrafficStore {
         })?;
         connection
             .execute(
-                "INSERT INTO resend_contexts (id,source_flow_id,created_at,current_json,history_json)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(id) DO UPDATE SET source_flow_id=excluded.source_flow_id,created_at=excluded.created_at,current_json=excluded.current_json,history_json=excluded.history_json",
+                "INSERT INTO resend_contexts (id,source_flow_id,created_at,current_json,history_json,name)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(id) DO UPDATE SET source_flow_id=excluded.source_flow_id,created_at=excluded.created_at,current_json=excluded.current_json,history_json=excluded.history_json,name=excluded.name",
                 params![
                     context.id,
                     context.source_flow_id.map(|id| i64::try_from(id).unwrap_or(i64::MAX)),
                     context.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
                     current_json,
                     history_json,
+                    context.name,
                 ],
             )
             .map_err(|e| {
@@ -1785,7 +1791,7 @@ impl TrafficStore {
         })?;
         let mut statement = connection
             .prepare(
-                "SELECT id,source_flow_id,created_at,current_json,history_json FROM resend_contexts ORDER BY created_at,id",
+                "SELECT id,source_flow_id,created_at,current_json,history_json,name FROM resend_contexts ORDER BY created_at,id",
             )
             .map_err(|e| storage_diag(catalogue::PROXY_RESEND_HISTORY_FAILED, "query", &self.root, &e.to_string()))?;
         let rows = statement
@@ -1798,6 +1804,7 @@ impl TrafficStore {
                     row.get::<_, String>(2)?,
                     current,
                     history,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(|e| {
@@ -1810,7 +1817,7 @@ impl TrafficStore {
             })?;
         let mut contexts = Vec::new();
         for row in rows {
-            let (id, source_flow_id, created_at, current, history) = row.map_err(|e| {
+            let (id, source_flow_id, created_at, current, history, name) = row.map_err(|e| {
                 storage_diag(
                     catalogue::PROXY_RESEND_HISTORY_FAILED,
                     "row",
@@ -1831,6 +1838,7 @@ impl TrafficStore {
                     .into_iter()
                     .map(|entry| self.resolve_resend_revision(entry))
                     .collect::<Result<Vec<_>, _>>()?,
+                name,
             });
         }
         Ok(contexts)
@@ -2472,6 +2480,12 @@ fn seed_next_flow_id(connection: &Connection, database: &Path) -> Result<u64, Di
     Ok(u64::try_from(max_id).unwrap_or(0).saturating_add(1))
 }
 
+/// Adds columns newer builds expect to tables created by older ones.
+fn ensure_columns(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
+    ensure_flows_columns(connection, database)?;
+    ensure_resend_columns(connection, database)
+}
+
 fn ensure_flows_columns(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
     let mut statement = connection
         .prepare("PRAGMA table_info(flows)")
@@ -2515,6 +2529,38 @@ fn ensure_flows_columns(connection: &Connection, database: &Path) -> Result<(), 
                 "ALTER TABLE flows ADD COLUMN origin TEXT NOT NULL DEFAULT 'capture'",
                 [],
             )
+            .map_err(|error| {
+                storage_diag(
+                    catalogue::PROXY_STORE_OPEN_FAILED,
+                    "schema",
+                    database,
+                    &error.to_string(),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Legacy stores predate durable Resend item names.
+fn ensure_resend_columns(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
+    let resend_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(resend_contexts)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .map_err(|error| {
+            storage_diag(
+                catalogue::PROXY_STORE_OPEN_FAILED,
+                "schema",
+                database,
+                &error.to_string(),
+            )
+        })?;
+    if !resend_columns.iter().any(|name| name == "name") {
+        connection
+            .execute("ALTER TABLE resend_contexts ADD COLUMN name TEXT", [])
             .map_err(|error| {
                 storage_diag(
                     catalogue::PROXY_STORE_OPEN_FAILED,
@@ -3303,6 +3349,7 @@ mod tests {
                 }],
                 followed_from: Some(1),
             }],
+            name: Some("Login probe".to_owned()),
         };
         store.upsert_resend(&context).expect("resend persisted");
         assert_eq!(
@@ -3313,6 +3360,27 @@ mod tests {
             store.snapshot().expect("snapshot").resend_contexts.len(),
             1
         );
+    }
+
+    #[test]
+    fn legacy_resend_table_without_name_column_migrates() {
+        let connection = Connection::open_in_memory().expect("memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE resend_contexts (
+                   id TEXT PRIMARY KEY, source_flow_id INTEGER, created_at TEXT NOT NULL,
+                   current_json TEXT NOT NULL, history_json TEXT NOT NULL
+                 );",
+            )
+            .expect("legacy schema");
+        ensure_resend_columns(&connection, Path::new("test")).expect("migrate");
+        ensure_resend_columns(&connection, Path::new("test")).expect("idempotent");
+        let name: Option<String> = connection
+            .query_row("SELECT name FROM resend_contexts LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(None);
+        assert_eq!(name, None);
     }
 
     #[test]

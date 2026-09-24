@@ -636,6 +636,13 @@
 .wb-split__pane--list {
   flex: 0 0 var(--wb-list);
 }
+/* The Resend queue holds compact rows; the editor and History need the width. */
+.wb-split[data-wbsplit="resend"] {
+  --wb-list: 26%;
+}
+.wb-split[data-wbsplit="resend"] > .wb-split__pane--list {
+  min-width: 11rem;
+}
 .wb-split__pane--detail {
   flex: 1 1 0;
 }
@@ -768,6 +775,11 @@
   color: var(--color-text-muted);
   text-align: right;
 }
+/* Unsent edits in the item's editor: a dot after the method chip. */
+.qrow.has-draft .qrow__method::after {
+  content: " •";
+  color: var(--color-accent);
+}
 .qrow__rename-input {
   flex: 1;
   min-width: 0;
@@ -887,8 +899,9 @@
    an endpoint+status line, then the body editor filling the height. */
 .resend-res__head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2) var(--space-3);
 }
 .resend-res__head .section-label {
   margin: 0;
@@ -939,9 +952,20 @@
   align-items: center;
   gap: var(--space-1);
   min-width: 0;
+  max-width: 100%;
 }
 .resend-hist-nav #resend-response-pick {
+  flex: 1 1 auto;
+  min-width: 0;
   max-width: 16rem;
+}
+/* The revision line wraps on narrow panes instead of crushing the endpoint. */
+.resend-res .reqline {
+  flex-wrap: wrap;
+}
+.resend-res .reqline__url {
+  flex: 1 1 12rem;
+  min-width: 10rem;
 }
 .resend-res__head .resend-hist-nav {
   margin-left: auto;
@@ -992,6 +1016,36 @@
 .resend-parse-error {
   margin: 0;
   color: var(--color-danger-ink);
+}
+/* Send row: Send / Cancel / auto-follow / timeout, wrapping on narrow panes. */
+.resend-actions {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+.resend-timeout {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-muted);
+}
+.resend-timeout .input {
+  width: auto;
+}
+/* A send that got no HTTP response: an explicit error, never a status line. */
+.resend-error {
+  margin: 0;
+}
+.resend-error .notice__body p {
+  margin: 0 0 var(--space-1);
+}
+.resend-error__detail code {
+  font-family: var(--font-mono);
+  word-break: break-word;
+}
+.resend-empty__actions {
+  justify-content: center;
+  margin-top: var(--space-2);
 }
 .resend-res__empty {
   flex: 1;

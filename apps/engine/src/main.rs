@@ -1590,7 +1590,7 @@ mod tests {
             .expect("active session snapshot");
         let send_result = engine
             .resend()
-            .send_in_session(&resend.id, &mut audited_session)
+            .send_in_session(&resend.id, None, &mut audited_session)
             .await
             .expect("resend sends through running proxy");
         runtime

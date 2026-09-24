@@ -1360,12 +1360,34 @@ pub mod catalogue {
         fix: "Start the session proxy and attach its sender before retrying; a resend will not fall back to a direct request.",
     };
 
+    /// A resend got no response within its send timeout.
+    pub const PROXY_RESEND_TIMED_OUT: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.resend-timed-out",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "The resend got no response before its send timeout.",
+        why: "The upstream accepted or stalled the exchange but did not answer within the configured timeout, so the send was abandoned.",
+        fix: "Check that the target is responsive, or raise the Resend timeout and retry; the attempt is kept in history.",
+    };
+
+    /// The operator cancelled a resend while it was in flight.
+    pub const PROXY_RESEND_CANCELLED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.resend-cancelled",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Warning,
+        what: "The resend was cancelled before a response arrived.",
+        why: "The operator stopped the send; the request may already have reached the target.",
+        fix: "Resend when ready; the cancelled attempt is kept in history.",
+    };
+
     /// Every Phase 2.4 resend definition.
     pub const PHASE_2_4: &[DiagnosticDefinition] = &[
         PROXY_RESEND_REQUEST_FAILED,
         PROXY_RESEND_HISTORY_FAILED,
         PROXY_RESEND_OUTSIDE_SCOPE,
         PROXY_RESEND_TRANSPORT_UNAVAILABLE,
+        PROXY_RESEND_TIMED_OUT,
+        PROXY_RESEND_CANCELLED,
     ];
 
     /// ffuf is required for a selected stateless bulk attack but is unavailable.
