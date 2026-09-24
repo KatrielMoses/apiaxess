@@ -11,6 +11,7 @@
     "lint:fuzz-template": "node scripts/check-fuzz-template.mjs",
     "lint:request-editor": "node scripts/check-request-editor.mjs",
     "lint:message-tools": "node scripts/check-message-tools.mjs",
+    "lint:surface-tally": "node scripts/check-surface-tally.mjs",
     "dev": "vite --host 127.0.0.1"
   },
   "devDependencies": {

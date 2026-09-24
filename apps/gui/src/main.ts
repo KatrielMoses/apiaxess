@@ -31,6 +31,7 @@ import {
 } from "./fuzz/template";
 import { parseRawRequest, rawRequestText, splitRawRequest as splitRawRequestParts, splitUrl, syncContentLength, urlOrigin } from "./http/request-editor";
 import { prettyBody } from "./http/body-view";
+import { isConfirmed, tallySurface } from "./surface/tally";
 import { curlCommand, findAll, hexDump, inspectRequest, type InspectorItem, isBinaryBody, requestMethod, setRequestMethod, showNonPrintables, urlEncode } from "./http/message-tools";
 
 /* ==================================================================== *
@@ -116,7 +117,7 @@ interface EndpointDetail {
   readonly pathParams: readonly string[];
   readonly responses: readonly { readonly status: string; readonly headers: readonly string[] }[];
 }
-interface SurfaceEndpoint { readonly method: string; readonly pathTemplate: string; readonly baseUrl?: string | null; readonly evidenceSource?: string | null; readonly minimumFactConfidence?: number | null; readonly signerCount: number; readonly detail?: EndpointDetail }
+interface SurfaceEndpoint { readonly method: string; readonly pathTemplate: string; readonly baseUrl?: string | null; readonly evidenceSource?: string | null; readonly staticEvidence?: boolean | null; readonly minimumFactConfidence?: number | null; readonly signerCount: number; readonly detail?: EndpointDetail }
 interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunId: string; readonly endpoints: readonly SurfaceEndpoint[]; readonly coverage: { readonly endpointCount: number; readonly confirmedEndpointCount: number; readonly inferredEndpointCount: number; readonly staticOnlyEndpointCount: number; readonly openHandoffCount: number; readonly resolvedHandoffCount: number }; readonly signerCount: number; readonly diagnostics: (Diagnostic | null)[]; }
 interface DiscoveryEstimate { target: string; requestCount: number; ratePerSecond: number; estimatedLabel: string; }
 interface BrowserLaunchStatus { running: boolean; browser?: string | null; target?: string | null; pid?: number | null; cdpConnected?: boolean; debugPort?: number | null; }
@@ -3303,13 +3304,15 @@ function renderSurface(surface: SurfaceSummary): void {
 </div>`;
   }).join("");
 
-  const unconfirmed = Math.max(0, coverage.endpointCount - coverage.confirmedEndpointCount);
+  // Header counts use the same per-endpoint rule as the row badges.
+  const tally = tallySurface(surface.endpoints);
+  const unconfirmed = tally.inferred;
   surfaceView.innerHTML = `<div class="stack stack--loose">
 <div class="metric-grid">
-  <div class="metric"><span class="metric__value">${coverage.endpointCount}</span><span class="metric__label">endpoints</span></div>
-  <div class="metric metric--success"><span class="metric__value">${coverage.confirmedEndpointCount}</span><span class="metric__label">confirmed</span></div>
-  <div class="metric"><span class="metric__value">${coverage.inferredEndpointCount}</span><span class="metric__label">inferred</span></div>
-  <div class="metric"><span class="metric__value">${coverage.staticOnlyEndpointCount}</span><span class="metric__label">static only</span></div>
+  <div class="metric"><span class="metric__value">${tally.endpoints}</span><span class="metric__label">endpoints</span></div>
+  <div class="metric metric--success" title="Observed in live traffic (dynamic capture)"><span class="metric__value">${tally.confirmed}</span><span class="metric__label">confirmed</span></div>
+  <div class="metric" title="Recovered from code only — not observed being hit"><span class="metric__value">${tally.inferred}</span><span class="metric__label">inferred</span></div>
+  <div class="metric" title="Confirmed endpoints that were also found in the app's code"><span class="metric__value">${tally.alsoInCode}</span><span class="metric__label">also in code</span></div>
   <div class="metric metric--accent"><span class="metric__value">${surface.signerCount}</span><span class="metric__label">signers</span></div>
 </div>
 
@@ -4265,14 +4268,11 @@ function endpointParty(endpoint: SurfaceEndpoint): "first" | "third" | null {
  * candidate (e.g. a bundled SDK base not observed being hit) — so an unconfirmed
  * candidate is never presented as confirmed surface. */
 function evidenceChipHtml(endpoint: SurfaceEndpoint): string {
-  const source = endpoint.evidenceSource;
-  if (source === "confirmed") {
-    return `<span class="party-chip party-chip--confirmed" title="Observed being hit in dynamic capture">confirmed</span>`;
+  // Same rule as the header tally (tallySurface): confirmed or inferred, never blank.
+  if (isConfirmed(endpoint)) {
+    return `<span class="party-chip party-chip--confirmed" title="${endpoint.staticEvidence === true ? "Observed being hit in dynamic capture, and also found in the app's code" : "Observed being hit in dynamic capture"}">confirmed</span>`;
   }
-  if (source === "static_inferred") {
-    return `<span class="party-chip party-chip--inferred" title="Static-inferred candidate — recovered from the app's code but not observed being hit. Treat as a lead, not a confirmed endpoint.">inferred</span>`;
-  }
-  return "";
+  return `<span class="party-chip party-chip--inferred" title="Static-inferred candidate — recovered from the app's code but not observed being hit. Treat as a lead, not a confirmed endpoint.">inferred</span>`;
 }
 
 /** Renders the first/third-party chip for an endpoint row, or "" when unknown. */
@@ -4296,16 +4296,18 @@ function normalizeFusedSurface(raw: unknown): SurfaceSummary {
     const scores = facts.map((fact) => Number((fact as Record<string, unknown>).score)).filter(Number.isFinite);
     // Observed = at least one fact traces to dynamic capture (the app was seen
     // hitting it); otherwise it is a static-only inferred candidate.
-    const observed = facts.some((fact) => {
+    const hasSource = (source: string): boolean => facts.some((fact) => {
       const sources = (fact as Record<string, unknown>).sources;
-      return Array.isArray(sources) && sources.includes("dynamic_capture");
+      return Array.isArray(sources) && sources.includes(source);
     });
+    const observed = hasSource("dynamic_capture");
     const detail = extractEndpointDetail(endpoint);
     return {
       method: String(identity.method ?? ""),
       pathTemplate: String(identity.path_template ?? identity.pathTemplate ?? ""),
       baseUrl: detail.baseUrl,
       evidenceSource: observed ? "confirmed" : "static_inferred",
+      staticEvidence: hasSource("static_analysis"),
       minimumFactConfidence: scores.length === 0 ? undefined : Math.min(...scores),
       signerCount: Array.isArray(entry.signers) ? entry.signers.length : 0,
       detail,

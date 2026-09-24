@@ -1412,11 +1412,10 @@ fn infer_shape_value(
     }
 }
 
-fn path_only(path: &str) -> String {
-    path.split_once('?')
-        .map_or(path, |(path, _)| path)
-        .split_once('#')
-        .map_or_else(|| path.to_owned(), |(path, _)| path.to_owned())
+/// The path of a request target, without its query string or fragment.
+fn path_only(target: &str) -> String {
+    let end = target.find(['?', '#']).unwrap_or(target.len());
+    target[..end].to_owned()
 }
 fn string_value(value: &str) -> Value {
     Value::String(value.to_owned())
@@ -1477,12 +1476,30 @@ fn infer_template(path: &str) -> Result<PathTemplate, String> {
         .collect::<Vec<_>>();
     PathTemplate::new(format!("/{}", segments.join("/"))).map_err(|error| error.to_string())
 }
+/// Whether a path segment has an identifier's shape — numeric, a UUID, a long
+/// hex hash, or a mixed letters+digits token — so it is templated as `{id}`.
+/// Words stay literal, including words carrying a single digit (`oauth2`,
+/// `v2`, `oauth2callback`): an id-like mixed token needs at least two digits.
 fn looks_dynamic(segment: &str) -> bool {
-    segment.bytes().all(|byte| byte.is_ascii_digit())
+    let digits = segment.bytes().filter(u8::is_ascii_digit).count();
+    let alnum = segment.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    (!segment.is_empty() && digits == segment.len())
+        || is_uuid(segment)
         || (segment.len() >= 12 && segment.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        || (segment.len() >= 8
-            && segment.chars().any(|c| c.is_ascii_digit())
-            && segment.chars().any(|c| c.is_ascii_alphabetic()))
+        || (alnum
+            && segment.len() >= 8
+            && digits >= 2
+            && segment.bytes().any(|byte| byte.is_ascii_alphabetic()))
+}
+
+/// `8-4-4-4-12` hex with dashes.
+fn is_uuid(segment: &str) -> bool {
+    let groups: Vec<_> = segment.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn handoff_feedback(
@@ -1626,6 +1643,61 @@ mod tests {
             loose_findings: Vec::new(),
             signers: Vec::new(),
         })
+    }
+
+    fn templates(flows: &[FlowCapture]) -> Vec<String> {
+        let config = DynamicCaptureConfig::new("run:test").expect("config");
+        let report =
+            capture_into_document(&empty_document(), flows, &config, Utc::now()).expect("report");
+        let mut templates: Vec<_> = report
+            .document
+            .surface
+            .endpoints
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} {}",
+                    e.identity.method,
+                    e.identity.path_template.as_str()
+                )
+            })
+            .collect();
+        templates.sort();
+        templates
+    }
+
+    /// Regression: a query string leaked into templating (`path_only` returned
+    /// the whole target when there was no `#`), so `/api/search?q=shoes&page=2`
+    /// was read as segment `search?q=shoes&page=2` and became `/api/{id}`.
+    #[test]
+    fn constant_words_stay_literal_and_varying_ids_template() {
+        let flows = [
+            flow(1, "/api/users/101?include=profile", br#"{"ok":true}"#),
+            flow(2, "/api/users/102", br#"{"ok":true}"#),
+            flow(3, "/api/search?q=shoes&page=2", br#"{"ok":true}"#),
+            flow(4, "/api/search?q=hats&page=10#top", br#"{"ok":true}"#),
+            flow(5, "/api/orders/7f3c2a90-1b4e-4c1a-9d2f-0a1b2c3d4e5f", b"{}"),
+            flow(6, "/oauth2callback?code=abc123", b"{}"),
+            flow(7, "/files/9f86d081884c7d659a2feaa0", b"{}"),
+        ];
+        assert_eq!(
+            templates(&flows),
+            [
+                "GET /api/orders/{id}",
+                "GET /api/search",
+                "GET /api/users/{id}",
+                "GET /files/{id}",
+                "GET /oauth2callback",
+            ]
+        );
+    }
+
+    #[test]
+    fn path_only_strips_query_and_fragment() {
+        assert_eq!(path_only("/a/b?x=1&y=2"), "/a/b");
+        assert_eq!(path_only("/a/b#frag"), "/a/b");
+        assert_eq!(path_only("/a?x=1#f"), "/a");
+        assert_eq!(path_only("/a/b"), "/a/b");
     }
 
     /// The selected shape of a schema slot.

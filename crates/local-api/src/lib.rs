@@ -358,6 +358,9 @@ struct SurfaceEndpointSummary {
     /// bundled SDK's configured base URL). Lets the GUI mark inferred candidates
     /// distinctly from confirmed surface so neither is presented as the other.
     evidence_source: &'static str,
+    /// Whether any fact also traces to static analysis (the endpoint is in the
+    /// app's code as well as, or instead of, observed traffic).
+    static_evidence: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     minimum_fact_confidence: Option<f64>,
     signer_count: usize,
@@ -1157,6 +1160,10 @@ fn surface_summary(surface: &apiaxess_api_model::UnifiedApiSurface) -> SurfaceSu
                 } else {
                     "static_inferred"
                 },
+                static_evidence: endpoint.fact_confidence.iter().any(|fact| {
+                    fact.sources
+                        .contains(&apiaxess_api_model::SourceType::StaticAnalysis)
+                }),
                 minimum_fact_confidence: endpoint
                     .fact_confidence
                     .iter()
