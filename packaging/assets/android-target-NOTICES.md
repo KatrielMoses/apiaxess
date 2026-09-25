@@ -24,10 +24,11 @@ exact versions and the file inventory are in `android-target-provenance.json` an
 - **APIaxess client APK** (`com.apiaxess.client`): first-party APIaxess software,
   staged from this repository's own build. Not third-party.
 - **ws-scrcpy** (screen streaming, Phase D2): **MIT License**, © the ws-scrcpy
-  authors (NetrisTV and contributors). APIaxess ships a pinned fork carrying only
-  a base-path / loopback-bind configuration change; the MIT licence text and the
-  copyright notice are preserved in `ws-scrcpy/LICENSE` beside the staged payload.
-  ws-scrcpy bundles scrcpy-server (Apache-2.0) which it pushes to the guest.
+  authors (NetrisTV and contributors). APIaxess ships unmodified upstream
+  ws-scrcpy, pinned by commit SHA, and runs it under the reverse-proxy base path
+  via its own `WS_SCRCPY_PATHNAME` setting (no source patch); the MIT licence text
+  and the copyright notice are preserved in `ws-scrcpy/LICENSE` beside the staged
+  payload. ws-scrcpy bundles scrcpy-server (Apache-2.0) which it pushes to the guest.
 - **Node.js runtime** (streaming host, Phase D2): the OpenJS Foundation Node.js
   distribution, shipped **unmodified** from nodejs.org. Node.js is under the MIT
   License; its bundled components (V8, libuv, OpenSSL, etc.) carry their own

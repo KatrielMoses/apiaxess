@@ -82,16 +82,16 @@ ws_scrcpy_port = 8000
 [artifacts]
 client_apk = "apps/android/artifacts/apiaxess-client-0.1.0-debug.apk"
 
-# Screen streaming (Phase D2): a pinned ws-scrcpy fork (MIT) on a bundled Node
-# runtime, staged into the add-on. ws-scrcpy has NO built-in auth and is bound to
-# 127.0.0.1 only — it is never directly reachable; the engine reverse-proxies it
-# behind the workbench origin-guard + session/device token. The fork is built to
-# serve from `base_path` (WS_SCRCPY_PATHNAME) so its own asset/WebSocket URLs stay
-# same-origin under the engine proxy, and it uses ws-scrcpy's "proxy over adb"
-# interface mode (the emulator quirk: scrcpy-server listens on the AVD's internal
-# interface). Assembly (Node + `npm run dist`) runs in the release pipeline; a
-# payload assembled without it still boots and captures traffic (the engine reports
-# sandbox.android-stream-unavailable).
+# Screen streaming (Phase D2): a pinned ws-scrcpy (MIT) on a bundled Node runtime,
+# staged into the add-on. ws-scrcpy has NO built-in auth; the engine reverse-proxies
+# it behind the workbench origin-guard + session/device token and connects to it on
+# loopback. ws-scrcpy is run with WS_SCRCPY_PATHNAME=`base_path` so its own asset,
+# deep-link, and WebSocket URLs stay same-origin UNDER the engine proxy's prefix
+# (and carry the stream cookie), and in "proxy over adb" interface mode (the
+# emulator quirk: scrcpy-server listens on the AVD's internal interface). Assembly
+# (Node + `npm run dist`) runs in the release pipeline; a payload assembled without
+# it still boots and captures traffic (the engine reports sandbox.android-stream-
+# unavailable). The pinned revision MUST support WS_SCRCPY_PATHNAME (see below).
 [streaming]
 # The base path the engine reverse-proxies the view under and the fork serves from.
 base_path = "/android-stream/"
@@ -109,9 +109,22 @@ url = "https://nodejs.org/dist/v20.17.0/node-v20.17.0-win-x64.zip"
 [streaming.node.linux_x64]
 url = "https://nodejs.org/dist/v20.17.0/node-v20.17.0-linux-x64.tar.xz"
 
-# Pinned ws-scrcpy fork (MIT). The APIaxess fork carries the base-path + loopback
-# bind configuration; pinned by git ref so the build is reproducible. Attribution
+# Pinned ws-scrcpy (MIT), by commit SHA so the build is reproducible. Attribution
 # is in android-target-NOTICES.md.
+#
+# Base-path routing is mandatory here: the engine reverse-proxies ws-scrcpy under
+# `base_path` and sets WS_SCRCPY_PATHNAME (plus WS_SCRCPY_HOST/PORT) at runtime so
+# ws-scrcpy's own asset, deep-link, and WebSocket URLs stay same-origin UNDER the
+# `/android-stream/` prefix (and so carry the stream cookie/token). The tagged
+# release v0.8.1 PREDATES WS_SCRCPY_PATHNAME (upstream added it after v0.8.1, on
+# master), so pinning v0.8.1 built an unprefixed ws-scrcpy: the embedded iframe
+# then showed the Device Tracker and its player/decoder deep-links resolved at the
+# GUI root without the prefix or token — the D4 streaming regression. The pin is
+# therefore a post-WS_SCRCPY_PATHNAME master commit. There is no separate fork;
+# the base-path support is upstream. (A fresh assembly on a build host + emulator
+# is still required to verify the live stream end-to-end.)
 [streaming.ws_scrcpy]
 repo = "https://github.com/NetrisTV/ws-scrcpy"
-git_ref = "v0.8.1"
+# master @ 2026-08-24 — supports the WS_SCRCPY_PATHNAME base-path routing the engine
+# relies on (documented under upstream "Run configuration"), unlike v0.8.1.
+git_ref = "8855ad1184ec7b41f1b28d1b899856f828e09c3e"

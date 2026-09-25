@@ -81,7 +81,7 @@ $emulatorPkg = Read-ManifestField -Section "sdk_packages" -Field "emulator" -Man
 $platformToolsPkg = Read-ManifestField -Section "sdk_packages" -Field "platform_tools" -Manifest $manifest
 $cmdToolsUrl = Read-ManifestField -Section "cmdline_tools.$Platform" -Field "url" -Manifest $manifest
 if (-not $ClientApk) { $ClientApk = Join-Path $repositoryRoot (Read-ManifestField -Section "artifacts" -Field "client_apk" -Manifest $manifest) }
-# Streaming (Phase D2): pinned Node + ws-scrcpy fork, staged into the payload.
+# Streaming (Phase D2): pinned Node + upstream ws-scrcpy (by commit SHA), staged into the payload.
 $streamBasePath = Read-ManifestField -Section "streaming" -Field "base_path" -Manifest $manifest
 $streamNodeDir = Read-ManifestField -Section "streaming" -Field "node_dir" -Manifest $manifest
 $streamWsDir = Read-ManifestField -Section "streaming" -Field "ws_scrcpy_dir" -Manifest $manifest
@@ -188,7 +188,7 @@ else {
     Write-Warning "Client APK not found at $ClientApk; the add-on will assemble without it. First-boot provisioning reports android-target.client-apk-missing until it is staged at <root>/$clientApkRel (build apps/android and re-run, or pass -ClientApk)."
 }
 
-# --- Stage the screen-streaming components (Phase D2): Node + ws-scrcpy fork ---
+# --- Stage the screen-streaming components (Phase D2): Node + ws-scrcpy ---
 # Best-effort: a failure here (or -SkipStreaming) still yields a bootable,
 # traffic-capturing target; the engine reports sandbox.android-stream-unavailable
 # until streaming is staged. ws-scrcpy binds loopback only and is reverse-proxied
@@ -232,13 +232,18 @@ if (-not $SkipStreaming) {
         }
         if (-not (Test-Path -LiteralPath $nodeExe)) { throw "Node executable not found at $nodeExe after staging." }
 
-        # Fetch the pinned ws-scrcpy fork (GitHub archive of the ref) and build dist.
+        # Fetch pinned ws-scrcpy (GitHub archive of the ref) and build dist.
         $wsRoot = Join-Path $sdkRoot $streamWsDir
         if (Test-Path -LiteralPath $wsRoot) { Remove-Item -LiteralPath $wsRoot -Recurse -Force }
         $wsZip = Join-Path $CacheDirectory ("ws-scrcpy-$wsScrcpyRef.zip")
         if (-not (Test-Path -LiteralPath $wsZip)) {
-            $archiveUrl = "$($wsScrcpyRepo.TrimEnd('/'))/archive/refs/tags/$wsScrcpyRef.zip"
-            Write-Host "Downloading pinned ws-scrcpy fork ($wsScrcpyRef)..."
+            # GitHub's archive path differs by ref kind: a 40-hex commit SHA is
+            # /archive/<sha>.zip, whereas a tag is /archive/refs/tags/<tag>.zip. The
+            # pin is a commit SHA (base-path support landed on master after v0.8.1),
+            # so route on the ref shape rather than assuming a tag.
+            $archivePath = if ($wsScrcpyRef -match '^[0-9a-fA-F]{40}$') { "archive/$wsScrcpyRef.zip" } else { "archive/refs/tags/$wsScrcpyRef.zip" }
+            $archiveUrl = "$($wsScrcpyRepo.TrimEnd('/'))/$archivePath"
+            Write-Host "Downloading pinned ws-scrcpy ($wsScrcpyRef)..."
             Invoke-WebRequest -UseBasicParsing -Uri $archiveUrl -OutFile $wsZip
         }
         $wsExtract = Join-Path $CacheDirectory "ws-scrcpy-extract"
@@ -251,16 +256,24 @@ if (-not $SkipStreaming) {
         Push-Location $wsRoot
         try {
             $env:PATH = "$([System.IO.Path]::GetDirectoryName($nodeExe));$env:PATH"
+            # Bake the reverse-proxy base path into the build too. ws-scrcpy honors
+            # WS_SCRCPY_PATHNAME at runtime (the engine sets it when it spawns
+            # ws-scrcpy), but webpack's publicPath is resolved at build, so set it
+            # here as well so bundled asset URLs carry the prefix regardless.
+            $env:WS_SCRCPY_PATHNAME = $streamBasePath
             & $npmCmd ci
             if ($LASTEXITCODE -ne 0) { throw "npm ci failed for ws-scrcpy." }
             & $npmCmd run dist
             if ($LASTEXITCODE -ne 0) { throw "npm run dist failed for ws-scrcpy." }
         }
-        finally { Pop-Location }
+        finally {
+            Remove-Item Env:\WS_SCRCPY_PATHNAME -ErrorAction SilentlyContinue
+            Pop-Location
+        }
         if (-not (Test-Path -LiteralPath (Join-Path $wsRoot $streamWsEntry))) {
             throw "ws-scrcpy build did not produce $streamWsEntry."
         }
-        # Preserve the MIT licence beside the staged fork for attribution.
+        # Preserve the MIT licence beside the staged payload for attribution.
         $streamingStaged = $true
         Write-Host "Staged ws-scrcpy ($wsScrcpyRef) on Node runtime for loopback streaming."
     }
@@ -330,7 +343,7 @@ $provenance = [ordered]@{
     ownedAvd        = $avdName
     clientApkStaged = $clientApkStaged
     streamingStaged = $streamingStaged
-    source          = "android-sdk (google signed repository); client APK + frida-server from this repository; ws-scrcpy fork + Node from upstream"
+    source          = "android-sdk (google signed repository); client APK + frida-server from this repository; ws-scrcpy + Node from upstream"
     licenses        = @("Apache-2.0 (AOSP userspace)", "GPL-2.0 (Linux kernel)", "GPL-2.0 (QEMU emulator)", "wxWindows-3.1 (frida-server)", "first-party (APIaxess client APK)", "MIT (ws-scrcpy)", "MIT (Node.js)")
 }
 Write-Utf8NoBom -Path (Join-Path $sdkRoot "android-target-provenance.json") -Content ($provenance | ConvertTo-Json -Depth 5)
