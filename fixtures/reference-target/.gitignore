@@ -1,0 +1,18 @@
+# Gradle / Android build outputs — the built APK is never committed.
+.gradle/
+.kotlin/
+build/
+/app/build/
+/artifacts/
+
+# Local SDK location and signing material.
+local.properties
+*.keystore
+*.jks
+
+# IDE
+.idea/
+*.iml
+
+# The Gradle wrapper JAR is a binary; build.sh uses a local Gradle 8.9 instead.
+gradle/wrapper/gradle-wrapper.jar

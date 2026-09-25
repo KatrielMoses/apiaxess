@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MailAccess</string>
+    <string name="settings_title">Settings</string>
+    <string name="action_create_user">Create user</string>
+    <string name="action_update_user">Update user</string>
+    <string name="action_delete_user">Delete user</string>
+    <string name="action_search">Search</string>
+    <string name="action_load_order">Load order</string>
+    <string name="action_reports">Reports</string>
+    <string name="action_load_profile">Load profile</string>
+    <string name="action_open_settings">Open settings</string>
+    <string name="action_save_settings">Save settings</string>
+    <string name="action_clear_session">Clear session</string>
+</resources>
