@@ -124,7 +124,7 @@ interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunI
 interface DiscoveryEstimate { target: string; requestCount: number; ratePerSecond: number; estimatedLabel: string; }
 interface BrowserLaunchStatus { running: boolean; browser?: string | null; target?: string | null; pid?: number | null; cdpConnected?: boolean; debugPort?: number | null; }
 interface TargetIdentifier { readonly kind: string; readonly value: string; }
-interface SessionStatus { readonly sessionId: string; readonly lifecycle: string; readonly artifactPath: string; readonly storePath: string; readonly flowCount: number; readonly resendCount: number; readonly fuzzerCount: number; readonly scopeConfigured: boolean; readonly recoveredFromCheckpoint: boolean; readonly lastCheckpointAt?: string | null; readonly scope?: { readonly declared_at?: string; readonly target?: { readonly target_type?: string; readonly primary?: TargetIdentifier } }; readonly analysisPipeline?: { readonly run_id?: string; readonly artifact_path?: string } | null; }
+interface SessionStatus { readonly sessionId: string; readonly lifecycle: string; readonly artifactPath: string; readonly storePath: string; readonly flowCount: number; readonly resendCount: number; readonly fuzzerCount: number; readonly scopeConfigured: boolean; readonly recoveredFromCheckpoint: boolean; readonly lastCheckpointAt?: string | null; readonly scope?: { readonly declared_at?: string; readonly target?: { readonly target_type?: string; readonly primary?: TargetIdentifier }; readonly allowed_targets?: readonly ScopeRule[] }; readonly analysisPipeline?: { readonly run_id?: string; readonly artifact_path?: string } | null; }
 interface AuditActionDescriptor { readonly kind: string; readonly summary: string; }
 interface AuditRecord { readonly id: string; readonly occurred_at: string; readonly action: AuditActionDescriptor; readonly outcome: string; readonly diagnostics: (Diagnostic | null)[]; }
 
@@ -224,6 +224,10 @@ const androidStop = document.querySelector<HTMLButtonElement>("#android-stop");
 const androidPhaseBadge = document.querySelector<HTMLElement>("#android-phase-badge");
 const androidStatus = document.querySelector<HTMLElement>("#android-status");
 const androidInstallPanel = document.querySelector<HTMLElement>("#android-install-panel");
+const androidScopeHost = document.querySelector<HTMLInputElement>("#android-scope-host");
+const androidScopeAdd = document.querySelector<HTMLButtonElement>("#android-scope-add");
+const androidScopeList = document.querySelector<HTMLUListElement>("#android-scope-list");
+const androidScopeHint = document.querySelector<HTMLElement>("#android-scope-hint");
 const androidApkPath = document.querySelector<HTMLInputElement>("#android-apk-path");
 const androidApkBrowse = document.querySelector<HTMLButtonElement>("#android-apk-browse");
 const androidApkFile = document.querySelector<HTMLInputElement>("#android-apk-file");
@@ -4161,6 +4165,65 @@ function hostOf(url: string): string {
 
 interface ScopeRule { id: string; host: { kind: string; domain?: string; host?: string }; ports: number[] }
 
+/** The label a scope rule is shown with: its exact host or its domain. */
+function scopeRuleLabel(rule: ScopeRule): string {
+  return rule.host.kind === "exact" ? (rule.host.host ?? "") : (rule.host.domain ?? "");
+}
+
+/** Renders the declared scope on the Android target's Capture scope panel. */
+function renderAndroidScope(status: SessionStatus): void {
+  if (androidScopeList === null) return;
+  const rules = status.scope?.allowed_targets ?? [];
+  androidScopeList.replaceChildren(...rules.map((rule) => {
+    const item = document.createElement("li");
+    item.className = "scope-list__item";
+    const label = scopeRuleLabel(rule);
+    item.append(document.createTextNode(rule.host.kind === "exact" ? label : `*.${label}`));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "scope-list__remove";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${label} from scope`);
+    remove.addEventListener("click", () => void removeScopeRule(rule.id, label));
+    item.append(remove);
+    return item;
+  }));
+  if (androidScopeHint !== null) androidScopeHint.textContent = rules.length === 0 ? "none declared" : `${rules.length} in scope`;
+}
+
+/** Removes one allow rule from the active session scope. */
+async function removeScopeRule(ruleId: string, label: string): Promise<void> {
+  try {
+    const current = await fetch("/api/v1/session/scope");
+    await requireOk(current, "scope read failed");
+    const scope = await current.json() as { allowed_targets?: ScopeRule[] };
+    scope.allowed_targets = (scope.allowed_targets ?? []).filter((rule) => rule.id !== ruleId);
+    const put = await fetch("/api/v1/session/scope", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(scope) });
+    await requireOk(put, "scope update failed");
+    toast(`Removed ${label} from scope`, "success");
+    await refreshSession();
+  } catch (error) {
+    reportUnexpected(error, { id: "web.scope-remove-failed", what: "Could not remove the host from scope.", why: "", fix: "Confirm a session is active, then retry." });
+  }
+}
+
+/** Adds the host typed on the Android target's Capture scope panel. */
+async function addAndroidScopeHost(): Promise<void> {
+  if (androidScopeHost === null) return;
+  const typed = androidScopeHost.value.trim();
+  if (typed === "") {
+    showDiagnostic({ id: "android.scope-host-empty", what: "No host to add.", why: "The Host in scope field is empty.", fix: "Type the host the app talks to (for example api.example.com), then add it." });
+    return;
+  }
+  const host = hostOf(typed.includes("://") ? typed : `https://${typed}`);
+  if (scopeTargetForHost(host) === null) {
+    showDiagnostic({ id: "android.scope-host-invalid", what: `"${typed}" is not a host.`, why: "Scope rules name a host or domain.", fix: "Type a host such as api.example.com or an IP address." });
+    return;
+  }
+  await addHostToScope(host);
+  androidScopeHost.value = "";
+}
+
 /** Adds a domain (and its subdomains) to the active session scope as a
  *  DomainSuffix allow rule, so its traffic is treated as in-scope. Adds the
  *  registrable domain, never the specific endpoint. */
@@ -5354,6 +5417,7 @@ function renderSession(status: SessionStatus): void {
   if (sessionChanged) refreshLayoutForSession();
   if (sessionBadge !== null) sessionBadge.textContent = status.lifecycle;
   updateScopePill(status);
+  renderAndroidScope(status);
   if (sessionDetail === null) return;
   sessionDetail.innerHTML = `<div class="stack">
 <div class="metric-grid">
@@ -5369,7 +5433,7 @@ function renderSession(status: SessionStatus): void {
   <dt>Store</dt><dd class="t-mono">${escapeHtml(status.storePath)}</dd>
   <dt>Checkpoint</dt><dd>${status.lastCheckpointAt === undefined || status.lastCheckpointAt === null ? "none this run" : escapeHtml(formatTime(status.lastCheckpointAt))}</dd>
 </dl>
-${status.scopeConfigured ? "" : `<div class="notice notice--caution"><span class="notice__icon">${icon("shield", { size: 18 })}</span><div class="notice__body"><p class="notice__title">No network allow rules declared</p><p>Active work is gated on a declared scope. Start a web session, or run an APK analysis, to establish one.</p></div></div>`}
+${status.scopeConfigured ? "" : `<div class="notice notice--caution"><span class="notice__icon">${icon("shield", { size: 18 })}</span><div class="notice__body"><p class="notice__title">No network allow rules declared</p><p>Active work is gated on a declared scope. Start a web session, run an APK analysis, or add hosts on the Android target's Capture scope panel to establish one.</p></div></div>`}
 ${status.recoveredFromCheckpoint ? `<div class="notice notice--accent"><span class="notice__icon">${icon("info", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Recovered from a checkpoint</p><p>Compact metadata newer than the full artifact was found and used. Save the session to write a full artifact again.</p></div></div>` : ""}
 </div>`;
 }
@@ -5390,13 +5454,19 @@ function updateScopePill(status: SessionStatus): void {
     pill.classList.remove("is-unscoped");
     if (label !== null) label.textContent = "AUTHORIZED";
     const primary = status.scope?.target?.primary?.value ?? "";
+    const rules = status.scope?.allowed_targets ?? [];
     let shown = "";
-    if (primary !== "") {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(primary)) {
       try {
         shown = new URL(primary).host;
       } catch {
         shown = primary;
       }
+    } else if (rules.length > 0) {
+      // A session without a URL target (Android target, workbench) is scoped by
+      // its host rules alone; name them rather than an internal session id.
+      const first = scopeRuleLabel(rules[0]!);
+      shown = rules.length > 1 ? `${first} +${rules.length - 1}` : first;
     }
     if (host !== null) host.textContent = shown;
     pill.title = shown === "" ? "Active scope is authorized" : `Authorized scope: ${shown}`;
@@ -5904,6 +5974,13 @@ function paintShell(): void {
     else leaveAndroidView();
   });
   androidLaunch?.addEventListener("click", () => void launchAndroidTarget());
+  androidScopeAdd?.addEventListener("click", () => void addAndroidScopeHost());
+  androidScopeHost?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void addAndroidScopeHost();
+    }
+  });
   androidStop?.addEventListener("click", () => void stopAndroidTarget());
   androidApkInstall?.addEventListener("click", () => void installTargetApk());
   androidApkBrowse?.addEventListener("click", () => void browseForAndroidApk());
@@ -6374,6 +6451,39 @@ function androidStatusBody(status: AndroidTargetStatus): string {
   return `${progress}${androidStepsMarkup(status)}${androidDiagnosticNotices(status)}`;
 }
 
+/** ws-scrcpy's scrcpy-server port on the device, which its "proxy over adb"
+ *  interface reaches (`remote=tcp:8886`). */
+const SCRCPY_SERVER_REMOTE = "tcp:8886";
+
+/**
+ * The embedded screen's URL: ws-scrcpy's stream view for one device, opened
+ * directly rather than its Device Tracker. Mirrors the deep-link ws-scrcpy
+ * itself builds: the page is served under `/android-stream/` (the engine's
+ * authenticated proxy, `?token=` sets the stream cookie), and the stream
+ * WebSocket is same-origin under the same prefix so the cookie authenticates it.
+ */
+function androidStreamSrc(serial: string, token: string, player: string, location: Location): string {
+  const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+  const stream = `${wsScheme}://${location.host}/android-stream/?action=proxy-adb&remote=${encodeURIComponent(SCRCPY_SERVER_REMOTE)}&udid=${encodeURIComponent(serial)}`;
+  const view = `action=stream&udid=${encodeURIComponent(serial)}&player=${encodeURIComponent(player)}&ws=${encodeURIComponent(stream)}&fitToScreen=true`;
+  return `/android-stream/?token=${encodeURIComponent(token)}#!${view}`;
+}
+
+/** ws-scrcpy player to decode the H.264 stream with: the browser's WebCodecs
+ *  decoder when it can decode H.264, else the pure-JavaScript Broadway decoder
+ *  (slower, but works in any browser). */
+async function preferredStreamPlayer(): Promise<"webcodecs" | "broadway"> {
+  try {
+    if (typeof VideoDecoder !== "undefined") {
+      const support = await VideoDecoder.isConfigSupported({ codec: "avc1.42E01E" });
+      if (support.supported === true) return "webcodecs";
+    }
+  } catch {
+    // Fall through to the software decoder.
+  }
+  return "broadway";
+}
+
 /**
  * Mounts or unmounts the embedded ws-scrcpy screen. It is mounted exactly once
  * per live stream: re-rendering the iframe on a status poll would reload and reset
@@ -6384,9 +6494,17 @@ function updateAndroidScreen(status: AndroidTargetStatus): void {
   const canStream = status.phase === "ready" && status.streaming;
   if (canStream) {
     if (androidScreenMounted) return;
-    const src = `/android-stream/?token=${encodeURIComponent(operatorToken)}`;
-    androidScreen.innerHTML = `<iframe class="android-screen__frame" title="Android target screen" src="${escapeHtml(src)}" allow="clipboard-read; clipboard-write"></iframe>`;
     androidScreenMounted = true;
+    const screen = androidScreen;
+    const serial = status.serial;
+    void preferredStreamPlayer().then((player) => {
+      if (!androidScreenMounted) return;
+      // Without a serial there is no device to open; the tracker lists what is attached.
+      const src = serial === null
+        ? `/android-stream/?token=${encodeURIComponent(operatorToken)}`
+        : androidStreamSrc(serial, operatorToken, player, window.location);
+      screen.innerHTML = `<iframe class="android-screen__frame" title="Android target screen" src="${escapeHtml(src)}" allow="clipboard-read; clipboard-write"></iframe>`;
+    });
     return;
   }
   androidScreenMounted = false;

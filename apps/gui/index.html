@@ -557,6 +557,34 @@
                 <div class="panel__body" id="android-status"></div>
               </article>
 
+              <article class="panel" id="android-scope-panel">
+                <div class="panel__header">
+                  <div class="panel__heading"><span data-icon="shield"></span><h2>Capture scope</h2></div>
+                  <span class="panel__hint" id="android-scope-hint">none declared</span>
+                </div>
+                <div class="panel__body stack">
+                  <div class="field">
+                    <label class="field__label" for="android-scope-host">Host in scope</label>
+                    <div class="filepicker">
+                      <input
+                        class="input input--mono"
+                        id="android-scope-host"
+                        type="text"
+                        spellcheck="false"
+                        placeholder="api.example.com"
+                      />
+                      <button class="btn" id="android-scope-add" type="button">Add to scope</button>
+                    </div>
+                    <p class="field__hint">
+                      The app's backend and any third-party hosts you are authorized to capture.
+                      Only in-scope traffic reaches the fused surface; traffic already captured
+                      from a host is re-classified when you add it.
+                    </p>
+                  </div>
+                  <ul class="scope-list" id="android-scope-list" aria-label="Hosts in scope"></ul>
+                </div>
+              </article>
+
               <article class="panel" id="android-install-panel" hidden>
                 <div class="panel__header">
                   <div class="panel__heading"><span data-icon="folder"></span><h2>Install target APK</h2></div>

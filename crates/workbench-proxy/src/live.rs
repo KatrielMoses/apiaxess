@@ -631,6 +631,25 @@ impl LiveWorkbench {
             .disposition
     }
 
+    /// Promotes stored flows that the current engagement scope now covers to
+    /// in-scope (upgrade-only), so traffic captured before the scope was
+    /// declared or widened is not silently left out of fusion. Returns how many
+    /// flows were promoted; `0` when no store is attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the store cannot be read or updated.
+    pub fn promote_stored_flows_into_scope(&self) -> Result<usize, Diagnostic> {
+        let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
+            return Ok(0);
+        };
+        store.promote_to_in_scope(|host, url| {
+            host.map_or(ScopeDisposition::Undetermined, |host| {
+                self.classify_scope(host, url)
+            })
+        })
+    }
+
     /// Imports HAR entries into the attached durable store.
     ///
     /// # Errors

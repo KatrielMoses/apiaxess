@@ -1607,6 +1607,44 @@ mark.findhit.is-current {
    chip lets the tester tell the app's own backend from the SDK/tracker hosts it
    also calls. Third-party gets the caution tone (noise to triage), first-party
    the calm accent (the target's own API). */
+/* Android target: declared capture scope, one removable chip per host rule. */
+.scope-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.scope-list:empty {
+  display: none;
+}
+
+.scope-list__item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0.1rem 0.1rem 0.1rem var(--space-2);
+  border: var(--border-hairline) solid var(--color-rule-strong);
+  border-radius: var(--radius-xs);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+}
+
+.scope-list__remove {
+  padding: 0 var(--space-1);
+  border: 0;
+  background: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.scope-list__remove:hover,
+.scope-list__remove:focus-visible {
+  color: var(--color-text);
+}
+
 .party-chip {
   display: inline-flex;
   align-items: center;

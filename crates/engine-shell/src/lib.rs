@@ -534,6 +534,10 @@ impl Engine {
         })?;
         runtime.replace_session(session)?;
         self.set_engagement_scope(runtime.session_snapshot()?.engagement_scope().clone());
+        // Traffic captured before this scope existed (or before a host was added)
+        // was classified against the old scope; re-classify it now so it reaches
+        // fusion instead of being silently excluded.
+        self.live_workbench.promote_stored_flows_into_scope()?;
         runtime.save()
     }
 
@@ -1371,26 +1375,33 @@ impl Engine {
         })
     }
 
-    /// The loopback port the GUI Android target's ws-scrcpy stream is bound to
-    /// (Phase D2), when a stream is running. The local-api reverse-proxy uses this
-    /// as its upstream; `None` means no stream is active, so the Android view
-    /// returns the honest `sandbox.android-stream-not-active` diagnostic.
+    /// The GUI Android target's running ws-scrcpy stream (Phase D2) as the
+    /// reverse-proxy upstream: its loopback port and the base path it was started
+    /// to serve under (`WS_SCRCPY_PATHNAME`, e.g. `/android-stream/`). `None` means
+    /// no stream is active, so the Android view returns the honest
+    /// `sandbox.android-stream-not-active` diagnostic.
     #[must_use]
-    pub fn android_stream_port(&self) -> Option<u16> {
+    pub fn android_stream_upstream(&self) -> Option<(u16, String)> {
         // Advanced/dev override: point the reverse-proxy at an externally-run
         // ws-scrcpy (e.g. a manually started stream) without launching the add-on.
+        // It is assumed to serve under the same base path the add-on uses unless
+        // `APIAXESS_ANDROID_STREAM_BASE_PATH` says otherwise.
         if let Some(port) = std::env::var("APIAXESS_ANDROID_STREAM_PORT")
             .ok()
             .and_then(|value| value.trim().parse::<u16>().ok())
             .filter(|port| *port != 0)
         {
-            return Some(port);
+            let base_path = std::env::var("APIAXESS_ANDROID_STREAM_BASE_PATH")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/android-stream/".to_owned());
+            return Some((port, base_path));
         }
         let stream = self.android_stream.lock().ok()?;
         stream
             .as_ref()
             .filter(|stream| stream.is_running())
-            .map(apiaxess_sandbox::android_target::AndroidTargetStream::port)
+            .map(|stream| (stream.port(), stream.base_path().to_owned()))
     }
 
     /// Stops the GUI Android target booted this session (Phase D1) and its

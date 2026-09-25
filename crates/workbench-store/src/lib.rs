@@ -1404,6 +1404,69 @@ impl TrafficStore {
         Ok(())
     }
 
+    /// Re-classifies stored flows against a scope that was declared or widened
+    /// after they were captured, promoting each flow the classifier now puts in
+    /// scope to `InScope`. Upgrade-only: an `InScope` flow is never demoted, so
+    /// traffic admitted earlier (for example by the sandboxed APK pass) keeps
+    /// reaching fusion. Returns how many flows were promoted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the metadata cannot be read or updated.
+    pub fn promote_to_in_scope(
+        &self,
+        classify_scope: impl Fn(Option<&str>, Option<&str>) -> ScopeDisposition,
+    ) -> Result<usize, Diagnostic> {
+        let in_scope = serde_json::to_string(&ScopeDisposition::InScope)
+            .map_err(|e| serialization_diag("scope", &e.to_string()))?;
+        let connection = self.connection.lock().map_err(|_| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                "lock",
+                &self.root,
+                "database mutex poisoned",
+            )
+        })?;
+        let corrupt = |step: &str, error: &rusqlite::Error| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                step,
+                &self.root,
+                &error.to_string(),
+            )
+        };
+        let candidates = {
+            let mut statement = connection
+                .prepare("SELECT id,host,url FROM flows WHERE scope != ?1")
+                .map_err(|e| corrupt("query", &e))?;
+            let rows = statement
+                .query_map(params![in_scope], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| corrupt("query", &e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| corrupt("read", &e))?
+        };
+        let mut promoted = 0;
+        for (id, host, url) in candidates {
+            if classify_scope(host.as_deref(), url.as_deref()) != ScopeDisposition::InScope {
+                continue;
+            }
+            connection
+                .execute(
+                    "UPDATE flows SET scope=?1 WHERE id=?2",
+                    params![in_scope, id],
+                )
+                .map_err(|e| corrupt("write", &e))?;
+            promoted += 1;
+        }
+        Ok(promoted)
+    }
+
     /// Reads one complete flow and resolves its content-addressed bodies.
     ///
     /// # Errors
@@ -3136,6 +3199,41 @@ mod tests {
             provenance: "proxy.hudsucker".to_owned(),
             origin: FlowOrigin::Capture,
         }
+    }
+
+    #[test]
+    fn flows_captured_before_a_scope_covered_them_are_promoted_not_demoted() {
+        let store = store();
+        let mut before = flow(1);
+        before.host = Some("api.mailbox.test".to_owned());
+        before.scope = ScopeDisposition::Undetermined;
+        store.upsert(&before).expect("insert");
+        let mut vendor = flow(2);
+        vendor.host = Some("feed.vendor.test".to_owned());
+        vendor.scope = ScopeDisposition::OutsideDeclaredScope;
+        store.upsert(&vendor).expect("insert");
+        let mut unrelated = flow(3);
+        unrelated.host = Some("noise.other.test".to_owned());
+        unrelated.scope = ScopeDisposition::OutsideDeclaredScope;
+        store.upsert(&unrelated).expect("insert");
+        // Already admitted (e.g. by the sandboxed APK pass) and not covered by
+        // the new scope: must stay in scope.
+        let mut admitted = flow(4);
+        admitted.host = Some("cdn.elsewhere.test".to_owned());
+        store.upsert(&admitted).expect("insert");
+
+        let promoted = store
+            .promote_to_in_scope(|host, _url| match host {
+                Some("api.mailbox.test" | "feed.vendor.test") => ScopeDisposition::InScope,
+                _ => ScopeDisposition::OutsideDeclaredScope,
+            })
+            .expect("promote");
+        assert_eq!(promoted, 2);
+        let scope_of = |id| store.get(id).expect("read").expect("present").scope;
+        assert_eq!(scope_of(1), ScopeDisposition::InScope);
+        assert_eq!(scope_of(2), ScopeDisposition::InScope);
+        assert_eq!(scope_of(3), ScopeDisposition::OutsideDeclaredScope);
+        assert_eq!(scope_of(4), ScopeDisposition::InScope);
     }
 
     #[test]

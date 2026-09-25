@@ -105,15 +105,18 @@ pub(crate) async fn stream_proxy(State(state): State<ApiState>, request: Request
         Err(response) => return response,
     };
 
-    let Some(port) = state.engine.android_stream_port() else {
+    let Some((port, base_path)) = state.engine.android_stream_upstream() else {
         let diagnostic = apiaxess_diagnostics::catalogue::ANDROID_STREAM_NOT_ACTIVE
             .instantiate(apiaxess_diagnostics::DiagnosticContext::new());
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(diagnostic)).into_response();
     };
 
+    // ws-scrcpy is started to serve under its own base path (`WS_SCRCPY_PATHNAME`),
+    // so the upstream path keeps that prefix: `/android-stream/x` -> `/android-stream/x`.
+    let upstream_path = upstream_path(&base_path, &tail);
     if is_upgrade {
         return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-            Ok(upgrade) => proxy_websocket(port, &tail, uri.query(), upgrade),
+            Ok(upgrade) => proxy_websocket(port, &upstream_path, uri.query(), upgrade),
             Err(rejection) => rejection.into_response(),
         };
     }
@@ -121,7 +124,7 @@ pub(crate) async fn stream_proxy(State(state): State<ApiState>, request: Request
     let Ok(body) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    proxy_http(port, &method, &tail, &uri, &headers, body, &auth).await
+    proxy_http(port, &method, &upstream_path, &uri, &headers, body, &auth).await
 }
 
 /// Whether the request is a WebSocket upgrade (`Upgrade: websocket` +
@@ -223,13 +226,13 @@ fn reject() -> Response {
 async fn proxy_http(
     port: u16,
     method: &Method,
-    tail: &str,
+    path: &str,
     uri: &Uri,
     headers: &HeaderMap,
     body: Bytes,
     auth: &StreamAuth,
 ) -> Response {
-    let target_url = upstream_url("http", port, tail, uri.query());
+    let target_url = upstream_url("http", port, path, uri.query());
     let mut request = http_client().request(method.clone(), target_url).body(body);
     for (name, value) in headers {
         if !is_stripped(name.as_str(), STRIPPED_REQUEST_HEADERS) {
@@ -269,11 +272,11 @@ async fn proxy_http(
 /// already been enforced before this upgrade is accepted.
 fn proxy_websocket(
     port: u16,
-    tail: &str,
+    path: &str,
     query: Option<&str>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let url = upstream_url("ws", port, tail, query);
+    let url = upstream_url("ws", port, path, query);
     upgrade.on_upgrade(move |client| bridge_sockets(client, url))
 }
 
@@ -320,11 +323,24 @@ async fn bridge_sockets(client: ws::WebSocket, upstream_url: String) {
     tokio::join!(to_upstream, to_client);
 }
 
-/// Builds the upstream URL on the loopback ws-scrcpy port, preserving the tail path
-/// and query but stripping our `token` parameter so it never reaches ws-scrcpy.
-fn upstream_url(scheme: &str, port: u16, tail: &str, query: Option<&str>) -> String {
+/// The upstream request path: ws-scrcpy's base path (normalized to `/base/`)
+/// followed by the part of the request below the engine's stream route.
+fn upstream_path(base_path: &str, tail: &str) -> String {
+    let base = base_path.trim_matches('/');
     let tail = tail.trim_start_matches('/');
-    let mut url = format!("{scheme}://127.0.0.1:{port}/{tail}");
+    if base.is_empty() {
+        format!("/{tail}")
+    } else {
+        format!("/{base}/{tail}")
+    }
+}
+
+/// Builds the upstream URL on the loopback ws-scrcpy port for an absolute path,
+/// preserving the query but stripping our `token` parameter so it never reaches
+/// ws-scrcpy.
+fn upstream_url(scheme: &str, port: u16, path: &str, query: Option<&str>) -> String {
+    let path = path.trim_start_matches('/');
+    let mut url = format!("{scheme}://127.0.0.1:{port}/{path}");
     if let Some(query) = forward_query(query) {
         url.push('?');
         url.push_str(&query);
@@ -552,6 +568,32 @@ mod tests {
             .unwrap();
         let response = stream_proxy(State(state), request).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn the_upstream_path_keeps_ws_scrcpy_base_path() {
+        // The regression: the proxy stripped `/android-stream` and ws-scrcpy, which
+        // serves only under its `WS_SCRCPY_PATHNAME`, answered `Cannot GET /`.
+        assert_eq!(upstream_path("/android-stream/", ""), "/android-stream/");
+        assert_eq!(
+            upstream_path("/android-stream/", "bundle.js"),
+            "/android-stream/bundle.js"
+        );
+        assert_eq!(
+            upstream_path("/android-stream", "/assets/decoder.wasm"),
+            "/android-stream/assets/decoder.wasm"
+        );
+        // An upstream configured to serve at the root keeps working.
+        assert_eq!(upstream_path("/", "bundle.js"), "/bundle.js");
+        assert_eq!(
+            upstream_url(
+                "ws",
+                8000,
+                &upstream_path("/android-stream/", ""),
+                Some("action=proxy-adb&token=abc&udid=emulator-5556")
+            ),
+            "ws://127.0.0.1:8000/android-stream/?action=proxy-adb&udid=emulator-5556"
+        );
     }
 
     #[test]
