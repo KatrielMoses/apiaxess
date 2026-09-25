@@ -165,6 +165,7 @@ const interceptToggle = document.querySelector<HTMLInputElement>("#intercept-tog
 const hostFilter = document.querySelector<HTMLInputElement>("#host-filter");
 const editor = document.querySelector<HTMLElement>("#editor");
 const methodInput = document.querySelector<HTMLInputElement>("#edit-method");
+const urlInput = document.querySelector<HTMLInputElement>("#edit-url");
 const headersInput = document.querySelector<HTMLTextAreaElement>("#edit-headers");
 const bodyInput = document.querySelector<HTMLTextAreaElement>("#edit-body");
 const selectedLabel = document.querySelector<HTMLElement>("#selected-label");
@@ -539,7 +540,10 @@ async function selectFlow(flowId: number): Promise<void> {
     await requireOk(response, "flow detail unavailable");
     selectedFlow = (await response.json()) as FlowDetail;
     if (methodInput !== null) methodInput.value = selectedFlow.summary.method ?? "GET";
-    if (headersInput !== null) headersInput.value = selectedFlow.requestHeaders.map(([name, value]) => `${name}: ${value}`).join("\n");
+    if (urlInput !== null) urlInput.value = selectedFlow.summary.url ?? "";
+    // Proxy-only headers are for this proxy, not the target, so they are not
+    // offered for editing (and so never go upstream on a modified forward).
+    if (headersInput !== null) headersInput.value = stripProxyArtifactHeaders(selectedFlow.requestHeaders).map(([name, value]) => `${name}: ${value}`).join("\n");
     if (bodyInput !== null) bodyInput.value = bytesToText(selectedFlow.requestBody);
     if (selectedLabel !== null) selectedLabel.textContent = `Flow #${flowId} · ${selectedFlow.summary.host ?? "unknown"}${selectedFlow.summary.path ?? ""}`;
     if (editor !== null) editor.hidden = false;
@@ -4499,8 +4503,13 @@ function editAction(action: "forward" | "drop" | "forward_modified"): void {
   const message: Record<string, unknown> = { type: "decide", flow_id: selectedFlow.summary.id, action };
   if (action === "forward_modified") {
     message.method = methodInput?.value ?? "GET";
+    message.url = urlInput?.value ?? "";
     message.headers = parseHeaders(headersInput?.value ?? "");
-    message.body = [...new TextEncoder().encode(bodyInput?.value ?? "")];
+    // An untouched body goes back as the held bytes, so a binary body is not
+    // mangled by the text round-trip through the editor.
+    const held = selectedFlow.requestBody ?? [];
+    const text = bodyInput?.value ?? "";
+    message.body = text === bytesToText(held) ? [...held] : [...new TextEncoder().encode(text)];
   }
   sendControl(message);
 }

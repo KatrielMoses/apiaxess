@@ -59,26 +59,21 @@ fn take_wire_headers(req: &mut Request<Body>) -> Option<Vec<(String, String)>> {
     Some(list)
 }
 
-/// The header list to write after an intercept edit replaced the headers:
-/// the edited map in its order, keeping authored case for names that survive.
+/// The header list to write after an intercept edit of a workbench send: the
+/// edited list in its order, keeping authored case for names that survive
+/// (the held request was shown with the `http` crate's lowercased names).
 fn wire_headers_after_edit(
     authored: &[(String, String)],
-    edited: &hudsucker::hyper::HeaderMap,
+    edited: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
     edited
-        .iter()
+        .into_iter()
         .map(|(name, value)| {
             let cased = authored
                 .iter()
-                .find(|(original, _)| original.eq_ignore_ascii_case(name.as_str()))
-                .map_or_else(
-                    || name.as_str().to_owned(),
-                    |(original, _)| original.clone(),
-                );
-            (
-                cased,
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
+                .find(|(original, _)| original.eq_ignore_ascii_case(&name))
+                .map_or(name, |(original, _)| original.clone());
+            (cased, value)
         })
         .collect()
 }
@@ -164,10 +159,15 @@ pub struct ProxyConfig {
 pub enum InterceptDecision {
     /// Forward the original request unchanged.
     Forward,
-    /// Replace request metadata/body before forwarding through the backend.
+    /// Replace the request before forwarding it. The edit is written upstream
+    /// byte-for-byte (headers in edited order and case) with its framing
+    /// recomputed for the edited body.
     ForwardModified {
         /// Replacement HTTP method.
         method: String,
+        /// Replacement absolute `http`/`https` URL; `None` keeps the held URL.
+        #[serde(default)]
+        url: Option<String>,
         /// Replacement headers.
         headers: Vec<(String, String)>,
         /// Replacement request body.
@@ -288,8 +288,13 @@ impl InterceptController {
         }
     }
 
+    /// Whether a request to `host` would be held for a decision right now.
+    fn holds(&self, host: Option<&str>) -> bool {
+        self.is_enabled() && self.matches_host(host)
+    }
+
     async fn await_decision(&self, flow_id: u64, host: Option<&str>) -> InterceptDecision {
-        if !self.is_enabled() || !self.matches_host(host) {
+        if !self.holds(host) {
             return InterceptDecision::Forward;
         }
         let (sender, receiver) = oneshot::channel();
@@ -811,7 +816,7 @@ impl HttpHandler for ObserveHandler {
         let origin = take_origin_marker(&mut req);
         // Applied before observation so the recorded request shows the headers
         // that actually go on the wire.
-        let mut wire_headers = take_wire_headers(&mut req);
+        let wire_headers = take_wire_headers(&mut req);
         // A CONNECT reaching the MITM request handler over HTTP/2 is an RFC 8441
         // extended-CONNECT (WebSocket-over-h2); ordinary CONNECT tunnels are
         // handled below this layer. Surface the known limitation as a signal.
@@ -824,25 +829,51 @@ impl HttpHandler for ObserveHandler {
         // to exactly this request — never to another concurrent stream on the same
         // connection or another client sharing transport attributes.
         self.current_flow_id = Some(flow_id);
+        // Set once the request body has been read and recorded up front, so it
+        // is not recorded a second time as it streams upstream.
+        let mut body_recorded = false;
         if let Some(intercept) = &self.intercept {
             intercept.wait().await;
-            match intercept.await_decision(flow_id, req.uri().host()).await {
+            let host = req.uri().host().map(str::to_owned);
+            if intercept.holds(host.as_deref()) {
+                // Read the whole body before pausing so the held request is
+                // shown, and edited, complete rather than headers-only.
+                let body = std::mem::replace(req.body_mut(), Body::empty());
+                let Ok(collected) = http_body_util::BodyExt::collect(body).await else {
+                    return RequestOrResponse::Response(
+                        Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("request body could not be read"))
+                            .expect("static body-read response is valid"),
+                    );
+                };
+                let bytes = collected.to_bytes();
+                self.record_request_body(flow_id, &bytes);
+                *req.body_mut() = Body::from(bytes);
+                body_recorded = true;
+            }
+            match intercept.await_decision(flow_id, host.as_deref()).await {
                 InterceptDecision::Forward => {}
                 InterceptDecision::ForwardModified {
                     method,
+                    url,
                     headers: replacement_headers,
                     body,
                 } => {
-                    if let Err(error) =
-                        modify_request(&mut req, &method, &replacement_headers, body)
+                    match edited_request(&req, &method, url.as_deref(), &replacement_headers, body)
                     {
-                        self.observer
-                            .observe(FlowEvent::Diagnostic(malformed_edit_diagnostic(
-                                flow_id, &error,
-                            )));
-                    }
-                    if let Some(authored) = &wire_headers {
-                        wire_headers = Some(wire_headers_after_edit(authored, req.headers()));
+                        Ok(edit) => {
+                            let response = self
+                                .forward_edit(ctx, flow_id, origin, edit, wire_headers.as_deref())
+                                .await;
+                            return RequestOrResponse::Response(response);
+                        }
+                        Err(error) => {
+                            // The original request is forwarded untouched.
+                            self.observer.observe(FlowEvent::Diagnostic(
+                                malformed_edit_diagnostic(flow_id, &error),
+                            ));
+                        }
                     }
                 }
                 InterceptDecision::Drop => {
@@ -860,16 +891,20 @@ impl HttpHandler for ObserveHandler {
             }
         }
         let (parts, body) = req.into_parts();
-        let body = capture_body(
-            body,
-            flow_id,
-            BodyDirection::Request,
-            Arc::clone(&self.observer),
-        );
+        let body = if body_recorded {
+            body
+        } else {
+            capture_body(
+                body,
+                flow_id,
+                BodyDirection::Request,
+                Arc::clone(&self.observer),
+            )
+        };
         if let (Some(wire_headers), Some(tls)) = (wire_headers, self.raw_upstream_tls.clone()) {
             if parts.method != Method::CONNECT {
                 let response = self
-                    .forward_raw(ctx, tls, &parts, &wire_headers, body)
+                    .forward_raw(ctx, tls, &parts, &wire_headers, body, true)
                     .await;
                 return RequestOrResponse::Response(response);
             }
@@ -918,9 +953,63 @@ impl HttpHandler for ObserveHandler {
 }
 
 impl ObserveHandler {
-    /// Writes a workbench send upstream byte-for-byte and returns the recorded
-    /// response, carrying the upstream status line and raw header list back to
-    /// the sender in private markers (added after recording, so never stored).
+    /// Records a fully-read request body, within the capture limit.
+    fn record_request_body(&self, flow_id: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.observer.observe(FlowEvent::BodyChunk {
+            flow_id,
+            direction: BodyDirection::Request,
+            bytes: bytes[..bytes.len().min(MAX_CAPTURE_BYTES)].to_vec(),
+        });
+    }
+
+    /// Forwards a validated intercept edit byte-for-byte. The flow is
+    /// re-recorded as edited so it shows what the target actually received.
+    /// `authored` is the header list of a held workbench send, whose case the
+    /// edit keeps and whose sender expects the private response markers.
+    async fn forward_edit(
+        &mut self,
+        ctx: &HttpContext,
+        flow_id: u64,
+        origin: FlowOrigin,
+        mut edit: EditedRequest,
+        authored: Option<&[(String, String)]>,
+    ) -> Response<Body> {
+        if let Some(authored) = authored {
+            edit.headers = wire_headers_after_edit(authored, edit.headers);
+        }
+        let Some(tls) = self.raw_upstream_tls.clone() else {
+            return self.upstream_failure(
+                ctx,
+                "byte-faithful upstream sender is not configured".to_owned(),
+            );
+        };
+        self.observer.observe(FlowEvent::Request {
+            flow_id,
+            method: edit.parts.method.to_string(),
+            uri: edit.parts.uri.to_string(),
+            version: format!("{:?}", Version::HTTP_11),
+            headers: edit.headers.clone(),
+            origin,
+        });
+        self.record_request_body(flow_id, &edit.body);
+        self.forward_raw(
+            ctx,
+            tls,
+            &edit.parts,
+            &edit.headers,
+            Body::from(edit.body),
+            authored.is_some(),
+        )
+        .await
+    }
+
+    /// Writes a request upstream byte-for-byte and returns the recorded
+    /// response. For a workbench send (`markers`), the upstream status line and
+    /// raw header list go back to the sender in private markers (added after
+    /// recording, so never stored); an observed client gets the plain response.
     async fn forward_raw(
         &mut self,
         ctx: &HttpContext,
@@ -928,12 +1017,18 @@ impl ObserveHandler {
         parts: &hudsucker::hyper::http::request::Parts,
         wire_headers: &[(String, String)],
         body: Body,
+        markers: bool,
     ) -> Response<Body> {
+        let fail = |this: &Self, chain: String| {
+            if markers {
+                this.raw_upstream_failure(ctx, chain)
+            } else {
+                this.upstream_failure(ctx, chain)
+            }
+        };
         let body = match http_body_util::BodyExt::collect(body).await {
             Ok(collected) => collected.to_bytes(),
-            Err(error) => {
-                return self.raw_upstream_failure(ctx, format!("read request body: {error}"));
-            }
+            Err(error) => return fail(self, format!("read request body: {error}")),
         };
         let raw = match crate::raw_http::exchange(
             tls,
@@ -945,7 +1040,7 @@ impl ObserveHandler {
         .await
         {
             Ok(raw) => raw,
-            Err(error) => return self.raw_upstream_failure(ctx, error),
+            Err(error) => return fail(self, error),
         };
         let status_line = raw.status_line();
         let header_list = encode_header_list(&raw.headers);
@@ -959,10 +1054,12 @@ impl ObserveHandler {
             }
         }
         let Ok(response) = builder.body(Body::from(bytes::Bytes::from(raw.body))) else {
-            return self
-                .raw_upstream_failure(ctx, format!("unrepresentable status {}", raw.status));
+            return fail(self, format!("unrepresentable status {}", raw.status));
         };
         let mut response = self.handle_response(ctx, response).await;
+        if !markers {
+            return response;
+        }
         for (marker, value) in [
             (UPSTREAM_STATUS_MARKER, status_line),
             (UPSTREAM_HEADERS_MARKER, header_list),
@@ -1020,29 +1117,93 @@ impl ObserveHandler {
     }
 }
 
-fn modify_request(
-    request: &mut Request<Body>,
-    method: &str,
-    replacement_headers: &[(String, String)],
+fn contains_header(headers: &[(String, String)], wanted: &str) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(wanted))
+}
+
+/// A validated intercept edit, ready for the byte-faithful upstream write.
+struct EditedRequest {
+    /// Edited method and URI (the rest of the held request's parts).
+    parts: hudsucker::hyper::http::request::Parts,
+    /// Header list to write, in edited order and case, with framing fixed.
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
-) -> Result<(), String> {
-    *request.method_mut() = method
+}
+
+/// Validates an intercept edit against the held request without touching it,
+/// so a malformed edit leaves the original request to be forwarded as held.
+///
+/// The edited headers go on the wire in their edited order and case, but the
+/// framing is made to match the edited body: the held body was read whole, so
+/// it is sent with a fixed length — `Transfer-Encoding` is dropped and
+/// `Content-Length` is recomputed in place (or added when a body has none).
+/// `Host` is derived from the URL only when the edit has none.
+fn edited_request(
+    held: &Request<Body>,
+    method: &str,
+    url: Option<&str>,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Result<EditedRequest, String> {
+    let method: Method = method
+        .trim()
         .parse()
         .map_err(|error| format!("invalid HTTP method: {error}"))?;
-    let headers = request.headers_mut();
-    headers.clear();
-    for (name, value) in replacement_headers {
-        let name: hudsucker::hyper::header::HeaderName = name
+    let target: hudsucker::hyper::Uri = match url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => url
             .parse()
-            .map_err(|error| format!("invalid header name: {error}"))?;
-        let value: hudsucker::hyper::header::HeaderValue = value
-            .parse()
-            .map_err(|error| format!("invalid header value: {error}"))?;
-        headers.append(name, value);
+            .map_err(|error| format!("invalid URL {url:?}: {error}"))?,
+        None => held.uri().clone(),
+    };
+    if !matches!(target.scheme_str(), Some("http" | "https")) || target.host().is_none() {
+        return Err(format!("URL must be an absolute http(s) URL, got {target}"));
     }
-    *request.body_mut() = Body::from(body);
-    Ok(())
+    let body_len = body.len().to_string();
+    let mut wire: Vec<(String, String)> = Vec::with_capacity(headers.len() + 2);
+    for (name, value) in headers {
+        let name = name.trim();
+        hudsucker::hyper::header::HeaderName::try_from(name)
+            .map_err(|error| format!("invalid header name {name:?}: {error}"))?;
+        hudsucker::hyper::header::HeaderValue::try_from(value.as_str())
+            .map_err(|error| format!("invalid value for header {name:?}: {error}"))?;
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            || name.to_ascii_lowercase().starts_with("x-apiaxess-")
+        {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            // One recomputed Content-Length, at the first one's position.
+            if !contains_header(&wire, name) {
+                wire.push((name.to_owned(), body_len.clone()));
+            }
+            continue;
+        }
+        wire.push((name.to_owned(), value.clone()));
+    }
+    if !contains_header(&wire, "host") {
+        if let Some(authority) = target.authority() {
+            wire.insert(0, ("Host".to_owned(), authority.to_string()));
+        }
+    }
+    if !body.is_empty() && !contains_header(&wire, "content-length") {
+        wire.push(("Content-Length".to_owned(), body_len));
+    }
+    let mut parts = Request::new(()).into_parts().0;
+    parts.method = method;
+    parts.uri = target;
+    Ok(EditedRequest {
+        parts,
+        headers: wire,
+        body,
+    })
 }
+
+/// The durable store owns retention policy. Keep the observer capture limit
+/// aligned with its 64 MiB per-body safety limit instead of the old 2.2
+/// in-memory 1 MiB preview limit.
+const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 fn capture_body(
     body: Body,
@@ -1050,10 +1211,6 @@ fn capture_body(
     direction: BodyDirection,
     observer: Arc<dyn FlowObserver>,
 ) -> Body {
-    // The durable store owns retention policy. Keep the observer capture limit
-    // aligned with its 64 MiB per-body safety limit instead of the old 2.2
-    // in-memory 1 MiB preview limit.
-    const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
     let retained = Arc::new(Mutex::new(0_usize));
     let stream = BodyStream::new(body).map_ok(move |frame| {
         if let Some(data) = frame.data_ref() {
@@ -1329,6 +1486,242 @@ mod tests {
         drop(observer);
         drop(store);
         fs::remove_dir_all(store_path).expect("remove test traffic store");
+    }
+
+    /// Holds one request on `controller` and returns its flow id.
+    async fn next_held(controller: &super::InterceptController, seen: &[u64]) -> u64 {
+        for _ in 0..200 {
+            if let Some(id) = controller
+                .pending_ids()
+                .into_iter()
+                .find(|id| !seen.contains(id))
+            {
+                return id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no request was held");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn intercept_shows_held_body_and_forwards_edits_faithfully() {
+        use super::InterceptDecision;
+
+        // Echo upstream: answers each request with the body it received and
+        // hands the raw request bytes back for wire assertions.
+        let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("upstream listener");
+        let upstream_address = upstream.local_addr().expect("upstream address");
+        let (wire_sender, mut wire) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let upstream_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = upstream.accept().await.expect("upstream accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let body = loop {
+                    let read = socket.read(&mut buffer).await.expect("upstream read");
+                    assert!(read > 0, "request ended before its body");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |value| value.trim().parse::<usize>().expect("length"));
+                    if request.len() >= end + 4 + length {
+                        break request[end + 4..end + 4 + length].to_vec();
+                    }
+                };
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                socket
+                    .write_all(&response)
+                    .await
+                    .expect("upstream response");
+                wire_sender
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .expect("wire channel");
+            }
+        });
+        let observer = Arc::new(LiveWorkbench::new());
+        let controller = observer.intercept_controller();
+        controller.set_enabled(true);
+        let handle = HudsuckerBackend
+            .start(
+                ProxyConfig {
+                    session_id: "session:intercept-edit-test".to_owned(),
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    ca: SessionCa::generate().expect("CA"),
+                    intercept: Some(Arc::clone(&controller)),
+                },
+                observer.clone(),
+            )
+            .await
+            .expect("proxy starts");
+        let proxy = handle.local_addr();
+        let authority = upstream_address.to_string();
+        let original = br#"{"name":"original-item"}"#;
+        let request = |body: &[u8]| {
+            let mut bytes = format!(
+                "POST http://{authority}/items HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            bytes.extend_from_slice(body);
+            bytes
+        };
+        let mut seen = Vec::new();
+
+        // Forward modified: the held body is visible before any decision, and
+        // the edit (longer body + added header) reaches the target as edited.
+        let client = {
+            let bytes = request(original);
+            tokio::spawn(async move { send_http_request(proxy, &bytes).await })
+        };
+        let held = next_held(&controller, &seen).await;
+        seen.push(held);
+        let detail = observer.flow(held).expect("held flow");
+        assert_eq!(detail.request_body.as_deref(), Some(&original[..]));
+        let edited = br#"{"name":"edited-item","extra":true}"#;
+        let mut headers = detail.request_headers.clone();
+        headers.push(("X-Edited".to_owned(), "Yes".to_owned()));
+        assert!(controller.decide(
+            held,
+            InterceptDecision::ForwardModified {
+                method: "POST".to_owned(),
+                url: None,
+                headers,
+                body: edited.to_vec(),
+            },
+        ));
+        let response = client.await.expect("client task").expect("client response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with(std::str::from_utf8(edited).expect("utf8")));
+        let on_wire = wire.recv().await.expect("modified request on the wire");
+        assert!(on_wire.contains("\r\nX-Edited: Yes\r\n"), "{on_wire}");
+        assert!(
+            on_wire.contains(&format!("\r\ncontent-length: {}\r\n", edited.len())),
+            "{on_wire}"
+        );
+        assert!(on_wire.ends_with(std::str::from_utf8(edited).expect("utf8")));
+        let recorded = observer.flow(held).expect("edited flow");
+        assert_eq!(recorded.request_body.as_deref(), Some(&edited[..]));
+        assert!(
+            recorded
+                .request_headers
+                .iter()
+                .any(|(name, _)| name == "X-Edited")
+        );
+        assert_eq!(recorded.summary.status, Some(200));
+
+        // Plain forward: the original request, body intact.
+        let client = {
+            let bytes = request(original);
+            tokio::spawn(async move { send_http_request(proxy, &bytes).await })
+        };
+        let held = next_held(&controller, &seen).await;
+        seen.push(held);
+        assert!(controller.decide(held, InterceptDecision::Forward));
+        let response = client.await.expect("client task").expect("client response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let on_wire = wire.recv().await.expect("original request on the wire");
+        assert!(on_wire.ends_with(std::str::from_utf8(original).expect("utf8")));
+        let recorded = observer.flow(held).expect("forwarded flow");
+        assert_eq!(recorded.request_body.as_deref(), Some(&original[..]));
+
+        // Drop: the client gets 403 and nothing reaches the target.
+        let client = {
+            let bytes = request(original);
+            tokio::spawn(async move { send_http_request(proxy, &bytes).await })
+        };
+        let held = next_held(&controller, &seen).await;
+        assert!(controller.decide(held, InterceptDecision::Drop));
+        let response = client.await.expect("client task").expect("client response");
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"));
+
+        handle.shutdown().await.expect("proxy shutdown");
+        upstream_task.await.expect("upstream task");
+        assert!(
+            wire.try_recv().is_err(),
+            "a dropped request reached the target"
+        );
+    }
+
+    #[test]
+    fn intercept_edit_recomputes_framing_and_rejects_malformed_edits() {
+        use hudsucker::{Body, hyper::Request};
+
+        let held = Request::builder()
+            .uri("http://api.example.test/items")
+            .body(Body::empty())
+            .expect("request");
+        let headers = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        // Order and case kept; stale length recomputed in place; chunked
+        // framing dropped (the body is sent whole); missing Host derived first.
+        let edit = super::edited_request(
+            &held,
+            "PUT",
+            None,
+            &headers(&[
+                ("X-First", "1"),
+                ("Content-Length", "24"),
+                ("Transfer-Encoding", "chunked"),
+                ("content-type", "text/plain"),
+            ]),
+            b"hello".to_vec(),
+        )
+        .expect("valid edit");
+        assert_eq!(edit.parts.method, "PUT");
+        assert_eq!(
+            edit.headers,
+            headers(&[
+                ("Host", "api.example.test"),
+                ("X-First", "1"),
+                ("Content-Length", "5"),
+                ("content-type", "text/plain"),
+            ])
+        );
+        // A body without framing gains Content-Length; an edited URL applies.
+        let edit = super::edited_request(
+            &held,
+            "POST",
+            Some("https://other.example.test:8443/v2?q=1"),
+            &headers(&[("Host", "kept.example.test")]),
+            b"{}".to_vec(),
+        )
+        .expect("valid edit");
+        assert_eq!(edit.parts.uri, "https://other.example.test:8443/v2?q=1");
+        assert_eq!(
+            edit.headers,
+            headers(&[("Host", "kept.example.test"), ("Content-Length", "2")])
+        );
+        // Malformed edits are rejected without touching the held request.
+        for (method, url, pairs) in [
+            ("GE T", None, vec![]),
+            ("GET", Some("/relative"), vec![]),
+            ("GET", None, vec![("Bad Name", "x")]),
+            ("GET", None, vec![("X-Injected", "a\r\nEvil: 1")]),
+        ] {
+            assert!(
+                super::edited_request(&held, method, url, &headers(&pairs), Vec::new()).is_err()
+            );
+        }
+        assert_eq!(held.method(), "GET");
     }
 
     #[tokio::test]

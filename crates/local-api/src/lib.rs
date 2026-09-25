@@ -570,6 +570,8 @@ enum ControlMessage {
         flow_id: u64,
         action: String,
         method: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
         headers: Option<Vec<(String, String)>>,
         body: Option<Vec<u8>>,
     },
@@ -2599,6 +2601,7 @@ async fn control_loop(mut socket: axum::extract::ws::WebSocket, live: Arc<LiveWo
                 flow_id,
                 action,
                 method,
+                url,
                 headers,
                 body,
             }) => {
@@ -2607,6 +2610,7 @@ async fn control_loop(mut socket: axum::extract::ws::WebSocket, live: Arc<LiveWo
                     "drop" => Some(InterceptDecision::Drop),
                     "forward_modified" => Some(InterceptDecision::ForwardModified {
                         method: method.unwrap_or_default(),
+                        url,
                         headers: headers.unwrap_or_default(),
                         body: body.unwrap_or_default(),
                     }),
