@@ -262,6 +262,10 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             axum::routing::post(install_target_apk),
         )
         .route(
+            "/api/v1/android-target/open-app",
+            axum::routing::post(open_target_app),
+        )
+        .route(
             "/api/v1/android-target/stop",
             axum::routing::post(stop_android_target),
         )
@@ -2443,6 +2447,20 @@ async fn install_target_apk(
         .install_target_apk(std::path::Path::new(&request.path))
         .map_err(|diagnostics| pairing_error(diagnostics, StatusCode::BAD_REQUEST))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Launches the app installed from the panel on the running Android target.
+async fn open_target_app(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    let component = state
+        .engine
+        .open_target_app()
+        .map_err(|diagnostics| pairing_error(diagnostics, StatusCode::BAD_REQUEST))?;
+    Ok(Json(serde_json::json!({ "component": component })))
 }
 
 /// Stops the running GUI Android target and its stream (Phase D3).

@@ -205,6 +205,14 @@ pub struct AndroidTargetStatus {
     pub capture_issue: Option<String>,
     /// Static analysis of the installed APK, fused with the live drive on Fuse.
     pub static_analysis: Option<AndroidStaticAnalysisStatus>,
+    /// Package of the APK installed onto the target from this panel, which
+    /// "Open app" launches. Cleared when the target stops or relaunches.
+    pub installed_package: Option<String>,
+    /// File name of that APK, for the panel's installed state.
+    pub installed_apk: Option<String>,
+    /// Why the installed APK's package could not be read (the install itself
+    /// succeeded), so the panel can explain a missing "Open app".
+    pub install_note: Option<String>,
     /// The latest step diagnostics (info, warnings, or the failure on `Error`).
     pub diagnostics: Vec<apiaxess_diagnostics::Diagnostic>,
 }
@@ -224,6 +232,9 @@ impl Default for AndroidTargetStatus {
             capture_proxy: None,
             capture_issue: None,
             static_analysis: None,
+            installed_package: None,
+            installed_apk: None,
+            install_note: None,
             diagnostics: Vec::new(),
         }
     }
@@ -1604,8 +1615,106 @@ impl Engine {
         apk_path: &Path,
     ) -> Result<(), Vec<apiaxess_diagnostics::Diagnostic>> {
         self.install_target_apk_only(apk_path)?;
+        self.record_installed_app(apk_path);
         self.start_android_static_analysis(apk_path);
         Ok(())
+    }
+
+    /// Records the just-installed APK's package (read from its compiled
+    /// manifest) so the panel can show it and offer "Open app".
+    fn record_installed_app(&self, apk_path: &Path) {
+        let package = apiaxess_sandbox::apk_manifest::package_name(apk_path);
+        if let Ok(mut status) = self.android_status.write() {
+            status.installed_apk = apk_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            match package {
+                Ok(package) => {
+                    status.installed_package = Some(package);
+                    status.install_note = None;
+                }
+                Err(why) => {
+                    status.installed_package = None;
+                    status.install_note = Some(format!(
+                        "Installed, but its package name could not be read ({why}); open it from the device's app drawer."
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Launches the app installed from the panel on the running target: resolves
+    /// its launcher activity and starts it. Returns the started component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`apiaxess_diagnostics::catalogue::ANDROID_TARGET_NOT_RUNNING`] when
+    /// no target is running, or
+    /// [`apiaxess_diagnostics::catalogue::ANDROID_TARGET_APP_OPEN_FAILED`] when no
+    /// app is recorded as installed, it has no launcher activity, or the device
+    /// refuses to start it.
+    pub fn open_target_app(&self) -> Result<String, Vec<apiaxess_diagnostics::Diagnostic>> {
+        let package = self
+            .android_status
+            .read()
+            .ok()
+            .and_then(|status| status.installed_package.clone())
+            .ok_or_else(|| {
+                vec![app_open_failed(
+                    "no app has been installed from this panel since the target launched",
+                )]
+            })?;
+        let control = {
+            let guard = self
+                .android_target
+                .lock()
+                .map_err(|_| vec![android_target_not_running()])?;
+            guard
+                .as_ref()
+                .ok_or_else(|| vec![android_target_not_running()])?
+                .control()
+        };
+        let timeout = std::time::Duration::from_secs(20);
+        let resolved = control
+            .shell(
+                &[
+                    "cmd".to_owned(),
+                    "package".to_owned(),
+                    "resolve-activity".to_owned(),
+                    "--brief".to_owned(),
+                    "-c".to_owned(),
+                    "android.intent.category.LAUNCHER".to_owned(),
+                    package.clone(),
+                ],
+                timeout,
+            )
+            .map_err(|diagnostic| vec![diagnostic])?;
+        let component = launcher_component(&resolved.stdout, &package).ok_or_else(|| {
+            vec![app_open_failed(&format!(
+                "{package} has no launcher activity to open"
+            ))]
+        })?;
+        let started = control
+            .shell(
+                &[
+                    "am".to_owned(),
+                    "start".to_owned(),
+                    "-n".to_owned(),
+                    component.clone(),
+                ],
+                timeout,
+            )
+            .map_err(|diagnostic| vec![diagnostic])?;
+        // `am start` exits 0 even for some failures and reports them on stdout.
+        let refused = started.stdout.contains("Error") || started.stderr.contains("Error");
+        if started.exit_code == Some(0) && !refused {
+            Ok(component)
+        } else {
+            Err(vec![app_open_failed(&format!(
+                "the device refused to start {component}: {}",
+                format!("{} {}", started.stdout.trim(), started.stderr.trim()).trim()
+            ))])
+        }
     }
 
     /// Runs static analysis of the just-installed APK in the background, keyed
@@ -1696,6 +1805,9 @@ impl Engine {
                 status.diagnostics.clear();
                 status.streaming = false;
                 status.ws_scrcpy_port = None;
+                status.installed_package = None;
+                status.installed_apk = None;
+                status.install_note = None;
             }
         }
     }
@@ -2450,6 +2562,32 @@ fn android_target_not_running() -> apiaxess_diagnostics::Diagnostic {
         .instantiate(apiaxess_diagnostics::DiagnosticContext::new())
 }
 
+fn app_open_failed(reason: &str) -> apiaxess_diagnostics::Diagnostic {
+    apiaxess_diagnostics::catalogue::ANDROID_TARGET_APP_OPEN_FAILED.instantiate(
+        apiaxess_diagnostics::DiagnosticContext::from_iter([(
+            "reason".to_owned(),
+            apiaxess_diagnostics::DiagnosticValue::String(reason.to_owned()),
+        )]),
+    )
+}
+
+/// The `package/Activity` component `cmd package resolve-activity --brief`
+/// printed for `package`, if it resolved one. The brief output ends with the
+/// component line; "No activity found" (or anything else) means none.
+fn launcher_component(output: &str, package: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .filter(|line| {
+            line.split_once('/').is_some_and(|(owner, activity)| {
+                owner == package && !activity.is_empty() && !activity.contains(char::is_whitespace)
+            })
+        })
+        .map(str::to_owned)
+}
+
 /// Builds a device provisioner over the bundled platform-tools `adb`.
 fn device_provisioner() -> apiaxess_sandbox::device_provision::DeviceProvisioner {
     let runtime = apiaxess_sandbox::BundledEmulatorConfig::resolve(
@@ -2883,6 +3021,42 @@ mod tests {
         assert_eq!(status.phase, super::AndroidTargetPhase::Error);
         assert_eq!(status.message, failure.what.to_string());
         assert_ne!(status.message, "The GUI Android target booted headless and is ready for provisioning.");
+    }
+
+    #[test]
+    fn launcher_component_is_read_from_resolve_activity_output() {
+        let output = "priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\n\
+                      pro.mailaccess.reference/.MainActivity\n";
+        assert_eq!(
+            super::launcher_component(output, "pro.mailaccess.reference").as_deref(),
+            Some("pro.mailaccess.reference/.MainActivity")
+        );
+        assert_eq!(
+            super::launcher_component("No activity found\n", "pro.mailaccess.reference"),
+            None
+        );
+        // A component for a different package is not this app's launcher.
+        assert_eq!(
+            super::launcher_component(
+                "com.android.launcher3/.Launcher\n",
+                "pro.mailaccess.reference"
+            ),
+            None
+        );
+        assert_eq!(
+            super::launcher_component("", "pro.mailaccess.reference"),
+            None
+        );
+    }
+
+    #[test]
+    fn open_app_before_any_install_is_actionable() {
+        let engine = super::Engine::new();
+        let error = engine.open_target_app().expect_err("nothing installed");
+        assert_eq!(
+            error[0].id.as_ref(),
+            "sandbox.android-target-app-open-failed"
+        );
     }
 
     #[test]

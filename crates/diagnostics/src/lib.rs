@@ -2488,10 +2488,21 @@ pub mod catalogue {
         fix: "Confirm the APK is a valid x86_64-compatible build and the target has free space, then retry; the underlying adb error is attached.",
     };
 
+    /// The installed app could not be opened on the Android target.
+    pub const ANDROID_TARGET_APP_OPEN_FAILED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-app-open-failed",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "The installed app could not be opened on the Android target.",
+        why: "No app is recorded as installed this session, the app has no launcher activity, or the device refused to start it.",
+        fix: "Install the APK from this panel first; if it is installed, open it from the device's app drawer on the screen. The reason is attached.",
+    };
+
     /// Every Phase D3 (workbench Android target panel) definition.
     pub const PHASE_D3: &[DiagnosticDefinition] = &[
         ANDROID_TARGET_NOT_RUNNING,
         ANDROID_TARGET_APK_INSTALL_FAILED,
+        ANDROID_TARGET_APP_OPEN_FAILED,
     ];
 
     /// The Frida server could not be deployed to the session runtime.

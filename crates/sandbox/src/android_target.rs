@@ -41,6 +41,9 @@ use crate::{
 pub const MANIFEST_FILE: &str = "android-target-manifest.json";
 
 const BACKEND_ID: &str = "sandbox.android-target";
+/// How long `stop` lets the emulator exit on its own after `emu kill` before
+/// force-stopping it (a clean exit releases the AVD's lock files).
+const EMULATOR_EXIT_GRACE: Duration = Duration::from_secs(20);
 
 /// First-boot provisioning switches recorded in the manifest.
 #[derive(Clone, Debug, Deserialize)]
@@ -632,7 +635,8 @@ impl BootedAndroidTarget {
         ))
     }
 
-    /// Powers the target off cleanly and stops the owned emulator process.
+    /// Powers the target off cleanly and stops the owned emulator process, then
+    /// removes the AVD's lock files so the next launch boots without cleanup.
     ///
     /// # Errors
     ///
@@ -645,13 +649,22 @@ impl BootedAndroidTarget {
             Duration::from_secs(20),
             &self.environment,
         );
-        if let Some(process) = self.process.take()
-            && let Err(error) = process.stop()
-        {
-            return Err(vec![boot_failed(format!(
-                "the GUI Android target process could not be stopped: {error}"
-            ))]);
+        if let Some(process) = self.process.take() {
+            // Give the emulator time to exit on its own after `emu kill`, so it
+            // releases its AVD locks itself; force-stopping it at once is what
+            // leaves them behind. Force only if the grace period runs out.
+            let deadline = Instant::now() + EMULATOR_EXIT_GRACE;
+            while process.is_running() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if let Err(error) = process.stop() {
+                return Err(vec![boot_failed(format!(
+                    "the GUI Android target process could not be stopped: {error}"
+                ))]);
+            }
         }
+        // The emulator is gone, so any lock left in the AVD directory is stale.
+        clear_stale_avd_locks(&self.addon.root, &self.addon.manifest.avd_name);
         Ok(())
     }
 }
@@ -834,9 +847,14 @@ mod tests {
 
     impl Scratch {
         fn new() -> Self {
+            // A per-process counter, not just the clock: Windows' coarse clock
+            // gave parallel tests the same timestamp, so they shared (and raced
+            // on) one directory.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "apiaxess-android-target-{}-{}",
+                "apiaxess-android-target-{}-{}-{}",
                 std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
             ));
             std::fs::create_dir_all(&path).expect("create scratch dir");

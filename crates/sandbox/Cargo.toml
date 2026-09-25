@@ -21,6 +21,9 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# Reads an installed APK's package name from its compiled manifest (the Android
+# target's "Open app"). Same version as the intake/routing crates: no new download.
+zip = "2.2.2"
 
 # Phase 11.4: frida-core linked via the first-party Rust bindings, replacing the
 # host Python/CLI Frida path. Optional + off by default so the standard build

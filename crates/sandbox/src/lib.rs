@@ -10,6 +10,7 @@
 #![allow(clippy::missing_errors_doc, clippy::unnecessary_literal_bound)]
 
 pub mod android_target;
+pub mod apk_manifest;
 pub mod device_provision;
 #[cfg(feature = "frida-embedded")]
 pub mod frida_embedded;
@@ -3595,6 +3596,32 @@ pub enum SandboxError {
 mod tests {
     use super::*;
     use apiaxess_host_capabilities::{CAPABILITY_AVD_EMULATOR, CapabilityObservation};
+
+    #[test]
+    fn stale_avd_locks_are_removed_and_avd_data_is_kept() {
+        let root = std::env::temp_dir().join(format!("apiaxess-avd-locks-{}", std::process::id()));
+        let avd = root.join("avd").join("target.avd");
+        // The emulator leaves these as directories (observed after a forced stop)
+        // or as plain files, depending on version.
+        std::fs::create_dir_all(avd.join("hardware-qemu.ini.lock")).expect("lock dir");
+        std::fs::create_dir_all(avd.join("snapshot.lock.lock")).expect("lock dir");
+        std::fs::write(avd.join("multiinstance.lock"), b"").expect("lock file");
+        std::fs::write(avd.join("userdata-qemu.img"), b"data").expect("userdata");
+        std::fs::write(avd.join("config.ini"), b"cfg").expect("config");
+
+        clear_stale_avd_locks(&root, "target");
+
+        for lock in [
+            "hardware-qemu.ini.lock",
+            "snapshot.lock.lock",
+            "multiinstance.lock",
+        ] {
+            assert!(!avd.join(lock).exists(), "{lock} should be removed");
+        }
+        assert!(avd.join("userdata-qemu.img").is_file());
+        assert!(avd.join("config.ini").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn observation(id: &str, availability: CapabilityAvailability) -> CapabilityObservation {
         CapabilityObservation {

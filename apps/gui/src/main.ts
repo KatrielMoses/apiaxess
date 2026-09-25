@@ -151,6 +151,12 @@ interface AndroidTargetStatus {
   readonly captureIssue?: string | null;
   /** Static analysis of the installed APK, fused with the live drive on Fuse. */
   readonly staticAnalysis?: { readonly state: "running" | "ready" | "failed"; readonly endpointCount?: number | null; readonly message?: string | null } | null;
+  /** Package of the APK installed from the panel, which "Open app" launches. */
+  readonly installedPackage?: string | null;
+  /** File name of that APK. */
+  readonly installedApk?: string | null;
+  /** Why the installed APK's package could not be read (install succeeded). */
+  readonly installNote?: string | null;
   readonly diagnostics: readonly Diagnostic[];
 }
 
@@ -238,6 +244,10 @@ const androidApkPath = document.querySelector<HTMLInputElement>("#android-apk-pa
 const androidApkBrowse = document.querySelector<HTMLButtonElement>("#android-apk-browse");
 const androidApkFile = document.querySelector<HTMLInputElement>("#android-apk-file");
 const androidApkInstall = document.querySelector<HTMLButtonElement>("#android-apk-install");
+const androidInstalled = document.querySelector<HTMLElement>("#android-installed");
+const androidInstalledTitle = document.querySelector<HTMLElement>("#android-installed-title");
+const androidInstalledDetail = document.querySelector<HTMLElement>("#android-installed-detail");
+const androidOpenApp = document.querySelector<HTMLButtonElement>("#android-open-app");
 const androidScreen = document.querySelector<HTMLElement>("#android-screen");
 
 /* ==================================================================== *
@@ -6003,6 +6013,7 @@ function paintShell(): void {
   });
   androidStop?.addEventListener("click", () => void stopAndroidTarget());
   androidApkInstall?.addEventListener("click", () => void installTargetApk());
+  androidOpenApp?.addEventListener("click", () => void openTargetApp());
   androidApkBrowse?.addEventListener("click", () => void browseForAndroidApk());
   androidApkFile?.addEventListener("change", () => {
     const file = androidApkFile.files?.[0];
@@ -6572,6 +6583,7 @@ function renderAndroidStatus(status: AndroidTargetStatus): void {
   }
   if (androidStop !== null) androidStop.hidden = !(inFlight || status.phase === "ready");
   if (androidInstallPanel !== null) androidInstallPanel.hidden = status.phase !== "ready";
+  updateAndroidInstalled(status);
   if (androidStatus !== null) { androidStatus.innerHTML = androidStatusBody(status); hydrateIcons(androidStatus); }
   updateAndroidScreen(status);
 }
@@ -6611,12 +6623,42 @@ async function stopAndroidTarget(): Promise<void> {
   });
 }
 
+/**
+ * The installed app's lasting state and its "Open app" action. Updated in place
+ * (text + visibility only) so the 1 s status poll never recreates the button
+ * under the user's click.
+ */
+function updateAndroidInstalled(status: AndroidTargetStatus): void {
+  if (androidInstalled === null) return;
+  const apk = status.installedApk ?? null;
+  const pkg = status.installedPackage ?? null;
+  androidInstalled.hidden = status.phase !== "ready" || apk === null;
+  if (androidInstalled.hidden) return;
+  if (androidInstalledTitle !== null) androidInstalledTitle.textContent = pkg === null ? `Installed ${apk}` : `Installed ${pkg}`;
+  if (androidInstalledDetail !== null) {
+    androidInstalledDetail.textContent = pkg === null
+      ? (status.installNote ?? "Open it from the device's app drawer on the screen.")
+      : `${apk} is on the target. Open it, then drive it on the screen; its traffic flows to the workbench.`;
+  }
+  if (androidOpenApp !== null) androidOpenApp.hidden = pkg === null;
+}
+
 async function installTargetApk(): Promise<void> {
   const path = androidApkPath?.value.trim() ?? "";
   if (path === "") { toast("Enter the full path to the APK you want to install."); androidApkPath?.focus(); return; }
   await withBusy(androidApkInstall, "Installing…", async () => {
     const response = await fetch("/api/v1/android-target/install-apk", { method: "POST", headers: pairingHeaders(true), body: JSON.stringify({ path }) });
-    if (response.status === 204) toast("Installed. Open the app on the screen and drive it — its traffic flows to the workbench.");
+    if (response.status === 204) {
+      toast("Installed. Open the app, then drive it on the screen.");
+      await refreshAndroidStatus();
+    } else showDiagnostic((await response.json()) as Diagnostic);
+  });
+}
+
+async function openTargetApp(): Promise<void> {
+  await withBusy(androidOpenApp, "Opening…", async () => {
+    const response = await fetch("/api/v1/android-target/open-app", { method: "POST", headers: pairingHeaders() });
+    if (response.ok) toast("Opened on the target. Drive it on the screen.");
     else showDiagnostic((await response.json()) as Diagnostic);
   });
 }

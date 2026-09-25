@@ -160,7 +160,7 @@ impl ProvisionedDevice {
         // (the owned AVD keeps its settings across boots) and cut the device off
         // from the network.
         if self.device_proxy_set {
-            if let Err(detail) = clear_device_proxy(&self.control) {
+            if let Err(detail) = clear_device_proxy(&self.control, SETTINGS_PERSIST_SETTLE) {
                 diagnostics.push(
                     catalogue::DEVICE_CAPTURE_NOT_ROUTED.instantiate(diag_context(
                         self.control.transport_id(),
@@ -373,6 +373,14 @@ impl DeviceProvisioner {
             )),
         );
 
+        // 2b. A proxy left behind by a previous session that never tore down
+        // (crash, killed engine) points at a tunnel that no longer exists. Clear it
+        // up front, so a provisioning step failing below never leaves the device
+        // routed into a dead proxy; step 7 sets it again for this session.
+        if options.route_device_proxy {
+            clear_leftover_device_proxy(&control, SETTINGS_PERSIST_SETTLE);
+        }
+
         // 3. Ensure root before touching the read-only system/APEX trust store.
         ensure_device_root(&control)?;
 
@@ -476,6 +484,9 @@ fn route_capture(
             true
         }
         Err(detail) => {
+            // The write may have partly applied; never leave the device pointed
+            // at a proxy this session will not tear down.
+            let _ = clear_device_proxy(control, SETTINGS_PERSIST_SETTLE);
             report
                 .diagnostics
                 .push(
@@ -495,6 +506,12 @@ fn route_capture(
 const GLOBAL_HTTP_PROXY: &str = "http_proxy";
 /// The value Android documents for "no proxy".
 const NO_PROXY: &str = ":0";
+/// How long to let a settings change reach disk before flushing it. Android's
+/// `SettingsProvider` persists `settings put` asynchronously (after up to 2 s), and
+/// an emulator killed with `emu kill` does not flush the guest's page cache. So a
+/// cleared proxy can read back as cleared while the next boot still sees the old
+/// value; waiting past the write delay and then `sync`ing makes the clear stick.
+const SETTINGS_PERSIST_SETTLE: Duration = Duration::from_millis(2_500);
 
 /// Sets the device-wide HTTP proxy and verifies it reads back.
 fn set_device_proxy(control: &Arc<dyn SandboxControl>, proxy: &str) -> Result<(), String> {
@@ -509,15 +526,45 @@ fn set_device_proxy(control: &Arc<dyn SandboxControl>, proxy: &str) -> Result<()
     }
 }
 
-/// Clears the device-wide HTTP proxy and verifies it is no longer set.
-fn clear_device_proxy(control: &Arc<dyn SandboxControl>) -> Result<(), String> {
+/// Clears the device-wide HTTP proxy, verifies it is no longer set, and makes
+/// the clear durable (see [`SETTINGS_PERSIST_SETTLE`]) so it survives the
+/// emulator being killed straight afterwards.
+fn clear_device_proxy(control: &Arc<dyn SandboxControl>, settle: Duration) -> Result<(), String> {
     put_global(control, GLOBAL_HTTP_PROXY, NO_PROXY)?;
     let current = get_global(control, GLOBAL_HTTP_PROXY)?;
-    if matches!(current.as_str(), "" | "null" | NO_PROXY) {
+    if !is_no_proxy(&current) {
+        return Err(format!(
+            "device proxy is still {current:?} after clearing it"
+        ));
+    }
+    persist_settings(control, settle)
+}
+
+/// Clears a proxy an earlier session left set; a no-op when none is set.
+fn clear_leftover_device_proxy(control: &Arc<dyn SandboxControl>, settle: Duration) {
+    if get_global(control, GLOBAL_HTTP_PROXY).is_ok_and(|current| !is_no_proxy(&current)) {
+        let _ = clear_device_proxy(control, settle);
+    }
+}
+
+fn is_no_proxy(value: &str) -> bool {
+    matches!(value, "" | "null" | NO_PROXY)
+}
+
+/// Waits for `SettingsProvider`'s asynchronous write, then flushes the guest's
+/// page cache so the settings file is on the virtual disk.
+fn persist_settings(control: &Arc<dyn SandboxControl>, settle: Duration) -> Result<(), String> {
+    std::thread::sleep(settle);
+    let output = control
+        .shell(&["sync".to_owned()], Duration::from_secs(30))
+        .map_err(|error| format!("sync after the settings change failed: {error}"))?;
+    if output.exit_code == Some(0) {
         Ok(())
     } else {
         Err(format!(
-            "device proxy is still {current:?} after clearing it"
+            "sync after the settings change exited {:?}: {}",
+            output.exit_code,
+            output.stderr.trim()
         ))
     }
 }
@@ -757,6 +804,7 @@ mod tests {
     struct SettingsDevice {
         global: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
         ignore_writes: bool,
+        shell_calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl SettingsDevice {
@@ -764,6 +812,7 @@ mod tests {
             Arc::new(Self {
                 global: std::sync::Mutex::new(std::collections::BTreeMap::new()),
                 ignore_writes,
+                shell_calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -799,6 +848,10 @@ mod tests {
             _timeout: Duration,
         ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
             let words = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            self.shell_calls
+                .lock()
+                .expect("calls")
+                .push(words.join(" "));
             let mut global = self.global.lock().expect("settings");
             Ok(match words.as_slice() {
                 ["settings", "put", "global", key, value] => {
@@ -850,7 +903,39 @@ mod tests {
         let control: Arc<dyn SandboxControl> = device.clone();
         set_device_proxy(&control, "127.0.0.1:8080").expect("proxy set");
         assert_eq!(device.proxy().as_deref(), Some("127.0.0.1:8080"));
-        clear_device_proxy(&control).expect("proxy cleared");
+        clear_device_proxy(&control, Duration::ZERO).expect("proxy cleared");
+        assert_eq!(device.proxy().as_deref(), Some(":0"));
+    }
+
+    #[test]
+    fn clearing_the_proxy_flushes_it_to_disk_after_verifying() {
+        let device = SettingsDevice::new(false);
+        let control: Arc<dyn SandboxControl> = device.clone();
+        set_device_proxy(&control, "127.0.0.1:8080").expect("proxy set");
+        device.shell_calls.lock().expect("calls").clear();
+        clear_device_proxy(&control, Duration::ZERO).expect("proxy cleared");
+        assert_eq!(
+            *device.shell_calls.lock().expect("calls"),
+            [
+                "settings put global http_proxy :0",
+                "settings get global http_proxy",
+                "sync",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_leftover_proxy_is_cleared_and_an_unset_one_left_alone() {
+        let device = SettingsDevice::new(false);
+        let control: Arc<dyn SandboxControl> = device.clone();
+        clear_leftover_device_proxy(&control, Duration::ZERO);
+        assert_eq!(
+            *device.shell_calls.lock().expect("calls"),
+            ["settings get global http_proxy"],
+            "nothing set: no write, no settle, no sync",
+        );
+        set_device_proxy(&control, "127.0.0.1:8080").expect("proxy set");
+        clear_leftover_device_proxy(&control, Duration::ZERO);
         assert_eq!(device.proxy().as_deref(), Some(":0"));
     }
 
