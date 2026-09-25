@@ -32,7 +32,16 @@ pub struct ApiSurface {
     pub signers: Vec<crate::signer::SignerArtifact>,
 }
 
-/// Stable endpoint key: method plus template, and nothing else.
+/// Stable endpoint key: method, template, and the host the endpoint is bound
+/// to.
+///
+/// `host` is set only when the host is bound to the endpoint's own evidence
+/// (a call-site URL, the Retrofit instance that built the interface, or an
+/// observed request). It is `None` when the host is unknown, which is not the
+/// same as "any host": an unknown-host endpoint is resolved against observed
+/// traffic only when exactly one host serves its method and template. Two
+/// different hosts serving the same method and template are distinct
+/// endpoints.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointIdentity {
@@ -40,6 +49,51 @@ pub struct EndpointIdentity {
     pub method: HttpMethod,
     /// Declared or inferred path template without query/fragment.
     pub path_template: PathTemplate,
+    /// Normalized host (`host` or `host:port`, lowercase), when bound.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl EndpointIdentity {
+    /// Whether two identities name the same method and template, regardless
+    /// of host.
+    #[must_use]
+    pub fn same_route(&self, other: &Self) -> bool {
+        self.method == other.method && self.path_template == other.path_template
+    }
+}
+
+/// Normalizes a base URL or bare authority to the host used in
+/// [`EndpointIdentity::host`]: scheme, userinfo, path, query and a default
+/// port are dropped and the host is lowercased. Returns `None` when no host
+/// is present.
+#[must_use]
+pub fn normalize_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (scheme, rest) = match value.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, value),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    let authority = authority.trim_end_matches('.').to_ascii_lowercase();
+    let default_port = match scheme.as_deref() {
+        Some("http") => Some(":80"),
+        Some("https") => Some(":443"),
+        _ => None,
+    };
+    let authority = match default_port {
+        Some(port) => authority
+            .strip_suffix(port)
+            .map_or(authority.clone(), ToOwned::to_owned),
+        None => authority,
+    };
+    if authority.is_empty() || authority.starts_with(':') {
+        None
+    } else {
+        Some(authority)
+    }
 }
 
 /// One endpoint and its independently evidenced metadata.

@@ -284,6 +284,7 @@ fn document() -> ApiDocument {
             identity: EndpointIdentity {
                 method: HttpMethod::new("get").unwrap(),
                 path_template: PathTemplate::new("/users/{id}").unwrap(),
+                host: None,
             },
             presence: presence.clone(),
             path_template: template,
@@ -344,10 +345,12 @@ fn endpoint_identity_ignores_query_inventory_and_normalizes_method() {
     let left = EndpointIdentity {
         method: HttpMethod::new("get").unwrap(),
         path_template: PathTemplate::new("/users/{id}").unwrap(),
+        host: None,
     };
     let right = EndpointIdentity {
         method: HttpMethod::new("GET").unwrap(),
         path_template: PathTemplate::new("/users/{id}").unwrap(),
+        host: None,
     };
     assert_eq!(left, right);
     assert!(PathTemplate::new("/users/{id}?sort=x").is_err());

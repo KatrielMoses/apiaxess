@@ -97,7 +97,8 @@ impl OpenApiEmitter {
             SchemaBuilder::new(surface, self.minimum_dynamic_samples, &mut diagnostics);
         let mut paths = BTreeMap::<String, Value>::new();
         let mut security_schemes = BTreeMap::<String, Value>::new();
-        let mut seen_operations = BTreeSet::new();
+        // Operation key -> host of the endpoint that claimed it.
+        let mut seen_operations = BTreeMap::<String, Option<String>>::new();
         let mut seen_operation_ids = BTreeSet::new();
         let endpoint_indices = surface
             .surface
@@ -132,13 +133,25 @@ impl OpenApiEmitter {
                 continue;
             };
             let operation_key = format!("{} {path}", endpoint.identity.method.as_str());
-            if !seen_operations.insert(operation_key.clone()) {
+            if let Some(claimed_host) = seen_operations.get(&operation_key) {
+                // The same route on another host is a distinct endpoint, but
+                // an OpenAPI path item holds one operation per method: record
+                // the extra host on the existing operation instead.
+                if claimed_host != &endpoint.identity.host {
+                    if let Some(Value::Object(operation)) = paths.get_mut(&path).and_then(|item| {
+                        item.get_mut(endpoint.identity.method.as_str().to_ascii_lowercase())
+                    }) {
+                        add_operation_host(operation, claimed_host.as_deref(), endpoint);
+                    }
+                    continue;
+                }
                 builder.diagnostics.push(diagnostic(
                     catalogue::OPENAPI_UNREPRESENTABLE,
                     [("field", model_path.clone()), ("detail", format!("duplicate OpenAPI operation after path normalization: {operation_key}"))],
                 ));
                 continue;
             }
+            seen_operations.insert(operation_key, endpoint.identity.host.clone());
             let path_item = paths
                 .entry(path.clone())
                 .or_insert_with(|| Value::Object(Map::new()));
@@ -1352,6 +1365,40 @@ fn set_operation_id(mut operation: Value, operation_id: String) -> Value {
         object.insert("operationId".to_owned(), Value::String(operation_id));
     }
     operation
+}
+
+/// Records one more host serving an already-emitted operation: in the
+/// `x-apiaxess-hosts` extension, and as an operation-level server when the
+/// endpoint's base URL carries a scheme.
+fn add_operation_host(
+    operation: &mut Map<String, Value>,
+    claimed: Option<&str>,
+    endpoint: &Endpoint,
+) {
+    let hosts = operation
+        .entry(format!("{X_PREFIX}hosts"))
+        .or_insert_with(|| json!(claimed.into_iter().collect::<Vec<_>>()));
+    if let (Value::Array(hosts), Some(host)) = (hosts, endpoint.identity.host.as_deref()) {
+        if !hosts.iter().any(|value| value == host) {
+            hosts.push(Value::String(host.to_owned()));
+        }
+    }
+    let base = endpoint
+        .base_url
+        .as_ref()
+        .and_then(|fact| fact.selected_candidate())
+        .map(|candidate| candidate.value.clone())
+        .filter(|value| value.contains("://"));
+    if let Some(base) = base {
+        let servers = operation
+            .entry("servers".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(servers) = servers {
+            if !servers.iter().any(|server| server["url"] == base.as_str()) {
+                servers.push(json!({"url": base}));
+            }
+        }
+    }
 }
 
 fn operation_id(identity: &EndpointIdentity) -> String {

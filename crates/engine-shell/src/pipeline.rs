@@ -5,6 +5,7 @@
 //! individual phase crates continue to own their analysis behavior.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     fmt::Write as _,
     path::PathBuf,
@@ -12,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use apiaxess_api_model::{RunId, SignerBinding, UnifiedApiSurface};
+use apiaxess_api_model::{HostParty, RunId, SignerBinding, UnifiedApiSurface};
 use apiaxess_app_crawler::{
     AppCrawler, CrawlConfig, CrawlReport, CredentialAnswer, CredentialDecision, CredentialKind,
     CredentialPromptReason, CredentialProvider, CredentialRedactor, CredentialRequest,
@@ -869,6 +870,8 @@ pub fn run_pipeline(
     surface_config
         .signer_bindings
         .clone_from(&config.signer_bindings);
+    // First-/third-party labels are relative to the app's own identity.
+    surface_config.first_party.app_package = package_name_from_artifact(&normalized).ok();
     let surface = assemble(
         &runtime
             .session_snapshot()
@@ -1404,103 +1407,28 @@ fn assemble(
     apiaxess_unified_surface::assemble_document(document, config, Utc::now())
 }
 
-/// First- vs third-party classification of a host the app was observed hitting.
-///
-/// This is an honest *label*, never a capture filter — every observed host is
-/// surfaced regardless. First-party is decided by affinity between the host's
-/// registrable-domain labels and the app's own package tokens; a curated set of
-/// well-known SDK/analytics/tracker domains marks the obvious third parties. A
-/// host that matches neither signal is left unclassified rather than guessed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostParty {
-    FirstParty,
-    ThirdParty,
-    Unclassified,
-}
-
-/// Well-known third-party SDK / analytics / tracker / payment host suffixes. A
-/// host ending in one of these is external to the app's own backend. The list is
-/// a labeling aid, not exhaustive — an unrecognized host is left unclassified.
-const THIRD_PARTY_SUFFIXES: &[&str] = &[
-    "facebook.com",
-    "fbcdn.net",
-    "graph.facebook.com",
-    "google.com",
-    "googleapis.com",
-    "google-analytics.com",
-    "googletagmanager.com",
-    "gstatic.com",
-    "doubleclick.net",
-    "crashlytics.com",
-    "app-measurement.com",
-    "firebaseio.com",
-    "firebaseinstallations.googleapis.com",
-    "clarity.ms",
-    "appsflyer.com",
-    "adjust.com",
-    "branch.io",
-    "sentry.io",
-    "bugsnag.com",
-    "mixpanel.com",
-    "amplitude.com",
-    "segment.io",
-    "segment.com",
-    "onesignal.com",
-    "cloudflareinsights.com",
-    "razorpay.com",
-    "juspay.in",
-    "cashfree.com",
-    "phonepe.com",
-    "paytm.in",
-];
-
-/// Classifies one observed host relative to the app package.
-fn classify_host_party(host: &str, package: &str) -> HostParty {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if THIRD_PARTY_SUFFIXES
-        .iter()
-        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
-    {
-        return HostParty::ThirdParty;
-    }
-    // Package tokens (`live.tamasha.playroom` → tamasha, playroom) matched against
-    // the host's own labels flags the app's own backend (`api.tamasha.live`).
-    let host_labels: Vec<&str> = host.split('.').collect();
-    let affinity = package
-        .split('.')
-        .filter(|token| token.len() >= 4 && !GENERIC_PACKAGE_TOKENS.contains(token))
-        .any(|token| host_labels.contains(&token));
-    if affinity {
-        HostParty::FirstParty
-    } else {
-        HostParty::Unclassified
-    }
-}
-
-/// Package name segments too generic to signal first-party affinity.
-const GENERIC_PACKAGE_TOKENS: &[&str] = &[
-    "com", "org", "net", "app", "apps", "android", "mobile", "www", "io", "co", "the",
-];
-
 /// Builds the honest, labeled summary of every host the app was observed hitting.
 ///
 /// Read from the durable store after capture so it reflects exactly what was
 /// captured. Every host appears; first-/third-party is a label so the tester can
 /// distinguish the app's own backend from the SDKs and trackers it depends on.
 fn observed_host_summary(runtime: &SessionRuntime, package: &str) -> Diagnostic {
-    let hosts: Vec<String> = runtime.store().summaries().map_or_else(
-        |_| Vec::new(),
+    // Flows per host: the weight used only when the package names no domain.
+    let flows_per_host: BTreeMap<String, usize> = runtime.store().summaries().map_or_else(
+        |_| BTreeMap::new(),
         |summaries| {
-            let mut hosts: Vec<String> = summaries
+            let mut counts = BTreeMap::new();
+            for host in summaries
                 .into_iter()
                 .filter(|flow| flow.origin == FlowOrigin::Capture)
                 .filter_map(|flow| flow.host)
-                .collect();
-            hosts.sort();
-            hosts.dedup();
-            hosts
+            {
+                *counts.entry(host).or_default() += 1;
+            }
+            counts
         },
     );
+    let hosts: Vec<String> = flows_per_host.keys().cloned().collect();
     // No calls captured: this is the Breezy-class honest-empty. The autonomous
     // crawler reached the app but no backend call fired — almost always because
     // the app needs in-app setup it can't complete (a city/location, a selection,
@@ -1510,14 +1438,21 @@ fn observed_host_summary(runtime: &SessionRuntime, package: &str) -> Diagnostic 
         diagnostic.why = "No API calls were captured. The app most likely requires in-app setup the autonomous crawler could not complete — e.g. choosing a location/city, making a selection, or an account step it lacks credentials for. Apps like this are best driven manually: install the APIaxess client APK on a device and interact with the app yourself while it captures live.".into();
         return diagnostic;
     }
+    let parties = apiaxess_unified_surface::party::classify_hosts(
+        &flows_per_host,
+        &apiaxess_unified_surface::FirstPartyHints {
+            app_package: Some(package.to_owned()),
+            first_party_hosts: Vec::new(),
+        },
+    );
     let mut first = Vec::new();
     let mut third = Vec::new();
     let mut other = Vec::new();
     for host in hosts {
-        match classify_host_party(&host, package) {
-            HostParty::FirstParty => first.push(host),
-            HostParty::ThirdParty => third.push(host),
-            HostParty::Unclassified => other.push(host),
+        match parties.get(&host) {
+            Some(HostParty::FirstParty) => first.push(host),
+            Some(HostParty::ThirdParty) => third.push(host),
+            None => other.push(host),
         }
     }
     let render = |label: &str, hosts: &[String]| {
@@ -1533,7 +1468,7 @@ fn observed_host_summary(runtime: &SessionRuntime, package: &str) -> Diagnostic 
         third.len(),
         other.len(),
         render("First-party", &first),
-        render("Third-party (SDK/analytics/tracker)", &third),
+        render("Third-party", &third),
         render("Unclassified", &other),
     );
     let mut diagnostic = PIPELINE_DYNAMIC_CRAWL.instantiate(DiagnosticContext::new());
@@ -1894,50 +1829,29 @@ mod tests {
     }
 
     #[test]
-    fn host_party_flags_the_apps_own_backend_first_party() {
-        // Package tokens (tamasha, playroom) matched against the host's labels flag
-        // the app's own backend, even though the TLD differs from the package's.
-        assert_eq!(
-            classify_host_party("api.tamasha.live", "live.tamasha.playroom"),
-            HostParty::FirstParty
+    fn observed_hosts_are_first_party_by_app_identity_not_by_a_tracker_list() {
+        let flows = [
+            ("api.tamasha.live", 12),
+            ("cdn.playroom.io", 3),
+            ("graph.facebook.com", 2),
+            ("edge.some-cdn.io", 40),
+        ]
+        .into_iter()
+        .map(|(host, count)| (host.to_owned(), count))
+        .collect::<BTreeMap<_, _>>();
+        let parties = apiaxess_unified_surface::party::classify_hosts(
+            &flows,
+            &apiaxess_unified_surface::FirstPartyHints {
+                app_package: Some("live.tamasha.playroom".to_owned()),
+                first_party_hosts: Vec::new(),
+            },
         );
-        assert_eq!(
-            classify_host_party("cdn.playroom.io", "live.tamasha.playroom"),
-            HostParty::FirstParty
-        );
-    }
-
-    #[test]
-    fn host_party_flags_known_sdks_third_party() {
-        // Known SDK / analytics / payment hosts are third-party regardless of package.
-        for host in [
-            "graph.facebook.com",
-            "app-measurement.com",
-            "settings.crashlytics.com",
-            "api.razorpay.com",
-            "assets.juspay.in",
-            "www.clarity.ms",
-        ] {
-            assert_eq!(
-                classify_host_party(host, "live.tamasha.playroom"),
-                HostParty::ThirdParty,
-                "{host} should be third-party"
-            );
-        }
-    }
-
-    #[test]
-    fn host_party_leaves_unrecognized_hosts_unclassified() {
-        // Not a known SDK and no package affinity → left unclassified, not guessed.
-        assert_eq!(
-            classify_host_party("edge.some-cdn.io", "live.tamasha.playroom"),
-            HostParty::Unclassified
-        );
-        // Generic package tokens (com, app) never manufacture first-party affinity.
-        assert_eq!(
-            classify_host_party("app.example-tracker.net", "com.app.thing"),
-            HostParty::Unclassified
-        );
+        assert_eq!(parties["api.tamasha.live"], HostParty::FirstParty);
+        assert_eq!(parties["cdn.playroom.io"], HostParty::FirstParty);
+        assert_eq!(parties["graph.facebook.com"], HostParty::ThirdParty);
+        // On no list, and the busiest host: still third-party, because it is
+        // not the app's own domain.
+        assert_eq!(parties["edge.some-cdn.io"], HostParty::ThirdParty);
     }
 
     #[test]

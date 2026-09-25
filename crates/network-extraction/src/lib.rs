@@ -31,6 +31,10 @@ use apiaxess_network_routing::{CorpusDocument, LibraryDetection, SignatureCorpus
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod java_scope;
+
+use java_scope::{CallSite, HttpClient};
+
 /// A structured failure to produce an invariant-valid API document.
 #[derive(Clone, Debug)]
 pub struct ExtractionFailure {
@@ -525,16 +529,29 @@ impl ModelBuilder {
             );
             return;
         };
+        // Only a base bound to this call site (its own URL, or the Retrofit
+        // instance that built its interface) makes the host part of identity.
+        // The sole-discovered fallback below is a guess and stays out of it.
         let identity = EndpointIdentity {
             method,
             path_template: path_template.clone(),
+            host: base_url
+                .as_deref()
+                .and_then(apiaxess_api_model::normalize_host),
         };
-        if self
-            .endpoints
-            .iter()
-            .any(|endpoint| endpoint.identity == identity)
-        {
+        if self.endpoints.iter().any(|endpoint| {
+            endpoint.identity == identity
+                || (identity.host.is_none() && endpoint.identity.same_route(&identity))
+        }) {
             return;
+        }
+        // A host-bound view of a route supersedes a host-less view of it
+        // (e.g. the same Retrofit route read from smali with its instance
+        // binding and from Java without one).
+        if identity.host.is_some() {
+            self.endpoints.retain(|endpoint| {
+                !(endpoint.identity.host.is_none() && endpoint.identity.same_route(&identity))
+            });
         }
         let evidence = self.evidence(extractor_id, evidence_path);
         let expected = detection.recoverability.adjusted_basis_points;
@@ -1506,6 +1523,9 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
         corpus: &SignatureCorpus,
         builder: &mut ModelBuilder,
     ) {
+        // Each service interface resolves against the base URL of the
+        // Retrofit instance that created it, never an app-wide guess.
+        let service_bases = retrofit_service_bases(corpus);
         // Routing evidence can originate in indexed DEX while the explicit
         // method/path pairing lives in apktool's decoded service interface.
         // Scan only decoded source views that themselves carry a Retrofit
@@ -1521,6 +1541,14 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
             let Some(text) = corpus.text_for(document) else {
                 continue;
             };
+            let service = match document.source_kind {
+                SourceKind::Smali => java_scope::smali_class_name(&text),
+                SourceKind::DecompiledSource => java_scope::java_class_name(&document.path, &text),
+                _ => None,
+            };
+            let service_base = service
+                .as_ref()
+                .and_then(|service| service_bases.get(service).cloned().flatten());
             for block in method_blocks(&text) {
                 let mut route = None;
                 let mut queries = Vec::new();
@@ -1544,14 +1572,15 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
                         _ => {}
                     }
                 }
-                if let Some((method, path)) = route {
+                if let Some((method, route)) = route {
+                    let (base_url, path) = resolve_retrofit_route(service_base.as_deref(), &route);
                     builder.add_rest(
                         "retrofit",
                         detection,
                         &method,
                         &path,
                         PathTemplateOrigin::Declared,
-                        None,
+                        base_url,
                         &queries,
                         &paths,
                         &headers,
@@ -1597,6 +1626,67 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
             }
         }
     }
+}
+
+/// Maps each Retrofit service interface to the base URL of the instance that
+/// created it (`new Retrofit.Builder().baseUrl(..).build().create(S.class)`).
+/// A service is bound only when every creation site agrees on one resolved
+/// base; an unresolved or conflicting base leaves it unbound (`None`).
+fn retrofit_service_bases(corpus: &SignatureCorpus) -> BTreeMap<String, Option<String>> {
+    let paths = corpus
+        .hits_for(&["retrofit2.retrofit"])
+        .into_iter()
+        .filter(|hit| hit.source_kind == SourceKind::DecompiledSource)
+        .map(|hit| hit.path)
+        .collect::<BTreeSet<_>>();
+    let mut constants = java_scope::ConstantIndex::new(corpus);
+    let mut bases = BTreeMap::<String, BTreeSet<Option<String>>>::new();
+    for document in corpus
+        .documents()
+        .iter()
+        .filter(|document| paths.contains(&document.path))
+    {
+        let Some(text) = corpus.text_for(document) else {
+            continue;
+        };
+        for binding in java_scope::retrofit_bindings(document, &text, &mut constants) {
+            bases
+                .entry(binding.service)
+                .or_default()
+                .insert(binding.base_url);
+        }
+    }
+    bases
+        .into_iter()
+        .map(|(service, bases)| {
+            let base = match bases.into_iter().collect::<Vec<_>>().as_slice() {
+                [Some(base)] => Some(base.clone()),
+                _ => None,
+            };
+            (service, base)
+        })
+        .collect()
+}
+
+/// Resolves a Retrofit route against its instance's base URL the way
+/// Retrofit (`HttpUrl.resolve`) does: an absolute route stands alone, a
+/// root-relative route (`/x`) replaces the base path, and a relative route
+/// is appended to the base path's directory. Returns the origin and path.
+fn resolve_retrofit_route(base: Option<&str>, route: &str) -> (Option<String>, String) {
+    if route.contains("://") {
+        return split_url(route);
+    }
+    let Some((Some(origin), base_path)) = base.map(split_url) else {
+        return (None, route.to_owned());
+    };
+    if route.starts_with('/') {
+        return (Some(origin), route.to_owned());
+    }
+    let directory = match base_path.rfind('/') {
+        Some(index) => &base_path[..=index],
+        None => "/",
+    };
+    (Some(origin), format!("{directory}{route}"))
 }
 
 /// Recovers route annotations from a decompiled, R8-obfuscated Retrofit
@@ -1822,11 +1912,17 @@ impl ProtocolDecoderExtractor for OkHttpExtractor {
         corpus: &SignatureCorpus,
         builder: &mut ModelBuilder,
     ) {
-        for document in matching_documents(detection, corpus) {
-            let Some(text) = corpus.text_for(document) else {
-                continue;
-            };
-            for block in method_blocks(&text) {
+        let documents = matching_documents(detection, corpus);
+        let covered = extract_java_call_sites(
+            detection,
+            corpus,
+            builder,
+            &documents,
+            HttpClient::OkHttp,
+            "okhttp",
+        );
+        for (document, text) in fallback_documents(corpus, &documents, &covered) {
+            for block in code_method_blocks(document, &text) {
                 if !block.to_ascii_lowercase().contains("request$builder")
                     && !block.to_ascii_lowercase().contains(".url")
                     && !block.to_ascii_lowercase().contains("addpathsegment")
@@ -1849,7 +1945,7 @@ impl ProtocolDecoderExtractor for OkHttpExtractor {
                         }
                     }
                 }
-                let method = http_method_from_text(&block);
+                let method = block_http_method(document, &block);
                 if let Some(url_value) = url.take() {
                     let (base, mut path) = split_url(&url_value);
                     for segment in path_segments {
@@ -1885,6 +1981,187 @@ impl ProtocolDecoderExtractor for OkHttpExtractor {
     }
 }
 
+/// Resolves hand-built HTTP call sites in decompiled Java one method at a
+/// time and records one endpoint per resolved call site. Returns the classes
+/// whose Java view was complete, so their smali view is not re-scanned by the
+/// coarser fallback (which cannot bind a verb to its call site).
+fn extract_java_call_sites(
+    detection: &LibraryDetection,
+    corpus: &SignatureCorpus,
+    builder: &mut ModelBuilder,
+    documents: &[&CorpusDocument],
+    client: HttpClient,
+    extractor_id: &str,
+) -> BTreeSet<String> {
+    let mut covered = BTreeSet::new();
+    let mut constants = java_scope::ConstantIndex::new(corpus);
+    for document in documents
+        .iter()
+        .filter(|document| document.source_kind == SourceKind::DecompiledSource)
+    {
+        let Some(text) = corpus.text_for(document) else {
+            continue;
+        };
+        if !java_scope::decompilation_incomplete(&text) {
+            if let Some(class) = java_scope::java_class_name(&document.path, &text) {
+                covered.insert(class);
+            }
+        }
+        let relevant = match client {
+            HttpClient::OkHttp => text.contains("Builder"),
+            HttpClient::UrlConnection => text.contains("openConnection"),
+        };
+        if !relevant {
+            continue;
+        }
+        for site in java_scope::resolve_call_sites(document, &text, &mut constants) {
+            if site.client() != client {
+                continue;
+            }
+            match site {
+                CallSite::Resolved(call) => builder.add_rest(
+                    extractor_id,
+                    detection,
+                    &call.method,
+                    &call.path,
+                    PathTemplateOrigin::Inferred,
+                    call.base_url,
+                    &call.query_names,
+                    &placeholders(&call.path),
+                    &call.header_names,
+                    call.has_body,
+                    &document.path,
+                ),
+                CallSite::Unresolved {
+                    method_name,
+                    missing,
+                    ..
+                } => {
+                    let what = match missing {
+                        java_scope::Missing::Url => "request URL",
+                        java_scope::Missing::Verb => "HTTP method",
+                    };
+                    builder.partial(
+                        &detection.library_id,
+                        &document.path,
+                        &format!(
+                            "{what} in method `{method_name}` is not recoverable inside that method"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    covered
+}
+
+/// Non-Java documents still worth the coarse per-method scan: smali whose
+/// class has no complete decompiled Java view, plus any other source kind.
+/// Documents are loaded one at a time as the caller iterates.
+fn fallback_documents<'a>(
+    corpus: &'a SignatureCorpus,
+    documents: &'a [&'a CorpusDocument],
+    covered: &'a BTreeSet<String>,
+) -> impl Iterator<Item = (&'a CorpusDocument, String)> + 'a {
+    documents
+        .iter()
+        .filter(|document| document.source_kind != SourceKind::DecompiledSource)
+        .filter_map(|document| {
+            let text = corpus.text_for(document)?;
+            if document.source_kind == SourceKind::Smali
+                && java_scope::smali_outer_class_name(&text)
+                    .is_some_and(|class| covered.contains(&class))
+            {
+                return None;
+            }
+            Some((*document, text))
+        })
+}
+
+/// Method-granular blocks for any code view: jadx Java is segmented by its
+/// brace structure, smali/Kotlin by their method markers.
+fn code_method_blocks(document: &CorpusDocument, text: &str) -> Vec<String> {
+    if document.source_kind == SourceKind::DecompiledSource {
+        if let Some(methods) = java_scope::java_method_texts(text) {
+            return methods;
+        }
+    }
+    method_blocks(text)
+}
+
+/// The HTTP verb for a method block, read from the representation's own call
+/// shape so a verb is only ever taken from the block it occurs in.
+fn block_http_method(document: &CorpusDocument, block: &str) -> String {
+    if document.source_kind == SourceKind::Smali {
+        smali_http_method(block).unwrap_or_else(|| "GET".to_owned())
+    } else {
+        http_method_from_text(block)
+    }
+}
+
+/// Binds a verb inside one smali method: `okhttp3` `Request$Builder` verb calls,
+/// `Request$Builder->method(String, ...)` and
+/// `HttpURLConnection->setRequestMethod(String)`, following the `const-string`
+/// that feeds the argument register. A connection that writes a body with no
+/// explicit verb is a POST.
+fn smali_http_method(block: &str) -> Option<String> {
+    let mut registers = BTreeMap::<String, String>::new();
+    let mut verb = None;
+    let mut writes_body = false;
+    for line in block.lines() {
+        let line = line.trim();
+        if let Some(rest) = line
+            .strip_prefix("const-string/jumbo ")
+            .or_else(|| line.strip_prefix("const-string "))
+        {
+            if let (Some((register, _)), Some(value)) = (rest.split_once(','), first_quoted(rest)) {
+                registers.insert(register.trim().to_owned(), value);
+            }
+            continue;
+        }
+        if !line.starts_with("invoke-") {
+            continue;
+        }
+        let arguments = line
+            .split_once('{')
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(arguments, _)| {
+                arguments
+                    .split(',')
+                    .map(|register| register.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let argument_literal = |index: usize| {
+            arguments
+                .get(index)
+                .and_then(|register| registers.get(register))
+                .map(|value| value.to_ascii_uppercase())
+        };
+        if line.contains("Lokhttp3/Request$Builder;->") {
+            for candidate in ["get", "head", "post", "put", "patch", "delete"] {
+                if line.contains(&format!("Lokhttp3/Request$Builder;->{candidate}("))
+                    || line.contains(&format!("Lokhttp3/Request$Builder;->{candidate}$default("))
+                {
+                    verb = Some(candidate.to_ascii_uppercase());
+                }
+            }
+            if line.contains("Lokhttp3/Request$Builder;->method(") {
+                verb = argument_literal(1).or(verb);
+            }
+        }
+        if line.contains("URLConnection;->setRequestMethod(") {
+            verb = argument_literal(1).or(verb);
+        }
+        if line.contains("URLConnection;->setDoOutput(")
+            || line.contains("URLConnection;->getOutputStream(")
+        {
+            writes_body = true;
+        }
+    }
+    verb.or_else(|| writes_body.then(|| "POST".to_owned()))
+}
+
 impl ProtocolDecoderExtractor for VolleyExtractor {
     fn protocol_decoder_id(&self) -> &'static str {
         "volley"
@@ -1900,7 +2177,7 @@ impl ProtocolDecoderExtractor for VolleyExtractor {
             let Some(text) = corpus.text_for(document) else {
                 continue;
             };
-            for block in method_blocks(&text) {
+            for block in code_method_blocks(document, &text) {
                 let lower = block.to_ascii_lowercase();
                 if !lower.contains("stringrequest")
                     && !lower.contains("jsonobjectrequest")
@@ -1916,7 +2193,7 @@ impl ProtocolDecoderExtractor for VolleyExtractor {
                     builder.add_rest(
                         "volley",
                         detection,
-                        &http_method_from_text(&block),
+                        &block_http_method(document, &block),
                         &path,
                         PathTemplateOrigin::Inferred,
                         base,
@@ -1939,7 +2216,31 @@ impl ProtocolDecoderExtractor for VolleyExtractor {
 }
 
 simple_id!(ApacheExtractor, "apache-httpclient");
-simple_id!(HttpUrlConnectionExtractor, "httpurlconnection");
+impl ProtocolDecoderExtractor for HttpUrlConnectionExtractor {
+    fn protocol_decoder_id(&self) -> &'static str {
+        "httpurlconnection"
+    }
+
+    fn extract(
+        &self,
+        detection: &LibraryDetection,
+        corpus: &SignatureCorpus,
+        builder: &mut ModelBuilder,
+    ) {
+        let documents = matching_documents(detection, corpus);
+        let covered = extract_java_call_sites(
+            detection,
+            corpus,
+            builder,
+            &documents,
+            HttpClient::UrlConnection,
+            "httpurlconnection",
+        );
+        let fallback = fallback_documents(corpus, &documents, &covered);
+        extract_simple_url_blocks(detection, builder, "httpurlconnection", fallback);
+    }
+}
+
 simple_id!(WebViewExtractor, "webview-js-bridge");
 
 impl ProtocolDecoderExtractor for RawSocketExtractor {
@@ -1969,11 +2270,20 @@ fn extract_simple_url_calls(
     builder: &mut ModelBuilder,
     extractor_id: &str,
 ) {
-    for document in matching_documents(detection, corpus) {
-        let Some(text) = corpus.text_for(document) else {
-            continue;
-        };
-        for block in method_blocks(&text) {
+    let documents = matching_documents(detection, corpus)
+        .into_iter()
+        .filter_map(|document| Some((document, corpus.text_for(document)?)));
+    extract_simple_url_blocks(detection, builder, extractor_id, documents);
+}
+
+fn extract_simple_url_blocks<'a>(
+    detection: &LibraryDetection,
+    builder: &mut ModelBuilder,
+    extractor_id: &str,
+    documents: impl IntoIterator<Item = (&'a CorpusDocument, String)>,
+) {
+    for (document, text) in documents {
+        for block in code_method_blocks(document, &text) {
             let lower = block.to_ascii_lowercase();
             let relevant = match extractor_id {
                 "apache-httpclient" => {
@@ -1997,7 +2307,7 @@ fn extract_simple_url_calls(
                 builder.add_rest(
                     extractor_id,
                     detection,
-                    &http_method_from_text(&block),
+                    &block_http_method(document, &block),
                     &path,
                     PathTemplateOrigin::Inferred,
                     base,
@@ -2748,6 +3058,32 @@ mod tests {
             provenance: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn retrofit_routes_resolve_against_their_own_base_like_retrofit_does() {
+        assert_eq!(
+            super::resolve_retrofit_route(Some("https://api.app.test/v2/"), "users/{id}"),
+            (
+                Some("https://api.app.test".to_owned()),
+                "/v2/users/{id}".to_owned()
+            )
+        );
+        assert_eq!(
+            super::resolve_retrofit_route(Some("https://api.app.test/v2/"), "/status"),
+            (
+                Some("https://api.app.test".to_owned()),
+                "/status".to_owned()
+            )
+        );
+        assert_eq!(
+            super::resolve_retrofit_route(Some("https://api.app.test/"), "https://other.test/x"),
+            (Some("https://other.test".to_owned()), "/x".to_owned())
+        );
+        assert_eq!(
+            super::resolve_retrofit_route(None, "users"),
+            (None, "users".to_owned())
+        );
     }
 
     #[test]

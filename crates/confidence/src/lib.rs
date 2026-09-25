@@ -929,6 +929,7 @@ mod tests {
             identity: EndpointIdentity {
                 method: HttpMethod::new("GET").unwrap(),
                 path_template: PathTemplate::new(path).unwrap(),
+                host: None,
             },
             base_url,
             presence,

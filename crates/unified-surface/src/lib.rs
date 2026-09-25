@@ -13,6 +13,10 @@ use apiaxess_api_model::{
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use chrono::{DateTime, Utc};
 
+pub mod party;
+
+pub use party::FirstPartyHints;
+
 /// Configuration for one pure Phase 5.3 assembly.
 #[derive(Clone, Debug)]
 pub struct UnifiedSurfaceConfig {
@@ -22,6 +26,8 @@ pub struct UnifiedSurfaceConfig {
     pub minimum_confirmed_basis_points: u16,
     /// Explicit API-wide or endpoint-specific signer attachments.
     pub signer_bindings: Vec<SignerBinding>,
+    /// What identifies the app's own backend, for first-/third-party labels.
+    pub first_party: FirstPartyHints,
 }
 
 impl UnifiedSurfaceConfig {
@@ -43,6 +49,7 @@ impl UnifiedSurfaceConfig {
             run_id,
             minimum_confirmed_basis_points: 5_000,
             signer_bindings: Vec::new(),
+            first_party: FirstPartyHints::default(),
         })
     }
 }
@@ -108,8 +115,9 @@ pub fn assemble_document(
         .filter(|binding| matches!(binding.target, SignerTarget::ApiWide))
         .map(|binding| binding.signer_id.as_str())
         .collect::<BTreeSet<_>>();
+    let parties = party::classify_endpoints(&surface.endpoints, &config.first_party);
     let mut endpoints = Vec::with_capacity(surface.endpoints.len());
-    for endpoint in &surface.endpoints {
+    for (endpoint, party) in surface.endpoints.iter().zip(parties) {
         let endpoint_signers = config
             .signer_bindings
             .iter()
@@ -137,6 +145,7 @@ pub fn assemble_document(
             endpoint: endpoint.clone(),
             fact_confidence,
             signers: all_signers,
+            party,
         });
 
         if endpoint.authentication.is_none() && !has_signer {
@@ -445,6 +454,7 @@ mod tests {
         let identity = EndpointIdentity {
             method: HttpMethod::new("GET").unwrap(),
             path_template: PathTemplate::new("/users").unwrap(),
+            host: None,
         };
         let presence = fact(
             FieldClass::Presence,

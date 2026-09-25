@@ -55,6 +55,24 @@ pub struct UnifiedEndpoint {
     pub fact_confidence: Vec<FactConfidence>,
     /// Signers attached to this endpoint.
     pub signers: Vec<String>,
+    /// Whether the endpoint's host is the app's own backend or a third party,
+    /// when both its host and the app's own host(s) are known.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party: Option<HostParty>,
+}
+
+/// First- or third-party relation of a host to the analyzed app.
+///
+/// Structural, not an allowlist: first-party means the host belongs to the
+/// app's own backend domain(s); every other host is third-party.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostParty {
+    /// The app's own backend.
+    FirstParty,
+    /// Any host outside the app's own backend domain(s).
+    ThirdParty,
 }
 
 /// The single durable Phase 5.3 deliverable consumed by Phase 6.

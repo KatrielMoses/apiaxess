@@ -17,7 +17,7 @@ use apiaxess_api_model::{
     EndpointIdentity, Entity, EntityId, EntityKind, Fact, FactCandidate, FieldClass,
     HeaderParameter, MergeInput, MergeRecord, MergeRelation, PathParameter, PathTemplateAssertion,
     PresenceAssertion, ProtocolOperation, QueryParameter, ResponseBody, RunId, SchemaShape,
-    SchemaSlot, SourceType,
+    SchemaSlot, SourceType, normalize_host,
 };
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use chrono::{DateTime, Utc};
@@ -119,8 +119,10 @@ pub fn fuse_document(
             catalogue::FUSION_IDENTITY_COLLISION,
             "identity",
             &format!(
-                "duplicate endpoint identity {}/{}",
-                identity.method, identity.path_template
+                "duplicate endpoint identity {} {}{}",
+                identity.method,
+                identity.host.as_deref().unwrap_or_default(),
+                identity.path_template
             ),
         )]);
     }
@@ -305,6 +307,9 @@ fn fuse_endpoint(
             classify_scalar,
             |_left, _right| None,
         )?;
+        if let Some(host) = &endpoint.identity.host {
+            select_base_for_host(base_url, host, activity, at);
+        }
     }
     count += merge_fact(
         &mut endpoint.presence,
@@ -879,6 +884,39 @@ fn select_resolution<T: Clone + PartialEq>(
     }
 }
 
+/// The endpoint's identity host is authoritative for its base URL: a static
+/// base guessed for a host-unknown route is superseded by the base observed
+/// on the host the endpoint is bound to.
+fn select_base_for_host(
+    fact: &mut Fact<String>,
+    host: &str,
+    activity: &ActivityId,
+    at: DateTime<Utc>,
+) {
+    let on_host = |candidate: &FactCandidate<String>| {
+        normalize_host(&candidate.value).as_deref() == Some(host)
+    };
+    if fact
+        .candidates
+        .iter()
+        .any(|candidate| candidate.id == fact.resolution.selected && on_host(candidate))
+    {
+        return;
+    }
+    // Prefer a full origin (`scheme://host`) over a bare host.
+    let selected = fact
+        .candidates
+        .iter()
+        .filter(|candidate| on_host(candidate))
+        .max_by_key(|candidate| candidate.value.contains("://"))
+        .map(|candidate| candidate.id.clone());
+    if let Some(selected) = selected {
+        fact.resolution.selected = selected;
+        fact.resolution.resolved_by = activity.clone();
+        fact.resolution.resolved_at = at;
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn classify_presence(_left: &PresenceAssertion, _right: &PresenceAssertion) -> MergeRelation {
     MergeRelation::TrueConflict
@@ -1127,6 +1165,7 @@ mod tests {
             identity: EndpointIdentity {
                 method: HttpMethod::new("GET").unwrap(),
                 path_template: PathTemplate::new("/users/{id}").unwrap(),
+                host: None,
             },
             base_url: None,
             presence: static_presence,
@@ -1164,6 +1203,50 @@ mod tests {
         assert_eq!(endpoint.presence.candidates.len(), 1);
         assert_eq!(endpoint.presence.merges[0].relation, MergeRelation::GapFill);
         assert!(endpoint.presence.merges[0].right.candidate.is_none());
+    }
+
+    #[test]
+    fn the_observed_base_on_the_identity_host_supersedes_a_guessed_static_base() {
+        let (mut document, static_entity, dynamic_entity) = fixture();
+        let endpoint = &mut document.surface.endpoints[0];
+        // Static guessed one app-wide base; capture bound the route to the
+        // host it was actually served from.
+        endpoint.identity.host = Some("feed.vendor.test".to_owned());
+        endpoint.base_url = Some(Fact {
+            field_class: FieldClass::Scalar,
+            expected_recoverability_basis_points: None,
+            candidates: vec![
+                FactCandidate {
+                    id: CandidateId::new("candidate:static:base").unwrap(),
+                    value: "https://api.app.test".to_owned(),
+                    evidence: vec![static_entity],
+                },
+                FactCandidate {
+                    id: CandidateId::new("candidate:dynamic:base").unwrap(),
+                    value: "https://feed.vendor.test".to_owned(),
+                    evidence: vec![dynamic_entity],
+                },
+            ],
+            resolution: Resolution {
+                selected: CandidateId::new("candidate:static:base").unwrap(),
+                policy: ResolutionPolicy::Explicit,
+                resolved_by: ActivityId::new("activity:static").unwrap(),
+                resolved_at: at(1),
+            },
+            merges: vec![],
+        });
+        let report =
+            fuse_document(&document, &FusionConfig::new("run:fusion").unwrap(), at(4)).unwrap();
+        let base = report.document.surface.endpoints[0]
+            .base_url
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            base.selected_candidate().unwrap().value,
+            "https://feed.vendor.test"
+        );
+        // The static guess is retained as evidence, not discarded.
+        assert_eq!(base.candidates.len(), 2);
     }
 
     #[test]

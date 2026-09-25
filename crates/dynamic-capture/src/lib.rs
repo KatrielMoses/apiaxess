@@ -17,7 +17,7 @@ use apiaxess_api_model::{
     PathParameter, PathTemplate, PathTemplateAssertion, PathTemplateOrigin, PresenceAssertion,
     ProvenanceRegistry, QueryParameter, RequirednessAssertion, Resolution, ResolutionPolicy,
     ResponseBody, ResponseSelector, RunId, SamplePayload, SchemaObservation, SchemaProperty,
-    SchemaShape, SchemaSlot, SourceType,
+    SchemaShape, SchemaSlot, SourceType, normalize_host,
 };
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use apiaxess_session::Session;
@@ -231,25 +231,47 @@ pub fn capture_into_document(
             sample_count: NonZeroU64::new(1).expect("literal is non-zero"),
         });
 
-        let static_matches: Vec<_> = document
+        // Host is part of endpoint identity. A static endpoint bound to this
+        // flow's host matches first; a host-unknown one is the fallback; one
+        // bound to a different host never matches (two hosts serving the
+        // same route are different endpoints).
+        let flow_host = flow_host(flow);
+        let route_matches = |endpoint: &&Endpoint| {
+            endpoint.identity.method == method
+                && template_matches(endpoint.identity.path_template.as_str(), &path)
+        };
+        let same_host: Vec<_> = document
             .surface
             .endpoints
             .iter()
-            .filter(|endpoint| {
-                endpoint.identity.method == method
-                    && template_matches(endpoint.identity.path_template.as_str(), &path)
-            })
+            .filter(route_matches)
+            .filter(|endpoint| flow_host.is_some() && endpoint.identity.host == flow_host)
             .map(|endpoint| endpoint.identity.clone())
             .collect();
-        let template = if static_matches.len() > 1 {
+        let static_matches = if same_host.is_empty() {
+            document
+                .surface
+                .endpoints
+                .iter()
+                .filter(route_matches)
+                .filter(|endpoint| endpoint.identity.host.is_none())
+                .map(|endpoint| endpoint.identity.clone())
+                .collect()
+        } else {
+            same_host
+        };
+        let static_target = if static_matches.len() > 1 {
             diagnostics.push(flow_diagnostic(
                 catalogue::DYNAMIC_TEMPLATE_MATCH_AMBIGUOUS,
                 flow,
                 "multiple static templates matched",
             ));
             continue;
-        } else if let Some(identity) = static_matches.into_iter().next() {
-            identity.path_template
+        } else {
+            static_matches.into_iter().next()
+        };
+        let template = if let Some(identity) = &static_target {
+            identity.path_template.clone()
         } else {
             match infer_template(&path) {
                 Ok(template) => template,
@@ -266,12 +288,18 @@ pub fn capture_into_document(
         let identity = EndpointIdentity {
             method,
             path_template: template,
+            host: flow_host,
         };
         let entry = accumulators
             .entry(identity.clone())
             .or_insert_with(|| Accumulator::new(identity));
+        entry.static_target = entry.static_target.take().or(static_target);
         entry.flow_entities.push(entity_id.clone());
-        entry.hosts.extend(flow.host.clone());
+        if let Some(origin) = flow_origin(flow) {
+            if !entry.hosts.contains(&origin) {
+                entry.hosts.push(origin);
+            }
+        }
         collect_parameters(entry, &path, raw_path, &flow.request_headers);
         entry.auth = entry.auth.clone().or_else(|| observed_auth(flow));
         if let Some(body) = &flow.request_body {
@@ -342,6 +370,39 @@ pub fn capture_into_document(
         .iter()
         .map(|e| e.identity.clone())
         .collect();
+    // A host-unknown static endpoint takes the observed host only when a
+    // single host served it; with several, which one it meant is unknown, so
+    // it stays static-only and each observed host is its own endpoint.
+    let mut hosts_per_target = BTreeMap::<EndpointIdentity, usize>::new();
+    for accumulator in accumulators.values() {
+        if let Some(target) = &accumulator.static_target {
+            *hosts_per_target.entry(target.clone()).or_default() += 1;
+        }
+    }
+    let mut confirmed_static = BTreeSet::new();
+    for accumulator in accumulators.values_mut() {
+        let Some(target) = accumulator.static_target.clone() else {
+            continue;
+        };
+        if target == accumulator.identity {
+            confirmed_static.insert(target);
+        } else if target.host.is_none() && hosts_per_target.get(&target) == Some(&1) {
+            if let Some(endpoint) = document
+                .surface
+                .endpoints
+                .iter_mut()
+                .find(|endpoint| endpoint.identity == target)
+            {
+                endpoint
+                    .identity
+                    .host
+                    .clone_from(&accumulator.identity.host);
+            }
+            confirmed_static.insert(target);
+        } else {
+            accumulator.static_target = None;
+        }
+    }
     let mut observed = Vec::new();
     for accumulator in accumulators.values() {
         observed.push(accumulator.identity.clone());
@@ -356,9 +417,8 @@ pub fn capture_into_document(
         }
     }
     observed.sort();
-    let observed_set: BTreeSet<_> = observed.iter().cloned().collect();
     let static_only_endpoints = static_identities
-        .difference(&observed_set)
+        .difference(&confirmed_static)
         .cloned()
         .collect::<Vec<_>>();
     let (resolved_handoffs, open_handoffs) = handoff_feedback(&document, &observed);
@@ -382,9 +442,9 @@ pub fn capture_into_document(
         run_id: config.run_id.clone(),
         flow_count: flows.len(),
         structured_flow_count,
-        inferred_endpoint_count: observed
-            .iter()
-            .filter(|identity| !static_identities.contains(*identity))
+        inferred_endpoint_count: accumulators
+            .values()
+            .filter(|accumulator| accumulator.static_target.is_none())
             .count(),
         observed_endpoints: observed,
         static_only_endpoints,
@@ -417,6 +477,8 @@ struct Sample {
 #[derive(Clone, Debug)]
 struct Accumulator {
     identity: EndpointIdentity,
+    /// The static endpoint this route was matched against, when any.
+    static_target: Option<EndpointIdentity>,
     flow_entities: Vec<EntityId>,
     hosts: Vec<String>,
     query: BTreeMap<String, Vec<Value>>,
@@ -432,6 +494,7 @@ impl Accumulator {
     fn new(identity: EndpointIdentity) -> Self {
         Self {
             identity,
+            static_target: None,
             flow_entities: Vec::new(),
             hosts: Vec::new(),
             query: BTreeMap::new(),
@@ -670,6 +733,28 @@ fn apply_accumulator(
         .position(|endpoint| endpoint.identity == entry.identity);
     if let Some(index) = static_index {
         let endpoint = &mut document.surface.endpoints[index];
+        // Carry the observed origin onto the endpoint; fusion selects the base
+        // whose host agrees with the endpoint's identity host.
+        for origin in &entry.hosts {
+            match &mut endpoint.base_url {
+                Some(base_url) => append_candidate(
+                    base_url,
+                    origin.clone(),
+                    &entry.flow_entities,
+                    ids.candidate(),
+                    false,
+                    activity,
+                ),
+                None => {
+                    endpoint.base_url = Some(scalar_fact(
+                        origin.clone(),
+                        &entry.flow_entities,
+                        ids.candidate(),
+                        activity,
+                    ));
+                }
+            }
+        }
         append_candidate(
             &mut endpoint.presence,
             PresenceAssertion::Present,
@@ -1413,6 +1498,29 @@ fn infer_shape_value(
 }
 
 /// The path of a request target, without its query string or fragment.
+/// The flow's normalized host, from its exact URL when recorded.
+fn flow_host(flow: &FlowCapture) -> Option<String> {
+    flow.url
+        .as_deref()
+        .and_then(normalize_host)
+        .or_else(|| flow.host.as_deref().and_then(normalize_host))
+}
+
+/// The flow's origin (`scheme://host[:port]`) as a base URL candidate, or the
+/// bare host when the flow recorded no URL.
+fn flow_origin(flow: &FlowCapture) -> Option<String> {
+    let host = flow_host(flow)?;
+    let scheme = flow
+        .url
+        .as_deref()
+        .and_then(|url| url.split_once("://"))
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    Some(match scheme {
+        Some(scheme) => format!("{scheme}://{host}"),
+        None => host,
+    })
+}
+
 fn path_only(target: &str) -> String {
     let end = target.find(['?', '#']).unwrap_or(target.len());
     target[..end].to_owned()
@@ -1664,6 +1772,138 @@ mod tests {
             .collect();
         templates.sort();
         templates
+    }
+
+    fn on_host(id: u64, host: &str, path: &str) -> FlowCapture {
+        let mut flow = flow(id, path, br#"{"ok":true}"#);
+        flow.host = Some(host.to_owned());
+        flow.url = Some(format!("https://{host}{path}"));
+        flow
+    }
+
+    fn capture(document: &ApiDocument, flows: &[FlowCapture]) -> DynamicCaptureReport {
+        // Each run needs its own ID, as a real second capture run would.
+        let run = format!("run:test:{}", document.surface.provenance.activities.len());
+        let config = DynamicCaptureConfig::new(run).expect("config");
+        capture_into_document(document, flows, &config, Utc::now()).expect("report")
+    }
+
+    fn hosts(document: &ApiDocument) -> Vec<Option<String>> {
+        let mut hosts: Vec<_> = document
+            .surface
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.identity.host.clone())
+            .collect();
+        hosts.sort();
+        hosts
+    }
+
+    fn selected_bases(endpoint: &Endpoint) -> Vec<String> {
+        endpoint
+            .base_url
+            .iter()
+            .flat_map(|fact| {
+                fact.candidates
+                    .iter()
+                    .map(|candidate| candidate.value.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_hosts_serving_the_same_route_stay_distinct_endpoints() {
+        let report = capture(
+            &empty_document(),
+            &[
+                on_host(1, "api.one.test", "/v1/status"),
+                on_host(2, "api.two.test", "/v1/status"),
+                on_host(3, "api.one.test", "/v1/status"),
+            ],
+        );
+        assert_eq!(
+            hosts(&report.document),
+            vec![
+                Some("api.one.test".to_owned()),
+                Some("api.two.test".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_bound_endpoint_fuses_only_with_traffic_from_its_own_host() {
+        let seeded = capture(
+            &empty_document(),
+            &[on_host(1, "api.one.test", "/v1/status")],
+        );
+        let report = capture(
+            &seeded.document,
+            &[
+                on_host(2, "api.one.test", "/v1/status"),
+                on_host(3, "api.two.test", "/v1/status"),
+            ],
+        );
+        let endpoints = &report.document.surface.endpoints;
+        assert_eq!(endpoints.len(), 2);
+        let own = endpoints
+            .iter()
+            .find(|endpoint| endpoint.identity.host.as_deref() == Some("api.one.test"))
+            .expect("existing endpoint kept");
+        // The second observation merged into the existing endpoint.
+        assert_eq!(own.presence.candidates.len(), 2);
+        assert!(report.coverage.static_only_endpoints.is_empty());
+    }
+
+    #[test]
+    fn a_host_unknown_endpoint_takes_the_single_host_it_was_observed_on() {
+        let mut seeded = capture(
+            &empty_document(),
+            &[on_host(1, "api.one.test", "/v1/status")],
+        );
+        let endpoint = &mut seeded.document.surface.endpoints[0];
+        endpoint.identity.host = None;
+        endpoint.base_url = None;
+        let report = capture(
+            &seeded.document,
+            &[on_host(2, "feed.vendor.test", "/v1/status")],
+        );
+        let endpoints = &report.document.surface.endpoints;
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(
+            endpoints[0].identity.host.as_deref(),
+            Some("feed.vendor.test")
+        );
+        assert_eq!(
+            selected_bases(&endpoints[0]),
+            vec!["https://feed.vendor.test".to_owned()]
+        );
+        assert!(report.coverage.static_only_endpoints.is_empty());
+    }
+
+    #[test]
+    fn a_host_unknown_endpoint_seen_on_two_hosts_is_not_assigned_either() {
+        let mut seeded = capture(
+            &empty_document(),
+            &[on_host(1, "api.one.test", "/v1/status")],
+        );
+        seeded.document.surface.endpoints[0].identity.host = None;
+        let report = capture(
+            &seeded.document,
+            &[
+                on_host(2, "api.one.test", "/v1/status"),
+                on_host(3, "api.two.test", "/v1/status"),
+            ],
+        );
+        assert_eq!(
+            hosts(&report.document),
+            vec![
+                None,
+                Some("api.one.test".to_owned()),
+                Some("api.two.test".to_owned())
+            ]
+        );
+        assert_eq!(report.coverage.static_only_endpoints.len(), 1);
+        assert_eq!(report.coverage.inferred_endpoint_count, 2);
     }
 
     /// Regression: a query string leaked into templating (`path_only` returned

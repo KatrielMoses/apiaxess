@@ -842,9 +842,10 @@ impl Engine {
             chrono::Utc::now(),
         )
         .map_err(|diagnostics| diagnostics.into_iter().collect::<Vec<_>>())?;
-        let surface_config =
+        let mut surface_config =
             apiaxess_unified_surface::UnifiedSurfaceConfig::new(format!("{run_id}:surface"))
                 .map_err(|error| vec![error])?;
+        surface_config.first_party = first_party_hints(session.engagement_scope());
         let surface = apiaxess_unified_surface::assemble_document(
             &confidence.document,
             &surface_config,
@@ -2554,6 +2555,28 @@ fn pipeline_failure(
 impl Default for Engine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// What identifies the session target's own backend: a web target's own
+/// origin/host, or an APK's package name. Scope rules are not used, because
+/// they can include third parties the target was authorized to reach.
+fn first_party_hints(
+    scope: &apiaxess_session::EngagementScope,
+) -> apiaxess_unified_surface::FirstPartyHints {
+    let identifiers = std::iter::once(&scope.target.primary)
+        .chain(&scope.target.aliases)
+        .collect::<Vec<_>>();
+    let value_of = |kinds: &[&str]| {
+        identifiers
+            .iter()
+            .filter(|identifier| kinds.contains(&identifier.kind.as_str()))
+            .map(|identifier| identifier.value.clone())
+            .collect::<Vec<_>>()
+    };
+    apiaxess_unified_surface::FirstPartyHints {
+        app_package: value_of(&["android.package"]).into_iter().next(),
+        first_party_hosts: value_of(&["url.origin", "domain.host"]),
     }
 }
 

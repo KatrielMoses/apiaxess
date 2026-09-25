@@ -21,7 +21,7 @@ pub use api::{
     LooseFinding, LooseFindingKind, PaginationSignal, PathParameter, PathTemplateAssertion,
     PathTemplateOrigin, PresenceAssertion, ProtocolOperation, ProtocolOperationIdentity,
     QueryParameter, ResponseBody, ResponseSelector, StaticBoundaryReason, StaticCoverage,
-    StaticKnowledgeStatus, StaticPassSummary,
+    StaticKnowledgeStatus, StaticPassSummary, normalize_host,
 };
 pub use confidence::{
     CONFIDENCE_SCHEMA_VERSION, ConfidenceSummary, CoveragePicture, FactConfidence,
@@ -49,7 +49,8 @@ pub use signer::{
     SignerOutput, SignerPrimitive, SignerProvenance, SignerRequest, SignerRuntime, SignerScheme,
 };
 pub use unified::{
-    SignerBinding, SignerTarget, UNIFIED_SURFACE_SCHEMA_VERSION, UnifiedApiSurface, UnifiedEndpoint,
+    HostParty, SignerBinding, SignerTarget, UNIFIED_SURFACE_SCHEMA_VERSION, UnifiedApiSurface,
+    UnifiedEndpoint,
 };
 
 #[cfg(test)]

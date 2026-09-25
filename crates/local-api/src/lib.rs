@@ -347,11 +347,16 @@ struct SurfaceSummaryResponse {
 struct SurfaceEndpointSummary {
     method: String,
     path_template: String,
-    /// Resolved base URL, when statically recovered — the host the GUI labels
-    /// first- vs third-party so the tester can tell the app's own API from the
-    /// SDK/tracker hosts it also talks to.
+    /// Resolved base URL, statically recovered or observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     base_url: Option<String>,
+    /// The host the endpoint is bound to, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    /// `first_party` for the app's own backend, `third_party` for any other
+    /// host; absent when the host or the app's own domain is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    party: Option<apiaxess_api_model::HostParty>,
     /// `confirmed` when at least one of the endpoint's facts was observed in
     /// dynamic capture (the app was actually seen hitting it), else
     /// `static_inferred` — a static candidate not observed being hit (e.g. a
@@ -1154,6 +1159,15 @@ fn surface_summary(surface: &apiaxess_api_model::UnifiedApiSurface) -> SurfaceSu
                     .as_ref()
                     .and_then(|fact| fact.selected_candidate())
                     .map(|candidate| candidate.value.clone()),
+                host: endpoint.endpoint.identity.host.clone().or_else(|| {
+                    endpoint
+                        .endpoint
+                        .base_url
+                        .as_ref()
+                        .and_then(|fact| fact.selected_candidate())
+                        .and_then(|candidate| apiaxess_api_model::normalize_host(&candidate.value))
+                }),
+                party: endpoint.party,
                 evidence_source: if endpoint.fact_confidence.iter().any(|fact| {
                     fact.sources
                         .contains(&apiaxess_api_model::SourceType::DynamicCapture)

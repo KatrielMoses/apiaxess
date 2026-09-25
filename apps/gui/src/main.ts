@@ -118,7 +118,8 @@ interface EndpointDetail {
   readonly pathParams: readonly string[];
   readonly responses: readonly { readonly status: string; readonly headers: readonly string[] }[];
 }
-interface SurfaceEndpoint { readonly method: string; readonly pathTemplate: string; readonly baseUrl?: string | null; readonly evidenceSource?: string | null; readonly staticEvidence?: boolean | null; readonly minimumFactConfidence?: number | null; readonly signerCount: number; readonly detail?: EndpointDetail }
+type HostParty = "first_party" | "third_party";
+interface SurfaceEndpoint { readonly method: string; readonly pathTemplate: string; readonly baseUrl?: string | null; readonly host?: string | null; readonly party?: HostParty | null; readonly evidenceSource?: string | null; readonly staticEvidence?: boolean | null; readonly minimumFactConfidence?: number | null; readonly signerCount: number; readonly detail?: EndpointDetail }
 interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunId: string; readonly endpoints: readonly SurfaceEndpoint[]; readonly coverage: { readonly endpointCount: number; readonly confirmedEndpointCount: number; readonly inferredEndpointCount: number; readonly staticOnlyEndpointCount: number; readonly openHandoffCount: number; readonly resolvedHandoffCount: number }; readonly signerCount: number; readonly diagnostics: (Diagnostic | null)[]; }
 interface DiscoveryEstimate { target: string; requestCount: number; ratePerSecond: number; estimatedLabel: string; }
 interface BrowserLaunchStatus { running: boolean; browser?: string | null; target?: string | null; pid?: number | null; cdpConnected?: boolean; debugPort?: number | null; }
@@ -4390,22 +4391,9 @@ function endpointUrl(endpoint: SurfaceEndpoint): string {
   return `https://${base}${path}`;
 }
 
-/** Well-known third-party SDK / analytics / tracker / payment host suffixes.
- * Mirrors the workbench's server-side list (engine-shell pipeline). A host ending
- * in one of these is external to the app's own backend — a labeling aid the tester
- * uses to tell the app's own API apart from the SDKs and trackers it also calls.
- * Every endpoint is still shown regardless; this only sets the chip. */
-const THIRD_PARTY_HOST_SUFFIXES = [
-  "facebook.com", "fbcdn.net", "google.com", "googleapis.com", "google-analytics.com",
-  "googletagmanager.com", "gstatic.com", "doubleclick.net", "crashlytics.com",
-  "app-measurement.com", "firebaseio.com", "clarity.ms", "appsflyer.com", "adjust.com",
-  "branch.io", "sentry.io", "bugsnag.com", "mixpanel.com", "amplitude.com", "segment.io",
-  "segment.com", "onesignal.com", "cloudflareinsights.com", "razorpay.com", "juspay.in",
-  "cashfree.com", "phonepe.com", "paytm.in",
-];
-
-/** Extracts the bare host from an endpoint's base URL (scheme/port/path stripped). */
+/** The endpoint's host: the engine's bound host, else its base URL's host. */
 function endpointHost(endpoint: SurfaceEndpoint): string {
+  if (endpoint.host !== undefined && endpoint.host !== null && endpoint.host !== "") return endpoint.host.replace(/:\d+$/, "");
   const base = (endpoint.detail?.baseUrl ?? endpoint.baseUrl ?? "").trim();
   if (base === "") return "";
   const afterScheme = base.includes("://") ? base.slice(base.indexOf("://") + 3) : base;
@@ -4414,14 +4402,13 @@ function endpointHost(endpoint: SurfaceEndpoint): string {
   return hostPort.replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
 }
 
-/** First- vs third-party label for an endpoint's host. Third-party when the host
- * matches a known SDK/tracker suffix; otherwise treated as the app's own surface.
- * Returns null when there is no host to classify (nothing to show). */
+/** First- vs third-party label for an endpoint's host, as classified by the
+ * engine: first-party is the app's own backend domain, any other host is
+ * third-party. Null when the engine could not tell (no chip is shown). */
 function endpointParty(endpoint: SurfaceEndpoint): "first" | "third" | null {
-  const host = endpointHost(endpoint);
-  if (host === "") return null;
-  const isThird = THIRD_PARTY_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
-  return isThird ? "third" : "first";
+  if (endpoint.party === "first_party") return "first";
+  if (endpoint.party === "third_party") return "third";
+  return null;
 }
 
 /** Renders the confirmed/inferred evidence chip: "confirmed" when the app was
@@ -4442,7 +4429,7 @@ function partyChipHtml(endpoint: SurfaceEndpoint): string {
   if (party === null) return "";
   const host = escapeHtml(endpointHost(endpoint));
   return party === "third"
-    ? `<span class="party-chip party-chip--third" title="Third-party SDK / analytics / tracker host the app calls (${host}) — real surface, but not the app's own backend">3rd party</span>`
+    ? `<span class="party-chip party-chip--third" title="Third-party host the app calls (${host}) — real surface, but not the app's own backend">3rd party</span>`
     : `<span class="party-chip party-chip--first" title="The app's own backend host (${host})">1st party</span>`;
 }
 
@@ -4463,10 +4450,13 @@ function normalizeFusedSurface(raw: unknown): SurfaceSummary {
     });
     const observed = hasSource("dynamic_capture");
     const detail = extractEndpointDetail(endpoint);
+    const party: HostParty | null = entry.party === "first_party" || entry.party === "third_party" ? entry.party : null;
     return {
       method: String(identity.method ?? ""),
       pathTemplate: String(identity.path_template ?? identity.pathTemplate ?? ""),
       baseUrl: detail.baseUrl,
+      host: typeof identity.host === "string" ? identity.host : null,
+      party,
       evidenceSource: observed ? "confirmed" : "static_inferred",
       staticEvidence: hasSource("static_analysis"),
       minimumFactConfidence: scores.length === 0 ? undefined : Math.min(...scores),

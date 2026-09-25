@@ -92,6 +92,7 @@ fn api_document() -> ApiDocument {
             identity: EndpointIdentity {
                 method: HttpMethod::new("GET").unwrap(),
                 path_template: PathTemplate::new("/users/{id}").unwrap(),
+                host: None,
             },
             presence: fact(
                 FieldClass::Presence,

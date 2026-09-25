@@ -101,9 +101,19 @@ impl PythonSdkEmitter {
                 &mut model_diagnostics,
             );
             let mut methods = Vec::new();
+            let mut method_names = BTreeSet::new();
             for endpoint in endpoints {
                 let model_path = endpoint_path(surface, &endpoint.identity);
-                let method_name = method_name(&endpoint.identity);
+                // The same route on two hosts is two endpoints; keep their
+                // generated method names distinct.
+                let mut method_name = method_name(&endpoint.identity);
+                if !method_names.insert(method_name.clone()) {
+                    if let Some(host) = &endpoint.identity.host {
+                        method_name =
+                            format!("{method_name}_on_{}", safe_name(host).trim_matches('_'));
+                        method_names.insert(method_name.clone());
+                    }
+                }
                 let mut signer_names = Vec::new();
                 for signer in surface.signers_for(&endpoint.identity) {
                     all_signer_ids.insert(signer.signer_id.clone());
