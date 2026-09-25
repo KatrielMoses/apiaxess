@@ -967,7 +967,10 @@ fn parse_status_line(line: &str) -> (Option<String>, Option<String>) {
 /// request has none. `Content-Length` is as-sent: with `update_content_length`
 /// its value is recomputed in place from the body, and a body with no framing
 /// header gets one appended so it is not silently dropped by the target.
-fn wire_header_list(request: &ResendRequest, update_content_length: bool) -> Vec<(String, String)> {
+pub(crate) fn wire_header_list(
+    request: &ResendRequest,
+    update_content_length: bool,
+) -> Vec<(String, String)> {
     let body_len = request.body.as_ref().map_or(0, Vec::len);
     let mut headers: Vec<(String, String)> = request
         .headers

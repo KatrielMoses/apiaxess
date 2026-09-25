@@ -31,8 +31,15 @@ use crate::{
     ResendSender, SendOptions, SendOutcome,
     backend::ORIGIN_MARKER_HEADER,
     payloads::{Cardinality, generate_processed, set_cardinality, validate_set},
-    resend::url_target,
+    raw_http::{WIRE_HEADERS_MARKER, encode_header_list},
+    resend::{url_target, wire_header_list},
 };
+
+/// The keyword ffuf substitutes. ffuf replaces its keyword anywhere in the
+/// request — URL, headers, body — so it must never occur there by accident:
+/// `_` is outside the base64 alphabet of the wire-headers marker, and a
+/// template is vanishingly unlikely to contain this literally (unlike `FUZZ`).
+const FFUF_KEYWORD: &str = "APIAXESS_FFUF_POINT";
 
 /// One generated attack request paired with the payload values that produced it.
 type PlannedRequest = (Vec<String>, ResendRequest);
@@ -246,7 +253,15 @@ impl FuzzerWorkbench {
             && config.update_content_length
             && config.redirect.mode == RedirectMode::Never
             && !config.redirect.process_cookies;
+        // ffuf takes the body as a `-d` string, so only a UTF-8 body can be
+        // carried byte-for-byte.
+        let body_carriable = config
+            .base_request
+            .body
+            .as_deref()
+            .is_none_or(|body| std::str::from_utf8(body).is_ok());
         let ffuf_capable = config.sequence.is_empty()
+            && body_carriable
             && config.auth_preflight.is_none()
             && config.positions.len() == 1
             && config.positions[0].location == FuzzerPositionLocation::Url
@@ -860,7 +875,9 @@ impl FuzzerWorkbench {
             "-u".to_owned(),
             url,
             "-w".to_owned(),
-            wordlist.display().to_string(),
+            format!("{}:{FFUF_KEYWORD}", wordlist.display()),
+            "-X".to_owned(),
+            job.config.base_request.method.clone(),
             "-of".to_owned(),
             "json".to_owned(),
             "-o".to_owned(),
@@ -875,7 +892,27 @@ impl FuzzerWorkbench {
             // Live list and the fused surface exactly like native fuzz traffic.
             "-H".to_owned(),
             ffuf_origin_header(),
+            // ffuf (Go) canonicalizes header names, sorts them, and adds its own
+            // User-Agent and Accept-Encoding, so template headers passed as `-H`
+            // would not go out as authored. Instead it carries the exact list the
+            // native tier sends in the private wire-headers marker; the proxy
+            // strips the marker and writes that list upstream byte-for-byte, so
+            // both tiers put the same request on the wire — and the inspector's
+            // "as sent" view (the same derivation) is true for both.
+            "-H".to_owned(),
+            ffuf_wire_headers(&job.config.base_request, &job.config.positions),
         ];
+        if let Some(body) = job
+            .config
+            .base_request
+            .body
+            .as_deref()
+            .filter(|body| !body.is_empty())
+        {
+            // UTF-8 is guaranteed by the tier check.
+            arguments.push("-d".to_owned());
+            arguments.push(String::from_utf8_lossy(body).into_owned());
+        }
         // Honor the configured throttle so the run matches its pre-run estimate
         // rather than firing unbounded at ffuf's default thread count. The ffuf
         // tier only runs a Fixed delay (the tier check enforces this).
@@ -2341,15 +2378,47 @@ fn ffuf_url(request: &ResendRequest, positions: &[PayloadPosition]) -> Result<St
         .find(|position| position.location == FuzzerPositionLocation::Url)
         .ok_or_else(|| fuzzer_config_diagnostic("ffuf", "ffuf requires a URL payload position"))?;
     let mut url = request.url.clone();
-    replace_range(&mut url, url_position.start, url_position.end, "FUZZ")?;
+    replace_range(&mut url, url_position.start, url_position.end, FFUF_KEYWORD)?;
     Ok(url)
+}
+
+/// The `-H` value carrying the native tier's exact header list (see
+/// [`wire_header_list`]). The list is the same for every probe, because the
+/// ffuf tier only fuzzes the URL — except a `Host` derived from a URL whose
+/// authority holds the payload: that is left out, and the proxy derives it
+/// from the substituted URL ffuf actually requested.
+fn ffuf_wire_headers(request: &ResendRequest, positions: &[PayloadPosition]) -> String {
+    let mut headers = wire_header_list(request, true);
+    let authored_host = request
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"));
+    if !authored_host
+        && positions
+            .iter()
+            .any(|position| in_authority(&request.url, position))
+    {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
+    }
+    format!("{WIRE_HEADERS_MARKER}: {}", encode_header_list(&headers))
+}
+
+/// Whether a URL position falls inside the URL's authority (`host[:port]`).
+fn in_authority(url: &str, position: &PayloadPosition) -> bool {
+    let Some(scheme_end) = url.find("://").map(|index| index + 3) else {
+        return false;
+    };
+    let authority_end = url[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |index| scheme_end + index);
+    position.start < authority_end && position.end > scheme_end
 }
 
 /// Reconstructs the exact request an ffuf probe sent by substituting the payload
 /// at the marked position(s) — the same position-based substitution the native
 /// sender uses. A plain `.replace("FUZZ", …)` was wrong: the base request holds
-/// the template's original span content (e.g. `base`), not the literal `FUZZ`
-/// keyword (that keyword only exists in the URL handed to ffuf via [`ffuf_url`]),
+/// the template's original span content (e.g. `base`), not the ffuf keyword
+/// (that keyword only exists in the URL handed to ffuf via [`ffuf_url`]),
 /// so string-replacement left the base template unsubstituted and the "as sent"
 /// request was factually false. Falls back to the base request unchanged if the
 /// offsets don't apply, rather than fabricating.
@@ -2377,7 +2446,7 @@ fn ffuf_payload(entry: &serde_json::Value) -> Option<String> {
         .and_then(|input| {
             input
                 .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case("FUZZ"))
+                .find(|(key, _)| key.as_str() == FFUF_KEYWORD || key.eq_ignore_ascii_case("FUZZ"))
                 .and_then(|(_, value)| value.as_str())
                 .or_else(|| {
                     input
@@ -3411,6 +3480,73 @@ mod tests {
         let (name, value) = header.split_once(": ").expect("well-formed header");
         assert!(name.eq_ignore_ascii_case(ORIGIN_MARKER_HEADER));
         assert_eq!(FlowOrigin::from_db_str(value), FlowOrigin::Fuzz);
+    }
+
+    #[test]
+    fn ffuf_carries_the_native_wire_header_list() {
+        use crate::raw_http::{WIRE_HEADERS_MARKER, decode_header_list};
+
+        let decode = |header: String| {
+            let (name, value) = header.split_once(": ").expect("well-formed header");
+            assert_eq!(name, WIRE_HEADERS_MARKER);
+            decode_header_list(value.as_bytes()).expect("decodable list")
+        };
+        let pairs = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let path_position = PayloadPosition {
+            location: FuzzerPositionLocation::Url,
+            header_name: None,
+            start: 23,
+            end: 27,
+            set_index: 0,
+        };
+        // Exactly what the native tier sends: authored order and case, the
+        // private markers dropped, Content-Length recomputed for the body.
+        let request = ResendRequest {
+            method: "POST".to_owned(),
+            url: "http://api.example.test/base".to_owned(),
+            headers: pairs(&[
+                ("user-agent", "curl/8.12.1"),
+                ("accept", "*/*"),
+                (ORIGIN_MARKER_HEADER, "fuzz"),
+                ("Content-Length", "999"),
+            ]),
+            body: Some(b"a=1".to_vec()),
+        };
+        assert_eq!(
+            decode(ffuf_wire_headers(&request, &[path_position.clone()])),
+            crate::resend::wire_header_list(&request, true)
+        );
+        assert_eq!(
+            decode(ffuf_wire_headers(&request, &[path_position.clone()])),
+            pairs(&[
+                ("Host", "api.example.test"),
+                ("user-agent", "curl/8.12.1"),
+                ("accept", "*/*"),
+                ("Content-Length", "3"),
+            ])
+        );
+        // A payload in the authority with no authored Host: Host is left for
+        // the proxy to derive from the substituted URL ffuf requested.
+        let subdomain = ResendRequest {
+            method: "GET".to_owned(),
+            url: "https://FUZZ.example.test".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        };
+        let host_position = PayloadPosition {
+            start: 8,
+            end: 12,
+            ..path_position.clone()
+        };
+        assert!(decode(ffuf_wire_headers(&subdomain, &[host_position.clone()])).is_empty());
+        assert!(in_authority(&subdomain.url, &host_position));
+        assert!(!in_authority(&request.url, &path_position));
+        // The substitution keyword can never collide with base64 marker text.
+        assert!(FFUF_KEYWORD.contains('_'));
     }
 
     #[test]

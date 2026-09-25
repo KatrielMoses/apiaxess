@@ -42,9 +42,31 @@ pub(crate) const ORIGIN_MARKER_HEADER: &str = "x-apiaxess-origin";
 /// (see [`crate::raw_http`]). When present, the request's headers are replaced
 /// by that list, in order, so the recorded flow shows what goes on the wire, and
 /// the authored list is returned for the byte-faithful upstream write.
+///
+/// A list without `Host` gets one first, derived from the request URL the way a
+/// client derives it (default port omitted). Resend's lists always carry one;
+/// the ffuf tier omits it when the payload sits in the authority, because only
+/// the request ffuf actually sent knows the substituted host.
 fn take_wire_headers(req: &mut Request<Body>) -> Option<Vec<(String, String)>> {
     let value = req.headers_mut().remove(WIRE_HEADERS_MARKER)?;
-    let list = decode_header_list(value.as_bytes())?;
+    let mut list = decode_header_list(value.as_bytes())?;
+    if !list
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        let uri = req.uri();
+        let default_port = if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        };
+        let host = uri.host()?;
+        let authority = match uri.port_u16() {
+            Some(port) if port != default_port => format!("{host}:{port}"),
+            _ => host.to_owned(),
+        };
+        list.insert(0, ("Host".to_owned(), authority));
+    }
     let mut replaced = hudsucker::hyper::HeaderMap::new();
     for (name, value) in &list {
         let (Ok(name), Ok(value)) = (

@@ -37,6 +37,67 @@ export function countTemplatePositions(template: string): number {
   return Math.floor((template.split(FUZZ_MARK).length - 1) / 2);
 }
 
+/** Byte ranges of every JSON *value* (not object keys) in `text`, in order.
+ *  Strings mark their content inside the quotes; numbers/`true`/`false`/`null`
+ *  mark the whole token. Nested object/array members are included; the
+ *  containers themselves are not. Returns [] when `text` is not valid JSON, so
+ *  Auto § never mangles a body it doesn't understand. */
+export function jsonValueSpans(text: string): [number, number][] {
+  try {
+    JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const spans: [number, number][] = [];
+  const stack: { array: boolean; expectKey: boolean }[] = [];
+  const isWs = (c: string): boolean => c === " " || c === "\t" || c === "\n" || c === "\r";
+  const atValue = (): boolean => {
+    const top = stack[stack.length - 1];
+    return top === undefined || top.array || !top.expectKey;
+  };
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (isWs(c)) { i++; continue; }
+    if (c === "{") { stack.push({ array: false, expectKey: true }); i++; continue; }
+    if (c === "[") { stack.push({ array: true, expectKey: false }); i++; continue; }
+    if (c === "}" || c === "]") { stack.pop(); i++; continue; }
+    if (c === ":") { const top = stack[stack.length - 1]; if (top !== undefined) top.expectKey = false; i++; continue; }
+    if (c === ",") { const top = stack[stack.length - 1]; if (top !== undefined && !top.array) top.expectKey = true; i++; continue; }
+    if (c === '"') {
+      const start = i;
+      i++;
+      while (i < text.length) {
+        if (text[i] === "\\") { i += 2; continue; }
+        if (text[i] === '"') { i++; break; }
+        i++;
+      }
+      // Mark a non-empty string value's content, quotes excluded.
+      if (atValue() && i - 1 > start + 1) spans.push([start + 1, i - 1]);
+      continue;
+    }
+    // A bare token: number, true, false, or null.
+    const start = i;
+    while (i < text.length && !isWs(text[i]) && !",}]".includes(text[i])) i++;
+    if (i > start && atValue()) spans.push([start, i]);
+  }
+  return spans;
+}
+
+/** Wraps each JSON value in `body` with `§…§`, preserving keys and structure.
+ *  Returns `body` unchanged when it is not JSON or has no markable value. */
+export function markJsonBodyValues(body: string): string {
+  const spans = jsonValueSpans(body);
+  if (spans.length === 0) return body;
+  // Insert from the end so earlier offsets stay valid.
+  let marked = body;
+  for (let index = spans.length - 1; index >= 0; index--) {
+    const [start, end] = spans[index];
+    marked = `${marked.slice(0, start)}${FUZZ_MARK}${marked.slice(start, end)}${FUZZ_MARK}${marked.slice(end)}`;
+  }
+  return marked;
+}
+
 /** Extracts marker pairs from one field, recording each as a byte range in the
  *  marker-stripped field. Returns null when the field's markers are unbalanced. */
 export function extractFieldMarkers(

@@ -26,6 +26,7 @@ import {
   FUZZ_MARK,
   type ParsedTemplate,
   countTemplatePositions,
+  markJsonBodyValues,
   parseFuzzTemplate,
   stripFuzzMarks,
 } from "./fuzz/template";
@@ -656,9 +657,12 @@ async function openFuzzer(flowId: number): Promise<void> {
 /** Seeds a fresh Fuzz draft from a request: an unmarked template plus sane
  *  defaults. The operator marks positions in the template before starting. */
 function seedFuzzDraft(request: ResendRequest): void {
+  // Each Send-to-Fuzz keeps its own draft (like Resend's per-item drafts), so
+  // sending a second request before starting the first never discards it.
+  saveActiveDraftTemplate();
   // Drop proxy-injected artifacts so the operator fuzzes the real request.
   const seeded: ResendRequest = { ...request, headers: stripProxyArtifactHeaders(request.headers) };
-  selectedFuzzer = {
+  const draft: FuzzerJob = {
     id: "", tier: "native", state: "draft",
     config: {
       baseRequest: seeded,
@@ -675,11 +679,43 @@ function seedFuzzDraft(request: ResendRequest): void {
     },
     results: [], diagnostics: [],
   };
+  const key = `draft-${(nextDraftSeq += 1)}`;
+  fuzzDrafts.set(key, draft);
+  fuzzDraftTemplates.set(key, rawRequestText(seeded));
+  selectedFuzzer = draft;
+  selectedDraftKey = key;
   fuzzTemplate = rawRequestText(seeded);
   selectedFuzzResult = null;
   fuzzResultSort = { key: "ordinal", dir: 1 };
-  currentFuzzDraft = selectedFuzzer;
   renderFuzzer();
+}
+
+/** Persists the current draft's edited template so switching to another draft
+ *  (or job) and back preserves each one's marks and edits. */
+function saveActiveDraftTemplate(): void {
+  if (selectedDraftKey === null || !fuzzDrafts.has(selectedDraftKey)) return;
+  readFuzzerForm();
+  fuzzDraftTemplates.set(selectedDraftKey, fuzzTemplate);
+}
+
+/** Selects a Fuzz queue row — a local draft or a started job — restoring that
+ *  draft's own template. */
+function selectFuzzerRow(key: string): void {
+  saveActiveDraftTemplate();
+  const draft = fuzzDrafts.get(key);
+  if (draft !== undefined) {
+    selectedFuzzer = draft;
+    selectedDraftKey = key;
+    fuzzTemplate = fuzzDraftTemplates.get(key) ?? rawRequestText(draft.config.baseRequest);
+  } else {
+    const job = fuzzerJobsList.get(key);
+    if (job === undefined) return;
+    selectedFuzzer = job;
+    selectedDraftKey = null;
+  }
+  selectedFuzzResult = null;
+  renderFuzzer();
+  renderFuzzList();
 }
 
 /** Config is only editable before the job is created; the backend snapshots it. */
@@ -736,9 +772,14 @@ function autoMarkFuzz(): void {
   const lines = head.split("\n");
   lines[0] = markParams(lines[0]);
   const headMarked = lines.join("\n");
-  const bodyMarked = /^[^=\s&]+=/.test(bodyRaw.trim())
-    ? bodyRaw.replace(/([^=&\n]+=)([^&\n]*)/g, (_match, key: string, value: string) => (value === "" ? `${key}` : `${key}${FUZZ_MARK}${value}${FUZZ_MARK}`))
-    : bodyRaw;
+  // JSON first: a JSON body has no `=`, so the form branch never matches it.
+  // markJsonBodyValues returns the body unchanged when it isn't valid JSON.
+  const jsonMarked = markJsonBodyValues(bodyRaw);
+  const bodyMarked = jsonMarked !== bodyRaw
+    ? jsonMarked
+    : /^[^=\s&]+=/.test(bodyRaw.trim())
+      ? bodyRaw.replace(/([^=&\n]+=)([^&\n]*)/g, (_match, key: string, value: string) => (value === "" ? `${key}` : `${key}${FUZZ_MARK}${value}${FUZZ_MARK}`))
+      : bodyRaw;
   fuzzTemplate = sep === -1 ? headMarked : `${headMarked}\n\n${bodyMarked}`;
   if (countTemplatePositions(fuzzTemplate) === 0) toast("No obvious parameters found — select a value and click Add §.", "info");
   renderFuzzer();
@@ -1911,6 +1952,7 @@ function failureLabel(diagnostic: ContextDiagnostic): string {
 async function launchFuzzer(): Promise<void> {
   if (selectedFuzzer === null) return;
   try {
+    const startedDraftKey = selectedDraftKey;
     if (selectedFuzzer.id === "") {
       readFuzzerForm();
       const config = selectedFuzzer.config;
@@ -1931,6 +1973,13 @@ async function launchFuzzer(): Promise<void> {
       const created = await fetch("/api/v1/workbench/fuzzer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(config) });
       await requireOk(created, "fuzzer configuration failed");
       selectedFuzzer = (await created.json()) as FuzzerJob;
+      // The draft became a real job; drop its local draft entry so it does not
+      // linger as a duplicate row.
+      if (startedDraftKey !== null) {
+        fuzzDrafts.delete(startedDraftKey);
+        fuzzDraftTemplates.delete(startedDraftKey);
+        selectedDraftKey = null;
+      }
     }
     const action = selectedFuzzer.state === "paused" ? "resume" : "start";
     fuzzStartedAt = Date.now();
@@ -3501,8 +3550,12 @@ function sendEndpointToFuzzer(index: number): void {
  * 7c. Workbench tools — Live traffic / Resend (Repeater) / Fuzz (Intruder)
  * ==================================================================== */
 
-/** The in-progress, not-yet-run Fuzz attack (its own list row until it starts). */
-let currentFuzzDraft: FuzzerJob | null = null;
+/** Not-yet-run Fuzz drafts, each its own queue row with its own edited template,
+ *  until it starts. Multiple coexist so no unstarted draft is silently lost. */
+const fuzzDrafts = new Map<string, FuzzerJob>();
+const fuzzDraftTemplates = new Map<string, string>();
+let selectedDraftKey: string | null = null;
+let nextDraftSeq = 0;
 
 /** Switches the Workbench between its three tools; nothing remounts. */
 function showWorkbenchTab(name: "live" | "resend" | "fuzz"): void {
@@ -3816,7 +3869,6 @@ async function migrateLocalResendNames(contexts: ResendContext[]): Promise<void>
 function syncFuzzToList(): void {
   if (selectedFuzzer !== null && selectedFuzzer.id !== "") {
     fuzzerJobsList.set(selectedFuzzer.id, selectedFuzzer);
-    if (currentFuzzDraft !== null && currentFuzzDraft.id === "") currentFuzzDraft = null;
   }
   renderFuzzList();
 }
@@ -3826,7 +3878,7 @@ function renderFuzzList(): void {
   const count = document.getElementById("fuzz-tab-count");
   if (list === null) return;
   const rows: { key: string; job: FuzzerJob }[] = [];
-  if (currentFuzzDraft !== null) rows.push({ key: "draft", job: currentFuzzDraft });
+  fuzzDrafts.forEach((job, key) => rows.push({ key, job }));
   [...fuzzerJobsList.values()].forEach((job) => rows.push({ key: job.id, job }));
   if (count !== null) {
     count.textContent = String(rows.length);
@@ -3838,21 +3890,16 @@ function renderFuzzList(): void {
   }
   list.innerHTML = rows
     .map(({ key, job }) => {
-      const active = key === "draft" ? selectedFuzzer?.id === "" : selectedFuzzer?.id === job.id;
+      const isDraft = fuzzDrafts.has(key);
+      const active = isDraft ? selectedDraftKey === key : selectedFuzzer?.id === job.id;
       const req = job.config.baseRequest;
-      const state = key === "draft" ? "draft" : job.state;
+      const state = isDraft ? "draft" : job.state;
       return queueRowHtml({ id: key, attr: "fuzz-key", method: req.method, url: req.url, status: state, active });
     })
     .join("");
   list.querySelectorAll<HTMLElement>("[data-fuzz-key]").forEach((row) => {
     row.addEventListener("click", () => {
-      const key = row.dataset.fuzzKey ?? "";
-      const job = key === "draft" ? currentFuzzDraft : fuzzerJobsList.get(key);
-      if (job !== null && job !== undefined) {
-        selectedFuzzer = job;
-        renderFuzzer();
-        renderFuzzList();
-      }
+      selectFuzzerRow(row.dataset.fuzzKey ?? "");
     });
   });
   list.querySelectorAll<HTMLElement>("[data-fuzz-key-rename]").forEach((button) => {
@@ -3872,8 +3919,8 @@ function renderFuzzList(): void {
     row.addEventListener("contextmenu", (event) => {
       event.preventDefault();
       const key = row.dataset.fuzzKeyRow ?? "";
-      const job = key === "draft" ? currentFuzzDraft : fuzzerJobsList.get(key);
-      if (job !== null && job !== undefined) showHostScopeMenu(event.clientX, event.clientY, job.config.baseRequest.url);
+      const job = fuzzDrafts.get(key) ?? fuzzerJobsList.get(key);
+      if (job !== undefined) showHostScopeMenu(event.clientX, event.clientY, job.config.baseRequest.url);
     });
   });
 }
@@ -3882,9 +3929,19 @@ function renderFuzzList(): void {
  *  locally; a persisted job is deleted on the backend too. */
 async function deleteFuzzJob(key: string): Promise<void> {
   if (key === "") return;
-  if (key === "draft") {
-    currentFuzzDraft = null;
-    if (selectedFuzzer?.id === "") { selectedFuzzer = null; seedFuzzerEmpty(); }
+  if (fuzzDrafts.has(key)) {
+    fuzzDrafts.delete(key);
+    fuzzDraftTemplates.delete(key);
+    if (selectedDraftKey === key) {
+      selectedDraftKey = null;
+      selectedFuzzer = null;
+      // Fall back to another draft, then a started job, then the empty state.
+      const nextDraft = [...fuzzDrafts.keys()][0];
+      const nextJob = [...fuzzerJobsList.keys()][0];
+      if (nextDraft !== undefined) { selectFuzzerRow(nextDraft); return; }
+      if (nextJob !== undefined) { selectFuzzerRow(nextJob); return; }
+      seedFuzzerEmpty();
+    }
     renderFuzzList();
     return;
   }

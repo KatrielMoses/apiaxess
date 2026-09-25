@@ -6,6 +6,8 @@
 import assert from "node:assert/strict";
 import {
   countTemplatePositions,
+  jsonValueSpans,
+  markJsonBodyValues,
   parseFuzzTemplate,
   rawRequestText,
 } from "../src/fuzz/template.ts";
@@ -91,4 +93,28 @@ const decode = (bytes) => new TextDecoder().decode(new Uint8Array(bytes));
   assert.ok(parsed.error !== undefined, "unbalanced markers rejected");
 }
 
-console.log("Fuzz template OK: raw round-trip + §-marker placement verified.");
+// 8. Auto § on a JSON body marks each value (not keys), including nested
+//    object/array members and non-string scalars, and the marked ranges land
+//    exactly on those values once the template is parsed back to byte offsets.
+{
+  const body = '{"name":"bob","role":"user","age":30,"admin":false,"tags":["a","b"],"meta":{"k":"v"},"empty":""}';
+  const marked = markJsonBodyValues(body);
+  const raw = `POST /api/login HTTP/1.1\nHost: h.test\nContent-Type: application/json\n\n${marked}`;
+  const parsed = parseFuzzTemplate(raw, "https");
+  const values = parsed.positions
+    .filter((p) => p.location === "body")
+    .map((p) => decode(parsed.body).slice(p.start, p.end));
+  // Keys are never marked; every non-empty scalar value is (empty string skipped).
+  assert.deepEqual(values, ["bob", "user", "30", "false", "a", "b", "v"], `json values: ${JSON.stringify(values)}`);
+  // The reconstructed body (markers stripped) is the original JSON, byte-for-byte.
+  assert.equal(decode(parsed.body), body, "json body round-trips unchanged");
+}
+
+// 9. jsonValueSpans returns [] for non-JSON, so Auto § leaves such bodies alone.
+{
+  assert.deepEqual(jsonValueSpans("name=bob&role=user"), []);
+  assert.deepEqual(jsonValueSpans("not json"), []);
+  assert.equal(markJsonBodyValues("name=bob&role=user"), "name=bob&role=user");
+}
+
+console.log("Fuzz template OK: raw round-trip + §-marker placement + JSON auto-mark verified.");
