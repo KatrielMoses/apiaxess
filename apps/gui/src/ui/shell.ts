@@ -9,6 +9,7 @@
  */
 
 import { icon, type IconName } from "../brand/icons";
+import { escapeHtml } from "./dom";
 import { onViewChange, showView, type ViewName } from "./nav";
 
 /** Which workspace phase (rail cell) owns each surface. */
@@ -114,12 +115,17 @@ function toggle(attr: "sidebar" | "dock" | "inspector", force?: boolean): void {
   syncStatusAffordances();
 }
 
-/** Shows a status-bar affordance for each collapsed pane so nothing hides silently. */
+/** Shows a status-bar affordance for each collapsed pane so nothing hides
+ *  silently, plus a menu affordance when the menubar itself is hidden at laptop
+ *  width — otherwise File/View actions would be unreachable. */
 function syncStatusAffordances(): void {
   const sidebarCell = document.querySelector<HTMLElement>("#statusbar-sidebar");
   const dockCell = document.querySelector<HTMLElement>("#statusbar-dock");
+  const menuCell = document.querySelector<HTMLElement>("#statusbar-menu");
   if (sidebarCell !== null) sidebarCell.hidden = shell.getAttribute("data-sidebar") !== "collapsed";
   if (dockCell !== null) dockCell.hidden = shell.getAttribute("data-dock") !== "collapsed";
+  // The menubar is `display:none` at ≤1119px (see shell.css); mirror that here.
+  if (menuCell !== null) menuCell.hidden = !window.matchMedia("(max-width: 1119px)").matches;
 }
 
 /* ------------------------------------------------------------------ *
@@ -314,8 +320,8 @@ function openPalette(): void {
   scrim.className = "palette__scrim";
   scrim.innerHTML = `
     <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
-      <input class="palette__input" type="text" placeholder="Go to surface, flow, endpoint or command" autocomplete="off" spellcheck="false" aria-label="Command palette" />
-      <div class="palette__list" role="listbox"></div>
+      <input class="palette__input" type="text" placeholder="Go to surface, flow, endpoint or command" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list" aria-label="Command palette" />
+      <div class="palette__list" id="palette-list" role="listbox"></div>
     </div>`;
   document.body.appendChild(scrim);
   paletteEl = scrim;
@@ -328,10 +334,15 @@ function openPalette(): void {
     const q = input.value.trim().toLowerCase();
     const matches = PALETTE_ITEMS.filter((i) => i.label.toLowerCase().includes(q));
     active = Math.min(active, Math.max(0, matches.length - 1));
+    if (matches.length === 0) {
+      list.innerHTML = `<div class="palette__empty" role="status">No commands match “${escapeHtml(input.value.trim())}”.</div>`;
+      input.removeAttribute("aria-activedescendant");
+      return;
+    }
     list.innerHTML = matches
       .map(
         (m, i) =>
-          `<button class="palette__item${i === active ? " is-active" : ""}" role="option" data-view="${m.view}">${icon(m.icon, { size: 15 })}<span>${m.label}</span>${m.group === "" ? "" : `<span class="palette__item-group">${m.group}</span>`}</button>`,
+          `<button class="palette__item${i === active ? " is-active" : ""}" id="palette-opt-${i}" role="option" aria-selected="${i === active}" data-view="${m.view}">${icon(m.icon, { size: 15 })}<span>${m.label}</span>${m.group === "" ? "" : `<span class="palette__item-group">${m.group}</span>`}</button>`,
       )
       .join("");
     list.querySelectorAll<HTMLElement>(".palette__item").forEach((el, i) => {
@@ -341,11 +352,13 @@ function openPalette(): void {
       });
       el.addEventListener("click", () => choose(el.dataset.view as ViewName));
     });
+    markActive();
   };
   const markActive = (): void => {
     list.querySelectorAll<HTMLElement>(".palette__item").forEach((el, i) => {
       el.classList.toggle("is-active", i === active);
-      if (i === active) el.scrollIntoView({ block: "nearest" });
+      el.setAttribute("aria-selected", String(i === active));
+      if (i === active) { el.scrollIntoView({ block: "nearest" }); input.setAttribute("aria-activedescendant", el.id); }
     });
   };
   const choose = (view: ViewName | undefined): void => {
@@ -456,6 +469,73 @@ function menuModel(): Menu[] {
 
 let openMenuId: string | null = null;
 
+/** Opens every menubar menu as one grouped dropdown, anchored to `trigger`.
+ *  This is the laptop-width fallback for the hidden menubar (#12) so File→New/
+ *  Open/Save and the View toggles stay reachable. */
+function openCompactMenu(trigger: HTMLElement): void {
+  document.getElementById("menu-dropdown")?.remove();
+  if (trigger.getAttribute("aria-expanded") === "true") {
+    trigger.setAttribute("aria-expanded", "false");
+    return;
+  }
+  trigger.setAttribute("aria-expanded", "true");
+  const model = menuModel();
+  const drop = document.createElement("div");
+  drop.className = "menu-dropdown";
+  drop.id = "menu-dropdown";
+  drop.setAttribute("role", "menu");
+  const actions: MenuItem[] = [];
+  drop.innerHTML = model
+    .map((menu, menuIndex) => {
+      const header = `<div class="menu-dropdown__group" role="presentation">${menu.label}</div>`;
+      const items = menu.items
+        .map((entry) => {
+          if (entry === "separator") return `<div class="menu-dropdown__sep" role="separator"></div>`;
+          actions.push(entry);
+          return `<button class="menu-dropdown__item" type="button" role="menuitem">${entry.label}${entry.hint === undefined ? "" : `<span class="menu-dropdown__hint">${entry.hint}</span>`}</button>`;
+        })
+        .join("");
+      return `${menuIndex === 0 ? "" : `<div class="menu-dropdown__sep" role="separator"></div>`}${header}${items}`;
+    })
+    .join("");
+  const rect = trigger.getBoundingClientRect();
+  document.body.appendChild(drop);
+  const width = drop.getBoundingClientRect().width;
+  // Anchor above the status bar, right-aligned to the trigger and on-screen.
+  drop.style.left = `${Math.round(Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8)))}px`;
+  drop.style.top = `${Math.round(rect.top - drop.getBoundingClientRect().height - 4)}px`;
+  const close = (): void => {
+    drop.remove();
+    trigger.setAttribute("aria-expanded", "false");
+    document.removeEventListener("click", onDoc, true);
+    document.removeEventListener("keydown", onKey, true);
+  };
+  drop.querySelectorAll<HTMLElement>(".menu-dropdown__item").forEach((el, index) => {
+    el.addEventListener("click", () => { close(); actions[index]?.run(); });
+  });
+  const onDoc = (event: MouseEvent): void => {
+    const target = event.target as Element | null;
+    if (target?.closest("#menu-dropdown, #statusbar-menu") === null) close();
+  };
+  const onKey = (event: KeyboardEvent): void => { if (event.key === "Escape") close(); };
+  // Defer so this same click doesn't immediately close the menu.
+  window.setTimeout(() => {
+    document.addEventListener("click", onDoc, true);
+    document.addEventListener("keydown", onKey, true);
+  }, 0);
+}
+
+/** Re-applies the persisted pane widths for the now-active session. Layout is
+ *  keyed per session, but the session id is unknown at first paint, so widths
+ *  saved under a real session id are only restorable once it loads (#9). */
+export function refreshLayoutForSession(): void {
+  if (shell === undefined) return;
+  const layout = readLayout();
+  setPane("sidebar", layout.sidebar ?? PANE_DEFAULTS.sidebar, false);
+  setPane("inspector", layout.inspector ?? PANE_DEFAULTS.inspector, false);
+  setPane("dock", layout.dock ?? PANE_DEFAULTS.dock, false);
+}
+
 function initMenubar(): void {
   const bar = document.getElementById("menubar");
   if (bar === null) return;
@@ -549,6 +629,11 @@ export function initShell(): void {
     cell.addEventListener("click", () => toggle(cell.dataset.toggle as "sidebar" | "dock")),
   );
   document.getElementById("omnibox")?.addEventListener("click", openPalette);
+  const menuAffordance = document.getElementById("statusbar-menu");
+  menuAffordance?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openCompactMenu(menuAffordance);
+  });
   document.getElementById("statusbar-diag")?.addEventListener("click", () =>
     document.getElementById("diagnostics-toggle")?.click(),
   );

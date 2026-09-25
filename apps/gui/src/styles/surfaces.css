@@ -530,15 +530,18 @@
 }
 
 .workbench__filter {
-  flex: 1 1 14rem;
-  min-width: 0;
+  flex: 1 1 20rem;
+  /* Keep the field genuinely usable: rather than let it collapse to a sliver
+     when it shares the bar with the search box, hold a readable minimum and
+     wrap to its own line (the bar is flex-wrap) when there isn't room. */
+  min-width: 18rem;
   /* Wide enough that the placeholder — which is the field's documentation —
      is readable in full once there is room for it. */
   max-width: 34rem;
 }
 
 .workbench__filter .input {
-  min-width: 0;
+  min-width: 12rem;
 }
 
 .workbench__grid {

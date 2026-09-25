@@ -334,6 +334,23 @@
   line-height: var(--leading-snug);
 }
 
+.field__error {
+  font-size: var(--text-micro);
+  color: var(--color-danger-ink);
+  line-height: var(--leading-snug);
+}
+.field__error::before {
+  content: "⚠ ";
+}
+.field.is-invalid .input,
+.field.is-invalid .select {
+  border-color: var(--color-danger-ink);
+}
+
+.panel__inline-error {
+  margin: var(--space-3) 0 0;
+}
+
 .field--inline {
   flex-direction: row;
   align-items: center;

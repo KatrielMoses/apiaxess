@@ -18,7 +18,7 @@ import {
   stateBlock,
 } from "./ui/dom";
 import { initNavigation, onViewChange, showView, trackNavOverflow } from "./ui/nav";
-import { initShell } from "./ui/shell";
+import { initShell, refreshLayoutForSession } from "./ui/shell";
 import { initTheme } from "./ui/theme";
 import { type CredentialDialogField, choiceDialog, confirmDialog, credentialDialog, promptDialog } from "./ui/overlay";
 import { toast } from "./ui/toast";
@@ -103,7 +103,7 @@ interface RetryPolicy { maxRetries: number; pauseMs: number; }
 type DelayPolicy = { type: "fixed"; ratePerSecond: number } | { type: "interval"; ms: number } | { type: "random"; minMs: number; maxMs: number };
 interface RedirectHop { status: number; location: string; }
 interface FuzzerConfig { baseRequest: ResendRequest; positions: FuzzerPosition[]; payloadSets: FuzzerPayloadSet[]; attackType: string; matchFilter: FuzzerMatchFilter; grep: GrepConfig; concurrency: number; delay: DelayPolicy; retry: RetryPolicy; redirect: RedirectPolicy; connectionClose: boolean; updateContentLength: boolean; maxResults: number; authPreflight?: ResendRequest | null; sequence?: unknown[]; }
-interface FuzzerJob { id: string; tier: "ffuf" | "native"; state: string; config: FuzzerConfig; results: FuzzerResult[]; diagnostics: (Diagnostic | null)[]; }
+interface FuzzerJob { id: string; tier: "ffuf" | "native"; state: string; config: FuzzerConfig; results: FuzzerResult[]; diagnostics: (Diagnostic | null)[]; progress?: { sent: number; total: number } | null; }
 interface CredentialPromptMsg { readonly id: number; readonly package: string; readonly screenSummary: string; readonly reason: string; readonly fields: readonly CredentialDialogField[]; }
 interface LiveUpdate { readonly flows: readonly FlowSummary[]; readonly diagnostics: readonly Diagnostic[]; readonly prompts?: readonly CredentialPromptMsg[]; }
 interface PipelineRun { readonly runId: string; readonly artifactPath: string; readonly stage: string; readonly status: "running" | "completed" | "failed"; readonly progressBasisPoints: number; readonly message: string; readonly diagnostics: (Diagnostic | null)[]; readonly dynamicRan: boolean; readonly updatedAt: string; readonly surfaceAvailable: boolean; }
@@ -305,6 +305,11 @@ let lastDiscoveryEstimateKey: string | null = null;
 let discoveryEstimateDebounce: number | undefined;
 let fuzzerPoll: number | undefined;
 let pipelinePoll: number | undefined;
+/** When the GUI first observed the current pipeline run, for a live elapsed
+ *  readout during long, quiet stages (intake) where the backend timestamp is
+ *  frozen (#17). */
+let pipelineStartedAt = 0;
+let pipelineStartedRunId = "";
 let discoveryPoll: number | undefined;
 /** Wall-clock ms when the current discovery run started, for live elapsed
  *  progress on the ffuf tier (which reports hits, not a sent count). */
@@ -378,6 +383,22 @@ function reportUnexpected(error: unknown, diagnostic: Diagnostic): void {
   if (error instanceof ApiRequestError) return;
   showDiagnostic({ ...diagnostic, why: String(error) });
   toast(diagnostic.what, "danger");
+}
+
+/** The structured diagnostic a failed request carried, or the fallback filled
+ *  in with the raw error text when the server gave no diagnostic. */
+function errorDiagnostic(error: unknown, fallback: Diagnostic): Diagnostic {
+  if (error instanceof ApiRequestError && error.diagnostic !== undefined) return error.diagnostic;
+  return { ...fallback, why: fallback.why === "" ? String(error) : fallback.why };
+}
+
+/** Renders (or clears) a diagnostic inline on the panel that triggered it, so a
+ *  form error is visible where the operator is looking — not only in the dock. */
+function showInlineError(el: HTMLElement | null, diagnostic: Diagnostic | null): void {
+  if (el === null) return;
+  if (diagnostic === null) { el.hidden = true; el.innerHTML = ""; return; }
+  el.hidden = false;
+  el.innerHTML = diagnosticListHtml([diagnostic], "");
 }
 
 function sendControl(message: unknown): void {
@@ -586,11 +607,21 @@ function renderDetailEmpty(): void {
   });
 }
 
+/** Renders a captured flow body: the retained bytes are shown, Pretty-printed
+ *  for JSON and hex-dumped for binary, with a size note — not just "N B
+ *  retained in memory" (#21). */
+function renderFlowBody(headers: readonly [string, string][], bytes: number[] | null | undefined): string {
+  if (bytes === null || bytes === undefined) return `<p class="t-small t-subtle">Body not retained by this backend.</p>`;
+  if (bytes.length === 0) return `<p class="t-small t-subtle">Empty body (0 B).</p>`;
+  const note = (label: string): string => `<p class="t-small t-subtle">${escapeHtml(`${formatBytes(bytes.length)}${label}`)}</p>`;
+  if (isBinaryBody(headers, bytes)) {
+    return `${note(" · binary, shown as hex")}<pre class="code">${escapeHtml(hexDump(bytes))}</pre>`;
+  }
+  const { text, formatted } = prettyBody(headers, bytesToText(bytes));
+  return `${note(formatted ? " · JSON" : "")}<pre class="code">${escapeHtml(text)}</pre>`;
+}
+
 function renderDetail(flow: FlowDetail): string {
-  const body = (bytes: number[] | null | undefined): string =>
-    bytes === null || bytes === undefined
-      ? "Body not retained by this backend."
-      : `${formatBytes(bytes.length)} retained in memory.`;
   const summary = flow.summary;
   return `<div class="stack">
 <dl class="kv">
@@ -605,12 +636,12 @@ function renderDetail(flow: FlowDetail): string {
   <section class="reqres__col stack stack--tight">
     <p class="section-label">Request</p>
     <pre class="code">${escapeHtml(formatHeaders(flow.requestHeaders))}</pre>
-    <p class="t-small t-subtle">${escapeHtml(body(flow.requestBody))}</p>
+    ${renderFlowBody(flow.requestHeaders, flow.requestBody)}
   </section>
   <section class="reqres__col stack stack--tight">
     <p class="section-label">Response</p>
     <pre class="code">${escapeHtml(formatHeaders(flow.responseHeaders))}</pre>
-    <p class="t-small t-subtle">${escapeHtml(body(flow.responseBody))}</p>
+    ${renderFlowBody(flow.responseHeaders, flow.responseBody)}
   </section>
 </div>
 </div>`;
@@ -1368,6 +1399,7 @@ function renderFuzzer(): void {
   fuzzerPanel.querySelector("#fuzzer-launch")?.addEventListener("click", () => void launchFuzzer());
   fuzzerPanel.querySelector("#fuzzer-pause")?.addEventListener("click", () => void pauseFuzzer());
   fuzzerPanel.querySelector("#fuzzer-stop")?.addEventListener("click", () => void stopFuzzer());
+  fuzzerPanel.querySelector("#fuzzer-rerun")?.addEventListener("click", () => { if (selectedFuzzer !== null) editAndRerunFuzz(selectedFuzzer); });
   fuzzerPanel.querySelector("[data-close-fuzzer]")?.addEventListener("click", () => {
     if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
     selectedFuzzer = null;
@@ -1525,7 +1557,7 @@ function renderPayloadSetBlock(set: FuzzerPayloadSet, index: number, perPosition
   const countText = set.source.type === "runtimeFile" ? "streamed at run" : `${count >= COUNT_HUGE ? "≈ huge" : count.toLocaleString()} value${count === 1 ? "" : "s"}`;
   const rows = set.processors.map((processor, position) => renderProcessorRow(processor, index, position)).join("");
   return `<div class="stack stack--tight fuzz-set" data-set-block="${index}">
-    <div class="row"><label class="field__label">${perPosition ? `Position ${index + 1}` : "Payload set"}</label><span class="spacer"></span><span class="t-subtle t-small">${countText}</span></div>
+    <div class="row"><label class="field__label">${perPosition ? `Position ${index + 1}` : "Payload set"}</label><span class="spacer"></span><span class="t-subtle t-small" data-set-count="${index}">${countText}</span></div>
     <div class="field"><label class="field__label">Payload type</label><select class="select" data-source-type="${index}">${selectOptions(PAYLOAD_SOURCE_TYPES, set.source.type)}</select></div>
     ${renderSourceSettings(set, index)}
     <div class="stack stack--tight fuzz-processing">
@@ -1697,11 +1729,20 @@ function renderAttackSettings(config: FuzzerConfig): string {
 function renderFuzzerLockedSummary(job: FuzzerJob): string {
   const config = job.config;
   const expected = estimateRequestCount(config.attackType, config.positions.length, config.payloadSets);
-  const sent = job.results.length;
   const matched = job.results.filter((result) => result.matched).length;
-  const percent = expected > 0 ? Math.min(100, Math.round((sent / expected) * 100)) : 0;
+  // The ffuf tier reports only matched hits, so its result count is not the
+  // attempt count; prefer its live progress (sent/total) when present (#16b).
+  const progress = job.progress ?? null;
+  const sent = progress !== null ? progress.sent : job.results.length;
+  const total = progress !== null && progress.total > 0 ? progress.total : expected;
+  const percent = total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : 0;
   const elapsed = fuzzStartedAt > 0 ? (Date.now() - fuzzStartedAt) / 1000 : 0;
-  const rate = job.state === "running" && elapsed > 0.5 ? `${(sent / elapsed).toFixed(1)}/s` : "";
+  // The first `concurrency` requests fire immediately as the initial in-flight
+  // batch before pacing throttles the rest, so an average taken during that
+  // burst overstates the rate (e.g. 5 sent at 0.5s reads ~10/s under a 2/s
+  // limit). Only show a rate once we're past that batch, when sent/elapsed
+  // reflects the real steady pacing (#19d).
+  const rate = job.state === "running" && elapsed > 1 && sent > config.concurrency ? `${(sent / elapsed).toFixed(1)}/s` : "";
   const tone = job.state === "completed" ? " progress--success" : job.state === "failed" ? " progress--failed" : job.state === "running" ? " progress--running" : "";
   const totalText = expected >= COUNT_HUGE ? "≈ huge" : expected.toLocaleString();
   const label = `${config.attackType.replace("_", " ")} · ${config.positions.length} position${config.positions.length === 1 ? "" : "s"} · ~${totalText} requests`;
@@ -1710,7 +1751,7 @@ function renderFuzzerLockedSummary(job: FuzzerJob): string {
     <p class="t-small t-subtle">${escapeHtml(label)}</p>
     <pre class="code fuzzer-base--compact">${escapeHtml(rawRequestText(config.baseRequest))}</pre>
     <div class="progress${tone}" role="progressbar" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100">
-      <div class="progress__meta"><span>Sent ${sent.toLocaleString()}${expected > 0 ? ` of ~${expected.toLocaleString()}` : ""} · ${matched} matched${rate === "" ? "" : ` · ${rate}`}</span><span class="progress__value">${percent}%</span></div>
+      <div class="progress__meta"><span>Sent ${sent.toLocaleString()}${total > 0 ? ` of ~${total.toLocaleString()}` : ""} · ${matched} matched${rate === "" ? "" : ` · ${rate}`}</span><span class="progress__value">${percent}%</span></div>
       <div class="progress__track"><div class="progress__fill" style="width:${percent}%"></div></div>
     </div>
   </div>`;
@@ -1728,7 +1769,34 @@ function renderFuzzerControls(job: FuzzerJob, locked: boolean): string {
   if (state === "paused") {
     return `<div class="row"><button class="btn btn--primary" id="fuzzer-launch" type="button">${icon("play", { size: 14 })}<span>Resume</span></button><button class="btn btn--danger" id="fuzzer-stop" type="button">${icon("stop", { size: 14 })}<span>Stop</span></button></div>`;
   }
-  return ""; // completed / stopped / failed — the results stand on their own
+  // completed / stopped / failed — offer edit & re-run into a fresh draft (#20).
+  return `<div class="row"><button class="btn" id="fuzzer-rerun" type="button">${icon("discovery", { size: 14 })}<span>Edit &amp; re-run</span></button></div>`;
+}
+
+/** Clones a finished job into a new editable draft — its config and, when known,
+ *  the exact §-marked template it ran — so the operator can tweak and run again. */
+function editAndRerunFuzz(job: FuzzerJob): void {
+  saveActiveDraftTemplate();
+  const key = `draft-${(nextDraftSeq += 1)}`;
+  const draft: FuzzerJob = {
+    id: "",
+    tier: "native",
+    state: "draft",
+    config: structuredClone(job.config),
+    results: [],
+    diagnostics: [],
+  };
+  fuzzDrafts.set(key, draft);
+  // Prefer the verbatim template it ran; else fall back to the unmarked base
+  // request (a job restored from disk), which the operator re-marks.
+  fuzzDraftTemplates.set(key, fuzzJobTemplates.get(job.id) ?? rawRequestText(draft.config.baseRequest));
+  selectedFuzzer = draft;
+  selectedDraftKey = key;
+  fuzzTemplate = fuzzDraftTemplates.get(key) ?? "";
+  selectedFuzzResult = null;
+  fuzzResultSort = { key: "ordinal", dir: 1 };
+  renderFuzzer();
+  renderFuzzList();
 }
 
 /** Re-renders only the results region (sort/row-select) without disturbing the
@@ -1778,6 +1846,14 @@ function updateFuzzPreview(): void {
     preview.textContent = fuzzPreviewText(positionCount, expected);
     preview.className = expected > 10000 ? "t-danger" : "t-subtle";
   }
+  // Keep each payload set's "N values" header live as values are typed, rather
+  // than only on a structural re-render (#19c).
+  selectedFuzzer.config.payloadSets.forEach((set, index) => {
+    const cell = fuzzerPanel?.querySelector<HTMLElement>(`[data-set-count="${index}"]`);
+    if (cell === null || cell === undefined) return;
+    const count = payloadSetCount(set);
+    cell.textContent = set.source.type === "runtimeFile" ? "streamed at run" : `${count >= COUNT_HUGE ? "≈ huge" : count.toLocaleString()} value${count === 1 ? "" : "s"}`;
+  });
 }
 
 function renderFuzzerResults(job: FuzzerJob): string {
@@ -1973,6 +2049,8 @@ async function launchFuzzer(): Promise<void> {
       const created = await fetch("/api/v1/workbench/fuzzer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(config) });
       await requireOk(created, "fuzzer configuration failed");
       selectedFuzzer = (await created.json()) as FuzzerJob;
+      // Remember the exact template this job ran, so it can be edited & re-run.
+      fuzzJobTemplates.set(selectedFuzzer.id, fuzzTemplate);
       // The draft became a real job; drop its local draft entry so it does not
       // linger as a duplicate row.
       if (startedDraftKey !== null) {
@@ -3143,10 +3221,19 @@ const STAGE_LABELS: Record<string, string> = {
 
 function renderPipeline(run: PipelineRun): void {
   if (pipelineStatus === null || pipelineProgress === null) return;
+  // Anchor an elapsed clock to when this run was first seen, so a long quiet
+  // stage still visibly ticks even while the backend's fields are unchanged.
+  if (run.runId !== pipelineStartedRunId) {
+    pipelineStartedRunId = run.runId;
+    pipelineStartedAt = Date.now();
+  }
   pipelineStatus.textContent = run.status + " · " + run.stage;
   const percent = Math.min(100, Math.max(0, run.progressBasisPoints / 100));
   const stageIndex = pipelineStages.indexOf(run.stage);
-  const tone = run.status === "completed" ? " progress--success" : run.status === "failed" ? " progress--failed" : " progress--running";
+  // While running with no measurable progress yet (a long intake stage), show an
+  // indeterminate bar so it reads as alive rather than hung at 0% (#17).
+  const indeterminate = run.status === "running" && run.progressBasisPoints < 100 ? " progress--indeterminate" : "";
+  const tone = run.status === "completed" ? " progress--success" : run.status === "failed" ? " progress--failed" : ` progress--running${indeterminate}`;
   // A static-only run skips the dynamic and signing-recovery stages entirely, so
   // those stages must read "skipped" — never the same "done" as a stage that
   // actually ran. Marking them done would contradict the "not incorporated" fact
@@ -3167,9 +3254,10 @@ function renderPipeline(run: PipelineRun): void {
   <dt>Artifact</dt><dd class="t-mono">${escapeHtml(run.artifactPath)}</dd>
   <dt>Dynamic</dt><dd>${run.dynamicRan ? "facts incorporated" : "not incorporated"}</dd>
   <dt>Updated</dt><dd>${escapeHtml(formatTime(run.updatedAt))}</dd>
+  ${run.status === "running" ? `<dt>Elapsed</dt><dd class="t-mono">${escapeHtml(formatDuration(Date.now() - pipelineStartedAt))} <span class="t-subtle">· working…</span></dd>` : ""}
 </dl>
 <div class="progress${tone}" role="progressbar" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100">
-  <div class="progress__meta"><span>${escapeHtml(run.message)}</span><span class="progress__value">${percent.toFixed(1)}%</span></div>
+  <div class="progress__meta"><span>${escapeHtml(run.message)}${run.status === "running" && percent < 1 ? " — this can take several minutes on large artifacts" : ""}</span><span class="progress__value">${percent.toFixed(1)}%</span></div>
   <div class="progress__track"><div class="progress__fill" style="width:${percent}%"></div></div>
 </div>
 <div class="stages">${stages}</div>
@@ -3200,7 +3288,10 @@ function renderPipelineEmpty(): void {
 async function startPipeline(): Promise<void> {
   const artifactPath = apkPath?.value.trim() ?? "";
   if (artifactPath === "") {
-    showDiagnostic({ id: "pipeline.artifact-path-required", what: "An APK path is required.", why: "The analysis pipeline reads the artifact directly from this machine's filesystem.", fix: "Enter the full path to the APK and start the run again." });
+    const diag = { id: "pipeline.artifact-path-required", what: "An APK path is required.", why: "The analysis pipeline reads the artifact directly from this machine's filesystem.", fix: "Enter the full path to the APK and start the run again." };
+    showDiagnostic(diag);
+    // The pipeline diagnostics area is the panel's own error surface (#15).
+    if (pipelineDiagnostics !== null) pipelineDiagnostics.innerHTML = diagnosticListHtml([diag], "");
     apkPath?.focus();
     return;
   }
@@ -3281,7 +3372,9 @@ async function startPipeline(): Promise<void> {
       pipelinePoll = window.setInterval(() => void refreshPipeline(), 1000);
     });
   } catch (error) {
-    reportUnexpected(error, { id: "pipeline.start-failed", what: "The analysis pipeline could not start.", why: "", fix: "Check that the artifact path exists and is readable by the engine, then retry." });
+    const diag = errorDiagnostic(error, { id: "pipeline.start-failed", what: "The analysis pipeline could not start.", why: "", fix: "Check that the artifact path exists and is readable by the engine, then retry." });
+    if (pipelineDiagnostics !== null) pipelineDiagnostics.innerHTML = diagnosticListHtml([diag], "");
+    reportUnexpected(error, diag);
   }
 }
 
@@ -3475,9 +3568,10 @@ function showEndpointMenu(x: number, y: number, index: number): void {
   document.querySelector(".context-menu")?.remove();
   const menu = document.createElement("div");
   menu.className = "context-menu";
+  menu.setAttribute("role", "menu");
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
-  menu.innerHTML = `<button class="context-menu__item" type="button" data-ep-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" data-ep-fuzzer>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>`;
+  menu.innerHTML = `<button class="context-menu__item" type="button" role="menuitem" data-ep-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" role="menuitem" data-ep-fuzzer>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>`;
   const close = (): void => {
     menu.remove();
     document.removeEventListener("click", close);
@@ -3556,6 +3650,10 @@ const fuzzDrafts = new Map<string, FuzzerJob>();
 const fuzzDraftTemplates = new Map<string, string>();
 let selectedDraftKey: string | null = null;
 let nextDraftSeq = 0;
+/** The §-marked template each started job was launched from, so a finished job
+ *  can be edited and re-run verbatim (#20). Populated for jobs started in this
+ *  session; a job restored from disk falls back to its unmarked base request. */
+const fuzzJobTemplates = new Map<string, string>();
 
 /** Switches the Workbench between its three tools; nothing remounts. */
 function showWorkbenchTab(name: "live" | "resend" | "fuzz"): void {
@@ -4094,12 +4192,13 @@ function showFlowMenu(x: number, y: number, flowId: number): void {
   document.querySelector(".context-menu")?.remove();
   const menu = document.createElement("div");
   menu.className = "context-menu";
+  menu.setAttribute("role", "menu");
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
   const host = flows.get(flowId)?.host ?? "";
   const scopeLabel = host === "" ? "" : (scopeTargetForHost(host)?.label ?? "");
-  const scopeItem = scopeLabel === "" ? "" : `<button class="context-menu__item" type="button" data-flow-scope>${icon("shield", { size: 14 })}<span>Add ${escapeHtml(scopeLabel)} to scope</span></button>`;
-  menu.innerHTML = `<button class="context-menu__item" type="button" data-flow-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" data-flow-fuzz>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>${scopeItem}`;
+  const scopeItem = scopeLabel === "" ? "" : `<button class="context-menu__item" type="button" role="menuitem" data-flow-scope>${icon("shield", { size: 14 })}<span>Add ${escapeHtml(scopeLabel)} to scope</span></button>`;
+  menu.innerHTML = `<button class="context-menu__item" type="button" role="menuitem" data-flow-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" role="menuitem" data-flow-fuzz>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>${scopeItem}`;
   const close = (): void => {
     menu.remove();
     document.removeEventListener("click", close);
@@ -4139,9 +4238,10 @@ function showHostScopeMenu(x: number, y: number, url: string): void {
   document.querySelector(".context-menu")?.remove();
   const menu = document.createElement("div");
   menu.className = "context-menu";
+  menu.setAttribute("role", "menu");
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
-  menu.innerHTML = `<button class="context-menu__item" type="button" data-scope-add>${icon("shield", { size: 14 })}<span>Add ${escapeHtml(scopeLabel)} to scope</span></button>`;
+  menu.innerHTML = `<button class="context-menu__item" type="button" role="menuitem" data-scope-add>${icon("shield", { size: 14 })}<span>Add ${escapeHtml(scopeLabel)} to scope</span></button>`;
   const close = (): void => {
     menu.remove();
     document.removeEventListener("click", close);
@@ -4576,9 +4676,13 @@ function editAction(action: "forward" | "drop" | "forward_modified"): void {
  * ==================================================================== */
 
 async function startWebSession(): Promise<void> {
+  const webError = document.querySelector<HTMLElement>("#web-error");
+  showInlineError(webError, null);
   const target = webTarget?.value.trim() ?? "";
   if (!target || !webAuthorize?.checked) {
-    showDiagnostic({ id: "web.authorization-required", what: "Web authorization is required.", why: "Starting a web session actively establishes a target scope.", fix: "Enter the target and affirm that you are authorized to test it." });
+    const diag = { id: "web.authorization-required", what: "Web authorization is required.", why: target === "" ? "No target URL was entered; a web session actively establishes a target scope." : "You must affirm that you are authorized to test this target.", fix: "Enter the target and affirm that you are authorized to test it." };
+    showDiagnostic(diag);
+    showInlineError(webError, diag);
     if (target === "") webTarget?.focus();
     else webAuthorize?.focus();
     return;
@@ -4619,7 +4723,9 @@ async function startWebSession(): Promise<void> {
     toast("Web session started", "success");
     await refreshSession();
   } catch (error) {
-    reportUnexpected(error, { id: "web.session-start-failed", what: "Web session could not start.", why: "", fix: "Check the target URL and local API." });
+    const diag = errorDiagnostic(error, { id: "web.session-start-failed", what: "Web session could not start.", why: "", fix: "Check the target URL and local API." });
+    showInlineError(webError, diag);
+    reportUnexpected(error, diag);
   }
 }
 
@@ -5240,11 +5346,22 @@ function renderExportIdle(): void {
  * ==================================================================== */
 
 function renderSession(status: SessionStatus): void {
+  const sessionChanged = lastSessionStatus?.sessionId !== status.sessionId;
   lastSessionStatus = status;
   if (headerSession !== null) {
     headerSession.textContent = status.sessionId;
     headerSession.title = status.artifactPath;
   }
+  // The status bar's session cell was static "no session"; keep it live so it
+  // never contradicts the header/sidebar (#18).
+  const statusbarSession = document.querySelector<HTMLElement>("#statusbar-session");
+  if (statusbarSession !== null) {
+    statusbarSession.textContent = status.sessionId;
+    statusbarSession.title = `${status.lifecycle} · ${status.artifactPath}`;
+  }
+  // Layout is keyed per session; now that the id is known, restore this
+  // session's persisted pane widths (#9).
+  if (sessionChanged) refreshLayoutForSession();
   if (sessionBadge !== null) sessionBadge.textContent = status.lifecycle;
   updateScopePill(status);
   if (sessionDetail === null) return;
@@ -5398,6 +5515,8 @@ async function openSession(): Promise<void> {
     confirmLabel: "Open session",
   });
   if (path === null) return;
+  const sessionError = document.querySelector<HTMLElement>("#session-error");
+  showInlineError(sessionError, null);
   const button = document.querySelector<HTMLButtonElement>("#session-open");
   try {
     await withBusy(button, "Opening…", async () => {
@@ -5408,7 +5527,9 @@ async function openSession(): Promise<void> {
     });
     await refreshSession();
   } catch (error) {
-    reportUnexpected(error, { id: "session.open-failed", what: "The session could not be opened.", why: "", fix: "Check that the artifact path exists and was written by this version, then retry." });
+    const diag = errorDiagnostic(error, { id: "session.open-failed", what: "The session could not be opened.", why: "", fix: "Check that the artifact path exists and was written by this version, then retry." });
+    showInlineError(sessionError, diag);
+    reportUnexpected(error, diag);
   }
 }
 
@@ -5618,13 +5739,14 @@ function settingField(entry: SettingEntry): string {
     entry.source === "environment"
       ? " An environment variable set outside the app takes precedence over a saved value."
       : "";
-  return `<div class="field">
+  return `<div class="field" data-field="${escapeHtml(entry.key)}">
     <div class="row row--between">
       <label class="field__label">${escapeHtml(entry.label)}</label>
       ${settingSourceBadge(entry.source)}
     </div>
     ${settingControl(entry)}
     <p class="field__hint">${escapeHtml(entry.description)}<span class="t-subtle">${escapeHtml(restart)}${escapeHtml(envNote)}</span></p>
+    <p class="field__error" data-error-for="${escapeHtml(entry.key)}" role="alert" hidden></p>
   </div>`;
 }
 
@@ -5693,18 +5815,51 @@ async function refreshSettings(): Promise<void> {
   }
 }
 
+/** Client-side validation for numeric knobs, mirroring the engine's own rule so
+ *  an invalid value is caught inline before it is rejected server-side. Returns
+ *  an error message, or null when the value is acceptable (empty clears it). */
+function validateSettingValue(key: string, value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+  if (key === "APIAXESS_DISCOVERY_RATE") {
+    return /^\d+$/.test(trimmed) && Number(trimmed) > 0 ? null : "Must be a positive number (requests per second).";
+  }
+  return null;
+}
+
+/** Shows or clears the inline error under a settings field. */
+function setSettingError(key: string, message: string | null): void {
+  const slot = document.querySelector<HTMLElement>(`#settings-body [data-error-for="${CSS.escape(key)}"]`);
+  const field = document.querySelector<HTMLElement>(`#settings-body [data-field="${CSS.escape(key)}"]`);
+  if (slot !== null) {
+    slot.textContent = message ?? "";
+    slot.hidden = message === null;
+  }
+  field?.classList.toggle("is-invalid", message !== null);
+}
+
 async function saveSettings(): Promise<void> {
   const button = document.querySelector<HTMLButtonElement>("#settings-save");
   const controls = document.querySelectorAll<HTMLInputElement | HTMLSelectElement>(
     "#settings-body [data-setting]",
   );
   const values: Record<string, string> = {};
+  let firstInvalid: HTMLElement | null = null;
   controls.forEach((control) => {
     const key = control.dataset.setting ?? "";
-    if (key !== "" && control.value !== (control.dataset.original ?? "")) {
+    if (key === "") return;
+    const error = validateSettingValue(key, control.value);
+    setSettingError(key, error);
+    if (error !== null && firstInvalid === null) firstInvalid = control;
+    if (control.value !== (control.dataset.original ?? "")) {
       values[key] = control.value;
     }
   });
+  if (firstInvalid !== null) {
+    (firstInvalid as HTMLElement).focus();
+    toast("Fix the highlighted setting before saving", "danger");
+    return;
+  }
   if (Object.keys(values).length === 0) {
     toast("No changes to save", "info");
     return;
@@ -5932,10 +6087,24 @@ function renderDevices(devices: readonly PairingDevice[]): void {
     const row = document.createElement("div");
     row.className = "list-row";
     row.style.gridTemplateColumns = "minmax(0, 1fr) auto";
-    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(device.serial)}</b> <span class="badge">${escapeHtml(device.state)}</span><br><span class="t-small t-subtle">${escapeHtml(device.description)}</span></span>`;
+    // Pairing establishes a reverse tunnel to the device, which only succeeds on
+    // an authorized, online device. Arming an OFFLINE/UNAUTHORIZED device (e.g.
+    // the app's own managed emulator while it boots) just fails the tunnel, so
+    // the control is disabled with a reason rather than offered and failing (#10).
+    const ready = device.state.toLowerCase() === "ready";
+    const reason = ready
+      ? ""
+      : device.state.toLowerCase() === "offline"
+        ? "Device is offline (booting, asleep, or a managed target) — it can't be paired yet."
+        : device.state.toLowerCase() === "unauthorized"
+          ? "Authorize this host's adb key on the device, then refresh."
+          : `Device is not ready (${device.state}).`;
+    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(device.serial)}</b> <span class="badge${ready ? "" : " badge--caution"}">${escapeHtml(device.state)}</span><br><span class="t-small t-subtle">${escapeHtml(device.description)}</span></span>`;
     const arm = document.createElement("button");
     arm.type = "button";
     arm.className = "btn btn--sm btn--primary";
+    arm.disabled = !ready;
+    if (!ready) arm.title = reason;
     arm.innerHTML = `${icon("shield", { size: 14 })}<span>Arm pairing</span>`;
     arm.addEventListener("click", () => void armDevice(device.serial, arm));
     row.append(arm);
@@ -6341,6 +6510,17 @@ function bytesToText(body: number[] | null | undefined): string {
   return body === null || body === undefined
     ? ""
     : new TextDecoder().decode(new Uint8Array(body));
+}
+
+/** A compact elapsed readout: `Ss`, `Mm Ss`, or `Hh Mm`. */
+function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
 void boot();

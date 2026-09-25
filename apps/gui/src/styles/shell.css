@@ -240,6 +240,13 @@
   margin: 4px 0;
   background: var(--s-line);
 }
+.menu-dropdown__group {
+  padding: 4px 12px 2px;
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--s-ink3);
+}
 .titlebar__omni {
   flex: 1;
   display: flex;
@@ -1087,6 +1094,12 @@
   font-size: 9.5px;
   letter-spacing: 0.16em;
   color: var(--s-ink3);
+}
+.palette__empty {
+  padding: 16px 14px;
+  font-size: 13px;
+  color: var(--s-ink3);
+  text-align: center;
 }
 
 /* ================================================================== *

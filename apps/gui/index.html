@@ -452,6 +452,7 @@
                     <span data-icon="surface"></span> Fuse into API surface
                   </button>
                 </div>
+                <div id="web-error" class="panel__inline-error" role="alert" hidden></div>
               </article>
 
             </div>
@@ -918,6 +919,7 @@
               </button>
             </div>
           </div>
+          <div id="session-error" class="panel__inline-error" role="alert" hidden></div>
 
           <div class="workflow">
             <div class="workflow__col">
@@ -1079,6 +1081,7 @@
           <span class="statusbar__dot statusbar__dot--telemetry" aria-hidden="true"></span>TELEMETRY
         </span>
         <span class="statusbar__spacer"></span>
+        <button class="statusbar__cell statusbar__cell--action" id="statusbar-menu" type="button" aria-haspopup="menu" aria-expanded="false" hidden>☰ MENU</button>
         <button class="statusbar__cell statusbar__cell--action" id="statusbar-sidebar" data-toggle="sidebar" type="button" hidden>SIDEBAR ⌘B</button>
         <button class="statusbar__cell statusbar__cell--action" id="statusbar-dock" data-toggle="dock" type="button" hidden>DOCK ⌘J</button>
         <button class="statusbar__cell statusbar__cell--action statusbar__cell--diag" id="statusbar-diag" data-open="diagnostics" type="button" hidden>0 DIAGNOSTICS</button>
