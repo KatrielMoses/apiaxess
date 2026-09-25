@@ -61,3 +61,6 @@ Thumbs.db
 
 # Local GUI/UX regression test skill — invoked in-repo, never published.
 /.claude/skills/test-apiaxess/
+
+# gstack browse-daemon local state (tool artifact, never committed).
+/.gstack/
