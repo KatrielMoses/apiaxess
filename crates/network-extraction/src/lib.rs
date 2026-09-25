@@ -14,10 +14,10 @@ use std::{
 
 use apiaxess_api_model::{
     ApiDocument, ApiSurface, Endpoint, EndpointIdentity, Fact, FactCandidate, FieldClass,
-    GraphQlOperationType, HeaderParameter, LooseFinding, LooseFindingKind, PathParameter,
-    PathTemplate, PathTemplateAssertion, PathTemplateOrigin, PresenceAssertion, ProtocolOperation,
-    ProtocolOperationIdentity, QueryParameter, Resolution, ResolutionPolicy, SchemaShape,
-    SchemaSlot,
+    GraphQlOperationType, HeaderParameter, LooseFinding, LooseFindingKind, ObjectOpenness,
+    PathParameter, PathTemplate, PathTemplateAssertion, PathTemplateOrigin, PresenceAssertion,
+    ProtocolOperation, ProtocolOperationIdentity, QueryParameter, Resolution, ResolutionPolicy,
+    SchemaProperty, SchemaShape, SchemaSlot,
 };
 use apiaxess_artifact_intake::NormalizedUnpackedArtifact;
 use apiaxess_diagnostics::{
@@ -31,9 +31,11 @@ use apiaxess_network_routing::{CorpusDocument, LibraryDetection, SignatureCorpus
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod dto;
 mod java_scope;
 
-use java_scope::{CallSite, HttpClient};
+use dto::{BodyField, BodyShape, DtoIndex, StaticBody};
+use java_scope::{BodyRef, CallSite, HttpClient};
 
 /// A structured failure to produce an invariant-valid API document.
 #[derive(Clone, Debug)]
@@ -457,6 +459,114 @@ impl ModelBuilder {
         }
     }
 
+    /// A request-body schema from a statically resolved field set: an object
+    /// whose properties are exactly the resolved fields, never more.
+    fn body_schema(
+        &mut self,
+        extractor_id: &str,
+        evidence: &apiaxess_api_model::EntityId,
+        expected: u16,
+        fields: &[BodyField],
+    ) -> SchemaSlot {
+        let shape = self.object_shape(extractor_id, evidence, expected, fields);
+        SchemaSlot {
+            shape: self.fact(
+                extractor_id,
+                FieldClass::TypeShape,
+                ResolutionPolicy::UnionOrWiden,
+                shape,
+                evidence.clone(),
+                expected,
+            ),
+            observations: Vec::new(),
+        }
+    }
+
+    fn object_shape(
+        &mut self,
+        extractor_id: &str,
+        evidence: &apiaxess_api_model::EntityId,
+        expected: u16,
+        fields: &[BodyField],
+    ) -> SchemaShape {
+        let mut properties = Vec::new();
+        for field in fields {
+            let Ok(name) = apiaxess_api_model::ParameterName::new(field.name.clone()) else {
+                continue;
+            };
+            let shape = self.body_shape(extractor_id, evidence, expected, &field.shape);
+            properties.push(SchemaProperty {
+                name,
+                schema: SchemaSlot {
+                    shape: self.fact(
+                        extractor_id,
+                        FieldClass::TypeShape,
+                        ResolutionPolicy::UnionOrWiden,
+                        shape,
+                        evidence.clone(),
+                        expected,
+                    ),
+                    observations: Vec::new(),
+                },
+                requiredness: self.fact(
+                    extractor_id,
+                    FieldClass::Requiredness,
+                    ResolutionPolicy::SampleGated,
+                    apiaxess_api_model::RequirednessAssertion::Declared {
+                        required: field.required,
+                    },
+                    evidence.clone(),
+                    expected,
+                ),
+            });
+        }
+        SchemaShape::Object {
+            properties,
+            // The field set comes from a declaration (a class, or the literal
+            // keys written in one method); nothing indicates extra fields.
+            openness: ObjectOpenness::Closed,
+        }
+    }
+
+    fn body_shape(
+        &mut self,
+        extractor_id: &str,
+        evidence: &apiaxess_api_model::EntityId,
+        expected: u16,
+        shape: &BodyShape,
+    ) -> SchemaShape {
+        match shape {
+            BodyShape::Unknown => SchemaShape::Unknown,
+            BodyShape::String => SchemaShape::String { format: None },
+            BodyShape::Integer(format) => SchemaShape::Integer {
+                format: format.map(ToOwned::to_owned),
+            },
+            BodyShape::Number(format) => SchemaShape::Number {
+                format: format.map(ToOwned::to_owned),
+            },
+            BodyShape::Boolean => SchemaShape::Boolean,
+            BodyShape::Array(items) => {
+                let item = self.body_shape(extractor_id, evidence, expected, items);
+                SchemaShape::Array {
+                    items: Box::new(SchemaSlot {
+                        shape: self.fact(
+                            extractor_id,
+                            FieldClass::TypeShape,
+                            ResolutionPolicy::UnionOrWiden,
+                            item,
+                            evidence.clone(),
+                            expected,
+                        ),
+                        observations: Vec::new(),
+                    }),
+                }
+            }
+            BodyShape::Object(fields) => {
+                self.object_shape(extractor_id, evidence, expected, fields)
+            }
+        }
+    }
+
     fn presence(
         &mut self,
         extractor_id: &str,
@@ -489,7 +599,7 @@ impl ModelBuilder {
         query_names: &[String],
         path_names: &[String],
         header_names: &[String],
-        has_body: bool,
+        body: &StaticBody,
         evidence_path: &str,
     ) {
         let path = normalize_path(path);
@@ -539,10 +649,31 @@ impl ModelBuilder {
                 .as_deref()
                 .and_then(apiaxess_api_model::normalize_host),
         };
-        if self.endpoints.iter().any(|endpoint| {
+        if let Some(index) = self.endpoints.iter().position(|endpoint| {
             endpoint.identity == identity
                 || (identity.host.is_none() && endpoint.identity.same_route(&identity))
         }) {
+            // Another view of the same route (smali vs Java, or a second
+            // extractor) may know the body's fields when the first did not.
+            if let StaticBody::Fields(fields) = body {
+                let unknown = self.endpoints[index]
+                    .request_body
+                    .as_ref()
+                    .is_none_or(|slot| {
+                        matches!(
+                            slot.shape
+                                .selected_candidate()
+                                .map(|candidate| &candidate.value),
+                            None | Some(SchemaShape::Unknown)
+                        )
+                    });
+                if unknown {
+                    let evidence = self.evidence(extractor_id, evidence_path);
+                    let expected = detection.recoverability.adjusted_basis_points;
+                    let slot = self.body_schema(extractor_id, &evidence, expected, fields);
+                    self.endpoints[index].request_body = Some(slot);
+                }
+            }
             return;
         }
         // A host-bound view of a route supersedes a host-less view of it
@@ -622,7 +753,13 @@ impl ModelBuilder {
         for name in query_names.iter().chain(path_names).chain(header_names) {
             self.bound_values.insert(name.clone());
         }
-        let request_body = has_body.then(|| self.schema(extractor_id, evidence.clone(), expected));
+        let request_body = match body {
+            StaticBody::Absent => None,
+            StaticBody::Opaque => Some(self.schema(extractor_id, evidence.clone(), expected)),
+            StaticBody::Fields(fields) => {
+                Some(self.body_schema(extractor_id, &evidence, expected, fields))
+            }
+        };
         self.endpoints.push(Endpoint {
             identity,
             base_url: base_url_fact,
@@ -645,12 +782,22 @@ impl ModelBuilder {
         identity: ProtocolOperationIdentity,
         evidence_path: &str,
     ) {
-        if self
-            .operations
-            .iter()
-            .any(|operation| operation.identity == identity)
-        {
+        if self.operations.iter().any(|operation| {
+            operation.identity == identity
+                || same_graphql_operation_unbound(&identity, &operation.identity)
+        }) {
             return;
+        }
+        // A GraphQL operation bound to the URL it is posted to supersedes a
+        // view of it that could not see the URL (a bare document literal).
+        if let ProtocolOperationIdentity::GraphQl {
+            endpoint_url: Some(_),
+            ..
+        } = &identity
+        {
+            self.operations.retain(|operation| {
+                !same_graphql_operation_unbound(&operation.identity, &identity)
+            });
         }
         let evidence = self.evidence(extractor_id, evidence_path);
         let expected = detection.recoverability.adjusted_basis_points;
@@ -663,6 +810,50 @@ impl ModelBuilder {
             request_body,
             response_body,
         });
+    }
+
+    /// Records the GraphQL operations a call site posts: the named
+    /// operations of the literal `query` document, or the literal
+    /// `operationName` when the document is not literal.
+    fn add_graphql_call(
+        &mut self,
+        extractor_id: &str,
+        detection: &LibraryDetection,
+        call: &java_scope::ResolvedCall,
+        evidence_path: &str,
+    ) {
+        let Some(BodyRef::Keys(keys)) = &call.body else {
+            return;
+        };
+        let literal = |name: &str| {
+            keys.iter()
+                .find(|key| key.name == name)
+                .and_then(|key| key.literal.clone())
+        };
+        let operation_name = literal("operationName");
+        let mut operations = literal("query")
+            .map(|document| graphql_operations(&document))
+            .unwrap_or_default();
+        if let Some(name) = &operation_name {
+            // The server executes the operation `operationName` selects.
+            operations.retain(|(_, operation)| operation == name);
+        }
+        let endpoint_url = call
+            .base_url
+            .as_ref()
+            .map(|base| format!("{}{}", base.trim_end_matches('/'), call.path));
+        for (operation_type, operation_name) in operations {
+            self.add_operation(
+                extractor_id,
+                detection,
+                ProtocolOperationIdentity::GraphQl {
+                    endpoint_url: endpoint_url.clone(),
+                    operation_type,
+                    operation_name,
+                },
+                evidence_path,
+            );
+        }
     }
 
     fn partial(&mut self, library_id: &str, location: &str, reason: &str) {
@@ -1526,6 +1717,7 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
         // Each service interface resolves against the base URL of the
         // Retrofit instance that created it, never an app-wide guess.
         let service_bases = retrofit_service_bases(corpus);
+        let mut dtos = DtoIndex::new(corpus);
         // Routing evidence can originate in indexed DEX while the explicit
         // method/path pairing lives in apktool's decoded service interface.
         // Scan only decoded source views that themselves carry a Retrofit
@@ -1550,6 +1742,7 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
                 .as_ref()
                 .and_then(|service| service_bases.get(service).cloned().flatten());
             for block in method_blocks(&text) {
+                let body_type = retrofit_smali_body_type(&block);
                 let mut route = None;
                 let mut queries = Vec::new();
                 let mut paths = Vec::new();
@@ -1574,6 +1767,11 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
                 }
                 if let Some((method, route)) = route {
                     let (base_url, path) = resolve_retrofit_route(service_base.as_deref(), &route);
+                    let body = match (&body_type, &service) {
+                        (Some(class), Some(service)) => dtos.body(class, service),
+                        _ if body => StaticBody::Opaque,
+                        _ => StaticBody::Absent,
+                    };
                     builder.add_rest(
                         "retrofit",
                         detection,
@@ -1584,7 +1782,7 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
                         &queries,
                         &paths,
                         &headers,
-                        body,
+                        &body,
                         &document.path,
                     );
                 }
@@ -1620,12 +1818,34 @@ impl ProtocolDecoderExtractor for RetrofitExtractor {
                     &[],
                     &placeholders(&path),
                     &[],
-                    false,
+                    &StaticBody::Absent,
                     &document.path,
                 );
             }
         }
     }
+}
+
+/// The declared type of a smali Retrofit method's `@Body` parameter, as a
+/// dotted class name (`.param pN # La/b/Dto;` carrying `Lretrofit2/http/Body;`).
+fn retrofit_smali_body_type(block: &str) -> Option<String> {
+    let mut param_type = None;
+    for line in block.lines() {
+        let line = line.trim();
+        if line.starts_with(".param ") {
+            param_type = line
+                .split_once('#')
+                .map(|(_, descriptor)| descriptor.trim())
+                .and_then(|descriptor| descriptor.strip_prefix('L'))
+                .and_then(|descriptor| descriptor.strip_suffix(';'))
+                .map(|internal| internal.replace(['/', '$'], "."));
+        } else if line.starts_with(".end param") {
+            param_type = None;
+        } else if line.contains("Lretrofit2/http/Body;") && param_type.is_some() {
+            return param_type;
+        }
+    }
+    None
 }
 
 /// Maps each Retrofit service interface to the base URL of the instance that
@@ -1772,7 +1992,7 @@ impl ProtocolDecoderExtractor for KtorExtractor {
                         &[],
                         &path_names,
                         &[],
-                        false,
+                        &StaticBody::Absent,
                         &document.path,
                     );
                 }
@@ -1845,13 +2065,15 @@ impl ProtocolDecoderExtractor for ApolloExtractor {
             let mut found = false;
             for line in text.lines() {
                 for literal in document_string_literals(document, line) {
-                    if let Some((kind, name)) = graphql_operation(&literal) {
-                        let endpoint = absolute_urls(&text).into_iter().next();
+                    // The endpoint a document is posted to is only known at
+                    // its call site (see the method-scoped resolver); a URL
+                    // elsewhere in the file is not evidence of it.
+                    for (kind, name) in graphql_operations(&literal) {
                         builder.add_operation(
                             "graphql-apollo",
                             detection,
                             ProtocolOperationIdentity::GraphQl {
-                                endpoint_url: endpoint,
+                                endpoint_url: None,
                                 operation_type: kind,
                                 operation_name: name,
                             },
@@ -1966,7 +2188,7 @@ impl ProtocolDecoderExtractor for OkHttpExtractor {
                         &query_names,
                         &placeholders(&path),
                         &[],
-                        false,
+                        &StaticBody::Absent,
                         &document.path,
                     );
                 } else {
@@ -1995,6 +2217,7 @@ fn extract_java_call_sites(
 ) -> BTreeSet<String> {
     let mut covered = BTreeSet::new();
     let mut constants = java_scope::ConstantIndex::new(corpus);
+    let mut dtos = DtoIndex::new(corpus);
     for document in documents
         .iter()
         .filter(|document| document.source_kind == SourceKind::DecompiledSource)
@@ -2018,6 +2241,9 @@ fn extract_java_call_sites(
             if site.client() != client {
                 continue;
             }
+            if let CallSite::Resolved(call) = &site {
+                builder.add_graphql_call(extractor_id, detection, call, &document.path);
+            }
             match site {
                 CallSite::Resolved(call) => builder.add_rest(
                     extractor_id,
@@ -2029,7 +2255,12 @@ fn extract_java_call_sites(
                     &call.query_names,
                     &placeholders(&call.path),
                     &call.header_names,
-                    call.has_body,
+                    &match &call.body {
+                        Some(BodyRef::Keys(keys)) => StaticBody::from_keys(keys),
+                        Some(BodyRef::Class { class, anchor }) => dtos.body(class, anchor),
+                        None if call.has_body => StaticBody::Opaque,
+                        None => StaticBody::Absent,
+                    },
                     &document.path,
                 ),
                 CallSite::Unresolved {
@@ -2200,7 +2431,7 @@ impl ProtocolDecoderExtractor for VolleyExtractor {
                         &queries,
                         &placeholders(&path),
                         &headers,
-                        false,
+                        &StaticBody::Absent,
                         &document.path,
                     );
                 } else {
@@ -2314,7 +2545,7 @@ fn extract_simple_url_blocks<'a>(
                     &[],
                     &placeholders(&path),
                     &[],
-                    false,
+                    &StaticBody::Absent,
                     &document.path,
                 );
             } else {
@@ -2683,18 +2914,36 @@ fn orient_grpc_pair(a: &str, b: &str) -> Option<(String, String)> {
     }
 }
 
-fn graphql_operation(value: &str) -> Option<(GraphQlOperationType, String)> {
-    let mut words = value.split_whitespace();
-    let operation_type = match words.next()?.to_ascii_lowercase().as_str() {
-        "query" => GraphQlOperationType::Query,
-        "mutation" => GraphQlOperationType::Mutation,
-        "subscription" => GraphQlOperationType::Subscription,
-        _ => return None,
-    };
-    let name = words
-        .next()?
-        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
-    (!name.is_empty()).then(|| (operation_type, name.to_owned()))
+/// Whether `unbound` is a GraphQL operation with no known endpoint URL that
+/// names the same operation (type and name) as `other`.
+fn same_graphql_operation_unbound(
+    unbound: &ProtocolOperationIdentity,
+    other: &ProtocolOperationIdentity,
+) -> bool {
+    match (unbound, other) {
+        (
+            ProtocolOperationIdentity::GraphQl {
+                endpoint_url: None,
+                operation_type: unbound_type,
+                operation_name: unbound_name,
+            },
+            ProtocolOperationIdentity::GraphQl {
+                operation_type,
+                operation_name,
+                ..
+            },
+        ) => unbound_type == operation_type && unbound_name == operation_name,
+        _ => false,
+    }
+}
+
+/// The named operations of a GraphQL document literal. Anonymous operations
+/// carry no name to key an operation on, so they are not emitted.
+fn graphql_operations(value: &str) -> Vec<(GraphQlOperationType, String)> {
+    apiaxess_api_model::parse_graphql_operations(value)
+        .into_iter()
+        .filter_map(|header| Some((header.operation_type, header.name?)))
+        .collect()
 }
 
 fn classify_string(value: &str) -> Option<LooseFindingKind> {
@@ -3008,6 +3257,11 @@ mod tests {
     }
 
     fn artifact(source: &str) -> NormalizedUnpackedArtifact {
+        artifact_files(&[("Network.smali", source)])
+    }
+
+    /// A normalized artifact whose smali root holds the given files.
+    fn artifact_files(files: &[(&str, &str)]) -> NormalizedUnpackedArtifact {
         let root = std::env::temp_dir().join(format!(
             "apiaxess-extraction-test-{}",
             SystemTime::now()
@@ -3021,7 +3275,11 @@ mod tests {
         fs::create_dir_all(&smali).expect("smali directory");
         fs::create_dir_all(&resources).expect("resources directory");
         fs::create_dir_all(&assets).expect("assets directory");
-        fs::write(smali.join("Network.smali"), source).expect("fixture source");
+        for (relative, source) in files {
+            let path = smali.join(relative);
+            fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
+            fs::write(path, source).expect("fixture source");
+        }
         NormalizedUnpackedArtifact {
             schema_version: 1,
             target_type_id: "android.apk".to_owned(),
@@ -3058,6 +3316,89 @@ mod tests {
             provenance: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_retrofit_body_data_class_resolves_to_its_serialized_fields() {
+        use apiaxess_api_model::{ObjectOpenness, SchemaShape};
+        let service = ".class public interface abstract Lcom/example/net/AccountApi;\n\
+             .super Ljava/lang/Object;\n\
+             .method public abstract signUp(Lcom/example/net/model/SignUp;)Lretrofit2/Call;\n\
+             .param p1    # Lcom/example/net/model/SignUp;\n\
+                 .annotation runtime Lretrofit2/http/Body;\n\
+                 .end annotation\n\
+             .end param\n\
+             .annotation runtime Lretrofit2/http/POST;\n\
+                 value = \"/v1/accounts\"\n\
+             .end annotation\n\
+             .end method\n";
+        let dto = ".class public final Lcom/example/net/model/SignUp;\n\
+             .super Ljava/lang/Object;\n\
+             .field public static final Companion:Lcom/example/net/model/SignUp$Companion;\n\
+             .field private final email:Ljava/lang/String;\n\
+             .field private final displayName:Ljava/lang/String;\n\
+                 .annotation runtime Lcom/google/gson/annotations/SerializedName;\n\
+                     value = \"display_name\"\n\
+                 .end annotation\n\
+             .end field\n\
+             .field private final age:I\n\
+             .field private final transient session:Ljava/lang/Object;\n\
+             .method public constructor <init>()V\n\
+             .end method\n";
+        let artifact = artifact_files(&[
+            ("com/example/net/AccountApi.smali", service),
+            ("com/example/net/model/SignUp.smali", dto),
+        ]);
+        let routed = NetworkingRouter::default().route(&artifact);
+        let report = extract(&artifact, &routed).expect("valid extraction model");
+        let endpoint = report
+            .document
+            .surface
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.identity.path_template.as_str() == "/v1/accounts")
+            .expect("body endpoint");
+        let body = endpoint.request_body.as_ref().expect("request body");
+        let SchemaShape::Object {
+            properties,
+            openness,
+        } = &body.shape.selected_candidate().unwrap().value
+        else {
+            panic!("body resolves to an object");
+        };
+        let fields = properties
+            .iter()
+            .map(|property| {
+                (
+                    property.name.as_str().to_owned(),
+                    property
+                        .schema
+                        .shape
+                        .selected_candidate()
+                        .unwrap()
+                        .value
+                        .clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                ("email".to_owned(), SchemaShape::String { format: None }),
+                (
+                    "display_name".to_owned(),
+                    SchemaShape::String { format: None }
+                ),
+                (
+                    "age".to_owned(),
+                    SchemaShape::Integer {
+                        format: Some("int32".to_owned())
+                    }
+                ),
+            ]
+        );
+        assert_eq!(*openness, ObjectOpenness::Closed);
+        assert!(report.document.validate().is_ok());
     }
 
     #[test]

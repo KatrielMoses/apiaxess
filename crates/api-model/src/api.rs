@@ -230,6 +230,165 @@ pub enum GraphQlOperationType {
     Subscription,
 }
 
+/// One operation definition read from a GraphQL document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphQlOperationHeader {
+    /// Query, mutation, or subscription.
+    pub operation_type: GraphQlOperationType,
+    /// The operation's name; `None` for an anonymous operation.
+    pub name: Option<String>,
+}
+
+/// Parses the operation definitions of a GraphQL document.
+///
+/// Reads only operation headers (`query Name($v: T) @dir { …`), skipping
+/// fragment definitions, comments and string contents. A definition counts
+/// only when it has a selection set, so prose that merely starts with the
+/// word "query" is not a GraphQL operation. Returns an empty list when the
+/// text is not a GraphQL executable document.
+#[must_use]
+pub fn parse_graphql_operations(document: &str) -> Vec<GraphQlOperationHeader> {
+    let chars = document.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut operations = Vec::new();
+    loop {
+        skip_ignored(&chars, &mut index);
+        if index >= chars.len() {
+            return operations;
+        }
+        if chars[index] == '{' {
+            // Query shorthand: an anonymous query.
+            if !skip_braces(&chars, &mut index) {
+                return Vec::new();
+            }
+            operations.push(GraphQlOperationHeader {
+                operation_type: GraphQlOperationType::Query,
+                name: None,
+            });
+            continue;
+        }
+        let keyword = read_name(&chars, &mut index);
+        let operation_type = match keyword.as_deref() {
+            Some("query") => Some(GraphQlOperationType::Query),
+            Some("mutation") => Some(GraphQlOperationType::Mutation),
+            Some("subscription") => Some(GraphQlOperationType::Subscription),
+            Some("fragment") => None,
+            _ => return Vec::new(),
+        };
+        skip_ignored(&chars, &mut index);
+        let name = read_name(&chars, &mut index);
+        // Variables, `on Type`, and directives, up to the selection set.
+        loop {
+            skip_ignored(&chars, &mut index);
+            match chars.get(index) {
+                Some('(') => {
+                    if !skip_balanced(&chars, &mut index, '(', ')') {
+                        return Vec::new();
+                    }
+                }
+                Some('@') => {
+                    index += 1;
+                    if read_name(&chars, &mut index).is_none() {
+                        return Vec::new();
+                    }
+                }
+                Some('{') => break,
+                Some(character) if is_name_start(*character) => {
+                    // `on Type` of a fragment definition.
+                    read_name(&chars, &mut index);
+                }
+                _ => return Vec::new(),
+            }
+        }
+        if !skip_braces(&chars, &mut index) {
+            return Vec::new();
+        }
+        if let Some(operation_type) = operation_type {
+            operations.push(GraphQlOperationHeader {
+                operation_type,
+                name,
+            });
+        }
+    }
+}
+
+fn is_name_start(character: char) -> bool {
+    character == '_' || character.is_ascii_alphabetic()
+}
+
+fn read_name(chars: &[char], index: &mut usize) -> Option<String> {
+    let start = *index;
+    if !chars.get(start).copied().is_some_and(is_name_start) {
+        return None;
+    }
+    while chars
+        .get(*index)
+        .is_some_and(|character| *character == '_' || character.is_ascii_alphanumeric())
+    {
+        *index += 1;
+    }
+    Some(chars[start..*index].iter().collect())
+}
+
+/// Skips whitespace, commas (insignificant in GraphQL), and `#` comments.
+fn skip_ignored(chars: &[char], index: &mut usize) {
+    while let Some(character) = chars.get(*index) {
+        if character.is_whitespace() || *character == ',' || *character == '\u{feff}' {
+            *index += 1;
+        } else if *character == '#' {
+            while chars
+                .get(*index)
+                .is_some_and(|character| *character != '\n')
+            {
+                *index += 1;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+fn skip_braces(chars: &[char], index: &mut usize) -> bool {
+    skip_balanced(chars, index, '{', '}')
+}
+
+/// Skips a balanced `open … close` group starting at `index`, ignoring
+/// delimiters inside strings and comments.
+fn skip_balanced(chars: &[char], index: &mut usize, open: char, close: char) -> bool {
+    let mut depth = 0_usize;
+    while let Some(&character) = chars.get(*index) {
+        match character {
+            '"' => {
+                *index += 1;
+                while let Some(&inner) = chars.get(*index) {
+                    *index += 1;
+                    if inner == '\\' {
+                        *index += 1;
+                    } else if inner == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            '#' => {
+                skip_ignored(chars, index);
+                continue;
+            }
+            _ if character == open => depth += 1,
+            _ if character == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    *index += 1;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        *index += 1;
+    }
+    false
+}
+
 /// One gRPC or GraphQL operation with independently evidenced schemas.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -17,11 +17,12 @@ pub mod unified;
 
 pub use api::{
     ApiKeyLocation, ApiSurface, AuthenticationScheme, DynamicCaptureSummary, DynamicHandoff,
-    Endpoint, EndpointIdentity, GraphQlOperationType, HeaderParameter, LibraryCoverage,
-    LooseFinding, LooseFindingKind, PaginationSignal, PathParameter, PathTemplateAssertion,
-    PathTemplateOrigin, PresenceAssertion, ProtocolOperation, ProtocolOperationIdentity,
-    QueryParameter, ResponseBody, ResponseSelector, StaticBoundaryReason, StaticCoverage,
-    StaticKnowledgeStatus, StaticPassSummary, normalize_host,
+    Endpoint, EndpointIdentity, GraphQlOperationHeader, GraphQlOperationType, HeaderParameter,
+    LibraryCoverage, LooseFinding, LooseFindingKind, PaginationSignal, PathParameter,
+    PathTemplateAssertion, PathTemplateOrigin, PresenceAssertion, ProtocolOperation,
+    ProtocolOperationIdentity, QueryParameter, ResponseBody, ResponseSelector,
+    StaticBoundaryReason, StaticCoverage, StaticKnowledgeStatus, StaticPassSummary, normalize_host,
+    parse_graphql_operations,
 };
 pub use confidence::{
     CONFIDENCE_SCHEMA_VERSION, ConfidenceSummary, CoveragePicture, FactConfidence,

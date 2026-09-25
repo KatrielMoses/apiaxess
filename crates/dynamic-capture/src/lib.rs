@@ -15,9 +15,10 @@ use apiaxess_api_model::{
     DynamicCaptureSummary, Endpoint, EndpointIdentity, Entity, EntityId, EntityKind, Fact,
     FactCandidate, FieldClass, HeaderParameter, HttpMethod, PaginationSignal, ParameterName,
     PathParameter, PathTemplate, PathTemplateAssertion, PathTemplateOrigin, PresenceAssertion,
-    ProvenanceRegistry, QueryParameter, RequirednessAssertion, Resolution, ResolutionPolicy,
-    ResponseBody, ResponseSelector, RunId, SamplePayload, SchemaObservation, SchemaProperty,
-    SchemaShape, SchemaSlot, SourceType, normalize_host,
+    ProtocolOperation, ProtocolOperationIdentity, ProvenanceRegistry, QueryParameter,
+    RequirednessAssertion, Resolution, ResolutionPolicy, ResponseBody, ResponseSelector, RunId,
+    SamplePayload, SchemaObservation, SchemaProperty, SchemaShape, SchemaSlot, SourceType,
+    normalize_host, parse_graphql_operations,
 };
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use apiaxess_session::Session;
@@ -167,6 +168,9 @@ pub fn capture_into_document(
     let mut ids = IdFactory::new(&config.run_id);
     let mut diagnostics = Vec::new();
     let mut accumulators: BTreeMap<EndpointIdentity, Accumulator> = BTreeMap::new();
+    // GraphQL operations observed in request bodies, with their flows.
+    let mut graphql_operations: BTreeMap<ProtocolOperationIdentity, Vec<EntityId>> =
+        BTreeMap::new();
     let mut flow_entities = Vec::new();
     let mut timestamps = Vec::new();
     let mut structured_flow_count = 0_usize;
@@ -340,6 +344,12 @@ pub fn capture_into_document(
                     .push(sample);
             }
         }
+        for operation in observed_graphql_operations(flow, raw_path) {
+            graphql_operations
+                .entry(operation)
+                .or_default()
+                .push(entity_id.clone());
+        }
         structured_flow_count += 1;
     }
 
@@ -402,6 +412,9 @@ pub fn capture_into_document(
         } else {
             accumulator.static_target = None;
         }
+    }
+    for (identity, flows) in &graphql_operations {
+        apply_graphql_operation(&mut document, identity, flows, &activity_id, &mut ids);
     }
     let mut observed = Vec::new();
     for accumulator in accumulators.values() {
@@ -1498,6 +1511,186 @@ fn infer_shape_value(
 }
 
 /// The path of a request target, without its query string or fragment.
+/// The GraphQL operations a request carries, recognized by shape: a JSON
+/// body (or batched array of bodies) with a `query` document and optional
+/// `operationName`, an `application/graphql` body, or a GET `query=`
+/// parameter. `operationName` selects the operation that runs; anonymous
+/// operations have no name to key on and are not lifted.
+fn observed_graphql_operations(
+    flow: &FlowCapture,
+    raw_path: &str,
+) -> Vec<ProtocolOperationIdentity> {
+    // Without a recorded URL the scheme is unknown: `host/path` then.
+    let Some(origin) = flow_origin(flow) else {
+        return Vec::new();
+    };
+    let endpoint_url = format!("{origin}{}", path_only(raw_path));
+    let content_type = flow
+        .request_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut requests: Vec<(String, Option<String>)> = Vec::new();
+    if let Some(body) = &flow.request_body {
+        if content_type.starts_with("application/graphql") {
+            requests.push((String::from_utf8_lossy(body).into_owned(), None));
+        } else if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            let items = match value {
+                Value::Array(items) => items,
+                other => vec![other],
+            };
+            for item in items {
+                if let Some(query) = item.get("query").and_then(Value::as_str) {
+                    let name = item
+                        .get("operationName")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    requests.push((query.to_owned(), name));
+                }
+            }
+        }
+    } else if let Some((_, query_string)) = raw_path.split_once('?') {
+        let parameter = |key: &str| {
+            query_string.split('&').find_map(|pair| {
+                let (name, value) = pair.split_once('=')?;
+                (name == key).then(|| percent_decode(value))
+            })
+        };
+        if let Some(query) = parameter("query") {
+            requests.push((query, parameter("operationName")));
+        }
+    }
+    let mut operations = Vec::new();
+    for (document, selected) in requests {
+        for header in parse_graphql_operations(&document) {
+            let Some(name) = header.name else {
+                continue;
+            };
+            if selected.as_ref().is_some_and(|selected| *selected != name) {
+                continue;
+            }
+            let identity = ProtocolOperationIdentity::GraphQl {
+                endpoint_url: Some(endpoint_url.clone()),
+                operation_type: header.operation_type,
+                operation_name: name,
+            };
+            if !operations.contains(&identity) {
+                operations.push(identity);
+            }
+        }
+    }
+    operations
+}
+
+/// Decodes `%XX` escapes and `+` in a URL query component.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let hex = |byte: u8| {
+        char::from(byte)
+            .to_digit(16)
+            .and_then(|digit| u8::try_from(digit).ok())
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let decoded = match bytes[index] {
+            b'+' => Some((b' ', 1)),
+            b'%' => bytes
+                .get(index + 1)
+                .copied()
+                .and_then(hex)
+                .zip(bytes.get(index + 2).copied().and_then(hex))
+                .map(|(high, low)| (high * 16 + low, 3)),
+            _ => None,
+        };
+        let (byte, width) = decoded.unwrap_or((bytes[index], 1));
+        out.push(byte);
+        index += width;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Records an observed GraphQL operation. It confirms an existing operation
+/// of the same type and name on the same URL, or one whose URL was unknown
+/// (which takes the observed URL); on another URL it is a separate operation.
+fn apply_graphql_operation(
+    document: &mut ApiDocument,
+    identity: &ProtocolOperationIdentity,
+    flows: &[EntityId],
+    activity: &apiaxess_api_model::ActivityId,
+    ids: &mut IdFactory,
+) {
+    let ProtocolOperationIdentity::GraphQl {
+        endpoint_url,
+        operation_type,
+        operation_name,
+    } = identity
+    else {
+        return;
+    };
+    let same_url = |existing: &Option<String>| match (existing, endpoint_url) {
+        (Some(existing), Some(observed)) => same_endpoint_url(existing, observed),
+        _ => false,
+    };
+    let operations = &mut document.surface.protocol_operations;
+    let position = operations
+        .iter()
+        .position(|operation| matches!(&operation.identity, ProtocolOperationIdentity::GraphQl { endpoint_url: existing, operation_type: existing_type, operation_name: existing_name } if existing_type == operation_type && existing_name == operation_name && same_url(existing)))
+        .or_else(|| {
+            operations.iter().position(|operation| {
+                matches!(&operation.identity, ProtocolOperationIdentity::GraphQl { endpoint_url: None, operation_type: existing_type, operation_name: existing_name } if existing_type == operation_type && existing_name == operation_name)
+            })
+        });
+    match position {
+        Some(index) => {
+            let operation = &mut operations[index];
+            if let ProtocolOperationIdentity::GraphQl {
+                endpoint_url: existing @ None,
+                ..
+            } = &mut operation.identity
+            {
+                existing.clone_from(endpoint_url);
+            }
+            append_candidate(
+                &mut operation.presence,
+                PresenceAssertion::Present,
+                flows,
+                ids.candidate(),
+                false,
+                activity,
+            );
+        }
+        None => operations.push(ProtocolOperation {
+            identity: identity.clone(),
+            presence: dynamic_fact(
+                FieldClass::Presence,
+                ResolutionPolicy::StaticCompleteDynamicConfirm,
+                PresenceAssertion::Present,
+                flows,
+                ids.candidate(),
+                activity,
+            ),
+            request_body: None,
+            response_body: None,
+        }),
+    }
+}
+
+/// Two endpoint URLs name the same endpoint when host and path agree.
+fn same_endpoint_url(left: &str, right: &str) -> bool {
+    let path = |url: &str| {
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let path = rest.find('/').map_or("/", |index| &rest[index..]);
+        path.split(['?', '#'])
+            .next()
+            .unwrap_or("/")
+            .trim_end_matches('/')
+            .to_owned()
+    };
+    normalize_host(left) == normalize_host(right) && path(left) == path(right)
+}
+
 /// The flow's normalized host, from its exact URL when recorded.
 fn flow_host(flow: &FlowCapture) -> Option<String> {
     flow.url
@@ -1809,6 +2002,139 @@ mod tests {
                     .map(|candidate| candidate.value.clone())
             })
             .collect()
+    }
+
+    fn graphql_post(id: u64, body: &str) -> FlowCapture {
+        let mut flow = post(id, "/graphql", body.as_bytes());
+        flow.url = Some("https://api.example.test/graphql".to_owned());
+        flow
+    }
+
+    fn operations(document: &ApiDocument) -> Vec<(Option<String>, &'static str, String, usize)> {
+        document
+            .surface
+            .protocol_operations
+            .iter()
+            .filter_map(|operation| match &operation.identity {
+                ProtocolOperationIdentity::GraphQl {
+                    endpoint_url,
+                    operation_type,
+                    operation_name,
+                } => Some((
+                    endpoint_url.clone(),
+                    match operation_type {
+                        apiaxess_api_model::GraphQlOperationType::Query => "query",
+                        apiaxess_api_model::GraphQlOperationType::Mutation => "mutation",
+                        apiaxess_api_model::GraphQlOperationType::Subscription => "subscription",
+                    },
+                    operation_name.clone(),
+                    operation.presence.candidates.len(),
+                )),
+                ProtocolOperationIdentity::Grpc { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_graphql_post_lifts_its_operation_name_and_type() {
+        let report = capture(
+            &empty_document(),
+            &[graphql_post(
+                1,
+                r#"{"operationName":"GetProfile","query":"query GetProfile($id: ID!) { profile(id: $id) { id } }","variables":{"id":7}}"#,
+            )],
+        );
+        assert_eq!(
+            operations(&report.document),
+            vec![(
+                Some("https://api.example.test/graphql".to_owned()),
+                "query",
+                "GetProfile".to_owned(),
+                1
+            )]
+        );
+        // The transport endpoint is still there, alongside its operation.
+        assert_eq!(report.document.surface.endpoints.len(), 1);
+    }
+
+    #[test]
+    fn distinct_graphql_operations_on_one_endpoint_stay_distinct() {
+        let report = capture(
+            &empty_document(),
+            &[
+                graphql_post(1, r#"{"query":"query Feed { feed { id } }"}"#),
+                graphql_post(
+                    2,
+                    r#"[{"query":"mutation Like($id: ID!) { like(id: $id) }"},{"query":"{ me { id } }"}]"#,
+                ),
+                graphql_post(
+                    3,
+                    r#"{"operationName":"B","query":"query A { a } query B { b }"}"#,
+                ),
+                graphql_post(4, r#"{"query":"query Feed { feed { id } }"}"#),
+            ],
+        );
+        let names = operations(&report.document)
+            .into_iter()
+            .map(|(_, kind, name, samples)| (kind, name, samples))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("query", "B".to_owned(), 1),
+                ("query", "Feed".to_owned(), 1),
+                ("mutation", "Like".to_owned(), 1),
+            ]
+        );
+        let feed = &report.document.surface.protocol_operations[1];
+        // Both Feed requests are evidence for the one operation.
+        assert_eq!(feed.presence.candidates[0].evidence.len(), 2);
+    }
+
+    #[test]
+    fn an_observed_operation_confirms_the_static_one_and_supplies_its_url() {
+        let mut seeded = capture(
+            &empty_document(),
+            &[graphql_post(1, r#"{"query":"query GetProfile { p }"}"#)],
+        );
+        if let ProtocolOperationIdentity::GraphQl { endpoint_url, .. } =
+            &mut seeded.document.surface.protocol_operations[0].identity
+        {
+            *endpoint_url = None;
+        }
+        let report = capture(
+            &seeded.document,
+            &[graphql_post(2, r#"{"query":"query GetProfile { p }"}"#)],
+        );
+        assert_eq!(
+            operations(&report.document),
+            vec![(
+                Some("https://api.example.test/graphql".to_owned()),
+                "query",
+                "GetProfile".to_owned(),
+                2
+            )]
+        );
+    }
+
+    #[test]
+    fn graphql_over_get_is_lifted_from_the_query_string() {
+        let mut flow = flow(
+            1,
+            "/graphql?query=query%20Me%20%7B%20me%20%7B%20id%20%7D%20%7D&operationName=Me",
+            br#"{"data":{}}"#,
+        );
+        flow.url = Some("https://api.example.test/graphql?query=x".to_owned());
+        let report = capture(&empty_document(), &[flow]);
+        assert_eq!(
+            operations(&report.document),
+            vec![(
+                Some("https://api.example.test/graphql".to_owned()),
+                "query",
+                "Me".to_owned(),
+                1
+            )]
+        );
     }
 
     #[test]

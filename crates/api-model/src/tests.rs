@@ -546,3 +546,38 @@ fn unsupported_versions_and_unknown_fields_fail_explicitly() {
         "unexpected result: {result:?}"
     );
 }
+
+#[test]
+fn graphql_operation_headers_parse_name_and_type_without_variable_fragments() {
+    use crate::{GraphQlOperationHeader, GraphQlOperationType, parse_graphql_operations};
+    let header = |operation_type, name: Option<&str>| GraphQlOperationHeader {
+        operation_type,
+        name: name.map(ToOwned::to_owned),
+    };
+    assert_eq!(
+        parse_graphql_operations(
+            "query GetProfile($id: ID!) { profile(id: $id) { id displayName } }"
+        ),
+        vec![header(GraphQlOperationType::Query, Some("GetProfile"))]
+    );
+    assert_eq!(
+        parse_graphql_operations(
+            "# comment\nfragment F on User { id }\nmutation Rename($n: String = \"a}b\") @live { rename(n: $n) { ...F } }"
+        ),
+        vec![header(GraphQlOperationType::Mutation, Some("Rename"))]
+    );
+    assert_eq!(
+        parse_graphql_operations("{ me { id } }"),
+        vec![header(GraphQlOperationType::Query, None)]
+    );
+    assert_eq!(
+        parse_graphql_operations("subscription OnMessage { message { id } } query Two { a }"),
+        vec![
+            header(GraphQlOperationType::Subscription, Some("OnMessage")),
+            header(GraphQlOperationType::Query, Some("Two")),
+        ]
+    );
+    // Prose starting with "query", and unterminated fragments, are not documents.
+    assert!(parse_graphql_operations("query the server for updates").is_empty());
+    assert!(parse_graphql_operations("query GetProfile($id").is_empty());
+}

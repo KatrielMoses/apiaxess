@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use apiaxess_network_routing::{CorpusDocument, SignatureCorpus, SourceKind};
 
+use crate::dto::{BodyField, BodyShape};
+
 /// Upper bound on nested constant resolution, which also breaks cycles.
 const MAX_CONSTANT_DEPTH: usize = 4;
 
@@ -38,6 +40,44 @@ pub(crate) struct ResolvedCall {
     pub(crate) query_names: Vec<String>,
     pub(crate) header_names: Vec<String>,
     pub(crate) has_body: bool,
+    /// The body's statically known shape, when it resolves in this method.
+    pub(crate) body: Option<BodyRef>,
+}
+
+/// One literal key written into a `JSONObject`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct JsonKey {
+    pub(crate) name: String,
+    pub(crate) shape: BodyShape,
+    /// The value, when it is a fully literal string (e.g. a GraphQL
+    /// document written under `query`).
+    pub(crate) literal: Option<String>,
+}
+
+impl JsonKey {
+    #[cfg(test)]
+    fn new(name: &str, shape: BodyShape) -> Self {
+        Self {
+            name: name.to_owned(),
+            shape,
+            literal: None,
+        }
+    }
+}
+
+/// A request body bound to its call site.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BodyRef {
+    /// Top-level keys written literally (`JSONObject().put("k", ..)`), each
+    /// with the shape of the value written, when known.
+    Keys(Vec<JsonKey>),
+    /// A serialized instance of an app class, resolved to fields later.
+    Class {
+        /// Dotted class name.
+        class: String,
+        /// Dotted name of the class whose code serializes it.
+        anchor: String,
+    },
 }
 
 /// The outcome for one call site found in a method.
@@ -134,6 +174,7 @@ pub(crate) fn resolve_call_sites(
     let mut sites = Vec::new();
     for method in &structure.methods {
         let mut evaluator = MethodEvaluator::new(&context, constants);
+        evaluator.seed_params(&method.params);
         for statement in statements(&method.tokens) {
             evaluator.statement(statement);
         }
@@ -159,6 +200,7 @@ pub(crate) fn retrofit_bindings(
     let mut bindings = Vec::new();
     for method in &structure.methods {
         let mut evaluator = MethodEvaluator::new(&context, constants);
+        evaluator.seed_params(&method.params);
         for statement in statements(&method.tokens) {
             evaluator.statement(statement);
         }
@@ -405,6 +447,8 @@ struct BraceNode {
 struct MethodTokens {
     name: String,
     tokens: Vec<Tok>,
+    /// Declared parameters as (simple type name, parameter name).
+    params: Vec<(String, String)>,
 }
 
 struct FileStructure {
@@ -466,6 +510,7 @@ fn parse_structure(tokens: &[Tok]) -> Option<FileStructure> {
                 structure.methods.push(MethodTokens {
                     name: nodes[node].name.clone(),
                     tokens: body,
+                    params: method_params(tokens, nodes[node].open),
                 });
             }
             BraceKind::Container => {
@@ -529,6 +574,86 @@ fn container_fields(tokens: &[Tok], nodes: &[BraceNode], node: usize) -> Vec<Vec
         &mut fields,
     );
     fields
+}
+
+/// The declared parameters of the method whose body opens at `open`, as
+/// (simple type name, name). Annotations and `final` are dropped; generic
+/// arguments are ignored (`Map<String, T> m` -> `Map`, `m`).
+fn method_params(tokens: &[Tok], open: usize) -> Vec<(String, String)> {
+    let mut start = open;
+    while start > 0 && !matches!(&tokens[start - 1], Tok::Sym(";" | "{" | "}")) {
+        start -= 1;
+    }
+    let header = &tokens[start..open];
+    let Some(close) = header.iter().rposition(|token| token.is_sym(")")) else {
+        return Vec::new();
+    };
+    let Some(paren) = matching_open_paren(header, close) else {
+        return Vec::new();
+    };
+    let inner = &header[paren + 1..close];
+    let mut params = Vec::new();
+    let mut current: Vec<&Tok> = Vec::new();
+    let mut depth = 0_i32;
+    for token in inner.iter().chain(std::iter::once(&Tok::Sym(","))) {
+        match token {
+            Tok::Sym("(" | "<" | "[") => depth += 1,
+            Tok::Sym(")" | ">" | "]") => depth -= 1,
+            Tok::Sym(",") if depth == 0 => {
+                if let Some(param) = parse_param(&current) {
+                    params.push(param);
+                }
+                current.clear();
+                continue;
+            }
+            _ => {}
+        }
+        current.push(token);
+    }
+    params
+}
+
+fn parse_param(tokens: &[&Tok]) -> Option<(String, String)> {
+    let mut rest = tokens;
+    // Drop leading annotations (`@Name` or `@Name(...)`) and modifiers.
+    loop {
+        match rest {
+            [Tok::Sym("@"), Tok::Ident(_), after @ ..] => {
+                rest = after;
+                if rest.first().is_some_and(|token| token.is_sym("(")) {
+                    let mut depth = 0_i32;
+                    let mut end = 0;
+                    for (index, token) in rest.iter().enumerate() {
+                        if token.is_sym("(") {
+                            depth += 1;
+                        } else if token.is_sym(")") {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = index + 1;
+                                break;
+                            }
+                        }
+                    }
+                    rest = &rest[end..];
+                }
+            }
+            [Tok::Ident(word), after @ ..] if word == "final" => rest = after,
+            _ => break,
+        }
+    }
+    let name = rest.last()?.ident()?.to_owned();
+    let mut ty = String::new();
+    let mut angle = 0_i32;
+    for token in &rest[..rest.len() - 1] {
+        match token {
+            Tok::Sym("<") => angle += 1,
+            Tok::Sym(">") => angle -= 1,
+            Tok::Ident(value) if angle == 0 => ty.clone_from(value),
+            Tok::Sym("[") if angle == 0 => ty.push_str("[]"),
+            _ => {}
+        }
+    }
+    (!ty.is_empty()).then_some((ty, name))
 }
 
 fn classify_brace(tokens: &[Tok], open: usize) -> (BraceKind, String) {
@@ -1117,7 +1242,22 @@ enum Val {
     RetrofitBuilder(Option<String>),
     /// A built `retrofit2.Retrofit` instance with its base URL.
     Retrofit(Option<String>),
-    Json,
+    /// An `org.json.JSONObject` and its literal keys (`None` once a key or
+    /// the source is not literal, e.g. `new JSONObject(map)`).
+    Json(Option<Vec<JsonKey>>),
+    /// JSON text (or its bytes) with a known shape.
+    JsonText(BodyRef),
+    /// An okhttp `RequestBody` wrapping JSON text with a known shape.
+    ReqBody(BodyRef),
+    /// A new instance of a class decompiled in this corpus.
+    Instance(String),
+    /// A method parameter: unknown value, declared type.
+    Param {
+        name: String,
+        ty: String,
+    },
+    /// The output stream (or a writer over it) of a connection's body.
+    OutStream(usize),
     Unknown(String),
 }
 
@@ -1128,6 +1268,7 @@ struct Site {
     verb: Verb,
     headers: Vec<String>,
     has_body: bool,
+    body: Option<BodyRef>,
     does_output: bool,
     /// The request only labels a synthesized response and is never sent.
     synthetic: bool,
@@ -1151,6 +1292,7 @@ impl Site {
             verb: Verb::Default,
             headers: Vec::new(),
             has_body: false,
+            body: None,
             does_output: false,
             synthetic: false,
         }
@@ -1369,8 +1511,24 @@ impl<'a, 'c> MethodEvaluator<'a, 'c> {
                 Some(Val::Str(parts)) => Val::Str(parts),
                 _ => Val::Unknown("value".to_owned()),
             },
-            Some("JSONObject") => Val::Json,
-            Some(other) => Val::Unknown(lower_first(other)),
+            Some("JSONObject") => Val::Json(args.is_empty().then(Vec::new)),
+            Some(other) => {
+                let values = args
+                    .iter()
+                    .map(|arg| self.eval(arg, depth))
+                    .collect::<Vec<_>>();
+                // A writer/stream wrapping a connection's output stream.
+                if let Some(site) = values.iter().find_map(|value| match value {
+                    Val::OutStream(site) => Some(*site),
+                    _ => None,
+                }) {
+                    return Val::OutStream(site);
+                }
+                match self.corpus_class(ty) {
+                    Some(class) => Val::Instance(class),
+                    None => Val::Unknown(lower_first(other)),
+                }
+            }
             None => Val::Unknown("value".to_owned()),
         }
     }
@@ -1432,29 +1590,8 @@ impl<'a, 'c> MethodEvaluator<'a, 'c> {
                 "toString" | "toExternalForm" => Val::Str(parts),
                 _ => Val::Unknown(getter_hint(name)),
             },
-            Val::Conn(site) => {
-                match name {
-                    "setRequestMethod" => {
-                        let verb = self.literal_arg(args, 0, depth);
-                        self.set_verb(site, verb);
-                    }
-                    "setRequestProperty" | "addRequestProperty" => {
-                        if let Some(header) = self.literal_arg(args, 0, depth) {
-                            push_unique(&mut self.sites[site].headers, header);
-                        }
-                    }
-                    "setDoOutput" => {
-                        if matches!(args.first(), Some(Expr::Name(value)) if value == &["true"]) {
-                            self.sites[site].does_output = true;
-                        }
-                    }
-                    "getOutputStream" => {
-                        self.sites[site].does_output = true;
-                        self.sites[site].has_body = true;
-                    }
-                    _ => {}
-                }
-                Val::Unknown(getter_hint(name))
+            target @ (Val::Conn(_) | Val::OutStream(_) | Val::JsonText(_)) => {
+                self.connection_call(target, name, args, depth)
             }
             target @ (Val::RetrofitBuilder(_) | Val::Retrofit(_)) => {
                 self.retrofit_call(target, name, args, depth)
@@ -1469,17 +1606,19 @@ impl<'a, 'c> MethodEvaluator<'a, 'c> {
                 }
                 Val::ResponseBuilder
             }
-            Val::Json => match name {
-                "put" | "putOpt" | "accumulate" => Val::Json,
-                _ => Val::Unknown("body".to_owned()),
-            },
-            Val::Request(_) | Val::Unknown(_) => {
+            Val::Json(keys) => self.json_call(keys, name, args, depth),
+            Val::ReqBody(_)
+            | Val::Instance(_)
+            | Val::Param { .. }
+            | Val::Request(_)
+            | Val::Unknown(_) => {
                 // An opaque call (`execute(new Request.Builder()...)`) still
                 // runs its arguments, which may hold the call site itself.
-                for arg in args {
-                    self.eval(arg, depth);
-                }
-                Val::Unknown(getter_hint(name))
+                let values = args
+                    .iter()
+                    .map(|arg| self.eval(arg, depth))
+                    .collect::<Vec<_>>();
+                self.opaque_call_result(name, &values)
             }
         }
     }
@@ -1544,22 +1683,12 @@ impl<'a, 'c> MethodEvaluator<'a, 'c> {
             "get" | "head" => self.sites[site].verb = Verb::Known(name.to_ascii_uppercase()),
             "post" | "put" | "patch" | "delete" => {
                 self.sites[site].verb = Verb::Known(name.to_ascii_uppercase());
-                if args
-                    .first()
-                    .is_some_and(|arg| !matches!(arg, Expr::Name(value) if value == &["null"]))
-                {
-                    self.sites[site].has_body = true;
-                }
+                self.bind_body(site, args.first(), depth);
             }
             "method" => {
                 let verb = self.literal_arg(args, 0, depth);
                 self.set_verb(site, verb);
-                if args
-                    .get(1)
-                    .is_some_and(|arg| !matches!(arg, Expr::Name(value) if value == &["null"]))
-                {
-                    self.sites[site].has_body = true;
-                }
+                self.bind_body(site, args.get(1), depth);
             }
             "header" | "addHeader" => {
                 if let Some(header) = self.literal_arg(args, 0, depth) {
@@ -1662,6 +1791,96 @@ impl<'a, 'c> MethodEvaluator<'a, 'c> {
         Val::Str(out)
     }
 
+    /// Calls on an `org.json.JSONObject`: literal `put` keys, and `toString`
+    /// into JSON text with that key set.
+    fn json_call(
+        &mut self,
+        keys: Option<Vec<JsonKey>>,
+        name: &str,
+        args: &[Expr],
+        depth: usize,
+    ) -> Val {
+        match name {
+            "put" | "putOpt" | "accumulate" => {
+                let key = self.literal_arg(args, 0, depth);
+                let shape = args
+                    .get(1)
+                    .map_or(BodyShape::Unknown, |arg| self.json_value_shape(arg, depth));
+                let literal = if shape == BodyShape::String {
+                    self.literal_arg(args, 1, depth)
+                } else {
+                    None
+                };
+                Val::Json(keys.zip(key).map(|(mut keys, name)| {
+                    if !keys.iter().any(|existing| existing.name == name) {
+                        keys.push(JsonKey {
+                            name,
+                            shape,
+                            literal,
+                        });
+                    }
+                    keys
+                }))
+            }
+            "toString" => match keys {
+                Some(keys) => Val::JsonText(BodyRef::Keys(keys)),
+                None => Val::Unknown("body".to_owned()),
+            },
+            _ => Val::Unknown("body".to_owned()),
+        }
+    }
+
+    /// Calls on an `HttpURLConnection`, its output stream, or JSON text:
+    /// verb, headers, and the body written to the connection.
+    fn connection_call(&mut self, target: Val, name: &str, args: &[Expr], depth: usize) -> Val {
+        match target {
+            Val::Conn(site) => {
+                match name {
+                    "setRequestMethod" => {
+                        let verb = self.literal_arg(args, 0, depth);
+                        self.set_verb(site, verb);
+                    }
+                    "setRequestProperty" | "addRequestProperty" => {
+                        if let Some(header) = self.literal_arg(args, 0, depth) {
+                            push_unique(&mut self.sites[site].headers, header);
+                        }
+                    }
+                    "setDoOutput" => {
+                        if matches!(args.first(), Some(Expr::Name(value)) if value == &["true"]) {
+                            self.sites[site].does_output = true;
+                        }
+                    }
+                    "getOutputStream" => {
+                        self.sites[site].does_output = true;
+                        self.sites[site].has_body = true;
+                        return Val::OutStream(site);
+                    }
+                    _ => {}
+                }
+                Val::Unknown(getter_hint(name))
+            }
+            Val::OutStream(site) => {
+                if matches!(
+                    name,
+                    "write" | "print" | "println" | "append" | "writeBytes"
+                ) {
+                    if let Some(Val::JsonText(body)) = args.first().map(|arg| self.eval(arg, depth))
+                    {
+                        self.sites[site].body = Some(body);
+                    }
+                }
+                Val::OutStream(site)
+            }
+            Val::JsonText(body) => match name {
+                "getBytes" | "toString" | "trim" | "toByteArray" | "encodeToByteArray" => {
+                    Val::JsonText(body)
+                }
+                _ => Val::Unknown(getter_hint(name)),
+            },
+            _ => Val::Unknown(getter_hint(name)),
+        }
+    }
+
     /// Calls on a Retrofit builder or instance: track the base URL and record
     /// `create(Service.class)` bindings.
     fn retrofit_call(&mut self, target: Val, name: &str, args: &[Expr], depth: usize) -> Val {
@@ -1749,6 +1968,91 @@ impl<'a, 'c> MethodEvaluator<'a, 'c> {
         }
     }
 
+    /// Binds a `post(body)`-style argument to the call site: any non-null
+    /// body marks the call as sending one, and a body whose JSON shape
+    /// resolved in this method is kept.
+    fn bind_body(&mut self, site: usize, arg: Option<&Expr>, depth: usize) {
+        let Some(arg) = arg else {
+            return;
+        };
+        if matches!(arg, Expr::Name(value) if value == &["null"]) {
+            return;
+        }
+        self.sites[site].has_body = true;
+        if let Val::ReqBody(body) | Val::JsonText(body) = self.eval(arg, depth) {
+            self.sites[site].body = Some(body);
+        }
+    }
+
+    /// The value of a call on an unknown receiver, given its evaluated
+    /// arguments: JSON serialization of a known object or `JSONObject`, and
+    /// okhttp `RequestBody.create(json, ..)`; anything else is opaque.
+    fn opaque_call_result(&self, name: &str, values: &[Val]) -> Val {
+        let json_text = |values: &[Val]| {
+            values.iter().find_map(|value| match value {
+                Val::JsonText(body) => Some(body.clone()),
+                _ => None,
+            })
+        };
+        match name {
+            "toJson" | "encodeToString" | "writeValueAsString" | "serialize" | "stringify" => {
+                let body = values.iter().find_map(|value| match value {
+                    Val::Instance(class) => Some(BodyRef::Class {
+                        class: class.clone(),
+                        anchor: self.file.class_name.clone().unwrap_or_default(),
+                    }),
+                    Val::Json(Some(keys)) => Some(BodyRef::Keys(keys.clone())),
+                    _ => None,
+                });
+                body.map_or(Val::Unknown("body".to_owned()), Val::JsonText)
+            }
+            "create" | "toRequestBody" => {
+                json_text(values).map_or(Val::Unknown("body".to_owned()), Val::ReqBody)
+            }
+            _ => Val::Unknown(getter_hint(name)),
+        }
+    }
+
+    /// The dotted name of a written type when it names a class decompiled in
+    /// this corpus (an app or bundled class, not a platform one).
+    fn corpus_class(&mut self, ty: &[String]) -> Option<String> {
+        self.file
+            .class_candidates(ty)
+            .into_iter()
+            .find(|candidate| self.constants.document_for(candidate).is_some())
+    }
+
+    /// Binds each declared parameter as a named, typed unknown value.
+    fn seed_params(&mut self, params: &[(String, String)]) {
+        for (ty, name) in params {
+            self.locals.insert(
+                name.clone(),
+                Val::Param {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                },
+            );
+        }
+    }
+
+    /// The JSON shape of a value written into a `JSONObject`.
+    fn json_value_shape(&mut self, arg: &Expr, depth: usize) -> BodyShape {
+        match arg {
+            Expr::Num(value) if value.contains('.') => return BodyShape::Number(None),
+            Expr::Num(_) => return BodyShape::Integer(None),
+            Expr::Name(value) if value == &["true"] || value == &["false"] => {
+                return BodyShape::Boolean;
+            }
+            _ => {}
+        }
+        match self.eval(arg, depth) {
+            Val::Str(_) | Val::JsonText(_) => BodyShape::String,
+            Val::Param { ty, .. } => shape_of_java_type(&ty),
+            Val::Json(Some(keys)) => BodyShape::Object(key_fields(&keys)),
+            _ => BodyShape::Unknown,
+        }
+    }
+
     /// Records an explicit verb; `None` means the argument did not resolve.
     fn set_verb(&mut self, site: usize, verb: Option<String>) {
         self.sites[site].verb = match verb {
@@ -1787,6 +2091,7 @@ impl<'a, 'c> MethodEvaluator<'a, 'c> {
                             query_names,
                             header_names: site.headers,
                             has_body: site.has_body,
+                            body: site.body,
                         })
                     }
                     None => CallSite::Unresolved {
@@ -1845,10 +2150,43 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+/// The JSON shape of a declared Java/Kotlin type, when it is a scalar,
+/// collection or `org.json` value.
+fn shape_of_java_type(ty: &str) -> BodyShape {
+    match ty {
+        "String" | "CharSequence" | "char" | "Character" => BodyShape::String,
+        "int" | "Integer" | "short" | "Short" | "byte" | "Byte" => {
+            BodyShape::Integer(Some("int32"))
+        }
+        "long" | "Long" => BodyShape::Integer(Some("int64")),
+        "float" | "Float" => BodyShape::Number(Some("float")),
+        "double" | "Double" => BodyShape::Number(Some("double")),
+        "boolean" | "Boolean" => BodyShape::Boolean,
+        "List" | "Set" | "Collection" | "JSONArray" => {
+            BodyShape::Array(Box::new(BodyShape::Unknown))
+        }
+        ty if ty.ends_with("[]") => {
+            BodyShape::Array(Box::new(shape_of_java_type(ty.trim_end_matches("[]"))))
+        }
+        _ => BodyShape::Unknown,
+    }
+}
+
+/// Literal `JSONObject` keys as body fields (none asserted required).
+pub(crate) fn key_fields(keys: &[JsonKey]) -> Vec<BodyField> {
+    keys.iter()
+        .map(|key| BodyField {
+            name: key.name.clone(),
+            shape: key.shape.clone(),
+            required: false,
+        })
+        .collect()
+}
+
 fn value_parts(value: Val) -> Vec<Part> {
     match value {
         Val::Str(parts) => parts,
-        Val::Unknown(hint) => vec![Part::Hole(hint)],
+        Val::Unknown(hint) | Val::Param { name: hint, .. } => vec![Part::Hole(hint)],
         _ => vec![Part::Hole("value".to_owned())],
     }
 }
@@ -2157,6 +2495,7 @@ mod tests {
         let mut sites = Vec::new();
         for method in &structure.methods {
             let mut evaluator = MethodEvaluator::new(&context, &mut constants);
+            evaluator.seed_params(&method.params);
             for statement in statements(&method.tokens) {
                 evaluator.statement(statement);
             }
@@ -2434,6 +2773,69 @@ class Client {
         );
     }
 
+    fn body_of(site: &CallSite) -> Option<BodyRef> {
+        match site {
+            CallSite::Resolved(call) => call.body.clone(),
+            CallSite::Unresolved { .. } => None,
+        }
+    }
+
+    #[test]
+    fn hand_built_json_bodies_bind_their_literal_keys_to_the_call_site() {
+        let sites = resolve(
+            r#"
+import java.net.HttpURLConnection;
+import java.net.URL;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import org.json.JSONObject;
+class Client {
+    int track(String event, long at) {
+        String body = new JSONObject().put("event", event).put("at", at).put("v", 2).toString();
+        return execute(new Request.Builder().url("https://h.test/v1/events").post(RequestBody.INSTANCE.create(body, this.json)).build());
+    }
+    int save(boolean push) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL("https://h.test/v1/settings").openConnection();
+        connection.setRequestMethod("PUT");
+        String body = new JSONObject().put("push", push).put("meta", new JSONObject().put("id", 1)).toString();
+        OutputStream outputStream = connection.getOutputStream();
+        OutputStream it = outputStream;
+        it.write(body.getBytes(Charsets.UTF_8));
+        return connection.getResponseCode();
+    }
+    int opaque(java.util.Map fields) {
+        String body = new JSONObject(fields).toString();
+        return execute(new Request.Builder().url("https://h.test/v1/raw").post(RequestBody.INSTANCE.create(body, this.json)).build());
+    }
+}
+"#,
+        );
+        assert_eq!(
+            body_of(&sites[0]),
+            Some(BodyRef::Keys(vec![
+                JsonKey::new("event", BodyShape::String),
+                JsonKey::new("at", BodyShape::Integer(Some("int64"))),
+                JsonKey::new("v", BodyShape::Integer(None)),
+            ]))
+        );
+        assert_eq!(
+            body_of(&sites[1]),
+            Some(BodyRef::Keys(vec![
+                JsonKey::new("push", BodyShape::Boolean),
+                JsonKey::new(
+                    "meta",
+                    BodyShape::Object(key_fields(&[JsonKey::new("id", BodyShape::Integer(None))]))
+                ),
+            ]))
+        );
+        // Keys that come from outside the method are not invented.
+        assert_eq!(body_of(&sites[2]), None);
+        let CallSite::Resolved(opaque) = &sites[2] else {
+            panic!("opaque-body call site still resolves");
+        };
+        assert!(opaque.has_body);
+    }
+
     #[test]
     fn a_request_that_only_labels_a_synthesized_response_is_not_a_call() {
         let sites = resolve(
@@ -2475,6 +2877,7 @@ class Client {
         let mut out = Vec::new();
         for method in &structure.methods {
             let mut evaluator = MethodEvaluator::new(&context, &mut constants);
+            evaluator.seed_params(&method.params);
             for statement in statements(&method.tokens) {
                 evaluator.statement(statement);
             }
