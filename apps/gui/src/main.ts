@@ -33,6 +33,7 @@ import {
 import { parseRawRequest, rawRequestText, splitRawRequest as splitRawRequestParts, splitUrl, syncContentLength, urlOrigin } from "./http/request-editor";
 import { prettyBody } from "./http/body-view";
 import { isConfirmed, tallySurface } from "./surface/tally";
+import { ingestWsEvents, initWsTab, type LiveWsEvent, loadWsConnections } from "./ws/ws-tab";
 import { curlCommand, findAll, hexDump, inspectRequest, type InspectorItem, isBinaryBody, requestMethod, setRequestMethod, showNonPrintables, urlEncode } from "./http/message-tools";
 
 /* ==================================================================== *
@@ -105,7 +106,7 @@ interface RedirectHop { status: number; location: string; }
 interface FuzzerConfig { baseRequest: ResendRequest; positions: FuzzerPosition[]; payloadSets: FuzzerPayloadSet[]; attackType: string; matchFilter: FuzzerMatchFilter; grep: GrepConfig; concurrency: number; delay: DelayPolicy; retry: RetryPolicy; redirect: RedirectPolicy; connectionClose: boolean; updateContentLength: boolean; maxResults: number; authPreflight?: ResendRequest | null; sequence?: unknown[]; }
 interface FuzzerJob { id: string; tier: "ffuf" | "native"; state: string; config: FuzzerConfig; results: FuzzerResult[]; diagnostics: (Diagnostic | null)[]; progress?: { sent: number; total: number } | null; }
 interface CredentialPromptMsg { readonly id: number; readonly package: string; readonly screenSummary: string; readonly reason: string; readonly fields: readonly CredentialDialogField[]; }
-interface LiveUpdate { readonly flows: readonly FlowSummary[]; readonly diagnostics: readonly Diagnostic[]; readonly prompts?: readonly CredentialPromptMsg[]; }
+interface LiveUpdate { readonly flows: readonly FlowSummary[]; readonly diagnostics: readonly Diagnostic[]; readonly prompts?: readonly CredentialPromptMsg[]; readonly websocket?: readonly LiveWsEvent[]; }
 interface PipelineRun { readonly runId: string; readonly artifactPath: string; readonly stage: string; readonly status: "running" | "completed" | "failed"; readonly progressBasisPoints: number; readonly message: string; readonly diagnostics: (Diagnostic | null)[]; readonly dynamicRan: boolean; readonly updatedAt: string; readonly surfaceAvailable: boolean; }
 /** Request/response essentials extracted from a fused endpoint for the expandable
  * detail and the send-to-resend/fuzzer actions. The surface is a normalized
@@ -314,7 +315,7 @@ const resendDrafts = new Map<string, { raw: string; target: string }>();
 const resendFailures = new Map<string, ContextDiagnostic>();
 /** Fuzz queue (Intruder): manually-created attacks only (discovery excluded). */
 const fuzzerJobsList = new Map<string, FuzzerJob>();
-let activeWorkbenchTab: "live" | "resend" | "fuzz" = "live";
+let activeWorkbenchTab: "live" | "resend" | "fuzz" | "ws" = "live";
 /** Endpoints of the currently rendered surface, so row expand and the
  * send-to-resend/fuzzer actions can resolve a clicked row by index. */
 let lastSurfaceEndpoints: readonly SurfaceEndpoint[] = [];
@@ -3690,9 +3691,10 @@ let nextDraftSeq = 0;
  *  session; a job restored from disk falls back to its unmarked base request. */
 const fuzzJobTemplates = new Map<string, string>();
 
-/** Switches the Workbench between its three tools; nothing remounts. */
-function showWorkbenchTab(name: "live" | "resend" | "fuzz"): void {
+/** Switches the Workbench between its tools; nothing remounts. */
+function showWorkbenchTab(name: "live" | "resend" | "fuzz" | "ws"): void {
   activeWorkbenchTab = name;
+  if (name === "ws") void loadWsConnections();
   document.querySelectorAll<HTMLElement>(".wb-tab").forEach((tab) => {
     const on = tab.dataset.wbtab === name;
     tab.classList.toggle("is-active", on);
@@ -4124,7 +4126,7 @@ function applyFlowSearch(): void {
 
 function initWorkbenchTools(): void {
   document.querySelectorAll<HTMLElement>(".wb-tab").forEach((tab) => {
-    tab.addEventListener("click", () => showWorkbenchTab((tab.dataset.wbtab as "live" | "resend" | "fuzz") ?? "live"));
+    tab.addEventListener("click", () => showWorkbenchTab((tab.dataset.wbtab as "live" | "resend" | "fuzz" | "ws") ?? "live"));
   });
   document.querySelector<HTMLInputElement>("#flow-search")?.addEventListener("input", applyFlowSearch);
   document.querySelector<HTMLSelectElement>("#flow-filter-method")?.addEventListener("change", applyFlowSearch);
@@ -4140,6 +4142,7 @@ function initWorkbenchTools(): void {
     if (selectedResend === null) seedResendEmpty();
   });
   initWorkbenchSplitters();
+  initWsTab();
   renderResendList();
   renderFuzzList();
 }
@@ -4697,6 +4700,8 @@ function connect(session: WorkbenchSession): void {
   telemetry.onmessage = (event) => {
     const update = JSON.parse(event.data) as LiveUpdate;
     update.flows.forEach((flow) => ingestFlow(flow));
+    // WebSocket events route to the WebSocket tab only, never the HTTP grid.
+    ingestWsEvents(update.websocket ?? []);
     update.diagnostics.forEach(showDiagnostic);
     (update.prompts ?? []).forEach((prompt) => void handleCredentialPrompt(prompt));
     renderFlows();

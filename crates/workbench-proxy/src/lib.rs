@@ -23,8 +23,9 @@ pub use apiaxess_workbench_store::{
 };
 pub use backend::{
     BackendHealth, BackendKind, BodyDirection, FlowEvent, FlowObserver, HudsuckerBackend,
-    InterceptController, InterceptDecision, NoopObserver, ProxyBackend, ProxyConfig, ProxyCore,
-    ProxyHandle, WebSocketDirection,
+    InterceptController, InterceptDecision, MAX_WEBSOCKET_PAYLOAD_BYTES, NoopObserver,
+    ProxyBackend, ProxyConfig, ProxyCore, ProxyHandle, WebSocketConnectionKey, WebSocketDirection,
+    WebSocketMessageKind,
 };
 pub use ca::{CaExport, SessionCa};
 pub use fuzzer::{FuzzerWorkbench, RequestCountPreview, preview_request_count};

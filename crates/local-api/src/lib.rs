@@ -174,6 +174,11 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         )
         .route("/api/v1/workbench/flows", get(list_flows))
         .route("/api/v1/workbench/flows/{flow_id}", get(get_flow))
+        .route("/api/v1/workbench/ws-connections", get(list_ws_connections))
+        .route(
+            "/api/v1/workbench/ws-connections/{connection_id}/messages",
+            get(list_ws_messages),
+        )
         .route("/api/v1/workbench/intercept/pending", get(pending_flows))
         .route("/api/v1/workbench/har", get(export_har).post(import_har))
         .route(
@@ -1468,6 +1473,57 @@ async fn list_flows(
         .map_err(storage_response)
 }
 
+async fn list_ws_connections(
+    State(state): State<ApiState>,
+) -> Result<
+    Json<Vec<apiaxess_engine_shell::WsConnectionView>>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    state
+        .engine
+        .ws_connections()
+        .map(Json)
+        .map_err(session_response)
+}
+
+/// Paging for a WebSocket connection's messages: after a sequence, up to a limit.
+#[derive(Deserialize)]
+struct WsMessagesQuery {
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// Largest page of WebSocket messages returned at once.
+const MAX_WS_MESSAGE_PAGE: usize = 1_000;
+
+async fn list_ws_messages(
+    State(state): State<ApiState>,
+    AxumPath(connection_id): AxumPath<u64>,
+    Query(query): Query<WsMessagesQuery>,
+) -> Result<
+    Json<Vec<apiaxess_workbench_proxy::live::LiveWebSocketMessage>>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    let limit = query.limit.unwrap_or(200).clamp(1, MAX_WS_MESSAGE_PAGE);
+    state
+        .engine
+        .ws_messages(connection_id, query.after, limit)
+        .map(|messages| {
+            Json(
+                messages
+                    .iter()
+                    .map(|message| {
+                        apiaxess_workbench_proxy::live::LiveWebSocketMessage::from_record_capped(
+                            message,
+                            apiaxess_workbench_proxy::MAX_WEBSOCKET_PAYLOAD_BYTES,
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .map_err(session_response)
+}
+
 async fn get_flow(
     State(state): State<ApiState>,
     AxumPath(flow_id): AxumPath<u64>,
@@ -2734,6 +2790,7 @@ async fn telemetry_loop(mut socket: axum::extract::ws::WebSocket, live: Arc<Live
             batch.flows.extend(update.flows);
             batch.diagnostics.extend(update.diagnostics);
             batch.prompts.extend(update.prompts);
+            batch.websocket.extend(update.websocket);
         }
         if socket
             .send(axum::extract::ws::Message::Text(

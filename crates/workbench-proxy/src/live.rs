@@ -102,6 +102,138 @@ pub struct LiveUpdate {
     /// Live credential prompts the engine is blocking on (never carries secrets).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prompts: Vec<CredentialPrompt>,
+    /// WebSocket connection and message events, as persisted (redacted). Tagged
+    /// separately from `flows`: WebSocket traffic is its own view, never part of
+    /// the HTTP flow list or fusion.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub websocket: Vec<LiveWebSocketEvent>,
+}
+
+/// One WebSocket event for the live telemetry stream.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveWebSocketEvent {
+    /// The connection, with its current state and message count.
+    pub connection: apiaxess_workbench_store::WsConnectionRecord,
+    /// The message this event carries, when it is a message event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<LiveWebSocketMessage>,
+}
+
+/// A WebSocket message on the telemetry stream.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveWebSocketMessage {
+    /// Position on the connection, from 1.
+    pub sequence: u64,
+    /// Sent or received.
+    pub direction: apiaxess_workbench_store::WsDirection,
+    /// Frame kind.
+    pub kind: apiaxess_workbench_store::WsMessageKind,
+    /// Retained payload (redacted), base64, capped at
+    /// [`LIVE_WEBSOCKET_PAYLOAD_BYTES`] for the live stream.
+    pub payload_base64: String,
+    /// Bytes of payload in `payload_base64`.
+    pub retained_bytes: u64,
+    /// Full payload size on the wire.
+    pub payload_bytes: u64,
+    /// When the proxy observed it.
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Payload bytes carried per message on the live stream; the full retained
+/// payload is read from the messages endpoint.
+pub const LIVE_WEBSOCKET_PAYLOAD_BYTES: usize = 64 * 1024;
+
+impl LiveWebSocketMessage {
+    /// A live-stream view of a persisted message (payload capped for the stream).
+    #[must_use]
+    pub fn from_record(record: &apiaxess_workbench_store::WsMessageRecord) -> Self {
+        Self::from_record_capped(record, LIVE_WEBSOCKET_PAYLOAD_BYTES)
+    }
+
+    /// A view of a persisted message carrying up to `cap` payload bytes.
+    #[must_use]
+    pub fn from_record_capped(
+        record: &apiaxess_workbench_store::WsMessageRecord,
+        cap: usize,
+    ) -> Self {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let retained = &record.payload[..record.payload.len().min(cap)];
+        Self {
+            sequence: record.sequence,
+            direction: record.direction,
+            kind: record.kind,
+            payload_base64: STANDARD.encode(retained),
+            retained_bytes: u64::try_from(retained.len()).unwrap_or(u64::MAX),
+            payload_bytes: record.payload_bytes,
+            observed_at: record.observed_at,
+        }
+    }
+}
+
+/// Live state of one open WebSocket connection.
+#[derive(Debug)]
+struct LiveWsConnection {
+    record: apiaxess_workbench_store::WsConnectionRecord,
+    next_sequence: u64,
+    client_closed: bool,
+    server_closed: bool,
+}
+
+/// A durable WebSocket write, performed off the forwarding path.
+enum WsWrite {
+    Connection(
+        Arc<TrafficStore>,
+        apiaxess_workbench_store::WsConnectionRecord,
+    ),
+    Message(
+        Arc<TrafficStore>,
+        apiaxess_workbench_store::WsConnectionRecord,
+        apiaxess_workbench_store::WsMessageRecord,
+    ),
+}
+
+/// Persists WebSocket writes in order on a dedicated thread (so a chatty stream
+/// never blocks frame forwarding on `SQLite`) and publishes each persisted,
+/// redacted record on the live stream.
+fn spawn_ws_writer(updates: broadcast::Sender<LiveUpdate>) -> mpsc::Sender<WsWrite> {
+    let (sender, receiver) = mpsc::channel::<WsWrite>();
+    std::thread::spawn(move || {
+        for write in receiver {
+            let event = match write {
+                WsWrite::Connection(store, record) => {
+                    store
+                        .upsert_ws_connection(&record)
+                        .map(|connection| LiveWebSocketEvent {
+                            connection,
+                            message: None,
+                        })
+                }
+                WsWrite::Message(store, connection, message) => {
+                    store.append_ws_message(&message).and_then(|message| {
+                        let connection = store.upsert_ws_connection(&connection)?;
+                        Ok(LiveWebSocketEvent {
+                            connection,
+                            message: Some(LiveWebSocketMessage::from_record(&message)),
+                        })
+                    })
+                }
+            };
+            let update = match event {
+                Ok(event) => LiveUpdate {
+                    websocket: vec![event],
+                    ..LiveUpdate::default()
+                },
+                Err(diagnostic) => LiveUpdate {
+                    diagnostics: vec![diagnostic],
+                    ..LiveUpdate::default()
+                },
+            };
+            let _ = updates.send(update);
+        }
+    });
+    sender
 }
 
 /// One field an operator should fill on a login/OTP screen. Carries no value.
@@ -170,6 +302,10 @@ pub struct LiveWorkbench {
     /// delegates to the store's single authoritative allocator so live capture
     /// and every other source share one id sequence.
     fallback_flow_id: AtomicU64,
+    /// Open WebSocket connections by (client, URL).
+    websockets: Mutex<HashMap<crate::WebSocketConnectionKey, LiveWsConnection>>,
+    /// Ordered, off-path WebSocket persistence.
+    ws_writer: Mutex<mpsc::Sender<WsWrite>>,
 }
 
 impl LiveWorkbench {
@@ -188,6 +324,7 @@ impl LiveWorkbench {
             let _ = write!(token, "{byte:02x}");
         }
         let (updates, _) = broadcast::channel(TELEMETRY_CAPACITY);
+        let ws_writer = spawn_ws_writer(updates.clone());
         Self {
             token: token.into(),
             intercept: Arc::new(InterceptController::default()),
@@ -202,6 +339,8 @@ impl LiveWorkbench {
             prompt_pending: Mutex::new(HashMap::new()),
             prompt_next_id: AtomicU64::new(1),
             fallback_flow_id: AtomicU64::new(1),
+            websockets: Mutex::new(HashMap::new()),
+            ws_writer: Mutex::new(ws_writer),
         }
     }
 
@@ -332,6 +471,7 @@ impl LiveWorkbench {
         let _ = self.updates.send(LiveUpdate {
             flows: Vec::new(),
             diagnostics: vec![diagnostic],
+            websocket: Vec::new(),
             prompts: Vec::new(),
         });
     }
@@ -359,6 +499,7 @@ impl LiveWorkbench {
         let _ = self.updates.send(LiveUpdate {
             flows: Vec::new(),
             diagnostics: Vec::new(),
+            websocket: Vec::new(),
             prompts: vec![prompt],
         });
         let Ok(answer) = receiver.recv_timeout(timeout) else {
@@ -542,7 +683,33 @@ impl FlowObserver for LiveWorkbench {
                 }
                 (flow_id, summary)
             }
-            FlowEvent::WebSocketMessage { .. } => return,
+            FlowEvent::WebSocketMessage {
+                connection,
+                direction,
+                kind,
+                payload,
+                payload_bytes,
+                close_code,
+                observed_at,
+            } => {
+                self.observe_ws_message(
+                    &connection,
+                    direction,
+                    kind,
+                    payload,
+                    payload_bytes,
+                    close_code,
+                    observed_at,
+                );
+                return;
+            }
+            FlowEvent::WebSocketClosed {
+                connection,
+                direction,
+            } => {
+                self.observe_ws_closed(&connection, direction);
+                return;
+            }
             FlowEvent::BodyChunk { .. } | FlowEvent::Diagnostic(_) => unreachable!(),
         };
         let _ = flow_id;
@@ -550,12 +717,142 @@ impl FlowObserver for LiveWorkbench {
         let _ = self.updates.send(LiveUpdate {
             flows: vec![summary],
             diagnostics: Vec::new(),
+            websocket: Vec::new(),
             prompts: Vec::new(),
         });
     }
 }
 
 impl LiveWorkbench {
+    fn ws_store(&self) -> Option<Arc<TrafficStore>> {
+        self.store.read().ok().and_then(|store| store.clone())
+    }
+
+    fn enqueue_ws(&self, write: WsWrite) {
+        if let Ok(writer) = self.ws_writer.lock() {
+            let _ = writer.send(write);
+        }
+    }
+
+    /// Records one WebSocket message: opens the connection record on first
+    /// sight (classified against scope like an HTTP flow), then persists the
+    /// message off the forwarding path.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_ws_message(
+        &self,
+        key: &crate::WebSocketConnectionKey,
+        direction: crate::WebSocketDirection,
+        kind: crate::WebSocketMessageKind,
+        payload: Vec<u8>,
+        payload_bytes: usize,
+        close_code: Option<u16>,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        use apiaxess_workbench_store::{
+            WsConnectionRecord, WsDirection, WsMessageKind, WsMessageRecord,
+        };
+        let Some(store) = self.ws_store() else {
+            return;
+        };
+        let Ok(mut websockets) = self.websockets.lock() else {
+            return;
+        };
+        let (connection, message) = {
+            let live = websockets.entry(key.clone()).or_insert_with(|| {
+                let (host, path) = ws_host_and_path(&key.url);
+                let scope = host
+                    .as_deref()
+                    .map_or(ScopeDisposition::Undetermined, |host| {
+                        self.classify_scope(host, Some(&key.url))
+                    });
+                let provenance = self
+                    .provenance
+                    .read()
+                    .map_or_else(|_| "proxy.observer".to_owned(), |value| value.clone());
+                LiveWsConnection {
+                    record: WsConnectionRecord {
+                        id: store.allocate_ws_connection_id(),
+                        url: key.url.clone(),
+                        host,
+                        path,
+                        scope,
+                        origin: FlowOrigin::Capture,
+                        opened_at: observed_at,
+                        closed_at: None,
+                        close_code: None,
+                        message_count: 0,
+                        provenance,
+                    },
+                    next_sequence: 1,
+                    client_closed: false,
+                    server_closed: false,
+                }
+            });
+            let sequence = live.next_sequence;
+            live.next_sequence += 1;
+            live.record.message_count = sequence;
+            if live.record.close_code.is_none() {
+                live.record.close_code = close_code;
+            }
+            let message = WsMessageRecord {
+                connection_id: live.record.id,
+                sequence,
+                direction: match direction {
+                    crate::WebSocketDirection::ClientToServer => WsDirection::ClientToServer,
+                    crate::WebSocketDirection::ServerToClient => WsDirection::ServerToClient,
+                },
+                kind: match kind {
+                    crate::WebSocketMessageKind::Text => WsMessageKind::Text,
+                    crate::WebSocketMessageKind::Binary => WsMessageKind::Binary,
+                    crate::WebSocketMessageKind::Ping => WsMessageKind::Ping,
+                    crate::WebSocketMessageKind::Pong => WsMessageKind::Pong,
+                    crate::WebSocketMessageKind::Close => WsMessageKind::Close,
+                    crate::WebSocketMessageKind::Frame => WsMessageKind::Frame,
+                },
+                payload,
+                payload_bytes: u64::try_from(payload_bytes).unwrap_or(u64::MAX),
+                observed_at,
+            };
+            (live.record.clone(), message)
+        };
+        drop(websockets);
+        if message.sequence == 1 {
+            self.enqueue_ws(WsWrite::Connection(Arc::clone(&store), connection.clone()));
+        }
+        self.enqueue_ws(WsWrite::Message(store, connection, message));
+    }
+
+    /// Marks one direction of a WebSocket connection ended; once both have,
+    /// records it closed.
+    fn observe_ws_closed(
+        &self,
+        key: &crate::WebSocketConnectionKey,
+        direction: crate::WebSocketDirection,
+    ) {
+        let Some(store) = self.ws_store() else {
+            return;
+        };
+        let Ok(mut websockets) = self.websockets.lock() else {
+            return;
+        };
+        let Some(live) = websockets.get_mut(key) else {
+            return;
+        };
+        match direction {
+            crate::WebSocketDirection::ClientToServer => live.client_closed = true,
+            crate::WebSocketDirection::ServerToClient => live.server_closed = true,
+        }
+        if !(live.client_closed && live.server_closed) {
+            return;
+        }
+        let Some(mut live) = websockets.remove(key) else {
+            return;
+        };
+        drop(websockets);
+        live.record.closed_at = Some(chrono::Utc::now());
+        self.enqueue_ws(WsWrite::Connection(store, live.record));
+    }
+
     fn persist_flow(&self, flow_id: u64) {
         let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
             return;
@@ -755,9 +1052,133 @@ fn protocol_from_version(version: &str) -> String {
     }
 }
 
+/// Host and path+query of a WebSocket URL.
+fn ws_host_and_path(url: &str) -> (Option<String>, Option<String>) {
+    let Ok(parsed) = url.parse::<reqwest::Url>() else {
+        return (None, None);
+    };
+    let path = match parsed.query() {
+        Some(query) => format!("{}?{query}", parsed.path()),
+        None => parsed.path().to_owned(),
+    };
+    (parsed.host_str().map(ToOwned::to_owned), Some(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end scenario, read top to bottom.
+    fn websocket_messages_persist_stream_live_and_stay_out_of_http_flows() {
+        let root = std::env::temp_dir().join(format!(
+            "apiaxess-live-ws-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = Arc::new(TrafficStore::open(&root, "session:ws-test").expect("store"));
+        let live = LiveWorkbench::new();
+        live.attach_store(Arc::clone(&store));
+        let mut updates = live.subscribe();
+        let key = crate::WebSocketConnectionKey {
+            client: "127.0.0.1:50123".parse().expect("address"),
+            url: "wss://echo.test/socket".to_owned(),
+        };
+        let frames = [
+            (
+                crate::WebSocketDirection::ClientToServer,
+                crate::WebSocketMessageKind::Text,
+                b"hello".to_vec(),
+            ),
+            (
+                crate::WebSocketDirection::ServerToClient,
+                crate::WebSocketMessageKind::Text,
+                b"hello".to_vec(),
+            ),
+            (
+                crate::WebSocketDirection::ClientToServer,
+                crate::WebSocketMessageKind::Binary,
+                vec![0, 1, 2, 255],
+            ),
+        ];
+        for (direction, kind, payload) in frames {
+            let payload_bytes = payload.len();
+            live.observe(FlowEvent::WebSocketMessage {
+                connection: key.clone(),
+                direction,
+                kind,
+                payload,
+                payload_bytes,
+                close_code: None,
+                observed_at: chrono::Utc::now(),
+            });
+        }
+        live.observe(FlowEvent::WebSocketClosed {
+            connection: key.clone(),
+            direction: crate::WebSocketDirection::ClientToServer,
+        });
+        live.observe(FlowEvent::WebSocketClosed {
+            connection: key,
+            direction: crate::WebSocketDirection::ServerToClient,
+        });
+
+        // The writer thread publishes each persisted message on the live stream.
+        let mut live_messages = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while live_messages.len() < 3 && std::time::Instant::now() < deadline {
+            match updates.try_recv() {
+                Ok(update) => {
+                    assert!(
+                        update.flows.is_empty(),
+                        "WebSocket must not become HTTP flows"
+                    );
+                    live_messages.extend(
+                        update
+                            .websocket
+                            .into_iter()
+                            .filter_map(|event| event.message),
+                    );
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert_eq!(
+            live_messages
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            live_messages[2].kind,
+            apiaxess_workbench_store::WsMessageKind::Binary
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let connection = loop {
+            let connections = store.ws_connections().expect("connections");
+            if connections.first().is_some_and(|c| c.closed_at.is_some())
+                || std::time::Instant::now() > deadline
+            {
+                break connections.into_iter().next().expect("one connection");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(connection.message_count, 3);
+        assert!(connection.closed_at.is_some(), "both directions ended");
+        assert_eq!(connection.host.as_deref(), Some("echo.test"));
+        let messages = store
+            .ws_messages(connection.id, None, 10)
+            .expect("messages");
+        assert_eq!(messages[2].payload, vec![0, 1, 2, 255]);
+        assert_eq!(
+            messages[1].direction,
+            apiaxess_workbench_store::WsDirection::ServerToClient
+        );
+        // HTTP flows are untouched.
+        assert!(store.summaries().expect("flows").is_empty());
+    }
 
     #[test]
     fn session_tokens_are_distinct_and_flow_details_are_lazy_but_complete() {

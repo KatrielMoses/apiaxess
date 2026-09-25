@@ -2305,3 +2305,130 @@ kbd {
     max-height: none;
   }
 }
+
+/* WebSocket tab: connection list, message stream, payload viewer. */
+.ws-filters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: var(--border);
+}
+
+.ws-filters .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-filters__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+
+.ws-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.ws-row__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ws-row__host,
+.ws-row__path,
+.ws-message__preview,
+.ws-detail__url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-row__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ws-status {
+  font-size: var(--text-nano);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.ws-status--open {
+  color: var(--color-success-ink);
+}
+
+.ws-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.ws-detail__head {
+  padding: var(--space-3) var(--space-5);
+  border-bottom: var(--border);
+}
+
+.ws-messages {
+  flex: 1 1 50%;
+  min-height: 0;
+  overflow: auto;
+}
+
+.ws-message {
+  grid-template-columns: 1.25rem 3.5rem minmax(0, 1fr) auto;
+}
+
+.ws-message__dir {
+  font-weight: var(--weight-medium);
+}
+
+.ws-message__dir--sent {
+  color: var(--color-text-accent);
+}
+
+.ws-message__dir--received {
+  color: var(--color-success-ink);
+}
+
+.ws-payload {
+  flex: 1 1 50%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: var(--border);
+  padding: var(--space-3) var(--space-5);
+  gap: var(--space-2);
+}
+
+.ws-payload__bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ws-payload__bar .input {
+  width: 10rem;
+}
+
+.ws-payload__body {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  white-space: pre;
+}
+
+.ws-payload__body.is-wrapped {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

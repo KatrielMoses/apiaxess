@@ -195,6 +195,13 @@ pub fn capture_into_document(
         if method_text.eq_ignore_ascii_case("CONNECT") {
             continue;
         }
+        // A WebSocket handshake is not a REST operation: its traffic is the
+        // WebSocket view's, kept out of the fused REST surface.
+        if flow.request_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
+        }) {
+            continue;
+        }
         let Ok(method) = HttpMethod::new(method_text) else {
             diagnostics.push(flow_diagnostic(
                 catalogue::DYNAMIC_INVALID_FLOW,
@@ -2135,6 +2142,26 @@ mod tests {
                 1
             )]
         );
+    }
+
+    #[test]
+    fn a_websocket_handshake_is_not_a_rest_endpoint() {
+        let mut handshake = on_host(1, "api.one.test", "/socket");
+        handshake
+            .request_headers
+            .push(("Upgrade".to_owned(), "websocket".to_owned()));
+        let report = capture(
+            &empty_document(),
+            &[handshake, on_host(2, "api.one.test", "/v1/status")],
+        );
+        let paths = report
+            .document
+            .surface
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.identity.path_template.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/v1/status".to_owned()]);
     }
 
     #[test]

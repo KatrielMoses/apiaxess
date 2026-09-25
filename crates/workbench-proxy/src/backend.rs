@@ -410,12 +410,27 @@ pub enum FlowEvent {
     },
     /// A WebSocket message was observed while being forwarded.
     WebSocketMessage {
+        /// The connection the message belongs to.
+        connection: WebSocketConnectionKey,
         /// Direction of the message.
         direction: WebSocketDirection,
-        /// Message kind, such as text, binary, ping, or close.
-        kind: String,
-        /// Payload size; the payload is not retained in Phase 2.1.
+        /// Frame kind.
+        kind: WebSocketMessageKind,
+        /// The payload, capped at [`MAX_WEBSOCKET_PAYLOAD_BYTES`].
+        payload: Vec<u8>,
+        /// The full payload size (larger than `payload.len()` when capped).
         payload_bytes: usize,
+        /// Close code, for a close frame that carries one.
+        close_code: Option<u16>,
+        /// When the proxy observed the message.
+        observed_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// One direction of a WebSocket connection ended (its stream closed).
+    WebSocketClosed {
+        /// The connection that ended.
+        connection: WebSocketConnectionKey,
+        /// The direction whose stream ended.
+        direction: WebSocketDirection,
     },
     /// A backend failure was converted to a canonical diagnostic.
     Diagnostic(Diagnostic),
@@ -430,8 +445,41 @@ pub enum BodyDirection {
     Response,
 }
 
+/// Largest WebSocket payload retained per message; larger frames are recorded
+/// with their full size and a truncated payload.
+pub const MAX_WEBSOCKET_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Identifies one proxied WebSocket connection: the client socket and the
+/// server URL. Both directions of a connection share it.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WebSocketConnectionKey {
+    /// The client's socket address at the proxy.
+    pub client: std::net::SocketAddr,
+    /// The server URL (`ws://` or `wss://`).
+    pub url: String,
+}
+
+/// Kind of an observed WebSocket frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketMessageKind {
+    /// UTF-8 text.
+    Text,
+    /// Binary data.
+    Binary,
+    /// Ping control frame.
+    Ping,
+    /// Pong control frame.
+    Pong,
+    /// Close control frame.
+    Close,
+    /// A raw frame outside the message layer.
+    Frame,
+}
+
 /// Direction of an observed WebSocket message.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WebSocketDirection {
     /// Client to upstream server.
     ClientToServer,
@@ -847,6 +895,20 @@ impl HttpHandler for ObserveHandler {
                 .observe(FlowEvent::Diagnostic(rfc8441_diagnostic()));
         }
         let flow_id = self.observe_request(&req, origin);
+        // WebSocket upgrades: the proxy relays frames with tungstenite, which does
+        // not implement permessage-deflate. Forwarding the client's offer would let
+        // the server compress its frames, which then fail to decode, so the
+        // server-to-client stream dies on its first message. Offer no extensions
+        // upstream (the client side already negotiates none). The recorded request
+        // above keeps what the client actually sent.
+        if req
+            .headers()
+            .get(hudsucker::hyper::header::UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        {
+            req.headers_mut().remove("sec-websocket-extensions");
+        }
         // Record on this per-request handler clone so `handle_response` correlates
         // to exactly this request — never to another concurrent stream on the same
         // connection or another client sharing transport attributes.
@@ -1300,32 +1362,97 @@ fn malformed_edit_diagnostic(flow_id: u64, error: &str) -> Diagnostic {
     catalogue::PROXY_INTERCEPT_EDIT_INVALID.instantiate(context)
 }
 
+/// The connection and direction a WebSocket context describes.
+fn websocket_endpoint(ctx: &WebSocketContext) -> (WebSocketConnectionKey, WebSocketDirection) {
+    match ctx {
+        WebSocketContext::ClientToServer { src, dst, .. } => (
+            WebSocketConnectionKey {
+                client: *src,
+                url: dst.to_string(),
+            },
+            WebSocketDirection::ClientToServer,
+        ),
+        WebSocketContext::ServerToClient { src, dst, .. } => (
+            WebSocketConnectionKey {
+                client: *dst,
+                url: src.to_string(),
+            },
+            WebSocketDirection::ServerToClient,
+        ),
+    }
+}
+
 impl WebSocketHandler for ObserveHandler {
+    /// hudsucker's forwarding loop, plus an end-of-stream event so a closed
+    /// connection is recorded as closed even without a close frame.
+    fn handle_websocket(
+        mut self,
+        ctx: WebSocketContext,
+        mut stream: impl hudsucker::futures::Stream<
+            Item = Result<Message, hudsucker::tokio_tungstenite::tungstenite::Error>,
+        > + Unpin
+        + Send
+        + 'static,
+        mut sink: impl hudsucker::futures::Sink<
+            Message,
+            Error = hudsucker::tokio_tungstenite::tungstenite::Error,
+        > + Unpin
+        + Send
+        + 'static,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        use hudsucker::futures::{SinkExt, StreamExt};
+        use hudsucker::tokio_tungstenite::tungstenite::Error as WsError;
+        async move {
+            while let Some(message) = stream.next().await {
+                let Ok(message) = message else {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                };
+                let Some(message) = self.handle_message(&ctx, message).await else {
+                    continue;
+                };
+                if let Err(error) = sink.send(message).await
+                    && !matches!(error, WsError::ConnectionClosed)
+                {
+                    break;
+                }
+            }
+            let (connection, direction) = websocket_endpoint(&ctx);
+            self.observer.observe(FlowEvent::WebSocketClosed {
+                connection,
+                direction,
+            });
+        }
+    }
+
     async fn handle_message(
         &mut self,
         ctx: &WebSocketContext,
         message: Message,
     ) -> Option<Message> {
-        let (direction, kind) = match ctx {
-            WebSocketContext::ClientToServer { .. } => {
-                (WebSocketDirection::ClientToServer, "client_to_server")
-            }
-            WebSocketContext::ServerToClient { .. } => {
-                (WebSocketDirection::ServerToClient, "server_to_client")
-            }
+        let (connection, direction) = websocket_endpoint(ctx);
+        let (kind, close_code) = match &message {
+            Message::Text(_) => (WebSocketMessageKind::Text, None),
+            Message::Binary(_) => (WebSocketMessageKind::Binary, None),
+            Message::Ping(_) => (WebSocketMessageKind::Ping, None),
+            Message::Pong(_) => (WebSocketMessageKind::Pong, None),
+            Message::Close(frame) => (
+                WebSocketMessageKind::Close,
+                frame.as_ref().map(|frame| u16::from(frame.code)),
+            ),
+            Message::Frame(_) => (WebSocketMessageKind::Frame, None),
         };
-        let message_kind = match &message {
-            Message::Text(_) => "text",
-            Message::Binary(_) => "binary",
-            Message::Ping(_) => "ping",
-            Message::Pong(_) => "pong",
-            Message::Close(_) => "close",
-            Message::Frame(_) => "frame",
-        };
+        let data = message.clone().into_data();
+        let payload_bytes = data.len();
+        let payload = data[..payload_bytes.min(MAX_WEBSOCKET_PAYLOAD_BYTES)].to_vec();
         self.observer.observe(FlowEvent::WebSocketMessage {
+            connection,
             direction,
-            kind: format!("{kind}:{message_kind}"),
-            payload_bytes: message.len(),
+            kind,
+            payload,
+            payload_bytes,
+            close_code,
+            observed_at: chrono::Utc::now(),
         });
         Some(message)
     }

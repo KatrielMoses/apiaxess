@@ -152,6 +152,18 @@ pub enum AndroidTargetPhase {
     Error,
 }
 
+/// A captured WebSocket connection with its first-/third-party label.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsConnectionView {
+    /// The connection as persisted.
+    #[serde(flatten)]
+    pub connection: apiaxess_workbench_store::WsConnectionRecord,
+    /// First- or third-party, when classifiable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party: Option<apiaxess_api_model::HostParty>,
+}
+
 /// Static analysis of the APK installed onto the Android target.
 #[derive(Clone, Debug)]
 enum AndroidStaticAnalysis {
@@ -852,6 +864,68 @@ impl Engine {
             *active = None;
         }
         Ok(stopped)
+    }
+
+    /// Every WebSocket connection captured in this session, each labeled first-
+    /// or third-party by the same structural classifier as the API surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when no session is active or the store read fails.
+    pub fn ws_connections(
+        &self,
+    ) -> Result<Vec<WsConnectionView>, apiaxess_diagnostics::Diagnostic> {
+        let runtime = self.session_runtime()?.ok_or_else(|| {
+            apiaxess_diagnostics::catalogue::PROXY_SESSION_NOT_ACTIVE
+                .instantiate(apiaxess_diagnostics::DiagnosticContext::new())
+        })?;
+        let store = runtime.store();
+        let connections = store.ws_connections()?;
+        // Weight hosts by all captured traffic, HTTP and WebSocket alike.
+        let mut weights = std::collections::BTreeMap::<String, usize>::new();
+        for flow in store.summaries()? {
+            if flow.origin == FlowOrigin::Capture {
+                if let Some(host) = flow.host {
+                    *weights.entry(host).or_default() += 1;
+                }
+            }
+        }
+        for connection in &connections {
+            if let Some(host) = &connection.host {
+                *weights.entry(host.clone()).or_default() += 1;
+            }
+        }
+        let hints = first_party_hints(runtime.session_snapshot()?.engagement_scope());
+        let parties = apiaxess_unified_surface::party::classify_hosts(&weights, &hints);
+        Ok(connections
+            .into_iter()
+            .map(|connection| WsConnectionView {
+                party: connection
+                    .host
+                    .as_ref()
+                    .and_then(|host| parties.get(host).copied()),
+                connection,
+            })
+            .collect())
+    }
+
+    /// One page of a WebSocket connection's messages, after `after` (sequence).
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when no session is active or the store read fails.
+    pub fn ws_messages(
+        &self,
+        connection_id: u64,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<apiaxess_workbench_store::WsMessageRecord>, apiaxess_diagnostics::Diagnostic>
+    {
+        let runtime = self.session_runtime()?.ok_or_else(|| {
+            apiaxess_diagnostics::catalogue::PROXY_SESSION_NOT_ACTIVE
+                .instantiate(apiaxess_diagnostics::DiagnosticContext::new())
+        })?;
+        runtime.store().ws_messages(connection_id, after, limit)
     }
 
     /// Builds the observation-based web surface from all captured traffic and

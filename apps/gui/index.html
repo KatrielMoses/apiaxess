@@ -651,6 +651,7 @@
               <button class="wb-tab is-active" type="button" role="tab" data-wbtab="live" aria-selected="true">Live traffic</button>
               <button class="wb-tab" type="button" role="tab" data-wbtab="resend" aria-selected="false">Resend<span class="wb-tab__count" id="resend-tab-count" hidden>0</span></button>
               <button class="wb-tab" type="button" role="tab" data-wbtab="fuzz" aria-selected="false">Fuzz<span class="wb-tab__count" id="fuzz-tab-count" hidden>0</span></button>
+              <button class="wb-tab" type="button" role="tab" data-wbtab="ws" aria-selected="false" title="WebSocket connections and their messages, kept separate from HTTP traffic">WebSocket<span class="wb-tab__count" id="ws-tab-count" hidden>0</span></button>
             </div>
 
             <!-- Live traffic -->
@@ -755,6 +756,28 @@
                 <div class="wb-split__gutter" data-wbgutter="fuzz" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize fuzz list"></div>
                 <div class="wb-split__pane wb-split__pane--detail">
                   <section class="workbench__drawer" id="fuzzer-panel"></section>
+                </div>
+              </div>
+            </div>
+
+            <!-- WebSocket: its own protocol view, never mixed into Live traffic -->
+            <div class="wb-workspace" data-wbpanel="ws" role="tabpanel" hidden>
+              <div class="wb-split" data-wbsplit="ws">
+                <div class="wb-split__pane wb-split__pane--list">
+                  <div class="wb-list__head">
+                    <button class="wb-list__collapse btn--icon" type="button" data-wb-collapse="ws" title="Collapse connections" aria-label="Collapse connections"><span data-icon="menu"></span></button>
+                    <span class="section-label wb-list__title">Connections</span>
+                    <span class="t-small t-subtle t-numeric wb-list__hint" id="ws-counts">0 connections</span>
+                  </div>
+                  <div class="ws-filters">
+                    <input class="input input--sm input--mono" id="ws-host-filter" type="search" placeholder="Filter hosts · api.example.com, *.internal" spellcheck="false" aria-label="Filter WebSocket connections by host" />
+                    <label class="t-small ws-filters__toggle"><input id="ws-open-only" type="checkbox" /> Open only</label>
+                  </div>
+                  <div class="workbench__scroll"><div class="list" id="ws-list" aria-live="polite"></div></div>
+                </div>
+                <div class="wb-split__gutter" data-wbgutter="ws" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize WebSocket list"></div>
+                <div class="wb-split__pane wb-split__pane--detail">
+                  <section class="workbench__drawer" id="ws-detail"></section>
                 </div>
               </div>
             </div>

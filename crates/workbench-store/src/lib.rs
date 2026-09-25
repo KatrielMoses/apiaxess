@@ -71,6 +71,83 @@ impl FlowOrigin {
     }
 }
 
+/// Direction of a WebSocket message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsDirection {
+    /// Sent by the client to the server.
+    ClientToServer,
+    /// Received by the client from the server.
+    ServerToClient,
+}
+
+/// Kind of a WebSocket frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsMessageKind {
+    /// UTF-8 text.
+    Text,
+    /// Binary data.
+    Binary,
+    /// Ping control frame.
+    Ping,
+    /// Pong control frame.
+    Pong,
+    /// Close control frame.
+    Close,
+    /// A raw frame outside the message layer.
+    Frame,
+}
+
+/// One WebSocket connection observed by the proxy. Its own identity, separate
+/// from HTTP flows: WebSocket traffic never enters the flow list or fusion.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsConnectionRecord {
+    /// Connection id (its own sequence, independent of flow ids).
+    pub id: u64,
+    /// Server URL (`ws://` or `wss://`), redacted.
+    pub url: String,
+    /// Server host.
+    pub host: Option<String>,
+    /// Request path and query, redacted.
+    pub path: Option<String>,
+    /// Advisory engagement-scope classification.
+    pub scope: ScopeDisposition,
+    /// Where the traffic came from.
+    pub origin: FlowOrigin,
+    /// When the connection was first observed.
+    pub opened_at: DateTime<Utc>,
+    /// When both directions had ended, if they have.
+    pub closed_at: Option<DateTime<Utc>>,
+    /// The close code of the first close frame, if any.
+    pub close_code: Option<u16>,
+    /// Messages recorded on this connection.
+    pub message_count: u64,
+    /// Capture provenance.
+    pub provenance: String,
+}
+
+/// One WebSocket message on a connection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsMessageRecord {
+    /// The connection it belongs to.
+    pub connection_id: u64,
+    /// Position on the connection, from 1.
+    pub sequence: u64,
+    /// Sent or received.
+    pub direction: WsDirection,
+    /// Frame kind.
+    pub kind: WsMessageKind,
+    /// Payload bytes as retained (redacted; possibly truncated).
+    pub payload: Vec<u8>,
+    /// Full payload size on the wire.
+    pub payload_bytes: u64,
+    /// When the proxy observed it.
+    pub observed_at: DateTime<Utc>,
+}
+
 /// One captured flow accepted by the durable store.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1177,6 +1254,8 @@ pub struct TrafficStore {
     /// into this single sequence is what makes concurrent inserts collision-proof,
     /// so no two flows can ever receive the same id and silently overwrite.
     next_flow_id: AtomicU64,
+    /// WebSocket connection-id allocator, seeded like the flow allocator.
+    next_ws_connection_id: AtomicU64,
 }
 
 impl std::fmt::Debug for TrafficStore {
@@ -1195,6 +1274,8 @@ impl TrafficStore {
     ///
     /// Returns a diagnostic when the runtime directory or database cannot be
     /// created, configured, or passed an integrity check.
+    // Linear setup: directory, schema, migrations, integrity, id seeding.
+    #[allow(clippy::too_many_lines)]
     pub fn open(parent: &Path, session_id: &str) -> Result<Self, Diagnostic> {
         let root = Self::session_root(parent, session_id);
         let blobs = root.join("blobs");
@@ -1274,6 +1355,7 @@ impl TrafficStore {
                     &e.to_string(),
                 )
             })?;
+        create_ws_tables(&connection, &database)?;
         ensure_columns(&connection, &database)?;
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -1296,12 +1378,14 @@ impl TrafficStore {
         // Seed the id allocator above every persisted flow so a reopened session
         // (resume) never reissues an id that already exists on disk.
         let seed = seed_next_flow_id(&connection, &database)?;
+        let ws_seed = seed_next_id(&connection, &database, "ws_connections")?;
         Ok(Self {
             root,
             blobs,
             connection: Mutex::new(connection),
             redactor: RwLock::new(None),
             next_flow_id: AtomicU64::new(seed),
+            next_ws_connection_id: AtomicU64::new(ws_seed),
         })
     }
 
@@ -1404,6 +1488,248 @@ impl TrafficStore {
         Ok(())
     }
 
+    /// Allocates the next WebSocket connection id for this store.
+    #[must_use]
+    pub fn allocate_ws_connection_id(&self) -> u64 {
+        self.next_ws_connection_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Runs the installed redactor over a WebSocket URL and payload, through the
+    /// same [`FlowRedactor`] that scrubs HTTP flows, so a credential sent over a
+    /// WebSocket is scrubbed exactly as one sent in an HTTP body would be.
+    fn redact_ws(&self, url: &mut String, path: &mut Option<String>, payload: &mut Vec<u8>) {
+        let Some(redactor) = self.redactor.read().ok().and_then(|guard| guard.clone()) else {
+            return;
+        };
+        let mut carrier = FlowCapture {
+            id: 0,
+            captured_at: Utc::now(),
+            protocol: "websocket".to_owned(),
+            method: None,
+            host: None,
+            url: Some(std::mem::take(url)),
+            path: path.take(),
+            status: None,
+            duration_ms: None,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            request_body: Some(std::mem::take(payload)),
+            response_body: None,
+            scope: ScopeDisposition::Undetermined,
+            provenance: String::new(),
+            origin: FlowOrigin::Capture,
+        };
+        redactor.redact(&mut carrier);
+        *url = carrier.url.unwrap_or_default();
+        *path = carrier.path;
+        *payload = carrier.request_body.unwrap_or_default();
+    }
+
+    /// Inserts or updates one WebSocket connection (redacted), returning the
+    /// record as persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when serialization or the write fails.
+    pub fn upsert_ws_connection(
+        &self,
+        connection: &WsConnectionRecord,
+    ) -> Result<WsConnectionRecord, Diagnostic> {
+        let mut record = connection.clone();
+        let mut no_payload = Vec::new();
+        self.redact_ws(&mut record.url, &mut record.path, &mut no_payload);
+        let scope = serde_json::to_string(&record.scope)
+            .map_err(|e| serialization_diag("scope", &e.to_string()))?;
+        let origin = serde_json::to_string(&record.origin)
+            .map_err(|e| serialization_diag("origin", &e.to_string()))?;
+        let db = self.lock_connection()?;
+        db.execute(
+            "INSERT INTO ws_connections (id,url,host,path,scope,origin,opened_at,closed_at,close_code,message_count,provenance)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET url=excluded.url,host=excluded.host,path=excluded.path,scope=excluded.scope,origin=excluded.origin,closed_at=excluded.closed_at,close_code=excluded.close_code,message_count=MAX(ws_connections.message_count,excluded.message_count),provenance=excluded.provenance",
+            params![
+                i64::try_from(record.id).unwrap_or(i64::MAX),
+                record.url,
+                record.host,
+                record.path,
+                scope,
+                origin,
+                record.opened_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                record
+                    .closed_at
+                    .map(|at| at.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+                record.close_code,
+                i64::try_from(record.message_count).unwrap_or(i64::MAX),
+                record.provenance,
+            ],
+        )
+        .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "write", &self.root, &e.to_string()))?;
+        Ok(record)
+    }
+
+    /// Appends one WebSocket message (payload redacted) and bumps its
+    /// connection's message count, returning the message as persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when serialization or the write fails.
+    pub fn append_ws_message(
+        &self,
+        message: &WsMessageRecord,
+    ) -> Result<WsMessageRecord, Diagnostic> {
+        let mut payload = message.payload.clone();
+        let mut no_url = String::new();
+        let mut no_path = None;
+        self.redact_ws(&mut no_url, &mut no_path, &mut payload);
+        let direction = serde_json::to_string(&message.direction)
+            .map_err(|e| serialization_diag("direction", &e.to_string()))?;
+        let kind = serde_json::to_string(&message.kind)
+            .map_err(|e| serialization_diag("kind", &e.to_string()))?;
+        let db = self.lock_connection()?;
+        let connection_id = i64::try_from(message.connection_id).unwrap_or(i64::MAX);
+        db.execute(
+            "INSERT OR REPLACE INTO ws_messages (connection_id,sequence,direction,kind,observed_at,payload_bytes,payload)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                connection_id,
+                i64::try_from(message.sequence).unwrap_or(i64::MAX),
+                direction,
+                kind,
+                message
+                    .observed_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                i64::try_from(message.payload_bytes).unwrap_or(i64::MAX),
+                payload,
+            ],
+        )
+        .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "write", &self.root, &e.to_string()))?;
+        db.execute(
+            "UPDATE ws_connections SET message_count=(SELECT COUNT(*) FROM ws_messages WHERE connection_id=?1) WHERE id=?1",
+            params![connection_id],
+        )
+        .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "write", &self.root, &e.to_string()))?;
+        Ok(WsMessageRecord {
+            payload,
+            ..message.clone()
+        })
+    }
+
+    /// Every WebSocket connection in this session, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the query or stored JSON fields are invalid.
+    pub fn ws_connections(&self) -> Result<Vec<WsConnectionRecord>, Diagnostic> {
+        let db = self.lock_connection()?;
+        let mut statement = db
+            .prepare("SELECT id,url,host,path,scope,origin,opened_at,closed_at,close_code,message_count,provenance FROM ws_connections ORDER BY opened_at,id")
+            .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "query", &self.root, &e.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                let scope: String = row.get(4)?;
+                let origin: String = row.get(5)?;
+                let opened: String = row.get(6)?;
+                let closed: Option<String> = row.get(7)?;
+                Ok(WsConnectionRecord {
+                    id: u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                    url: row.get(1)?,
+                    host: row.get(2)?,
+                    path: row.get(3)?,
+                    scope: serde_json::from_str(&scope).unwrap_or(ScopeDisposition::Undetermined),
+                    origin: serde_json::from_str(&origin).unwrap_or(FlowOrigin::Capture),
+                    opened_at: parse_time(&opened),
+                    closed_at: closed.as_deref().map(parse_time),
+                    close_code: row.get(8)?,
+                    message_count: u64::try_from(row.get::<_, i64>(9)?).unwrap_or_default(),
+                    provenance: row.get(10)?,
+                })
+            })
+            .map_err(|e| {
+                storage_diag(
+                    catalogue::PROXY_STORE_CORRUPT,
+                    "query",
+                    &self.root,
+                    &e.to_string(),
+                )
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                "read",
+                &self.root,
+                &e.to_string(),
+            )
+        })
+    }
+
+    /// One page of a WebSocket connection's messages: those after `after`
+    /// (a sequence number; `None` from the start), at most `limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the query or stored fields are invalid.
+    pub fn ws_messages(
+        &self,
+        connection_id: u64,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<WsMessageRecord>, Diagnostic> {
+        let db = self.lock_connection()?;
+        let mut statement = db
+            .prepare("SELECT connection_id,sequence,direction,kind,observed_at,payload_bytes,payload FROM ws_messages WHERE connection_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3")
+            .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "query", &self.root, &e.to_string()))?;
+        let rows = statement
+            .query_map(
+                params![
+                    i64::try_from(connection_id).unwrap_or(i64::MAX),
+                    i64::try_from(after.unwrap_or(0)).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    let direction: String = row.get(2)?;
+                    let kind: String = row.get(3)?;
+                    let observed: String = row.get(4)?;
+                    Ok(WsMessageRecord {
+                        connection_id: u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                        sequence: u64::try_from(row.get::<_, i64>(1)?).unwrap_or_default(),
+                        direction: serde_json::from_str(&direction)
+                            .unwrap_or(WsDirection::ServerToClient),
+                        kind: serde_json::from_str(&kind).unwrap_or(WsMessageKind::Frame),
+                        observed_at: parse_time(&observed),
+                        payload_bytes: u64::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
+                        payload: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(|e| {
+                storage_diag(
+                    catalogue::PROXY_STORE_CORRUPT,
+                    "query",
+                    &self.root,
+                    &e.to_string(),
+                )
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                "read",
+                &self.root,
+                &e.to_string(),
+            )
+        })
+    }
+
+    fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, Diagnostic> {
+        self.connection.lock().map_err(|_| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                "lock",
+                &self.root,
+                "database mutex poisoned",
+            )
+        })
+    }
+
     /// Re-classifies stored flows against a scope that was declared or widened
     /// after they were captured, promoting each flow the classifier now puts in
     /// scope to `InScope`. Upgrade-only: an `InScope` flow is never demoted, so
@@ -1459,6 +1785,35 @@ impl TrafficStore {
             connection
                 .execute(
                     "UPDATE flows SET scope=?1 WHERE id=?2",
+                    params![in_scope, id],
+                )
+                .map_err(|e| corrupt("write", &e))?;
+            promoted += 1;
+        }
+        // WebSocket connections are classified against the same scope.
+        let ws_candidates = {
+            let mut statement = connection
+                .prepare("SELECT id,host,url FROM ws_connections WHERE scope != ?1")
+                .map_err(|e| corrupt("query", &e))?;
+            let rows = statement
+                .query_map(params![in_scope], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| corrupt("query", &e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| corrupt("read", &e))?
+        };
+        for (id, host, url) in ws_candidates {
+            if classify_scope(host.as_deref(), url.as_deref()) != ScopeDisposition::InScope {
+                continue;
+            }
+            connection
+                .execute(
+                    "UPDATE ws_connections SET scope=?1 WHERE id=?2",
                     params![in_scope, id],
                 )
                 .map_err(|e| corrupt("write", &e))?;
@@ -2556,6 +2911,72 @@ struct StoredFuzzerResult {
 
 /// Computes the initial flow-id allocator value: one above the highest persisted
 /// id, so a reopened store never reissues an id already on disk.
+/// Creates the WebSocket tables (additive: stores created by older builds
+/// simply gain them, and their existing tables are untouched).
+fn create_ws_tables(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS ws_connections (
+               id INTEGER PRIMARY KEY,
+               url TEXT NOT NULL,
+               host TEXT,
+               path TEXT,
+               scope TEXT NOT NULL,
+               origin TEXT NOT NULL,
+               opened_at TEXT NOT NULL,
+               closed_at TEXT,
+               close_code INTEGER,
+               message_count INTEGER NOT NULL DEFAULT 0,
+               provenance TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS ws_messages (
+               connection_id INTEGER NOT NULL,
+               sequence INTEGER NOT NULL,
+               direction TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               observed_at TEXT NOT NULL,
+               payload_bytes INTEGER NOT NULL,
+               payload BLOB NOT NULL,
+               PRIMARY KEY (connection_id, sequence)
+             );
+             -- Connections live only as long as the proxy that observed them.
+             -- One still marked open when its store is reopened was cut off by
+             -- an engine stop: it ended no later than its last message.
+             UPDATE ws_connections
+                SET closed_at = COALESCE(
+                  (SELECT MAX(observed_at) FROM ws_messages
+                    WHERE connection_id = ws_connections.id),
+                  opened_at)
+              WHERE closed_at IS NULL;",
+        )
+        .map_err(|e| {
+            storage_diag(
+                catalogue::PROXY_STORE_OPEN_FAILED,
+                "schema",
+                database,
+                &e.to_string(),
+            )
+        })
+}
+
+fn seed_next_id(connection: &Connection, database: &Path, table: &str) -> Result<u64, Diagnostic> {
+    let max_id: i64 = connection
+        .query_row(
+            &format!("SELECT COALESCE(MAX(id),0) FROM {table}"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            storage_diag(
+                catalogue::PROXY_STORE_OPEN_FAILED,
+                "seed-id",
+                database,
+                &error.to_string(),
+            )
+        })?;
+    Ok(u64::try_from(max_id).unwrap_or(0).saturating_add(1))
+}
+
 fn seed_next_flow_id(connection: &Connection, database: &Path) -> Result<u64, Diagnostic> {
     let max_id: i64 = connection
         .query_row("SELECT COALESCE(MAX(id),0) FROM flows", [], |row| {
@@ -3199,6 +3620,148 @@ mod tests {
             provenance: "proxy.hudsucker".to_owned(),
             origin: FlowOrigin::Capture,
         }
+    }
+
+    /// Scrubs one fixed secret, as the credential layer does.
+    struct SecretRedactor;
+
+    impl FlowRedactor for SecretRedactor {
+        fn redact(&self, flow: &mut FlowCapture) {
+            let scrub = |bytes: &mut Vec<u8>| {
+                let text = String::from_utf8_lossy(bytes).replace("hunter2-SECRET", "[REDACTED]");
+                *bytes = text.into_bytes();
+            };
+            if let Some(url) = &mut flow.url {
+                *url = url.replace("hunter2-SECRET", "[REDACTED]");
+            }
+            if let Some(path) = &mut flow.path {
+                *path = path.replace("hunter2-SECRET", "[REDACTED]");
+            }
+            if let Some(body) = &mut flow.request_body {
+                scrub(body);
+            }
+        }
+    }
+
+    fn ws_connection(store: &TrafficStore, url: &str) -> WsConnectionRecord {
+        WsConnectionRecord {
+            id: store.allocate_ws_connection_id(),
+            url: url.to_owned(),
+            host: Some("echo.test".to_owned()),
+            path: Some("/socket?token=hunter2-SECRET".to_owned()),
+            scope: ScopeDisposition::OutsideDeclaredScope,
+            origin: FlowOrigin::Capture,
+            opened_at: Utc::now(),
+            closed_at: None,
+            close_code: None,
+            message_count: 0,
+            provenance: "proxy.test".to_owned(),
+        }
+    }
+
+    fn ws_message(connection_id: u64, sequence: u64, payload: &[u8]) -> WsMessageRecord {
+        WsMessageRecord {
+            connection_id,
+            sequence,
+            direction: if sequence % 2 == 1 {
+                WsDirection::ClientToServer
+            } else {
+                WsDirection::ServerToClient
+            },
+            kind: WsMessageKind::Text,
+            payload: payload.to_vec(),
+            payload_bytes: payload.len() as u64,
+            observed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn websocket_connections_and_messages_round_trip_in_pages() {
+        let store = store();
+        let connection = ws_connection(&store, "wss://echo.test/socket");
+        store.upsert_ws_connection(&connection).expect("connection");
+        for sequence in 1..=5 {
+            store
+                .append_ws_message(&ws_message(
+                    connection.id,
+                    sequence,
+                    format!("m{sequence}").as_bytes(),
+                ))
+                .expect("message");
+        }
+        let listed = store.ws_connections().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 5);
+        let first = store.ws_messages(connection.id, None, 2).expect("page");
+        assert_eq!(
+            first.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let rest = store.ws_messages(connection.id, Some(2), 10).expect("page");
+        assert_eq!(
+            rest.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(rest[0].direction, WsDirection::ClientToServer);
+        assert_eq!(rest[2].payload, b"m5");
+        // Ids are their own sequence and survive a reopen.
+        let parent = store
+            .root
+            .parent()
+            .expect("session root parent")
+            .to_path_buf();
+        drop(store);
+        let reopened = TrafficStore::open(&parent, "session:test").expect("reopen");
+        assert_eq!(reopened.allocate_ws_connection_id(), connection.id + 1);
+        // A connection left open by an engine stop reloads as ended, at its
+        // last message: nothing is live after a reopen.
+        let after = reopened.ws_connections().expect("list");
+        assert_eq!(
+            after[0].closed_at,
+            Some(rest[2].observed_at),
+            "a stale open connection closes at its last message"
+        );
+    }
+
+    #[test]
+    fn a_secret_sent_over_a_websocket_never_reaches_disk() {
+        let store = store();
+        store.set_redactor(Arc::new(SecretRedactor));
+        let connection = ws_connection(&store, "wss://echo.test/socket?token=hunter2-SECRET");
+        let persisted = store.upsert_ws_connection(&connection).expect("connection");
+        assert!(!persisted.url.contains("hunter2-SECRET"));
+        let message = store
+            .append_ws_message(&ws_message(
+                connection.id,
+                1,
+                br#"{"password":"hunter2-SECRET"}"#,
+            ))
+            .expect("message");
+        assert!(!String::from_utf8_lossy(&message.payload).contains("hunter2-SECRET"));
+        let root = store.root().to_path_buf();
+        drop(store);
+        // Every byte the store wrote, database and WAL included.
+        let mut pending = vec![root];
+        let mut scanned = 0;
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .expect("read dir")
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path()),
+                );
+            } else {
+                let bytes = std::fs::read(&path).expect("read file");
+                scanned += 1;
+                assert!(
+                    !bytes.windows(14).any(|window| window == b"hunter2-SECRET"),
+                    "secret found on disk in {}",
+                    path.display()
+                );
+            }
+        }
+        assert!(scanned > 0);
     }
 
     #[test]
