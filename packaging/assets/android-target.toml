@@ -128,3 +128,13 @@ repo = "https://github.com/NetrisTV/ws-scrcpy"
 # master @ 2026-08-24 — supports the WS_SCRCPY_PATHNAME base-path routing the engine
 # relies on (documented under upstream "Run configuration"), unlike v0.8.1.
 git_ref = "8855ad1184ec7b41f1b28d1b899856f828e09c3e"
+# Features compiled out via build.config.override.json. The ADB shell pulls in
+# node-pty, whose native install fails on Windows under Node >= 20.12 (spawn
+# EINVAL) and which the drivable target does not need.
+#
+# fetch-android-target.ps1 also applies, to every fresh copy of this pin: PATHNAME =
+# base_path in the build config, and a loopback-bind patch so ws-scrcpy listens on
+# WS_SCRCPY_HOST (default 127.0.0.1) and WS_SCRCPY_PORT as the engine sets them.
+# Upstream binds all interfaces with no auth. The script smoke-tests the result
+# and fails the assembly if any of this does not hold.
+excluded_features = "INCLUDE_ADB_SHELL"

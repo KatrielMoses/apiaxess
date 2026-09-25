@@ -89,6 +89,9 @@ $streamWsEntry = Read-ManifestField -Section "streaming" -Field "ws_scrcpy_entry
 $nodeUrl = Read-ManifestField -Section "streaming.node.$Platform" -Field "url" -Manifest $manifest
 $wsScrcpyRepo = Read-ManifestField -Section "streaming.ws_scrcpy" -Field "repo" -Manifest $manifest
 $wsScrcpyRef = Read-ManifestField -Section "streaming.ws_scrcpy" -Field "git_ref" -Manifest $manifest
+# Build-config features compiled out of ws-scrcpy (comma-separated), e.g. the ADB
+# shell, whose node-pty dependency cannot install on Windows under current Node.
+$wsScrcpyExcluded = @((Read-ManifestField -Section "streaming.ws_scrcpy" -Field "excluded_features" -Manifest $manifest) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
 # A slim GUI target the user drives: cold boot each session for reliability, but
 # userdata (installed APK + completed logins) persists across boots. NOT -wipe-data
@@ -189,10 +192,12 @@ else {
 }
 
 # --- Stage the screen-streaming components (Phase D2): Node + ws-scrcpy ---
-# Best-effort: a failure here (or -SkipStreaming) still yields a bootable,
-# traffic-capturing target; the engine reports sandbox.android-stream-unavailable
-# until streaming is staged. ws-scrcpy binds loopback only and is reverse-proxied
-# by the engine behind the workbench gate — it is never directly reachable.
+# The drivable target is its screen, so a stream that fails to build is a build
+# failure: the script stops non-zero rather than shipping a stream-less add-on.
+# Only an explicit -SkipStreaming assembles without it (the engine then reports
+# sandbox.android-stream-unavailable). ws-scrcpy binds loopback only and is
+# reverse-proxied by the engine behind the workbench gate; it is never directly
+# reachable (see the loopback patch below, and the smoke test that proves it).
 $streamingStaged = $false
 if (-not $SkipStreaming) {
     try {
@@ -202,7 +207,7 @@ if (-not $SkipStreaming) {
         $nodeArchive = Join-Path $CacheDirectory ([System.IO.Path]::GetFileName(($nodeUrl -split '\?')[0]))
         if (-not (Test-Path -LiteralPath $nodeArchive)) {
             Write-Host "Downloading Node runtime for ws-scrcpy ($Platform)..."
-            Invoke-WebRequest -UseBasicParsing -Uri $nodeUrl -OutFile $nodeArchive
+            try { Invoke-WebRequest -UseBasicParsing -Uri $nodeUrl -OutFile $nodeArchive } catch { Remove-Item -LiteralPath $nodeArchive -ErrorAction SilentlyContinue; throw "downloading the Node runtime from $nodeUrl failed ($($_.Exception.Message))." }
         }
         $nodeExtract = Join-Path $CacheDirectory "node-extract-$Platform"
         if (Test-Path -LiteralPath $nodeExtract) { Remove-Item -LiteralPath $nodeExtract -Recurse -Force }
@@ -244,7 +249,7 @@ if (-not $SkipStreaming) {
             $archivePath = if ($wsScrcpyRef -match '^[0-9a-fA-F]{40}$') { "archive/$wsScrcpyRef.zip" } else { "archive/refs/tags/$wsScrcpyRef.zip" }
             $archiveUrl = "$($wsScrcpyRepo.TrimEnd('/'))/$archivePath"
             Write-Host "Downloading pinned ws-scrcpy ($wsScrcpyRef)..."
-            Invoke-WebRequest -UseBasicParsing -Uri $archiveUrl -OutFile $wsZip
+            try { Invoke-WebRequest -UseBasicParsing -Uri $archiveUrl -OutFile $wsZip } catch { Remove-Item -LiteralPath $wsZip -ErrorAction SilentlyContinue; throw "downloading ws-scrcpy $wsScrcpyRef from $archiveUrl failed ($($_.Exception.Message))." }
         }
         $wsExtract = Join-Path $CacheDirectory "ws-scrcpy-extract"
         if (Test-Path -LiteralPath $wsExtract) { Remove-Item -LiteralPath $wsExtract -Recurse -Force }
@@ -252,34 +257,98 @@ if (-not $SkipStreaming) {
         $wsInner = Get-ChildItem -LiteralPath $wsExtract -Directory | Select-Object -First 1
         Move-Item -LiteralPath $wsInner.FullName -Destination $wsRoot
 
+        # APIaxess adaptations of upstream ws-scrcpy, applied to every fresh copy so no
+        # assembly depends on a hand-patched add-on:
+        # 1. Build config: compile out the excluded features (the ADB shell, and with
+        #    it node-pty) and serve under the engine's reverse-proxy base path.
+        $buildConfig = [ordered]@{ PATHNAME = $streamBasePath }
+        foreach ($feature in $wsScrcpyExcluded) { $buildConfig[$feature] = $false }
+        Write-Utf8NoBom -Path (Join-Path $wsRoot "build.config.override.json") -Content ($buildConfig | ConvertTo-Json)
+        # 2. Listen on loopback, on the port the engine chooses. Upstream binds every
+        #    interface on its config port and has no auth, so unpatched it would let
+        #    anyone on the network view and drive the device around the engine's gate.
+        $httpServerSource = Join-Path $wsRoot "src/server/services/HttpServer.ts"
+        $listenAnchor = "server.listen(port, () => {"
+        $httpServer = Get-Content -LiteralPath $httpServerSource -Raw
+        if (-not $httpServer.Contains($listenAnchor)) {
+            throw "ws-scrcpy $wsScrcpyRef no longer contains '$listenAnchor' in src/server/services/HttpServer.ts; the loopback-bind patch must be updated for this pin."
+        }
+        $httpServer = $httpServer.Replace($listenAnchor, "server.listen(Number(process.env.WS_SCRCPY_PORT) || port, process.env.WS_SCRCPY_HOST || '127.0.0.1', () => {")
+        Write-Utf8NoBom -Path $httpServerSource -Content $httpServer
+
         # Build the distributable server bundle with the bundled Node's npm.
         Push-Location $wsRoot
         try {
             $env:PATH = "$([System.IO.Path]::GetDirectoryName($nodeExe));$env:PATH"
-            # Bake the reverse-proxy base path into the build too. ws-scrcpy honors
-            # WS_SCRCPY_PATHNAME at runtime (the engine sets it when it spawns
-            # ws-scrcpy), but webpack's publicPath is resolved at build, so set it
-            # here as well so bundled asset URLs carry the prefix regardless.
-            $env:WS_SCRCPY_PATHNAME = $streamBasePath
-            & $npmCmd ci
-            if ($LASTEXITCODE -ne 0) { throw "npm ci failed for ws-scrcpy." }
+            # --ignore-scripts: the only install scripts are node-pty's native build
+            # (it fails on Windows with `spawn EINVAL` under Node >= 20.12, and the
+            # shell it serves is compiled out above) and the iOS/appium setup, which
+            # the Android target does not use.
+            & $npmCmd ci --ignore-scripts
+            if ($LASTEXITCODE -ne 0) { throw "npm ci failed for ws-scrcpy (exit $LASTEXITCODE)." }
             & $npmCmd run dist
-            if ($LASTEXITCODE -ne 0) { throw "npm run dist failed for ws-scrcpy." }
+            if ($LASTEXITCODE -ne 0) { throw "npm run dist failed for ws-scrcpy (exit $LASTEXITCODE)." }
         }
         finally {
-            Remove-Item Env:\WS_SCRCPY_PATHNAME -ErrorAction SilentlyContinue
             Pop-Location
         }
-        if (-not (Test-Path -LiteralPath (Join-Path $wsRoot $streamWsEntry))) {
+        $wsEntryPath = Join-Path $wsRoot $streamWsEntry
+        if (-not (Test-Path -LiteralPath $wsEntryPath)) {
             throw "ws-scrcpy build did not produce $streamWsEntry."
         }
-        # Preserve the MIT licence beside the staged payload for attribution.
+        if ((Get-Content -LiteralPath $wsEntryPath -Raw).Contains("node-pty")) {
+            throw "ws-scrcpy build still references node-pty; the excluded features ($($wsScrcpyExcluded -join ', ')) did not take effect."
+        }
+
+        # Smoke test the built server exactly as the engine runs it: it must serve
+        # under the base path (and not at the root) and listen on loopback only.
+        $smokePort = 18000 + (Get-Random -Maximum 1000)
+        $smokeInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $smokeInfo.FileName = $nodeExe
+        $smokeInfo.Arguments = "`"$wsEntryPath`""
+        $smokeInfo.WorkingDirectory = $wsRoot
+        $smokeInfo.UseShellExecute = $false
+        $smokeInfo.RedirectStandardOutput = $true
+        $smokeInfo.RedirectStandardError = $true
+        $smokeInfo.Environment["WS_SCRCPY_HOST"] = "127.0.0.1"
+        $smokeInfo.Environment["WS_SCRCPY_PORT"] = "$smokePort"
+        $smokeInfo.Environment["WS_SCRCPY_PATHNAME"] = $streamBasePath
+        $smokeInfo.Environment["ADB"] = Join-Path $sdkRoot ("platform-tools/" + $(if ($Platform -eq "windows_x64") { "adb.exe" } else { "adb" }))
+        $smoke = [System.Diagnostics.Process]::Start($smokeInfo)
+        try {
+            $served = $null
+            for ($attempt = 0; $attempt -lt 60 -and -not $smoke.HasExited; $attempt++) {
+                Start-Sleep -Milliseconds 500
+                try {
+                    $served = (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$smokePort$streamBasePath" -TimeoutSec 5).StatusCode
+                    break
+                }
+                catch { }
+            }
+            if ($served -ne 200) {
+                $output = if ($smoke.HasExited) { $smoke.StandardError.ReadToEnd() + $smoke.StandardOutput.ReadToEnd() } else { "" }
+                throw "the built ws-scrcpy did not serve $streamBasePath on 127.0.0.1:$smokePort (status: $served). $output"
+            }
+            $rootStatus = try { (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$smokePort/" -TimeoutSec 5).StatusCode } catch { [int]$_.Exception.Response.StatusCode }
+            if ($rootStatus -eq 200) {
+                throw "the built ws-scrcpy also serves at the root, not only under $streamBasePath; the base path did not take effect."
+            }
+            if ($Platform -eq "windows_x64") {
+                $exposed = @(Get-NetTCPConnection -LocalPort $smokePort -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -notin @("127.0.0.1", "::1") })
+                if ($exposed.Count -gt 0) {
+                    throw "the built ws-scrcpy listens on $($exposed[0].LocalAddress):$smokePort, not loopback only; the loopback-bind patch did not take effect."
+                }
+            }
+        }
+        finally {
+            if (-not $smoke.HasExited) { $smoke.Kill($true) }
+            $smoke.Dispose()
+        }
         $streamingStaged = $true
-        Write-Host "Staged ws-scrcpy ($wsScrcpyRef) on Node runtime for loopback streaming."
+        Write-Host "Staged ws-scrcpy ($wsScrcpyRef) on Node runtime: serves $streamBasePath on loopback (smoke-tested)."
     }
     catch {
-        Write-Warning "Streaming components were not staged ($($_.Exception.Message)); the target still boots and captures traffic. The engine reports sandbox.android-stream-unavailable until ws-scrcpy + Node are staged (re-run without -SkipStreaming on a build host with network + a C/C++ toolchain)."
-        $streamingStaged = $false
+        throw "Android target streaming could not be staged: $($_.Exception.Message) The drivable target needs its screen stream, so this assembly is a failure. Fix the cause and re-run, or pass -SkipStreaming to deliberately assemble a target without a screen."
     }
 }
 
