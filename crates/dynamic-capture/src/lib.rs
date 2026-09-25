@@ -18,7 +18,7 @@ use apiaxess_api_model::{
     ProtocolOperation, ProtocolOperationIdentity, ProvenanceRegistry, QueryParameter,
     RequirednessAssertion, Resolution, ResolutionPolicy, ResponseBody, ResponseSelector, RunId,
     SamplePayload, SchemaObservation, SchemaProperty, SchemaShape, SchemaSlot, SourceType,
-    normalize_host, parse_graphql_operations,
+    normalize_host, parse_graphql_operations, parse_grpc_method_path,
 };
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use apiaxess_session::Session;
@@ -171,6 +171,8 @@ pub fn capture_into_document(
     // GraphQL operations observed in request bodies, with their flows.
     let mut graphql_operations: BTreeMap<ProtocolOperationIdentity, Vec<EntityId>> =
         BTreeMap::new();
+    // gRPC calls observed on the wire, with their flows.
+    let mut grpc_operations: BTreeMap<ProtocolOperationIdentity, Vec<EntityId>> = BTreeMap::new();
     let mut flow_entities = Vec::new();
     let mut timestamps = Vec::new();
     let mut structured_flow_count = 0_usize;
@@ -241,6 +243,19 @@ pub fn capture_into_document(
             recorded_at: flow.captured_at,
             sample_count: NonZeroU64::new(1).expect("literal is non-zero"),
         });
+        // A gRPC call is a protobuf RPC, not a REST resource: it surfaces as
+        // the service/method operation it is (the identity the static pass
+        // reads from generated stubs), not as an opaque POST. Its
+        // length-prefixed protobuf body is not decoded: without the .proto
+        // schema it yields only field numbers and wire types.
+        if let Some(operation) = observed_grpc_operation(flow, &path) {
+            grpc_operations
+                .entry(operation)
+                .or_default()
+                .push(entity_id.clone());
+            structured_flow_count += 1;
+            continue;
+        }
 
         // Host is part of endpoint identity. A static endpoint bound to this
         // flow's host matches first; a host-unknown one is the fallback; one
@@ -422,6 +437,9 @@ pub fn capture_into_document(
     }
     for (identity, flows) in &graphql_operations {
         apply_graphql_operation(&mut document, identity, flows, &activity_id, &mut ids);
+    }
+    for (identity, flows) in &grpc_operations {
+        apply_grpc_operation(&mut document, identity, flows, &activity_id, &mut ids);
     }
     let mut observed = Vec::new();
     for accumulator in accumulators.values() {
@@ -1590,6 +1608,64 @@ fn observed_graphql_operations(
     operations
 }
 
+/// The gRPC operation a flow is, when it carries a gRPC content type
+/// (`application/grpc`, `+proto`, `-web`, `-web-text`, ...) on a
+/// `/package.Service/Method` path.
+fn observed_grpc_operation(flow: &FlowCapture, path: &str) -> Option<ProtocolOperationIdentity> {
+    let grpc = |headers: &[(String, String)]| {
+        headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value
+                    .trim()
+                    .get(..16)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("application/grpc"))
+        })
+    };
+    if !grpc(&flow.request_headers) && !grpc(&flow.response_headers) {
+        return None;
+    }
+    let (service, method) = parse_grpc_method_path(path)?;
+    Some(ProtocolOperationIdentity::Grpc { service, method })
+}
+
+/// Records an observed gRPC call: it confirms the same service/method (from
+/// the static pass or an earlier flow) or adds it as a dynamic operation.
+fn apply_grpc_operation(
+    document: &mut ApiDocument,
+    identity: &ProtocolOperationIdentity,
+    flows: &[EntityId],
+    activity: &apiaxess_api_model::ActivityId,
+    ids: &mut IdFactory,
+) {
+    let operations = &mut document.surface.protocol_operations;
+    match operations
+        .iter_mut()
+        .find(|operation| &operation.identity == identity)
+    {
+        Some(operation) => append_candidate(
+            &mut operation.presence,
+            PresenceAssertion::Present,
+            flows,
+            ids.candidate(),
+            false,
+            activity,
+        ),
+        None => operations.push(ProtocolOperation {
+            identity: identity.clone(),
+            presence: dynamic_fact(
+                FieldClass::Presence,
+                ResolutionPolicy::StaticCompleteDynamicConfirm,
+                PresenceAssertion::Present,
+                flows,
+                ids.candidate(),
+                activity,
+            ),
+            request_body: None,
+            response_body: None,
+        }),
+    }
+}
+
 /// Decodes `%XX` escapes and `+` in a URL query component.
 fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
@@ -2062,6 +2138,92 @@ mod tests {
         );
         // The transport endpoint is still there, alongside its operation.
         assert_eq!(report.document.surface.endpoints.len(), 1);
+    }
+
+    fn grpc_call(id: u64, path: &str, content_type: &str) -> FlowCapture {
+        let mut flow = flow(id, path, &[0, 0, 0, 0, 2, 8, 1]);
+        flow.method = Some("POST".to_owned());
+        flow.request_headers
+            .push(("content-type".to_owned(), content_type.to_owned()));
+        flow.request_body = Some(vec![0, 0, 0, 0, 3, 10, 1, 120]);
+        flow.response_headers = vec![("content-type".to_owned(), content_type.to_owned())];
+        flow
+    }
+
+    fn grpc_operations(document: &ApiDocument) -> Vec<(String, String, usize)> {
+        document
+            .surface
+            .protocol_operations
+            .iter()
+            .filter_map(|operation| match &operation.identity {
+                ProtocolOperationIdentity::Grpc { service, method } => Some((
+                    service.clone(),
+                    method.clone(),
+                    operation.presence.candidates.len(),
+                )),
+                ProtocolOperationIdentity::GraphQl { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_grpc_call_surfaces_as_its_service_method_not_an_opaque_post() {
+        let report = capture(
+            &empty_document(),
+            &[
+                grpc_call(1, "/shop.v1.CartService/AddItem", "application/grpc"),
+                grpc_call(2, "/shop.v1.CartService/AddItem", "application/grpc+proto"),
+                grpc_call(3, "/Greeter/SayHello", "application/grpc-web-text"),
+            ],
+        );
+        assert_eq!(
+            grpc_operations(&report.document),
+            vec![
+                ("Greeter".to_owned(), "SayHello".to_owned(), 1),
+                ("shop.v1.CartService".to_owned(), "AddItem".to_owned(), 1),
+            ]
+        );
+        // Not a REST endpoint, and no schema is invented for the protobuf body.
+        assert!(report.document.surface.endpoints.is_empty());
+        assert!(
+            report
+                .document
+                .surface
+                .protocol_operations
+                .iter()
+                .all(|operation| operation.request_body.is_none()
+                    && operation.response_body.is_none())
+        );
+        // A second capture of the same call confirms the one operation.
+        let again = capture(
+            &report.document,
+            &[grpc_call(
+                4,
+                "/shop.v1.CartService/AddItem",
+                "application/grpc",
+            )],
+        );
+        assert_eq!(
+            grpc_operations(&again.document),
+            vec![
+                ("Greeter".to_owned(), "SayHello".to_owned(), 1),
+                ("shop.v1.CartService".to_owned(), "AddItem".to_owned(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_grpc_content_type_on_a_method_path_is_read_as_grpc() {
+        // A REST POST that happens to look like a method path stays REST.
+        let report = capture(
+            &empty_document(),
+            &[
+                post(1, "/shop.v1.CartService/AddItem", br#"{"sku":"a"}"#),
+                grpc_call(2, "/api/v1/items/7", "application/grpc"),
+            ],
+        );
+        assert!(grpc_operations(&report.document).is_empty());
+        assert_eq!(report.document.surface.endpoints.len(), 2);
     }
 
     #[test]

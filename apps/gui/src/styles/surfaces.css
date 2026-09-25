@@ -2432,3 +2432,57 @@ kbd {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Live traffic: what a flow is beyond request/response (event stream, gRPC). */
+.flow-kind {
+  margin-left: var(--space-2);
+  padding: 0 var(--space-1);
+  border: var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-nano);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.flow-kind--live {
+  color: var(--color-success-ink);
+}
+
+/* Server-Sent Events: one block per event, not one growing body. */
+.sse-events__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.sse-event__meta {
+  margin: 0 0 var(--space-1);
+}
+
+.sse-event__data {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* HAR import: the scope it derived, editable in place. */
+.har-scope {
+  padding: var(--space-2) var(--space-4);
+}
+
+.har-scope .notice {
+  align-items: flex-start;
+}
+
+.har-scope__hosts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.protocol-op {
+  grid-template-columns: 3.5rem minmax(0, 1fr) auto;
+}

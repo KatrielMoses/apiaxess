@@ -174,6 +174,10 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         )
         .route("/api/v1/workbench/flows", get(list_flows))
         .route("/api/v1/workbench/flows/{flow_id}", get(get_flow))
+        .route(
+            "/api/v1/workbench/flows/{flow_id}/sse-events",
+            get(list_sse_events),
+        )
         .route("/api/v1/workbench/ws-connections", get(list_ws_connections))
         .route(
             "/api/v1/workbench/ws-connections/{connection_id}/messages",
@@ -1486,9 +1490,10 @@ async fn list_ws_connections(
         .map_err(session_response)
 }
 
-/// Paging for a WebSocket connection's messages: after a sequence, up to a limit.
+/// Paging for a stream (WebSocket messages or event-stream events): after a
+/// sequence, up to a limit.
 #[derive(Deserialize)]
-struct WsMessagesQuery {
+struct StreamPageQuery {
     after: Option<u64>,
     limit: Option<usize>,
 }
@@ -1499,7 +1504,7 @@ const MAX_WS_MESSAGE_PAGE: usize = 1_000;
 async fn list_ws_messages(
     State(state): State<ApiState>,
     AxumPath(connection_id): AxumPath<u64>,
-    Query(query): Query<WsMessagesQuery>,
+    Query(query): Query<StreamPageQuery>,
 ) -> Result<
     Json<Vec<apiaxess_workbench_proxy::live::LiveWebSocketMessage>>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
@@ -1522,6 +1527,27 @@ async fn list_ws_messages(
             )
         })
         .map_err(session_response)
+}
+
+/// Largest page of Server-Sent Events returned at once.
+const MAX_SSE_EVENT_PAGE: usize = 1_000;
+
+/// A page of the Server-Sent Events captured on one HTTP flow.
+async fn list_sse_events(
+    State(state): State<ApiState>,
+    AxumPath(flow_id): AxumPath<u64>,
+    Query(query): Query<StreamPageQuery>,
+) -> Result<
+    Json<Vec<apiaxess_workbench_store::SseEventRecord>>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    let limit = query.limit.unwrap_or(200).clamp(1, MAX_SSE_EVENT_PAGE);
+    state
+        .engine
+        .live_workbench()
+        .sse_events(flow_id, query.after, limit)
+        .map(Json)
+        .map_err(storage_response)
 }
 
 async fn get_flow(
@@ -1579,11 +1605,13 @@ async fn export_har(
 async fn import_har(
     State(state): State<ApiState>,
     body: Bytes,
-) -> Result<Json<usize>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+) -> Result<
+    Json<apiaxess_engine_shell::HarImportReport>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
     state
         .engine
-        .live_workbench()
-        .import_har(&body, "har.import")
+        .import_har(&body)
         .map(Json)
         .map_err(storage_response)
 }
@@ -2791,6 +2819,7 @@ async fn telemetry_loop(mut socket: axum::extract::ws::WebSocket, live: Arc<Live
             batch.diagnostics.extend(update.diagnostics);
             batch.prompts.extend(update.prompts);
             batch.websocket.extend(update.websocket);
+            batch.sse.extend(update.sse);
         }
         if socket
             .send(axum::extract::ws::Message::Text(

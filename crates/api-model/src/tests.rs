@@ -581,3 +581,27 @@ fn graphql_operation_headers_parse_name_and_type_without_variable_fragments() {
     assert!(parse_graphql_operations("query the server for updates").is_empty());
     assert!(parse_graphql_operations("query GetProfile($id").is_empty());
 }
+
+#[test]
+fn grpc_method_paths_parse_to_service_and_method() {
+    use crate::parse_grpc_method_path;
+    assert_eq!(
+        parse_grpc_method_path("/shop.v1.CartService/AddItem"),
+        Some(("shop.v1.CartService".to_owned(), "AddItem".to_owned()))
+    );
+    assert_eq!(
+        parse_grpc_method_path("/Greeter/SayHello"),
+        Some(("Greeter".to_owned(), "SayHello".to_owned()))
+    );
+    for rest in [
+        "/api/v1/items",
+        "/shop.v1.CartService/AddItem/extra",
+        "shop.v1.CartService/AddItem",
+        "/shop..Cart/Add",
+        "/shop.Cart/Add-Item",
+        "/shop.Cart/",
+        "/",
+    ] {
+        assert_eq!(parse_grpc_method_path(rest), None, "{rest}");
+    }
+}

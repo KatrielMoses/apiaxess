@@ -408,6 +408,14 @@ pub enum FlowEvent {
         /// Chunk bytes, capped by the live in-memory retention limit.
         bytes: Vec<u8>,
     },
+    /// A forwarded body ended: it completed, or the connection carrying it
+    /// was dropped. Long-lived bodies (event streams) close on this.
+    BodyEnd {
+        /// Paired request flow ID.
+        flow_id: u64,
+        /// Body direction.
+        direction: BodyDirection,
+    },
     /// A WebSocket message was observed while being forwarded.
     WebSocketMessage {
         /// The connection the message belongs to.
@@ -1317,7 +1325,13 @@ fn capture_body(
     observer: Arc<dyn FlowObserver>,
 ) -> Body {
     let retained = Arc::new(Mutex::new(0_usize));
+    let end = BodyEndSignal {
+        flow_id,
+        direction,
+        observer: Arc::clone(&observer),
+    };
     let stream = BodyStream::new(body).map_ok(move |frame| {
+        let _ = &end;
         if let Some(data) = frame.data_ref() {
             let bytes = if let Ok(mut retained) = retained.lock() {
                 let remaining = MAX_CAPTURE_BYTES.saturating_sub(*retained);
@@ -1338,6 +1352,23 @@ fn capture_body(
         frame
     });
     Body::from(StreamBody::new(stream))
+}
+
+/// Reports the end of a forwarded body when the stream carrying it is dropped,
+/// which happens on completion and on a client or upstream disconnect alike.
+struct BodyEndSignal {
+    flow_id: u64,
+    direction: BodyDirection,
+    observer: Arc<dyn FlowObserver>,
+}
+
+impl Drop for BodyEndSignal {
+    fn drop(&mut self) {
+        self.observer.observe(FlowEvent::BodyEnd {
+            flow_id: self.flow_id,
+            direction: self.direction,
+        });
+    }
 }
 
 fn intercept_timeout_diagnostic(flow_id: u64) -> Diagnostic {

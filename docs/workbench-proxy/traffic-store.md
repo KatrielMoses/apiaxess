@@ -33,7 +33,17 @@ The local API exposes HAR only as an interchange adapter:
 
 - `GET /api/v1/workbench/har` exports stored flows.
 - `POST /api/v1/workbench/har` imports a HAR log with explicit
-  `har.import` provenance.
+  `har.import` provenance and returns `{ imported, derivedScope? }`. When the
+  session has no declared scope, one is derived first from the HAR's own
+  hosts (exact-host rules for the first-party hosts, or every HAR host when
+  none dominates), audited as `session.scope.derive-from-har`, so the
+  imported traffic is in scope and fuses. `derivedScope` lists the hosts put
+  in scope and the ones left out; the GUI shows both and lets the operator
+  narrow or widen the scope.
+- `GET /api/v1/workbench/flows/{id}/sse-events?after=&limit=` pages the
+  Server-Sent Events captured on a `text/event-stream` flow (stored in
+  `sse_events`, redacted like bodies). The flow summary's `sse` field carries
+  `{ eventCount, closed }`.
 
 Storage open, integrity, write, canonical commit, resume, and HAR failures use
 stable diagnostics. A referenced blob is hash-verified on read; a missing or

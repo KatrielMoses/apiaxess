@@ -2861,22 +2861,11 @@ fn grpc_path(line: &str) -> Option<(String, String)> {
 /// rejects over-read binary literals whose method segment carries trailing junk
 /// (a non-identifier byte fails the method check).
 fn parse_grpc_full_method_name(value: &str) -> Option<(String, String)> {
-    let rest = value.strip_prefix('/')?;
-    let (service, method) = rest.split_once('/')?;
-    // Exactly one interior slash: additional path segments mean this is a REST
-    // path, not a gRPC full method name.
-    if method.contains('/') {
-        return None;
-    }
-    // The service must be package-qualified (`package.Service`); REST segments
-    // like `api` or `health` are not, which is what disambiguates them.
-    if !service.contains('.') || !is_dotted_proto_identifier(service) {
-        return None;
-    }
-    if !is_proto_identifier(method) {
-        return None;
-    }
-    Some((service.to_owned(), method.to_owned()))
+    // The shared path parser (the one dynamic capture reads live calls with)
+    // enforces the shape; a literal in code must also be package-qualified,
+    // since a bare `/api/health`-like pair is far likelier a REST path.
+    let (service, method) = apiaxess_api_model::parse_grpc_method_path(value)?;
+    service.contains('.').then_some((service, method))
 }
 
 /// A single Protocol Buffers identifier: an ASCII letter or `_`, then ASCII

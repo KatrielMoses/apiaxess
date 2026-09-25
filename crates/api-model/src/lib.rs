@@ -22,7 +22,7 @@ pub use api::{
     PathTemplateAssertion, PathTemplateOrigin, PresenceAssertion, ProtocolOperation,
     ProtocolOperationIdentity, QueryParameter, ResponseBody, ResponseSelector,
     StaticBoundaryReason, StaticCoverage, StaticKnowledgeStatus, StaticPassSummary, normalize_host,
-    parse_graphql_operations,
+    parse_graphql_operations, parse_grpc_method_path,
 };
 pub use confidence::{
     CONFIDENCE_SCHEMA_VERSION, ConfidenceSummary, CoveragePicture, FactConfidence,

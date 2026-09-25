@@ -1949,6 +1949,7 @@ mod tests {
                 content_type: None,
                 size: Some(2),
                 origin: FlowOrigin::Capture,
+                sse: None,
             },
             request_headers: vec![
                 ("host".to_owned(), "api.example.test".to_owned()),
@@ -1990,6 +1991,7 @@ mod tests {
                 content_type: None,
                 size: Some(2),
                 origin: FlowOrigin::Capture,
+                sse: None,
             },
             request_headers: Vec::new(),
             response_headers: Vec::new(),

@@ -13,6 +13,8 @@
     "lint:message-tools": "node scripts/check-message-tools.mjs",
     "lint:surface-tally": "node scripts/check-surface-tally.mjs",
     "lint:ws-model": "node scripts/check-ws-model.mjs",
+    "lint:flow-kind": "node scripts/check-flow-kind.mjs",
+    "lint:surface-operations": "node scripts/check-surface-operations.mjs",
     "dev": "vite --host 127.0.0.1"
   },
   "devDependencies": {

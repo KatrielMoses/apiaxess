@@ -17,8 +17,11 @@ use getrandom::fill;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
+use crate::sse::{SseParser, is_event_stream};
 use crate::{BodyDirection, FlowEvent, FlowObserver, InterceptController};
-use apiaxess_workbench_store::{FlowCapture, FlowOrigin, TrafficStore};
+use apiaxess_workbench_store::{
+    FlowCapture, FlowOrigin, SseEventRecord, SseStreamState, TrafficStore,
+};
 
 const TELEMETRY_CAPACITY: usize = 256;
 const MAX_LIVE_FLOWS: usize = 1_000;
@@ -62,6 +65,10 @@ pub struct FlowSummary {
     /// can filter and a future "show attack traffic" toggle can opt in.
     #[serde(default)]
     pub origin: FlowOrigin,
+    /// Event-stream state, for a flow whose response is `text/event-stream`:
+    /// a long-lived response read as a list of events, not one growing body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sse: Option<SseStreamState>,
 }
 
 /// Full in-memory flow detail fetched after selecting a live flow.
@@ -89,7 +96,33 @@ pub struct FlowRecord {
     pub detail: FlowDetail,
     captured_at: chrono::DateTime<chrono::Utc>,
     created_at: std::time::Instant,
+    sse: Option<LiveSse>,
 }
+
+/// Live state of one flow's event stream.
+#[derive(Clone, Debug, Default)]
+struct LiveSse {
+    parser: SseParser,
+    event_count: u64,
+    closed: bool,
+    last_summary: Option<std::time::Instant>,
+}
+
+impl LiveSse {
+    fn state(&self) -> SseStreamState {
+        SseStreamState {
+            event_count: self.event_count,
+            closed: self.closed,
+        }
+    }
+}
+
+/// How often a streaming flow's row is refreshed while events arrive.
+const SSE_SUMMARY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Data carried per event on the live stream; the full retained data is read
+/// from the events endpoint.
+pub const LIVE_SSE_DATA_BYTES: usize = 64 * 1024;
 
 /// One coalesced telemetry update.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -107,6 +140,10 @@ pub struct LiveUpdate {
     /// the HTTP flow list or fusion.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub websocket: Vec<LiveWebSocketEvent>,
+    /// Server-Sent Events as persisted (redacted), data capped at
+    /// [`LIVE_SSE_DATA_BYTES`]. Each belongs to an HTTP flow in `flows`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sse: Vec<SseEventRecord>,
 }
 
 /// One WebSocket event for the live telemetry stream.
@@ -181,8 +218,9 @@ struct LiveWsConnection {
     server_closed: bool,
 }
 
-/// A durable WebSocket write, performed off the forwarding path.
-enum WsWrite {
+/// A durable streaming write (WebSocket or event stream), performed off the
+/// forwarding path.
+enum StreamWrite {
     Connection(
         Arc<TrafficStore>,
         apiaxess_workbench_store::WsConnectionRecord,
@@ -192,34 +230,80 @@ enum WsWrite {
         apiaxess_workbench_store::WsConnectionRecord,
         apiaxess_workbench_store::WsMessageRecord,
     ),
+    SseOpen(Arc<TrafficStore>, u64, chrono::DateTime<chrono::Utc>),
+    SseEvent(Arc<TrafficStore>, SseEventRecord),
+    SseClose(Arc<TrafficStore>, u64, chrono::DateTime<chrono::Utc>),
 }
 
-/// Persists WebSocket writes in order on a dedicated thread (so a chatty stream
-/// never blocks frame forwarding on `SQLite`) and publishes each persisted,
-/// redacted record on the live stream.
-fn spawn_ws_writer(updates: broadcast::Sender<LiveUpdate>) -> mpsc::Sender<WsWrite> {
-    let (sender, receiver) = mpsc::channel::<WsWrite>();
+/// An event with its data capped for the live stream.
+fn live_sse_event(mut record: SseEventRecord) -> SseEventRecord {
+    if record.data.len() > LIVE_SSE_DATA_BYTES {
+        let mut end = LIVE_SSE_DATA_BYTES;
+        while !record.data.is_char_boundary(end) {
+            end -= 1;
+        }
+        record.data.truncate(end);
+    }
+    record
+}
+
+/// Persists streaming writes in order on a dedicated thread (so a chatty stream
+/// never blocks forwarding on `SQLite`) and publishes each persisted, redacted
+/// record on the live stream.
+fn spawn_stream_writer(updates: broadcast::Sender<LiveUpdate>) -> mpsc::Sender<StreamWrite> {
+    let (sender, receiver) = mpsc::channel::<StreamWrite>();
     std::thread::spawn(move || {
         for write in receiver {
-            let event = match write {
-                WsWrite::Connection(store, record) => {
-                    store
+            let event =
+                match write {
+                    StreamWrite::SseOpen(store, flow_id, at) => {
+                        if let Err(diagnostic) = store.open_sse_stream(flow_id, at) {
+                            let _ = updates.send(LiveUpdate {
+                                diagnostics: vec![diagnostic],
+                                ..LiveUpdate::default()
+                            });
+                        }
+                        continue;
+                    }
+                    StreamWrite::SseClose(store, flow_id, at) => {
+                        if let Err(diagnostic) = store.close_sse_stream(flow_id, at) {
+                            let _ = updates.send(LiveUpdate {
+                                diagnostics: vec![diagnostic],
+                                ..LiveUpdate::default()
+                            });
+                        }
+                        continue;
+                    }
+                    StreamWrite::SseEvent(store, record) => {
+                        let update = match store.append_sse_event(&record) {
+                            Ok(record) => LiveUpdate {
+                                sse: vec![live_sse_event(record)],
+                                ..LiveUpdate::default()
+                            },
+                            Err(diagnostic) => LiveUpdate {
+                                diagnostics: vec![diagnostic],
+                                ..LiveUpdate::default()
+                            },
+                        };
+                        let _ = updates.send(update);
+                        continue;
+                    }
+                    StreamWrite::Connection(store, record) => store
                         .upsert_ws_connection(&record)
                         .map(|connection| LiveWebSocketEvent {
                             connection,
                             message: None,
+                        }),
+                    StreamWrite::Message(store, connection, message) => {
+                        store.append_ws_message(&message).and_then(|message| {
+                            let connection = store.upsert_ws_connection(&connection)?;
+                            Ok(LiveWebSocketEvent {
+                                connection,
+                                message: Some(LiveWebSocketMessage::from_record(&message)),
+                            })
                         })
-                }
-                WsWrite::Message(store, connection, message) => {
-                    store.append_ws_message(&message).and_then(|message| {
-                        let connection = store.upsert_ws_connection(&connection)?;
-                        Ok(LiveWebSocketEvent {
-                            connection,
-                            message: Some(LiveWebSocketMessage::from_record(&message)),
-                        })
-                    })
-                }
-            };
+                    }
+                };
             let update = match event {
                 Ok(event) => LiveUpdate {
                     websocket: vec![event],
@@ -304,8 +388,8 @@ pub struct LiveWorkbench {
     fallback_flow_id: AtomicU64,
     /// Open WebSocket connections by (client, URL).
     websockets: Mutex<HashMap<crate::WebSocketConnectionKey, LiveWsConnection>>,
-    /// Ordered, off-path WebSocket persistence.
-    ws_writer: Mutex<mpsc::Sender<WsWrite>>,
+    /// Ordered, off-path WebSocket and event-stream persistence.
+    stream_writer: Mutex<mpsc::Sender<StreamWrite>>,
 }
 
 impl LiveWorkbench {
@@ -324,7 +408,7 @@ impl LiveWorkbench {
             let _ = write!(token, "{byte:02x}");
         }
         let (updates, _) = broadcast::channel(TELEMETRY_CAPACITY);
-        let ws_writer = spawn_ws_writer(updates.clone());
+        let stream_writer = spawn_stream_writer(updates.clone());
         Self {
             token: token.into(),
             intercept: Arc::new(InterceptController::default()),
@@ -340,7 +424,7 @@ impl LiveWorkbench {
             prompt_next_id: AtomicU64::new(1),
             fallback_flow_id: AtomicU64::new(1),
             websockets: Mutex::new(HashMap::new()),
-            ws_writer: Mutex::new(ws_writer),
+            stream_writer: Mutex::new(stream_writer),
         }
     }
 
@@ -404,9 +488,28 @@ impl LiveWorkbench {
         let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
             return Ok(self.flow(flow_id));
         };
-        store
-            .get(flow_id)
-            .map(|flow| flow.map(flow_detail_from_capture))
+        let Some(mut detail) = store.get(flow_id)?.map(flow_detail_from_capture) else {
+            return Ok(None);
+        };
+        detail.summary.sse = store.sse_state(flow_id)?;
+        Ok(Some(detail))
+    }
+
+    /// A page of a flow's captured Server-Sent Events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when no store is attached or the read fails.
+    pub fn sse_events(
+        &self,
+        flow_id: u64,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SseEventRecord>, Diagnostic> {
+        let Some(store) = self.stream_store() else {
+            return Err(catalogue::PROXY_STORE_OPEN_FAILED.instantiate(DiagnosticContext::new()));
+        };
+        store.sse_events(flow_id, after, limit)
     }
 
     /// Reads metadata from the durable store when one is attached.
@@ -469,10 +572,8 @@ impl LiveWorkbench {
             diagnostics.truncate(100);
         }
         let _ = self.updates.send(LiveUpdate {
-            flows: Vec::new(),
             diagnostics: vec![diagnostic],
-            websocket: Vec::new(),
-            prompts: Vec::new(),
+            ..LiveUpdate::default()
         });
     }
 
@@ -497,10 +598,8 @@ impl LiveWorkbench {
             return None;
         }
         let _ = self.updates.send(LiveUpdate {
-            flows: Vec::new(),
-            diagnostics: Vec::new(),
-            websocket: Vec::new(),
             prompts: vec![prompt],
+            ..LiveUpdate::default()
         });
         let Ok(answer) = receiver.recv_timeout(timeout) else {
             if let Ok(mut pending) = self.prompt_pending.lock() {
@@ -574,12 +673,21 @@ impl FlowObserver for LiveWorkbench {
             self.publish_diagnostic(diagnostic);
             return;
         }
+        if let FlowEvent::BodyEnd { flow_id, direction } = event {
+            if direction == BodyDirection::Response {
+                self.observe_sse_end(flow_id);
+            }
+            return;
+        }
         if let FlowEvent::BodyChunk {
             flow_id,
             direction,
             bytes,
         } = event
         {
+            if direction == BodyDirection::Response && self.observe_sse_chunk(flow_id, &bytes) {
+                return;
+            }
             if let Ok(mut flows) = self.flows.lock()
                 && let Some(flow) = flows.get_mut(&flow_id)
             {
@@ -615,6 +723,7 @@ impl FlowObserver for LiveWorkbench {
                     content_type: None,
                     size: None,
                     origin,
+                    sse: None,
                 };
                 let detail = FlowDetail {
                     summary: summary.clone(),
@@ -630,6 +739,7 @@ impl FlowObserver for LiveWorkbench {
                             detail,
                             captured_at: chrono::Utc::now(),
                             created_at: std::time::Instant::now(),
+                            sse: None,
                         },
                     );
                     while flows.len() > MAX_LIVE_FLOWS {
@@ -660,7 +770,16 @@ impl FlowObserver for LiveWorkbench {
                     size: header_value(&headers, "content-length")
                         .and_then(|value| value.parse().ok()),
                     origin: FlowOrigin::Capture,
+                    sse: None,
                 };
+                // An event stream is read into events as it arrives. One sent
+                // content-encoded cannot be framed without decoding it, so it
+                // stays an ordinary body.
+                let event_stream = header_value(&headers, "content-type")
+                    .is_some_and(|value| is_event_stream(&value))
+                    && header_value(&headers, "content-encoding")
+                        .is_none_or(|value| value.trim().eq_ignore_ascii_case("identity"));
+                let mut opened_stream = false;
                 if let Ok(mut flows) = self.flows.lock() {
                     if let Some(flow) = flows.get_mut(&flow_id) {
                         summary = flow.detail.summary.clone();
@@ -677,9 +796,18 @@ impl FlowObserver for LiveWorkbench {
                             )
                             .unwrap_or(u64::MAX),
                         );
+                        if event_stream && flow.sse.is_none() {
+                            let stream = LiveSse::default();
+                            summary.sse = Some(stream.state());
+                            flow.sse = Some(stream);
+                            opened_stream = true;
+                        }
                         flow.detail.summary = summary.clone();
                         flow.detail.response_headers = headers;
                     }
+                }
+                if opened_stream && let Some(store) = self.stream_store() {
+                    self.enqueue_stream(StreamWrite::SseOpen(store, flow_id, chrono::Utc::now()));
                 }
                 (flow_id, summary)
             }
@@ -710,28 +838,111 @@ impl FlowObserver for LiveWorkbench {
                 self.observe_ws_closed(&connection, direction);
                 return;
             }
-            FlowEvent::BodyChunk { .. } | FlowEvent::Diagnostic(_) => unreachable!(),
+            FlowEvent::BodyChunk { .. } | FlowEvent::BodyEnd { .. } | FlowEvent::Diagnostic(_) => {
+                unreachable!()
+            }
         };
         let _ = flow_id;
         self.persist_flow(flow_id);
         let _ = self.updates.send(LiveUpdate {
             flows: vec![summary],
-            diagnostics: Vec::new(),
-            websocket: Vec::new(),
-            prompts: Vec::new(),
+            ..LiveUpdate::default()
         });
     }
 }
 
 impl LiveWorkbench {
-    fn ws_store(&self) -> Option<Arc<TrafficStore>> {
+    fn stream_store(&self) -> Option<Arc<TrafficStore>> {
         self.store.read().ok().and_then(|store| store.clone())
     }
 
-    fn enqueue_ws(&self, write: WsWrite) {
-        if let Ok(writer) = self.ws_writer.lock() {
+    fn enqueue_stream(&self, write: StreamWrite) {
+        if let Ok(writer) = self.stream_writer.lock() {
             let _ = writer.send(write);
         }
+    }
+
+    /// Feeds a response chunk to the flow's event-stream parser. Returns
+    /// `false` when the flow is not an event stream (the chunk is then an
+    /// ordinary body chunk). Events persist off the forwarding path; the raw
+    /// stream is not also kept as one growing body.
+    fn observe_sse_chunk(&self, flow_id: u64, bytes: &[u8]) -> bool {
+        let (events, summary) = {
+            let Ok(mut flows) = self.flows.lock() else {
+                return false;
+            };
+            let Some(flow) = flows.get_mut(&flow_id) else {
+                return false;
+            };
+            let Some(stream) = flow.sse.as_mut() else {
+                return false;
+            };
+            let observed_at = chrono::Utc::now();
+            let events = stream
+                .parser
+                .feed(bytes)
+                .into_iter()
+                .map(|event| {
+                    stream.event_count += 1;
+                    SseEventRecord {
+                        flow_id,
+                        sequence: stream.event_count,
+                        event: event.event,
+                        data: event.data,
+                        data_bytes: u64::try_from(event.data_bytes).unwrap_or(u64::MAX),
+                        id: event.id,
+                        retry_ms: event.retry_ms,
+                        observed_at,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let due = !events.is_empty()
+                && stream
+                    .last_summary
+                    .is_none_or(|last| last.elapsed() >= SSE_SUMMARY_INTERVAL);
+            if due {
+                stream.last_summary = Some(std::time::Instant::now());
+            }
+            flow.detail.summary.sse = Some(stream.state());
+            (events, due.then(|| flow.detail.summary.clone()))
+        };
+        if let Some(store) = self.stream_store() {
+            for event in events {
+                self.enqueue_stream(StreamWrite::SseEvent(Arc::clone(&store), event));
+            }
+        }
+        if let Some(summary) = summary {
+            let _ = self.updates.send(LiveUpdate {
+                flows: vec![summary],
+                ..LiveUpdate::default()
+            });
+        }
+        true
+    }
+
+    /// Marks a flow's event stream ended when its response body ends.
+    fn observe_sse_end(&self, flow_id: u64) {
+        let summary = {
+            let Ok(mut flows) = self.flows.lock() else {
+                return;
+            };
+            let Some(flow) = flows.get_mut(&flow_id) else {
+                return;
+            };
+            let Some(stream) = flow.sse.as_mut().filter(|stream| !stream.closed) else {
+                return;
+            };
+            stream.closed = true;
+            flow.detail.summary.sse = Some(stream.state());
+            flow.detail.summary.clone()
+        };
+        if let Some(store) = self.stream_store() {
+            self.enqueue_stream(StreamWrite::SseClose(store, flow_id, chrono::Utc::now()));
+        }
+        let _ = self.updates.send(LiveUpdate {
+            flows: vec![summary],
+            ..LiveUpdate::default()
+        });
     }
 
     /// Records one WebSocket message: opens the connection record on first
@@ -751,7 +962,7 @@ impl LiveWorkbench {
         use apiaxess_workbench_store::{
             WsConnectionRecord, WsDirection, WsMessageKind, WsMessageRecord,
         };
-        let Some(store) = self.ws_store() else {
+        let Some(store) = self.stream_store() else {
             return;
         };
         let Ok(mut websockets) = self.websockets.lock() else {
@@ -817,9 +1028,12 @@ impl LiveWorkbench {
         };
         drop(websockets);
         if message.sequence == 1 {
-            self.enqueue_ws(WsWrite::Connection(Arc::clone(&store), connection.clone()));
+            self.enqueue_stream(StreamWrite::Connection(
+                Arc::clone(&store),
+                connection.clone(),
+            ));
         }
-        self.enqueue_ws(WsWrite::Message(store, connection, message));
+        self.enqueue_stream(StreamWrite::Message(store, connection, message));
     }
 
     /// Marks one direction of a WebSocket connection ended; once both have,
@@ -829,7 +1043,7 @@ impl LiveWorkbench {
         key: &crate::WebSocketConnectionKey,
         direction: crate::WebSocketDirection,
     ) {
-        let Some(store) = self.ws_store() else {
+        let Some(store) = self.stream_store() else {
             return;
         };
         let Ok(mut websockets) = self.websockets.lock() else {
@@ -850,7 +1064,7 @@ impl LiveWorkbench {
         };
         drop(websockets);
         live.record.closed_at = Some(chrono::Utc::now());
-        self.enqueue_ws(WsWrite::Connection(store, live.record));
+        self.enqueue_stream(StreamWrite::Connection(store, live.record));
     }
 
     fn persist_flow(&self, flow_id: u64) {
@@ -993,6 +1207,7 @@ fn flow_summary_from_store(flow: apiaxess_workbench_store::FlowSummary) -> FlowS
         content_type: flow.content_type,
         size: flow.response_size,
         origin: flow.origin,
+        sse: flow.sse,
     }
 }
 
@@ -1013,6 +1228,7 @@ fn flow_detail_from_capture(flow: FlowCapture) -> FlowDetail {
             }),
             size: flow.response_body.as_ref().map(|body| body.len() as u64),
             origin: flow.origin,
+            sse: None,
         },
         request_headers: flow.request_headers,
         response_headers: flow.response_headers,
@@ -1067,6 +1283,154 @@ fn ws_host_and_path(url: &str) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn an_event_stream_is_captured_as_events_on_its_http_flow() {
+        let root = std::env::temp_dir().join(format!(
+            "apiaxess-live-sse-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = Arc::new(TrafficStore::open(&root, "session:sse-test").expect("store"));
+        let live = LiveWorkbench::new();
+        live.attach_store(Arc::clone(&store));
+        let mut updates = live.subscribe();
+        let flow_id = live.allocate_flow_id();
+        live.observe(FlowEvent::Request {
+            flow_id,
+            method: "GET".to_owned(),
+            uri: "https://feed.test/events".to_owned(),
+            version: "HTTP/1.1".to_owned(),
+            headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
+            origin: FlowOrigin::Capture,
+        });
+        live.observe(FlowEvent::Response {
+            flow_id,
+            client_addr: "127.0.0.1:50124".parse().expect("address"),
+            status: 200,
+            version: "HTTP/1.1".to_owned(),
+            headers: vec![(
+                "content-type".to_owned(),
+                "text/event-stream; charset=utf-8".to_owned(),
+            )],
+        });
+        // Events arrive split across chunks, mid-line and mid-event.
+        for chunk in [
+            &b": connected\n\nevent: tick\nid: 1\ndata: {\"n\":"[..],
+            b"1}\n\ndata: line one\ndata: line two\n",
+            b"\nretry: 5000\ndata: third\n\n",
+        ] {
+            live.observe(FlowEvent::BodyChunk {
+                flow_id,
+                direction: BodyDirection::Response,
+                bytes: chunk.to_vec(),
+            });
+        }
+        live.observe(FlowEvent::BodyEnd {
+            flow_id,
+            direction: BodyDirection::Response,
+        });
+
+        let mut live_events = Vec::new();
+        let mut last_summary = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while live_events.len() < 3 && std::time::Instant::now() < deadline {
+            match updates.try_recv() {
+                Ok(update) => {
+                    live_events.extend(update.sse);
+                    if let Some(summary) = update.flows.into_iter().last() {
+                        last_summary = Some(summary);
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert_eq!(
+            live_events
+                .iter()
+                .map(|event| (event.sequence, event.event.as_deref(), event.data.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some("tick"), "{\"n\":1}"),
+                (2, None, "line one\nline two"),
+                (3, None, "third"),
+            ]
+        );
+        assert_eq!(live_events[0].id.as_deref(), Some("1"));
+        assert_eq!(live_events[2].retry_ms, Some(5000));
+        // The row reads as a finished stream, never as a hung request.
+        assert_eq!(
+            last_summary.and_then(|summary| summary.sse),
+            Some(SseStreamState {
+                event_count: 3,
+                closed: true
+            })
+        );
+        // Durable: the same events, the flow summarized as a closed stream,
+        // and no raw stream kept as one growing body.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut state = None;
+        while std::time::Instant::now() < deadline {
+            state = store.sse_state(flow_id).expect("state");
+            if state.is_some_and(|state| state.closed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            state,
+            Some(SseStreamState {
+                event_count: 3,
+                closed: true
+            })
+        );
+        assert_eq!(
+            store.sse_events(flow_id, None, 10).expect("events").len(),
+            3
+        );
+        let detail = live.durable_flow(flow_id).expect("read").expect("flow");
+        assert_eq!(detail.response_body, None);
+        assert_eq!(detail.summary.sse, state);
+        assert_eq!(detail.summary.method.as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn an_ordinary_response_is_not_read_as_an_event_stream() {
+        let live = LiveWorkbench::new();
+        let flow_id = live.allocate_flow_id();
+        live.observe(FlowEvent::Request {
+            flow_id,
+            method: "GET".to_owned(),
+            uri: "https://api.test/items".to_owned(),
+            version: "HTTP/1.1".to_owned(),
+            headers: Vec::new(),
+            origin: FlowOrigin::Capture,
+        });
+        live.observe(FlowEvent::Response {
+            flow_id,
+            client_addr: "127.0.0.1:50125".parse().expect("address"),
+            status: 200,
+            version: "HTTP/1.1".to_owned(),
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+        });
+        live.observe(FlowEvent::BodyChunk {
+            flow_id,
+            direction: BodyDirection::Response,
+            bytes: b"data: not an event\n\n".to_vec(),
+        });
+        live.observe(FlowEvent::BodyEnd {
+            flow_id,
+            direction: BodyDirection::Response,
+        });
+        let detail = live.flow(flow_id).expect("flow");
+        assert_eq!(detail.summary.sse, None);
+        assert_eq!(
+            detail.response_body.as_deref(),
+            Some(&b"data: not an event\n\n"[..])
+        );
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)] // One end-to-end scenario, read top to bottom.

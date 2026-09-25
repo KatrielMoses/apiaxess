@@ -164,6 +164,27 @@ pub struct WsConnectionView {
     pub party: Option<apiaxess_api_model::HostParty>,
 }
 
+/// The outcome of importing a HAR into the active session.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarImportReport {
+    /// Flows imported.
+    pub imported: usize,
+    /// The scope derived from the HAR, when the session had none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_scope: Option<HarDerivedScope>,
+}
+
+/// A scope derived from an imported HAR's own hosts.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarDerivedScope {
+    /// Hosts put in scope, each as an exact-host rule.
+    pub hosts: Vec<String>,
+    /// The HAR's other hosts, left out of scope as third-party.
+    pub excluded_hosts: Vec<String>,
+}
+
 /// Static analysis of the APK installed onto the Android target.
 #[derive(Clone, Debug)]
 enum AndroidStaticAnalysis {
@@ -572,6 +593,23 @@ impl Engine {
         &self,
         scope: EngagementScope,
     ) -> Result<SessionStatus, apiaxess_diagnostics::Diagnostic> {
+        self.apply_session_scope(
+            scope,
+            AuditActor::User,
+            "session.scope.update",
+            "Updated the declared engagement scope".to_owned(),
+        )
+    }
+
+    /// Declares `scope` on the session, audits it as `kind` by `actor`, and
+    /// re-classifies stored traffic against it.
+    fn apply_session_scope(
+        &self,
+        scope: EngagementScope,
+        actor: AuditActor,
+        kind: &str,
+        summary: String,
+    ) -> Result<SessionStatus, apiaxess_diagnostics::Diagnostic> {
         let runtime = self.session_runtime()?.ok_or_else(|| {
             apiaxess_diagnostics::catalogue::PROXY_SESSION_NOT_ACTIVE
                 .instantiate(apiaxess_diagnostics::DiagnosticContext::new())
@@ -580,16 +618,16 @@ impl Engine {
         let mut session = runtime.session_snapshot()?;
         session.update_engagement_scope(scope, now)?;
         let action_id = format!(
-            "session.scope.update:{}",
+            "{kind}:{}",
             fresh_session_id()?.as_str().trim_start_matches("session:")
         );
         session.record_action(ActionRecordInput {
             id: action_id,
             occurred_at: now,
-            actor: AuditActor::User,
+            actor,
             action: ActionDescriptor {
-                kind: "session.scope.update".to_owned(),
-                summary: "Updated the declared engagement scope".to_owned(),
+                kind: kind.to_owned(),
+                summary,
             },
             target: ActionTarget::SessionTarget,
             outcome: ActionOutcome::Completed,
@@ -907,6 +945,99 @@ impl Engine {
                 connection,
             })
             .collect())
+    }
+
+    /// Imports a HAR into the session's traffic. When the session has no scope
+    /// declared, one is derived from the HAR first (see
+    /// [`Self::derive_scope_from_har`]) so the imported traffic is in scope and
+    /// fuses, instead of every flow being silently excluded as undetermined.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the HAR is invalid, the derived scope cannot
+    /// be declared, or the import fails.
+    pub fn import_har(
+        &self,
+        bytes: &[u8],
+    ) -> Result<HarImportReport, apiaxess_diagnostics::Diagnostic> {
+        let derived_scope = match self.session_runtime()? {
+            Some(runtime) => {
+                let scope = runtime.session_snapshot()?.engagement_scope().clone();
+                if scope.allowed_targets.is_empty() {
+                    self.derive_scope_from_har(scope, bytes)?
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let imported = self.live_workbench.import_har(bytes, "har.import")?;
+        Ok(HarImportReport {
+            imported,
+            derived_scope,
+        })
+    }
+
+    /// Declares a scope from a HAR's own hosts, as exact-host rules: the hosts
+    /// the structural classifier finds first-party (the dominant domain), or
+    /// every HAR host when none dominates. Never wider than the HAR's hosts;
+    /// the audit trail records it as derived, and the operator can narrow it.
+    fn derive_scope_from_har(
+        &self,
+        mut scope: EngagementScope,
+        bytes: &[u8],
+    ) -> Result<Option<HarDerivedScope>, apiaxess_diagnostics::Diagnostic> {
+        // Only hosts that form a valid scope rule are candidates.
+        let rule = |host: &str| AllowedNetworkTarget {
+            id: format!(
+                "har:{}",
+                host.chars()
+                    .map(|ch| match ch {
+                        'a'..='z' | '0'..='9' | '.' | '-' | '_' => ch,
+                        _ => '-',
+                    })
+                    .collect::<String>()
+            ),
+            host: HostMatch::Exact {
+                host: host.to_owned(),
+            },
+            ports: Vec::new(),
+        };
+        let weights = apiaxess_workbench_store::har_hosts(bytes)?
+            .into_iter()
+            .filter(|(host, _)| {
+                EngagementScope {
+                    allowed_targets: vec![rule(host)],
+                    ..scope.clone()
+                }
+                .validate()
+                .is_ok()
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if weights.is_empty() {
+            return Ok(None);
+        }
+        let parties =
+            apiaxess_unified_surface::party::classify_hosts(&weights, &first_party_hints(&scope));
+        let (hosts, excluded_hosts): (Vec<_>, Vec<_>) = weights.keys().cloned().partition(|host| {
+            parties.is_empty()
+                || parties.get(host) == Some(&apiaxess_api_model::HostParty::FirstParty)
+        });
+        scope.allowed_targets = hosts.iter().map(|host| rule(host)).collect();
+        self.apply_session_scope(
+            scope,
+            AuditActor::Engine,
+            "session.scope.derive-from-har",
+            format!(
+                "No scope was declared: scoped to {} host(s) from the imported HAR ({})",
+                hosts.len(),
+                hosts.join(", ")
+            ),
+        )?;
+        Ok(Some(HarDerivedScope {
+            hosts,
+            excluded_hosts,
+        }))
     }
 
     /// One page of a WebSocket connection's messages, after `after` (sequence).
@@ -3051,6 +3182,258 @@ mod tests {
             arguments
                 .iter()
                 .any(|arg| arg == "--proxy-bypass-list=<-loopback>")
+        );
+    }
+
+    /// An engine with a fresh session attached, scoped to `hosts` (none: the
+    /// session has no declared scope, as before a target is declared).
+    fn engine_with_session(hosts: &[&str]) -> super::Engine {
+        use apiaxess_session::{
+            AllowedNetworkTarget, EngagementScope, HostMatch, Session, SessionId, TargetIdentifier,
+            TargetIdentity,
+        };
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("apiaxess-engine-test-{nanos}"));
+        let now = chrono::Utc::now();
+        let session_id = SessionId::new(format!("session:engine-test-{nanos}")).expect("id");
+        let scope = EngagementScope {
+            declared_at: now,
+            target: TargetIdentity {
+                target_type: "local-workbench".to_owned(),
+                primary: TargetIdentifier {
+                    kind: "session.id".to_owned(),
+                    value: session_id.as_str().to_owned(),
+                },
+                aliases: Vec::new(),
+            },
+            allowed_targets: hosts
+                .iter()
+                .map(|host| AllowedNetworkTarget {
+                    id: format!("test:{host}"),
+                    host: HostMatch::Exact {
+                        host: (*host).to_owned(),
+                    },
+                    ports: Vec::new(),
+                })
+                .collect(),
+        };
+        let mut session = Session::new(
+            session_id,
+            scope,
+            apiaxess_api_model::ApiDocument::new(apiaxess_api_model::ApiSurface {
+                provenance: apiaxess_api_model::ProvenanceRegistry::default(),
+                endpoints: Vec::new(),
+                protocol_operations: Vec::new(),
+                loose_findings: Vec::new(),
+                signers: Vec::new(),
+            }),
+            now,
+        );
+        session.activate(now).expect("activate");
+        let store = std::sync::Arc::new(
+            apiaxess_workbench_store::TrafficStore::open(&root, session.id().as_str())
+                .expect("store"),
+        );
+        let engine = super::Engine::new();
+        engine
+            .attach_session_runtime(std::sync::Arc::new(super::SessionRuntime::new(
+                session,
+                store,
+                root.join("session.json"),
+            )))
+            .expect("attach");
+        engine
+    }
+
+    fn har(entries: &[(&str, &str)]) -> Vec<u8> {
+        let entries = entries
+            .iter()
+            .map(|(method, url)| {
+                serde_json::json!({
+                    "request": {"method": method, "url": url, "headers": []},
+                    "response": {"status": 200, "headers": [
+                        {"name": "content-type", "value": "application/json"}
+                    ], "content": {"text": "{\"ok\":true}", "mimeType": "application/json"}}
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&serde_json::json!({"log": {"entries": entries}})).expect("har")
+    }
+
+    fn stored_scopes(engine: &super::Engine) -> Vec<(String, apiaxess_session::ScopeDisposition)> {
+        let runtime = engine.session_runtime().expect("runtime").expect("session");
+        runtime
+            .store()
+            .summaries()
+            .expect("summaries")
+            .into_iter()
+            .map(|flow| (flow.host.unwrap_or_default(), flow.scope))
+            .collect()
+    }
+
+    #[test]
+    fn a_har_imported_without_a_scope_is_scoped_to_its_own_first_party_hosts_and_fuses() {
+        let engine = engine_with_session(&[]);
+        let report = engine
+            .import_har(&har(&[
+                ("GET", "https://app.example.test/v1/items"),
+                ("GET", "https://app.example.test:8443/v1/items/7"),
+                ("POST", "https://api.example.test/v1/orders"),
+                ("GET", "https://cdn.tracker.test/pixel.gif"),
+            ]))
+            .expect("import");
+        assert_eq!(report.imported, 4);
+        let derived = report.derived_scope.expect("a scope was derived");
+        assert_eq!(derived.hosts, vec!["api.example.test", "app.example.test"]);
+        assert_eq!(derived.excluded_hosts, vec!["cdn.tracker.test"]);
+        // Exactly the HAR's own first-party hosts: exact rules, never wider.
+        let scope = engine.session_scope().expect("scope");
+        assert!(scope.allowed_targets.iter().all(|rule| matches!(
+            &rule.host,
+            apiaxess_session::HostMatch::Exact { host } if derived.hosts.contains(host)
+        )));
+        assert_eq!(scope.allowed_targets.len(), 2);
+        for (host, disposition) in stored_scopes(&engine) {
+            let expected = if host == "cdn.tracker.test" {
+                apiaxess_session::ScopeDisposition::OutsideDeclaredScope
+            } else {
+                apiaxess_session::ScopeDisposition::InScope
+            };
+            assert_eq!(disposition, expected, "{host}");
+        }
+        // Recorded in the audit trail as derived, not as an operator action.
+        let audit = engine.session_audit().expect("audit");
+        assert!(audit.iter().any(|record| {
+            serde_json::to_string(record)
+                .expect("record")
+                .contains("session.scope.derive-from-har")
+        }));
+        // Import a HAR, fuse, get a surface.
+        let surface = engine.fuse_web_capture().expect("fuse");
+        let mut endpoints = surface
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.endpoint.identity.host.clone().unwrap_or_default(),
+                    endpoint.endpoint.identity.path_template.as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("api.example.test".to_owned(), "/v1/orders".to_owned()),
+                ("app.example.test".to_owned(), "/v1/items".to_owned()),
+                // A non-default port is part of an endpoint's host identity.
+                (
+                    "app.example.test:8443".to_owned(),
+                    "/v1/items/{id}".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_har_imported_into_a_scoped_session_leaves_the_scope_alone() {
+        let engine = engine_with_session(&["app.example.test"]);
+        let before = engine.session_scope().expect("scope");
+        let report = engine
+            .import_har(&har(&[
+                ("GET", "https://app.example.test/v1/items"),
+                ("GET", "https://other.example.test/v1/items"),
+            ]))
+            .expect("import");
+        assert_eq!(report.imported, 2);
+        assert!(report.derived_scope.is_none());
+        assert_eq!(engine.session_scope().expect("scope"), before);
+        let mut scopes = stored_scopes(&engine);
+        scopes.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            scopes,
+            vec![
+                (
+                    "app.example.test".to_owned(),
+                    apiaxess_session::ScopeDisposition::InScope
+                ),
+                (
+                    "other.example.test".to_owned(),
+                    apiaxess_session::ScopeDisposition::OutsideDeclaredScope
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn web_fuse_lifts_graphql_operations_and_grpc_calls_from_captured_traffic() {
+        let engine = engine_with_session(&["api.example.test"]);
+        let runtime = engine.session_runtime().expect("runtime").expect("session");
+        let store = runtime.store();
+        let captured = |method: &str, path: &str, content_type: &str, body: &[u8]| {
+            apiaxess_workbench_store::FlowCapture {
+                id: store.allocate_flow_id(),
+                captured_at: chrono::Utc::now(),
+                protocol: "h2".to_owned(),
+                method: Some(method.to_owned()),
+                host: Some("api.example.test".to_owned()),
+                url: Some(format!("https://api.example.test{path}")),
+                path: Some(path.to_owned()),
+                status: Some(200),
+                duration_ms: Some(3),
+                request_headers: vec![("content-type".to_owned(), content_type.to_owned())],
+                response_headers: vec![("content-type".to_owned(), content_type.to_owned())],
+                request_body: Some(body.to_vec()),
+                response_body: None,
+                scope: apiaxess_session::ScopeDisposition::InScope,
+                provenance: "proxy.observer".to_owned(),
+                origin: apiaxess_workbench_store::FlowOrigin::Capture,
+            }
+        };
+        store
+            .upsert(&captured(
+                "POST",
+                "/graphql",
+                "application/json",
+                br#"{"operationName":"AddToCart","query":"mutation AddToCart($sku: ID!) { addToCart(sku: $sku) { id } }"}"#,
+            ))
+            .expect("graphql flow");
+        store
+            .upsert(&captured(
+                "POST",
+                "/shop.v1.CartService/Checkout",
+                "application/grpc",
+                &[0, 0, 0, 0, 2, 8, 1],
+            ))
+            .expect("grpc flow");
+        let surface = engine.fuse_web_capture().expect("fuse");
+        let operations = surface
+            .surface
+            .protocol_operations
+            .iter()
+            .map(|operation| operation.identity.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            operations.contains(&apiaxess_api_model::ProtocolOperationIdentity::GraphQl {
+                endpoint_url: Some("https://api.example.test/graphql".to_owned()),
+                operation_type: apiaxess_api_model::GraphQlOperationType::Mutation,
+                operation_name: "AddToCart".to_owned(),
+            })
+        );
+        assert!(
+            operations.contains(&apiaxess_api_model::ProtocolOperationIdentity::Grpc {
+                service: "shop.v1.CartService".to_owned(),
+                method: "Checkout".to_owned(),
+            })
+        );
+        // The gRPC call is not also an opaque REST POST.
+        assert!(
+            surface.endpoints.iter().all(|endpoint| endpoint
+                .endpoint
+                .identity
+                .path_template
+                .as_str()
+                != "/shop.v1.CartService/Checkout")
         );
     }
 

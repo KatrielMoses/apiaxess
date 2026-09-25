@@ -148,6 +148,41 @@ pub struct WsMessageRecord {
     pub observed_at: DateTime<Utc>,
 }
 
+/// One Server-Sent Event read from a flow's `text/event-stream` response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SseEventRecord {
+    /// The flow whose response carried the event.
+    pub flow_id: u64,
+    /// Position in the stream, from 1.
+    pub sequence: u64,
+    /// The `event:` type; absent means the default `message` type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// The `data:` lines, joined by line feeds (redacted; possibly truncated).
+    pub data: String,
+    /// Full size of the data on the wire.
+    pub data_bytes: u64,
+    /// The `id:` field set by this event, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The `retry:` reconnection time set by this event, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_ms: Option<u64>,
+    /// When the proxy observed the event.
+    pub observed_at: DateTime<Utc>,
+}
+
+/// The event-stream state of a flow whose response is `text/event-stream`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SseStreamState {
+    /// Events captured so far.
+    pub event_count: u64,
+    /// Whether the stream has ended.
+    pub closed: bool,
+}
+
 /// One captured flow accepted by the durable store.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,6 +276,9 @@ pub struct FlowSummary {
     /// How this flow entered the store (capture vs. Resend/Fuzz-synthesized).
     #[serde(default)]
     pub origin: FlowOrigin,
+    /// Event-stream state, for a flow whose response is `text/event-stream`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse: Option<SseStreamState>,
 }
 
 /// Editable HTTP request held by one resend context or revision.
@@ -1356,6 +1394,7 @@ impl TrafficStore {
                 )
             })?;
         create_ws_tables(&connection, &database)?;
+        create_sse_tables(&connection, &database)?;
         ensure_columns(&connection, &database)?;
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -1614,6 +1653,208 @@ impl TrafficStore {
         })
     }
 
+    /// Records that a flow's response is an event stream, opened at `opened_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the write fails.
+    pub fn open_sse_stream(
+        &self,
+        flow_id: u64,
+        opened_at: DateTime<Utc>,
+    ) -> Result<(), Diagnostic> {
+        let db = self.lock_connection()?;
+        db.execute(
+            "INSERT OR IGNORE INTO sse_streams (flow_id,opened_at,closed_at,event_count) VALUES (?1,?2,NULL,0)",
+            params![
+                i64::try_from(flow_id).unwrap_or(i64::MAX),
+                opened_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )
+        .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "write", &self.root, &e.to_string()))?;
+        Ok(())
+    }
+
+    /// Scrubs registered secrets from an event's data and id through the same
+    /// choke-point as flow bodies: the event travels as a carrier flow whose
+    /// bodies are its id and data.
+    fn redact_sse(&self, record: &mut SseEventRecord) {
+        let Some(redactor) = self.redactor.read().ok().and_then(|guard| guard.clone()) else {
+            return;
+        };
+        let mut carrier = FlowCapture {
+            id: record.flow_id,
+            captured_at: record.observed_at,
+            protocol: "sse".to_owned(),
+            method: None,
+            host: None,
+            url: None,
+            path: None,
+            status: None,
+            duration_ms: None,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            request_body: record.id.take().map(String::into_bytes),
+            response_body: Some(std::mem::take(&mut record.data).into_bytes()),
+            scope: ScopeDisposition::Undetermined,
+            provenance: String::new(),
+            origin: FlowOrigin::Capture,
+        };
+        redactor.redact(&mut carrier);
+        record.id = carrier
+            .request_body
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        record.data =
+            String::from_utf8_lossy(&carrier.response_body.unwrap_or_default()).into_owned();
+    }
+
+    /// Appends one event to a flow's stream (redacted), returning the event as
+    /// persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the write fails.
+    pub fn append_sse_event(&self, event: &SseEventRecord) -> Result<SseEventRecord, Diagnostic> {
+        let mut record = event.clone();
+        self.redact_sse(&mut record);
+        let db = self.lock_connection()?;
+        let flow_id = i64::try_from(record.flow_id).unwrap_or(i64::MAX);
+        db.execute(
+            "INSERT OR REPLACE INTO sse_events (flow_id,sequence,event,data,data_bytes,event_id,retry_ms,observed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                flow_id,
+                i64::try_from(record.sequence).unwrap_or(i64::MAX),
+                record.event,
+                record.data,
+                i64::try_from(record.data_bytes).unwrap_or(i64::MAX),
+                record.id,
+                record.retry_ms.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                record.observed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )
+        .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "write", &self.root, &e.to_string()))?;
+        db.execute(
+            "UPDATE sse_streams SET event_count=(SELECT COUNT(*) FROM sse_events WHERE flow_id=?1) WHERE flow_id=?1",
+            params![flow_id],
+        )
+        .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "write", &self.root, &e.to_string()))?;
+        Ok(record)
+    }
+
+    /// Records that a flow's event stream ended at `closed_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the write fails.
+    pub fn close_sse_stream(
+        &self,
+        flow_id: u64,
+        closed_at: DateTime<Utc>,
+    ) -> Result<(), Diagnostic> {
+        let db = self.lock_connection()?;
+        db.execute(
+            "UPDATE sse_streams SET closed_at=?2 WHERE flow_id=?1 AND closed_at IS NULL",
+            params![
+                i64::try_from(flow_id).unwrap_or(i64::MAX),
+                closed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )
+        .map_err(|e| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                "write",
+                &self.root,
+                &e.to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// The event-stream state of a flow, when its response is an event stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the query fails.
+    pub fn sse_state(&self, flow_id: u64) -> Result<Option<SseStreamState>, Diagnostic> {
+        let db = self.lock_connection()?;
+        db.query_row(
+            "SELECT event_count, closed_at IS NOT NULL FROM sse_streams WHERE flow_id=?1",
+            params![i64::try_from(flow_id).unwrap_or(i64::MAX)],
+            |row| {
+                Ok(SseStreamState {
+                    event_count: u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                    closed: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                "query",
+                &self.root,
+                &e.to_string(),
+            )
+        })
+    }
+
+    /// A page of a flow's events: up to `limit`, with sequence after `after`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the query or stored fields are invalid.
+    pub fn sse_events(
+        &self,
+        flow_id: u64,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SseEventRecord>, Diagnostic> {
+        let db = self.lock_connection()?;
+        let mut statement = db
+            .prepare("SELECT sequence,event,data,data_bytes,event_id,retry_ms,observed_at FROM sse_events WHERE flow_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3")
+            .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "query", &self.root, &e.to_string()))?;
+        let rows = statement
+            .query_map(
+                params![
+                    i64::try_from(flow_id).unwrap_or(i64::MAX),
+                    i64::try_from(after.unwrap_or(0)).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    let observed: String = row.get(6)?;
+                    Ok(SseEventRecord {
+                        flow_id,
+                        sequence: u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                        event: row.get(1)?,
+                        data: row.get(2)?,
+                        data_bytes: u64::try_from(row.get::<_, i64>(3)?).unwrap_or_default(),
+                        id: row.get(4)?,
+                        retry_ms: row
+                            .get::<_, Option<i64>>(5)?
+                            .and_then(|value| u64::try_from(value).ok()),
+                        observed_at: parse_time(&observed),
+                    })
+                },
+            )
+            .map_err(|e| {
+                storage_diag(
+                    catalogue::PROXY_STORE_CORRUPT,
+                    "query",
+                    &self.root,
+                    &e.to_string(),
+                )
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                "row",
+                &self.root,
+                &e.to_string(),
+            )
+        })
+    }
+
     /// Every WebSocket connection in this session, oldest first.
     ///
     /// # Errors
@@ -1860,7 +2101,7 @@ impl TrafficStore {
                 "database mutex poisoned",
             )
         })?;
-        let mut statement = connection.prepare("SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_body_hash,response_body_hash,response_headers,scope,provenance,url,origin FROM flows ORDER BY captured_at,id")
+        let mut statement = connection.prepare("SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_body_hash,response_body_hash,response_headers,scope,provenance,url,origin,sse_streams.event_count,sse_streams.closed_at IS NOT NULL FROM flows LEFT JOIN sse_streams ON sse_streams.flow_id = flows.id ORDER BY captured_at,id")
             .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "query", &self.root, &e.to_string()))?;
         let rows = statement
             .query_map([], |row| {
@@ -1897,6 +2138,13 @@ impl TrafficStore {
                     provenance: row.get(12)?,
                     url: row.get(13)?,
                     origin: FlowOrigin::from_db_str(&row.get::<_, String>(14)?),
+                    sse: match row.get::<_, Option<i64>>(15)? {
+                        Some(count) => Some(SseStreamState {
+                            event_count: u64::try_from(count).unwrap_or_default(),
+                            closed: row.get::<_, bool>(16)?,
+                        }),
+                        None => None,
+                    },
                 })
             })
             .map_err(|e| {
@@ -2959,6 +3207,45 @@ fn create_ws_tables(connection: &Connection, database: &Path) -> Result<(), Diag
         })
 }
 
+fn create_sse_tables(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS sse_streams (
+               flow_id INTEGER PRIMARY KEY,
+               opened_at TEXT NOT NULL,
+               closed_at TEXT,
+               event_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS sse_events (
+               flow_id INTEGER NOT NULL,
+               sequence INTEGER NOT NULL,
+               event TEXT,
+               data TEXT NOT NULL,
+               data_bytes INTEGER NOT NULL,
+               event_id TEXT,
+               retry_ms INTEGER,
+               observed_at TEXT NOT NULL,
+               PRIMARY KEY (flow_id, sequence)
+             );
+             -- A stream lives only as long as the proxy forwarding it: one still
+             -- open when its store is reopened ended no later than its last event.
+             UPDATE sse_streams
+                SET closed_at = COALESCE(
+                  (SELECT MAX(observed_at) FROM sse_events
+                    WHERE flow_id = sse_streams.flow_id),
+                  opened_at)
+              WHERE closed_at IS NULL;",
+        )
+        .map_err(|e| {
+            storage_diag(
+                catalogue::PROXY_STORE_OPEN_FAILED,
+                "schema",
+                database,
+                &e.to_string(),
+            )
+        })
+}
+
 fn seed_next_id(connection: &Connection, database: &Path, table: &str) -> Result<u64, Diagnostic> {
     let max_id: i64 = connection
         .query_row(
@@ -3413,12 +3700,36 @@ fn decode_har_body(content: &HarContent) -> Result<Option<Vec<u8>>, Diagnostic> 
 fn split_url(url: &str) -> (Option<String>, Option<String>) {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let (authority, path) = rest.split_once('/').unwrap_or((rest, "/"));
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, v)| v)
-        .split_once(':')
-        .map_or(authority, |(_, v)| v);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, v)| v);
+    // The host is what precedes the port; a bracketed IPv6 literal keeps its
+    // own colons.
+    let host = match authority.strip_prefix('[') {
+        Some(literal) => literal.split_once(']').map_or(literal, |(host, _)| host),
+        None => authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
     (Some(host.to_owned()), Some(format!("/{path}")))
+}
+
+/// The request hosts of a HAR document, with how many entries each carries.
+///
+/// # Errors
+///
+/// Returns a diagnostic when the bytes are not a HAR document.
+pub fn har_hosts(bytes: &[u8]) -> Result<std::collections::BTreeMap<String, usize>, Diagnostic> {
+    let document: HarDocument =
+        serde_json::from_slice(bytes).map_err(|e| interchange_diag("import", &e.to_string()))?;
+    let mut hosts = std::collections::BTreeMap::new();
+    for entry in document.log.entries {
+        if let (Some(host), _) = split_url(&entry.request.url) {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            if !host.is_empty() {
+                *hosts.entry(host).or_default() += 1;
+            }
+        }
+    }
+    Ok(hosts)
 }
 
 fn parse_time(value: &str) -> DateTime<Utc> {
@@ -3640,7 +3951,153 @@ mod tests {
             if let Some(body) = &mut flow.request_body {
                 scrub(body);
             }
+            if let Some(body) = &mut flow.response_body {
+                scrub(body);
+            }
         }
+    }
+
+    /// Panics if the secret appears in any byte the store wrote (database and
+    /// WAL included).
+    fn assert_secret_absent_on_disk(root: PathBuf) {
+        let mut pending = vec![root];
+        let mut scanned = 0;
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .expect("read dir")
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path()),
+                );
+            } else {
+                let bytes = std::fs::read(&path).expect("read file");
+                scanned += 1;
+                assert!(
+                    !bytes.windows(14).any(|window| window == b"hunter2-SECRET"),
+                    "secret found on disk in {}",
+                    path.display()
+                );
+            }
+        }
+        assert!(scanned > 0);
+    }
+
+    fn sse_event(flow_id: u64, sequence: u64, data: &str) -> SseEventRecord {
+        SseEventRecord {
+            flow_id,
+            sequence,
+            event: (sequence % 2 == 0).then(|| "update".to_owned()),
+            data: data.to_owned(),
+            data_bytes: data.len() as u64,
+            id: Some(format!("e{sequence}")),
+            retry_ms: None,
+            observed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn sse_events_page_in_order_and_mark_the_flow_as_a_stream() {
+        let store = store();
+        let mut stream = flow(store.allocate_flow_id());
+        stream.method = Some("GET".to_owned());
+        stream.response_body = None;
+        store.upsert(&stream).expect("flow");
+        let plain = flow(store.allocate_flow_id());
+        store.upsert(&plain).expect("flow");
+        store.open_sse_stream(stream.id, Utc::now()).expect("open");
+        for sequence in 1..=5 {
+            store
+                .append_sse_event(&sse_event(stream.id, sequence, &format!("tick {sequence}")))
+                .expect("event");
+        }
+        let summaries = store.summaries().expect("summaries");
+        let state = |id| {
+            summaries
+                .iter()
+                .find(|flow| flow.id == id)
+                .expect("flow")
+                .sse
+        };
+        assert_eq!(
+            state(stream.id),
+            Some(SseStreamState {
+                event_count: 5,
+                closed: false
+            })
+        );
+        assert_eq!(state(plain.id), None, "an ordinary flow is not a stream");
+        let first = store.sse_events(stream.id, None, 2).expect("page");
+        assert_eq!(
+            first.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(first[1].event.as_deref(), Some("update"));
+        assert_eq!(first[0].id.as_deref(), Some("e1"));
+        let rest = store.sse_events(stream.id, Some(2), 10).expect("page");
+        assert_eq!(
+            rest.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(rest[2].data, "tick 5");
+        store
+            .close_sse_stream(stream.id, Utc::now())
+            .expect("close");
+        let closed = store.summaries().expect("summaries");
+        assert_eq!(
+            closed
+                .iter()
+                .find(|flow| flow.id == stream.id)
+                .and_then(|flow| flow.sse),
+            Some(SseStreamState {
+                event_count: 5,
+                closed: true
+            })
+        );
+    }
+
+    #[test]
+    fn an_sse_stream_left_open_by_an_engine_stop_reloads_as_ended() {
+        let store = store();
+        let stream = flow(store.allocate_flow_id());
+        store.upsert(&stream).expect("flow");
+        store.open_sse_stream(stream.id, Utc::now()).expect("open");
+        store
+            .append_sse_event(&sse_event(stream.id, 1, "only"))
+            .expect("event");
+        let parent = store.root.parent().expect("parent").to_path_buf();
+        drop(store);
+        let reopened = TrafficStore::open(&parent, "session:test").expect("reopen");
+        let summary = reopened
+            .summaries()
+            .expect("summaries")
+            .into_iter()
+            .find(|flow| flow.id == stream.id)
+            .expect("flow");
+        assert_eq!(
+            summary.sse,
+            Some(SseStreamState {
+                event_count: 1,
+                closed: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_secret_in_an_sse_event_never_reaches_disk() {
+        let store = store();
+        store.set_redactor(Arc::new(SecretRedactor));
+        let stream = flow(store.allocate_flow_id());
+        store.upsert(&stream).expect("flow");
+        store.open_sse_stream(stream.id, Utc::now()).expect("open");
+        let mut event = sse_event(stream.id, 1, r#"{"session":"hunter2-SECRET"}"#);
+        event.id = Some("hunter2-SECRET".to_owned());
+        let persisted = store.append_sse_event(&event).expect("event");
+        assert!(!persisted.data.contains("hunter2-SECRET"));
+        assert_eq!(persisted.id.as_deref(), Some("[REDACTED]"));
+        let root = store.root().to_path_buf();
+        drop(store);
+        assert_secret_absent_on_disk(root);
     }
 
     fn ws_connection(store: &TrafficStore, url: &str) -> WsConnectionRecord {
@@ -3915,6 +4372,38 @@ mod tests {
             .query_row("SELECT origin FROM flows WHERE id=1", [], |row| row.get(0))
             .expect("origin column present");
         assert_eq!(FlowOrigin::from_db_str(&origin), FlowOrigin::Capture);
+    }
+
+    #[test]
+    fn a_har_url_host_is_the_host_not_its_port() {
+        assert_eq!(
+            split_url("http://127.0.0.1:9120/ws?room=a"),
+            (Some("127.0.0.1".to_owned()), Some("/ws?room=a".to_owned()))
+        );
+        assert_eq!(
+            split_url("https://user:pw@api.example.test:8443/x")
+                .0
+                .as_deref(),
+            Some("api.example.test")
+        );
+        assert_eq!(split_url("http://[::1]:8080/").0.as_deref(), Some("::1"));
+        assert_eq!(
+            split_url("https://api.example.test/x").0.as_deref(),
+            Some("api.example.test")
+        );
+        let har = br#"{"log":{"entries":[
+            {"request":{"method":"GET","url":"https://App.Example.test:8443/a","headers":[]},"response":{"status":200,"headers":[]}},
+            {"request":{"method":"GET","url":"https://app.example.test/b","headers":[]},"response":{"status":200,"headers":[]}},
+            {"request":{"method":"GET","url":"https://cdn.other.test/c.js","headers":[]},"response":{"status":200,"headers":[]}}
+        ]}}"#;
+        let hosts = har_hosts(har).expect("hosts");
+        assert_eq!(
+            hosts.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("app.example.test".to_owned(), 2),
+                ("cdn.other.test".to_owned(), 1)
+            ]
+        );
     }
 
     #[test]

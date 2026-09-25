@@ -33,6 +33,8 @@ import {
 import { parseRawRequest, rawRequestText, splitRawRequest as splitRawRequestParts, splitUrl, syncContentLength, urlOrigin } from "./http/request-editor";
 import { prettyBody } from "./http/body-view";
 import { isConfirmed, tallySurface } from "./surface/tally";
+import { graphqlOperationsOn, readProtocolOperations, type SurfaceOperation } from "./surface/operations";
+import { appendLiveEvents, grpcMethodOf, isEventTruncated, renderEventData, type SseEvent, type SseState, sseLabel } from "./http/flow-kind";
 import { ingestWsEvents, initWsTab, type LiveWsEvent, loadWsConnections } from "./ws/ws-tab";
 import { curlCommand, findAll, hexDump, inspectRequest, type InspectorItem, isBinaryBody, requestMethod, setRequestMethod, showNonPrintables, urlEncode } from "./http/message-tools";
 
@@ -44,7 +46,7 @@ import { curlCommand, findAll, hexDump, inspectRequest, type InspectorItem, isBi
 interface SystemStatus { readonly apiVersion: string; readonly service: string; readonly state: "ready"; }
 interface WorkbenchSession { readonly authToken: string; readonly interceptEnabled: boolean; }
 interface WorkbenchHealth { readonly proxyRunning: boolean; readonly backend?: { readonly hudsuckerAvailable: boolean }; }
-interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; readonly origin?: string | null; }
+interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; readonly origin?: string | null; readonly sse?: SseState | null; }
 interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; }
 export interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
 interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; httpVersion?: string | null; reason?: string | null; }
@@ -106,7 +108,7 @@ interface RedirectHop { status: number; location: string; }
 interface FuzzerConfig { baseRequest: ResendRequest; positions: FuzzerPosition[]; payloadSets: FuzzerPayloadSet[]; attackType: string; matchFilter: FuzzerMatchFilter; grep: GrepConfig; concurrency: number; delay: DelayPolicy; retry: RetryPolicy; redirect: RedirectPolicy; connectionClose: boolean; updateContentLength: boolean; maxResults: number; authPreflight?: ResendRequest | null; sequence?: unknown[]; }
 interface FuzzerJob { id: string; tier: "ffuf" | "native"; state: string; config: FuzzerConfig; results: FuzzerResult[]; diagnostics: (Diagnostic | null)[]; progress?: { sent: number; total: number } | null; }
 interface CredentialPromptMsg { readonly id: number; readonly package: string; readonly screenSummary: string; readonly reason: string; readonly fields: readonly CredentialDialogField[]; }
-interface LiveUpdate { readonly flows: readonly FlowSummary[]; readonly diagnostics: readonly Diagnostic[]; readonly prompts?: readonly CredentialPromptMsg[]; readonly websocket?: readonly LiveWsEvent[]; }
+interface LiveUpdate { readonly flows: readonly FlowSummary[]; readonly diagnostics: readonly Diagnostic[]; readonly prompts?: readonly CredentialPromptMsg[]; readonly websocket?: readonly LiveWsEvent[]; readonly sse?: readonly SseEvent[]; }
 interface PipelineRun { readonly runId: string; readonly artifactPath: string; readonly stage: string; readonly status: "running" | "completed" | "failed"; readonly progressBasisPoints: number; readonly message: string; readonly diagnostics: (Diagnostic | null)[]; readonly dynamicRan: boolean; readonly updatedAt: string; readonly surfaceAvailable: boolean; }
 /** Request/response essentials extracted from a fused endpoint for the expandable
  * detail and the send-to-resend/fuzzer actions. The surface is a normalized
@@ -121,7 +123,7 @@ interface EndpointDetail {
 }
 type HostParty = "first_party" | "third_party";
 interface SurfaceEndpoint { readonly method: string; readonly pathTemplate: string; readonly baseUrl?: string | null; readonly host?: string | null; readonly party?: HostParty | null; readonly evidenceSource?: string | null; readonly staticEvidence?: boolean | null; readonly minimumFactConfidence?: number | null; readonly signerCount: number; readonly detail?: EndpointDetail }
-interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunId: string; readonly endpoints: readonly SurfaceEndpoint[]; readonly coverage: { readonly endpointCount: number; readonly confirmedEndpointCount: number; readonly inferredEndpointCount: number; readonly staticOnlyEndpointCount: number; readonly openHandoffCount: number; readonly resolvedHandoffCount: number }; readonly signerCount: number; readonly diagnostics: (Diagnostic | null)[]; }
+interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunId: string; readonly endpoints: readonly SurfaceEndpoint[]; readonly coverage: { readonly endpointCount: number; readonly confirmedEndpointCount: number; readonly inferredEndpointCount: number; readonly staticOnlyEndpointCount: number; readonly openHandoffCount: number; readonly resolvedHandoffCount: number }; readonly signerCount: number; readonly diagnostics: (Diagnostic | null)[]; readonly protocolOperations?: readonly SurfaceOperation[]; }
 interface DiscoveryEstimate { target: string; requestCount: number; ratePerSecond: number; estimatedLabel: string; }
 interface BrowserLaunchStatus { running: boolean; browser?: string | null; target?: string | null; pid?: number | null; cdpConnected?: boolean; debugPort?: number | null; }
 interface TargetIdentifier { readonly kind: string; readonly value: string; }
@@ -501,7 +503,7 @@ function renderFlows(): void {
     const method = (flow.method ?? "").toUpperCase();
     item.dataset.method = method;
     item.dataset.statusClass = statusClass(flow.status);
-    item.innerHTML = `<span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method === "" ? "—" : method)}</span><span class="list-row__target"><b>${escapeHtml(flow.host ?? "unknown")}</b>${escapeHtml(decodeForDisplay(flow.path ?? ""))}</span><span class="list-row__status" data-class="${statusClass(flow.status)}">${flow.status ?? "…"}</span>`;
+    item.innerHTML = `<span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method === "" ? "—" : method)}</span><span class="list-row__target"><b>${escapeHtml(flow.host ?? "unknown")}</b>${escapeHtml(decodeForDisplay(flow.path ?? ""))}${flowKindChipHtml(flow)}</span><span class="list-row__status" data-class="${statusClass(flow.status)}">${flow.status ?? "…"}</span>`;
     item.addEventListener("click", () => void selectFlow(flow.id));
     item.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -511,6 +513,17 @@ function renderFlows(): void {
   });
   applyFlowSearch();
   updateWorkbenchCounts();
+}
+
+/** A chip naming what a flow is beyond request/response: an event stream
+ *  (with its live event count, so it never reads as hung) or a gRPC call. */
+function flowKindChipHtml(flow: FlowSummary): string {
+  if (flow.sse !== null && flow.sse !== undefined) {
+    return ` <span class="flow-kind${flow.sse.closed ? "" : " flow-kind--live"}" title="Server-Sent Events: a long-lived response, captured as a list of events">${escapeHtml(sseLabel(flow.sse))}</span>`;
+  }
+  const grpc = grpcMethodOf([flow.contentType], flow.path);
+  if (grpc !== null) return ` <span class="flow-kind" title="gRPC call: ${escapeHtml(`${grpc.service} / ${grpc.method}`)}">gRPC</span>`;
+  return "";
 }
 
 function updateWorkbenchCounts(): void {
@@ -606,6 +619,8 @@ async function selectFlow(flowId: number): Promise<void> {
     if (selectedLabel !== null) selectedLabel.textContent = `Flow #${flowId} · ${selectedFlow.summary.host ?? "unknown"}${selectedFlow.summary.path ?? ""}`;
     if (editor !== null) editor.hidden = false;
     if (detail !== null) detail.innerHTML = renderDetail(selectedFlow);
+    sseView = null;
+    if (selectedFlow.summary.sse !== null && selectedFlow.summary.sse !== undefined) void loadSseEvents(flowId);
     renderDetailActions(flowId);
     updateDecisionControls();
     renderFlows();
@@ -659,28 +674,98 @@ function renderFlowBody(headers: readonly [string, string][], bytes: number[] | 
 
 function renderDetail(flow: FlowDetail): string {
   const summary = flow.summary;
+  const header = (headers: readonly [string, string][], name: string): string | null => headers.find(([key]) => key.toLowerCase() === name)?.[1] ?? null;
+  const grpc = grpcMethodOf([header(flow.requestHeaders, "content-type"), header(flow.responseHeaders, "content-type")], summary.path);
+  const sse = summary.sse ?? null;
+  const grpcNote = grpc === null ? "" : `<p class="t-small t-subtle">Protobuf body not decoded: without the service's .proto schema, a length-prefixed protobuf message yields only field numbers and wire types, so it is shown as bytes rather than with guessed field names.</p>`;
+  const responseBody = sse === null
+    ? renderFlowBody(flow.responseHeaders, flow.responseBody)
+    : `<div class="sse-events" id="flow-sse-events" aria-live="polite"><p class="t-small t-subtle">Loading events…</p></div>`;
   return `<div class="stack">
 <dl class="kv">
   <dt>Method</dt><dd class="t-mono">${escapeHtml(summary.method ?? "—")}</dd>
   <dt>URL</dt><dd class="t-mono">${escapeHtml(summary.url ?? `${summary.host ?? ""}${summary.path ?? ""}`)}</dd>
   <dt>Status</dt><dd class="t-mono">${summary.status ?? "pending"}</dd>
-  <dt>Duration</dt><dd class="t-mono">${summary.durationMs === null || summary.durationMs === undefined ? "—" : `${summary.durationMs} ms`}</dd>
-  <dt>Type</dt><dd class="t-mono">${escapeHtml(summary.contentType ?? "—")}</dd>
+  <dt>Duration</dt><dd class="t-mono">${summary.durationMs === null || summary.durationMs === undefined ? "—" : `${summary.durationMs} ms`}${sse === null ? "" : " to headers"}</dd>
+  <dt>Type</dt><dd class="t-mono">${escapeHtml(summary.contentType ?? "—")}</dd>${sse === null ? "" : `
+  <dt>Stream</dt><dd class="t-mono" id="flow-sse-state">${escapeHtml(sseLabel(sse))}</dd>`}${grpc === null ? "" : `
+  <dt>Protocol</dt><dd class="t-mono">gRPC · ${escapeHtml(`${grpc.service} / ${grpc.method}`)}</dd>`}
 </dl>
 <hr class="rule" />
 <div class="reqres">
   <section class="reqres__col stack stack--tight">
     <p class="section-label">Request</p>
     <pre class="code">${escapeHtml(formatHeaders(flow.requestHeaders))}</pre>
-    ${renderFlowBody(flow.requestHeaders, flow.requestBody)}
+    ${renderFlowBody(flow.requestHeaders, flow.requestBody)}${grpcNote}
   </section>
   <section class="reqres__col stack stack--tight">
-    <p class="section-label">Response</p>
+    <p class="section-label">${sse === null ? "Response" : "Response · events"}</p>
     <pre class="code">${escapeHtml(formatHeaders(flow.responseHeaders))}</pre>
-    ${renderFlowBody(flow.responseHeaders, flow.responseBody)}
+    ${responseBody}${sse === null ? grpcNote : ""}
   </section>
 </div>
 </div>`;
+}
+
+/* ---- Server-Sent Events on the selected flow ---- */
+
+/** Events per page read from the engine. */
+const SSE_PAGE_SIZE = 500;
+
+/** The selected flow's loaded events; `complete` when every event up to the
+ *  stream's count is loaded, so live events append without a gap. */
+let sseView: { flowId: number; items: SseEvent[]; complete: boolean } | null = null;
+
+function sseEventHtml(event: SseEvent): string {
+  const meta = [`#${event.sequence}`, event.event ?? "message", event.id === null || event.id === undefined ? "" : `id ${event.id}`, event.retryMs === null || event.retryMs === undefined ? "" : `retry ${event.retryMs} ms`, formatTime(event.observedAt)].filter((part) => part !== "").join(" · ");
+  const truncated = isEventTruncated(event) ? `<p class="t-small t-subtle">Truncated: ${formatBytes(event.dataBytes)} on the wire.</p>` : "";
+  return `<div class="sse-event"><p class="t-small t-subtle t-mono sse-event__meta">${escapeHtml(meta)}</p><pre class="code sse-event__data">${escapeHtml(renderEventData(event.data))}</pre>${truncated}</div>`;
+}
+
+function renderSseEvents(): void {
+  const region = document.querySelector<HTMLElement>("#flow-sse-events");
+  if (region === null || sseView === null) return;
+  if (sseView.items.length === 0) {
+    region.innerHTML = `<p class="t-small t-subtle">${sseView.complete ? "No events yet: they appear here as the server sends them." : "Loading events…"}</p>`;
+    return;
+  }
+  const more = sseView.complete ? "" : `<button class="btn btn--sm btn--quiet" type="button" data-sse-more>Load more events</button>`;
+  region.innerHTML = `<div class="sse-events__list">${sseView.items.map(sseEventHtml).join("")}</div>${more}`;
+  region.querySelector<HTMLButtonElement>("[data-sse-more]")?.addEventListener("click", () => void loadSseEvents(sseView?.flowId ?? -1, true));
+}
+
+/** Reads the selected flow's events, first page or the next one. */
+async function loadSseEvents(flowId: number, more = false): Promise<void> {
+  const loaded = more && sseView?.flowId === flowId ? sseView.items : [];
+  const after = loaded.at(-1)?.sequence ?? 0;
+  try {
+    const response = await fetch(`/api/v1/workbench/flows/${flowId}/sse-events?after=${after}&limit=${SSE_PAGE_SIZE}`);
+    await requireOk(response, "event stream unavailable");
+    const page = (await response.json()) as SseEvent[];
+    if (selectedFlow?.summary.id !== flowId) return;
+    sseView = { flowId, items: [...loaded, ...page], complete: page.length < SSE_PAGE_SIZE };
+    renderSseEvents();
+  } catch (error) {
+    reportUnexpected(error, { id: "proxy.sse-events-unavailable", what: "The captured events could not be loaded.", why: "", fix: "Reconnect the active session, then select the flow again." });
+  }
+}
+
+/** Routes live events to the selected flow's event list, appending in place. */
+function ingestSseEvents(events: readonly SseEvent[]): void {
+  // No early return on an empty batch: the stream's close arrives as a
+  // summary update carrying no events, and the label must still follow it.
+  if (sseView === null) return;
+  const mine = events.filter((event) => event.flowId === sseView?.flowId);
+  if (mine.length > 0 && sseView.complete) {
+    const before = sseView.items.length;
+    if (!appendLiveEvents(sseView.items, mine)) sseView.complete = false;
+    const list = document.querySelector<HTMLElement>("#flow-sse-events .sse-events__list");
+    if (list !== null && before > 0 && sseView.complete) list.insertAdjacentHTML("beforeend", sseView.items.slice(before).map(sseEventHtml).join(""));
+    else renderSseEvents();
+  }
+  const state = flows.get(sseView.flowId)?.sse;
+  const label = document.querySelector<HTMLElement>("#flow-sse-state");
+  if (label !== null && state !== null && state !== undefined) label.textContent = sseLabel(state);
 }
 
 async function refreshPending(): Promise<void> {
@@ -3480,7 +3565,7 @@ function renderSurface(surface: SurfaceSummary): void {
 <span class="endpoint-row__caret" data-icon="chevronRight" aria-hidden="true"></span>
 <span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method)}</span>
 <span class="endpoint-row__path" title="${escapeHtml(entry.pathTemplate)}">${escapeHtml(entry.pathTemplate)}</span>
-<span class="endpoint-row__meta">${evidenceChipHtml(entry)}${partyChipHtml(entry)}${confidenceHtml}<span class="badge">${entry.signerCount} signer${entry.signerCount === 1 ? "" : "s"}</span></span>
+<span class="endpoint-row__meta">${graphqlChipHtml(entry, surface.protocolOperations ?? [])}${evidenceChipHtml(entry)}${partyChipHtml(entry)}${confidenceHtml}<span class="badge">${entry.signerCount} signer${entry.signerCount === 1 ? "" : "s"}</span></span>
 </button>
 <div class="endpoint-detail" data-ep-detail="${index}" hidden></div>
 </div>`;
@@ -3514,6 +3599,7 @@ function renderSurface(surface: SurfaceSummary): void {
   <div class="panel__body panel__body--flush surface-endpoints">${endpointRows === "" ? stateBlock({ icon: "surface", title: "No endpoints were produced", body: "Run the APK pipeline or fuse captured web traffic to assemble a surface.", compact: true }) : endpointRows}</div>
 </article>
 
+${protocolOperationsPanelHtml(surface.protocolOperations ?? [])}
 <article class="panel">
   <div class="panel__header">
     <div class="panel__heading">${icon("info", { size: 16 })}<h2>Provenance</h2></div>
@@ -4260,8 +4346,9 @@ async function addAndroidScopeHost(): Promise<void> {
 /** Adds a domain (and its subdomains) to the active session scope as a
  *  DomainSuffix allow rule, so its traffic is treated as in-scope. Adds the
  *  registrable domain, never the specific endpoint. */
-async function addHostToScope(host: string): Promise<void> {
-  const target = scopeTargetForHost(host);
+async function addHostToScope(host: string, exact = false): Promise<void> {
+  const normalized = host.trim().toLowerCase().replace(/\.$/, "");
+  const target: ScopeTarget | null = exact ? (normalized === "" ? null : { label: normalized, kind: "exact", value: normalized }) : scopeTargetForHost(host);
   if (target === null) return;
   try {
     const current = await fetch("/api/v1/session/scope");
@@ -4519,6 +4606,37 @@ function evidenceChipHtml(endpoint: SurfaceEndpoint): string {
   return `<span class="party-chip party-chip--inferred" title="Static-inferred candidate — recovered from the app's code but not observed being hit. Treat as a lead, not a confirmed endpoint.">inferred</span>`;
 }
 
+/** Names the GraphQL operations an endpoint carries, so a POST /graphql row
+ *  reads as the operations it runs rather than an opaque POST. */
+function graphqlChipHtml(endpoint: SurfaceEndpoint, operations: readonly SurfaceOperation[]): string {
+  const carried = graphqlOperationsOn(operations, endpoint.host, endpoint.pathTemplate);
+  if (carried.length === 0) return "";
+  return `<span class="party-chip party-chip--confirmed" title="${escapeHtml(carried.map((operation) => operation.label).join(", "))}">GraphQL · ${carried.length} operation${carried.length === 1 ? "" : "s"}</span>`;
+}
+
+/** Lists GraphQL operations and gRPC methods: operations in their native
+ *  protocol shape, not flattened into REST endpoints. */
+function protocolOperationsPanelHtml(operations: readonly SurfaceOperation[]): string {
+  if (operations.length === 0) return "";
+  const rows = operations.map((operation) => {
+    const tag = operation.kind === "grpc" ? "gRPC" : "GQL";
+    const source = operation.observed
+      ? `<span class="party-chip party-chip--confirmed" title="${operation.inCode ? "Observed in captured traffic, and also found in the app's code" : "Observed in captured traffic"}">confirmed</span>`
+      : `<span class="party-chip party-chip--inferred" title="Found in the app's code, not observed being called">inferred</span>`;
+    const where = operation.kind === "graphql" && operation.endpointUrl !== null ? `<span class="t-small t-subtle t-mono">${escapeHtml(operation.endpointUrl)}</span>` : "";
+    const note = operation.kind === "grpc" ? `<span class="t-small t-subtle" title="Without the service's .proto schema a protobuf body yields only field numbers and wire types">protobuf body not decoded without schema</span>` : "";
+    return `<div class="list-row protocol-op"><span class="list-row__method" data-method="${tag}">${tag}</span><span class="list-row__target t-mono">${escapeHtml(operation.label)} ${where}</span><span class="endpoint-row__meta">${note}${source}</span></div>`;
+  }).join("");
+  return `<article class="panel">
+  <div class="panel__header">
+    <div class="panel__heading">${icon("surface", { size: 16 })}<h2>Protocol operations</h2></div>
+    <span class="panel__hint">${operations.length} GraphQL / gRPC</span>
+  </div>
+  <div class="panel__body panel__body--flush">${rows}</div>
+</article>
+`;
+}
+
 /** Renders the first/third-party chip for an endpoint row, or "" when unknown. */
 function partyChipHtml(endpoint: SurfaceEndpoint): string {
   const party = endpointParty(endpoint);
@@ -4577,6 +4695,7 @@ function normalizeFusedSurface(raw: unknown): SurfaceSummary {
     },
     signerCount: Array.isArray((value.surface as Record<string, unknown> | undefined)?.signers) ? ((value.surface as Record<string, unknown>).signers as unknown[]).length : 0,
     diagnostics: Array.isArray(value.diagnostics) ? value.diagnostics as Diagnostic[] : [],
+    protocolOperations: readProtocolOperations(value),
   };
 }
 
@@ -4702,6 +4821,8 @@ function connect(session: WorkbenchSession): void {
     update.flows.forEach((flow) => ingestFlow(flow));
     // WebSocket events route to the WebSocket tab only, never the HTTP grid.
     ingestWsEvents(update.websocket ?? []);
+    // Event-stream events belong to their HTTP flow's detail.
+    ingestSseEvents(update.sse ?? []);
     update.diagnostics.forEach(showDiagnostic);
     (update.prompts ?? []).forEach((prompt) => void handleCredentialPrompt(prompt));
     renderFlows();
@@ -4942,8 +5063,12 @@ async function importHar(file: File): Promise<void> {
     const text = await file.text();
     const response = await fetch("/api/v1/workbench/har", { method: "POST", headers: { "content-type": "application/json" }, body: text });
     await requireOk(response, "HAR import failed");
-    const imported = (await response.json()) as number;
+    const report = (await response.json()) as HarImportReport;
+    const imported = report.imported;
     toast(`Imported ${imported} flow${imported === 1 ? "" : "s"} from ${file.name}`, "success");
+    harScope = report.derivedScope ?? null;
+    renderHarScopeNotice();
+    if (harScope !== null) await refreshSession();
     // Fold the imported flows into the live list immediately.
     try {
       const flowsResponse = await fetch("/api/v1/workbench/flows");
@@ -4952,6 +5077,58 @@ async function importHar(file: File): Promise<void> {
   } catch (error) {
     reportUnexpected(error, { id: "proxy.har-import-failed", what: "The HAR file could not be imported.", why: "", fix: "Confirm the file is a valid HAR export and that a session is active, then retry." });
   }
+}
+
+interface HarDerivedScope { hosts: string[]; excludedHosts: string[]; }
+interface HarImportReport { readonly imported: number; readonly derivedScope?: HarDerivedScope | null; }
+
+/** The scope the last HAR import derived, shown until dismissed. */
+let harScope: HarDerivedScope | null = null;
+
+/** Tells the operator the scope a HAR import set, and lets them narrow it
+ *  (remove a host) or widen it to a host the HAR left out. */
+function renderHarScopeNotice(): void {
+  const notice = document.querySelector<HTMLElement>("#har-scope-notice");
+  if (notice === null) return;
+  if (harScope === null) { notice.hidden = true; notice.replaceChildren(); return; }
+  const scope = harScope;
+  const chip = (host: string, action: "remove" | "add"): string => action === "remove"
+    ? `<span class="scope-list__item">${escapeHtml(host)}<button class="scope-list__remove" type="button" data-har-remove="${escapeHtml(host)}" aria-label="Remove ${escapeHtml(host)} from scope">×</button></span>`
+    : `<button class="btn btn--sm btn--quiet" type="button" data-har-add="${escapeHtml(host)}">Add ${escapeHtml(host)}</button>`;
+  notice.hidden = false;
+  notice.innerHTML = `<div class="notice notice--caution">
+  <span class="notice__icon">${icon("alert", { size: 18 })}</span>
+  <div class="notice__body">
+    <p class="notice__title">No scope was set — scoped to ${scope.hosts.length} host${scope.hosts.length === 1 ? "" : "s"} from the HAR</p>
+    <div class="har-scope__hosts">${scope.hosts.map((host) => chip(host, "remove")).join("")}</div>
+    ${scope.excludedHosts.length === 0 ? "" : `<p class="t-small">Also in the HAR, not in scope: ${scope.excludedHosts.map((host) => chip(host, "add")).join(" ")}</p>`}
+    <p class="t-small t-subtle">Only in-scope traffic fuses into the surface. Remove a host to narrow the scope, or add one the HAR also used.</p>
+  </div>
+  <button class="btn btn--sm btn--quiet" type="button" data-har-dismiss aria-label="Dismiss">Dismiss</button>
+</div>`;
+  notice.querySelectorAll<HTMLButtonElement>("[data-har-remove]").forEach((button) => button.addEventListener("click", () => void removeHarScopeHost(button.dataset.harRemove ?? "")));
+  notice.querySelectorAll<HTMLButtonElement>("[data-har-add]").forEach((button) => button.addEventListener("click", () => void addHarScopeHost(button.dataset.harAdd ?? "")));
+  notice.querySelector<HTMLButtonElement>("[data-har-dismiss]")?.addEventListener("click", () => { harScope = null; renderHarScopeNotice(); });
+}
+
+async function removeHarScopeHost(host: string): Promise<void> {
+  try {
+    const current = await fetch("/api/v1/session/scope");
+    await requireOk(current, "scope read failed");
+    const scope = await current.json() as { allowed_targets?: ScopeRule[] };
+    const rule = (scope.allowed_targets ?? []).find((candidate) => candidate.host.kind === "exact" && candidate.host.host === host);
+    if (rule !== undefined) await removeScopeRule(rule.id, host);
+    if (harScope !== null) harScope = { hosts: harScope.hosts.filter((value) => value !== host), excludedHosts: [...harScope.excludedHosts, host] };
+    renderHarScopeNotice();
+  } catch (error) {
+    reportUnexpected(error, { id: "web.scope-remove-failed", what: "Could not remove the host from scope.", why: "", fix: "Confirm a session is active, then retry." });
+  }
+}
+
+async function addHarScopeHost(host: string): Promise<void> {
+  await addHostToScope(host, true);
+  if (harScope !== null) harScope = { hosts: [...harScope.hosts, host], excludedHosts: harScope.excludedHosts.filter((value) => value !== host) };
+  renderHarScopeNotice();
 }
 
 async function exportHar(): Promise<void> {

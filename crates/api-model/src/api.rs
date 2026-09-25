@@ -239,6 +239,26 @@ pub struct GraphQlOperationHeader {
     pub name: Option<String>,
 }
 
+/// Parses a gRPC method path, `/package.Service/Method` (the HTTP/2 `:path`
+/// of a call and the full method name generated stubs carry), into its
+/// service and method. The service is a dot-separated path of proto
+/// identifiers (a package-less `/Service/Method` also parses) and the method a
+/// bare proto identifier; anything else, including a longer REST-style path,
+/// is not a gRPC method path.
+#[must_use]
+pub fn parse_grpc_method_path(path: &str) -> Option<(String, String)> {
+    fn is_proto_identifier(segment: &str) -> bool {
+        let mut chars = segment.chars();
+        matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    }
+    let (service, method) = path.strip_prefix('/')?.split_once('/')?;
+    let valid = !method.contains('/')
+        && is_proto_identifier(method)
+        && service.split('.').all(is_proto_identifier);
+    valid.then(|| (service.to_owned(), method.to_owned()))
+}
+
 /// Parses the operation definitions of a GraphQL document.
 ///
 /// Reads only operation headers (`query Name($v: T) @dir { …`), skipping

@@ -15,6 +15,7 @@ mod payload_lists;
 mod payloads;
 mod raw_http;
 pub mod resend;
+pub mod sse;
 pub mod transparent;
 pub mod trust;
 
