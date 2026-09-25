@@ -91,6 +91,11 @@ pub struct ProvisionOptions {
     /// Host path to the bundled frida-server binary; required when
     /// `start_frida_server` is set.
     pub frida_server_path: Option<PathBuf>,
+    /// Route the whole device's HTTP(S) traffic through the MITM by setting the
+    /// device-wide proxy to the reverse-tunnelled proxy port. For a device the
+    /// workbench owns (the managed emulator); a user's own paired device keeps
+    /// its settings and captures through the client app instead.
+    pub route_device_proxy: bool,
 }
 
 /// Summary of what provisioning did, retained for the operator surface.
@@ -106,6 +111,11 @@ pub struct DeviceProvisionReport {
     pub reverse_mappings: Vec<PortMapping>,
     /// Whether the optional frida-server is running.
     pub frida_server_started: bool,
+    /// The device-wide proxy capture is routed through (`127.0.0.1:<port>`),
+    /// when `route_device_proxy` was requested and verified.
+    pub device_proxy: Option<String>,
+    /// Why capture routing was requested but is not active.
+    pub capture_issue: Option<String>,
     /// Ordered step diagnostics (info and any non-fatal warnings).
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -116,6 +126,8 @@ pub struct ProvisionedDevice {
     trust: Option<CaTrustReceipt>,
     reverse_mappings: Vec<PortMapping>,
     report: DeviceProvisionReport,
+    /// Whether this provisioning set the device-wide proxy (cleared on teardown).
+    device_proxy_set: bool,
 }
 
 impl std::fmt::Debug for ProvisionedDevice {
@@ -144,6 +156,20 @@ impl ProvisionedDevice {
     /// Returns the trust/tunnel teardown diagnostics that did not verify.
     pub fn teardown(mut self) -> Result<(), Vec<Diagnostic>> {
         let mut diagnostics = Vec::new();
+        // Clear the device-wide proxy first: left set, it would outlive the tunnel
+        // (the owned AVD keeps its settings across boots) and cut the device off
+        // from the network.
+        if self.device_proxy_set {
+            if let Err(detail) = clear_device_proxy(&self.control) {
+                diagnostics.push(
+                    catalogue::DEVICE_CAPTURE_NOT_ROUTED.instantiate(diag_context(
+                        self.control.transport_id(),
+                        "teardown",
+                        detail,
+                    )),
+                );
+            }
+        }
         if let Some(trust) = self.trust.take() {
             diagnostics.extend(trust.teardown().err().unwrap_or_default());
         }
@@ -323,6 +349,8 @@ impl DeviceProvisioner {
             mechanism: TrustMechanism::AvdWritableSystem,
             reverse_mappings: Vec::new(),
             frida_server_started: false,
+            device_proxy: None,
+            capture_issue: None,
             diagnostics: Vec::new(),
         };
 
@@ -409,16 +437,130 @@ impl DeviceProvisioner {
             establish_reverse(&control, *mapping)?;
         }
 
+        // 7. Route the device's traffic through the MITM: the device-wide proxy
+        // points at the tunnelled proxy port, after the last adbd restart so the
+        // tunnel it relies on is live. Non-fatal (the target still boots and
+        // streams), but reported, so an empty Live view is never unexplained.
+        let device_proxy_set =
+            options.route_device_proxy && route_capture(&control, options, &mut report);
+
         Ok(ProvisionedDevice {
             control,
             trust: Some(trust),
             reverse_mappings: mappings,
             report,
+            device_proxy_set,
         })
     }
 }
 
 /// Establishes one `adb reverse` mapping.
+/// Points the device-wide proxy at the tunnelled MITM port and records the
+/// outcome in the report. Returns whether the proxy is set.
+fn route_capture(
+    control: &Arc<dyn SandboxControl>,
+    options: &ProvisionOptions,
+    report: &mut DeviceProvisionReport,
+) -> bool {
+    let proxy = format!("127.0.0.1:{}", options.proxy.device_port);
+    match set_device_proxy(control, &proxy) {
+        Ok(()) => {
+            report
+                .diagnostics
+                .push(catalogue::DEVICE_CAPTURE_ROUTED.instantiate(diag_context(
+                    control.transport_id(),
+                    "proxy",
+                    proxy.clone(),
+                )));
+            report.device_proxy = Some(proxy);
+            true
+        }
+        Err(detail) => {
+            report
+                .diagnostics
+                .push(
+                    catalogue::DEVICE_CAPTURE_NOT_ROUTED.instantiate(diag_context(
+                        control.transport_id(),
+                        "error",
+                        detail.clone(),
+                    )),
+                );
+            report.capture_issue = Some(detail);
+            false
+        }
+    }
+}
+
+/// The Android global setting holding the device-wide HTTP proxy.
+const GLOBAL_HTTP_PROXY: &str = "http_proxy";
+/// The value Android documents for "no proxy".
+const NO_PROXY: &str = ":0";
+
+/// Sets the device-wide HTTP proxy and verifies it reads back.
+fn set_device_proxy(control: &Arc<dyn SandboxControl>, proxy: &str) -> Result<(), String> {
+    put_global(control, GLOBAL_HTTP_PROXY, proxy)?;
+    let current = get_global(control, GLOBAL_HTTP_PROXY)?;
+    if current == proxy {
+        Ok(())
+    } else {
+        Err(format!(
+            "device proxy reads back as {current:?} after setting it to {proxy:?}"
+        ))
+    }
+}
+
+/// Clears the device-wide HTTP proxy and verifies it is no longer set.
+fn clear_device_proxy(control: &Arc<dyn SandboxControl>) -> Result<(), String> {
+    put_global(control, GLOBAL_HTTP_PROXY, NO_PROXY)?;
+    let current = get_global(control, GLOBAL_HTTP_PROXY)?;
+    if matches!(current.as_str(), "" | "null" | NO_PROXY) {
+        Ok(())
+    } else {
+        Err(format!(
+            "device proxy is still {current:?} after clearing it"
+        ))
+    }
+}
+
+fn put_global(control: &Arc<dyn SandboxControl>, key: &str, value: &str) -> Result<(), String> {
+    let output = control
+        .shell(
+            &[
+                "settings".to_owned(),
+                "put".to_owned(),
+                "global".to_owned(),
+                key.to_owned(),
+                value.to_owned(),
+            ],
+            Duration::from_secs(15),
+        )
+        .map_err(|error| format!("settings put global {key} failed: {error}"))?;
+    if output.exit_code == Some(0) {
+        Ok(())
+    } else {
+        Err(format!(
+            "settings put global {key} exited {:?}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        ))
+    }
+}
+
+fn get_global(control: &Arc<dyn SandboxControl>, key: &str) -> Result<String, String> {
+    let output = control
+        .shell(
+            &[
+                "settings".to_owned(),
+                "get".to_owned(),
+                "global".to_owned(),
+                key.to_owned(),
+            ],
+            Duration::from_secs(15),
+        )
+        .map_err(|error| format!("settings get global {key} failed: {error}"))?;
+    Ok(output.stdout.trim().to_owned())
+}
+
 fn establish_reverse(
     control: &Arc<dyn SandboxControl>,
     mapping: PortMapping,
@@ -609,6 +751,115 @@ fn version_context(backend: &str, sdk: u32, mechanism: TrustMechanism) -> Diagno
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device whose `settings global` table is an in-memory map; optionally
+    /// one that silently ignores writes (the "set but not applied" failure).
+    struct SettingsDevice {
+        global: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+        ignore_writes: bool,
+    }
+
+    impl SettingsDevice {
+        fn new(ignore_writes: bool) -> Arc<Self> {
+            Arc::new(Self {
+                global: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                ignore_writes,
+            })
+        }
+
+        fn proxy(&self) -> Option<String> {
+            self.global
+                .lock()
+                .expect("settings")
+                .get("http_proxy")
+                .cloned()
+        }
+
+        fn output(stdout: &str) -> crate::SandboxCommandOutput {
+            crate::SandboxCommandOutput {
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                exit_code: Some(0),
+            }
+        }
+    }
+
+    impl SandboxControl for SettingsDevice {
+        fn command(
+            &self,
+            _arguments: &[String],
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            Ok(Self::output(""))
+        }
+
+        fn shell(
+            &self,
+            arguments: &[String],
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            let words = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut global = self.global.lock().expect("settings");
+            Ok(match words.as_slice() {
+                ["settings", "put", "global", key, value] => {
+                    if !self.ignore_writes {
+                        global.insert((*key).to_owned(), (*value).to_owned());
+                    }
+                    Self::output("")
+                }
+                ["settings", "get", "global", key] => {
+                    Self::output(global.get(*key).map_or("null", String::as_str))
+                }
+                _ => Self::output(""),
+            })
+        }
+
+        fn put(
+            &self,
+            _bytes: &[u8],
+            _remote_path: &str,
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            Ok(Self::output(""))
+        }
+
+        fn remove(
+            &self,
+            _remote_path: &str,
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            Ok(Self::output(""))
+        }
+
+        fn install_apks(
+            &self,
+            _apk_paths: &[PathBuf],
+            _timeout: Duration,
+        ) -> Result<crate::SandboxCommandOutput, Diagnostic> {
+            Ok(Self::output(""))
+        }
+
+        fn transport_id(&self) -> &str {
+            "test-device"
+        }
+    }
+
+    #[test]
+    fn capture_routing_sets_verifies_and_clears_the_device_proxy() {
+        let device = SettingsDevice::new(false);
+        let control: Arc<dyn SandboxControl> = device.clone();
+        set_device_proxy(&control, "127.0.0.1:8080").expect("proxy set");
+        assert_eq!(device.proxy().as_deref(), Some("127.0.0.1:8080"));
+        clear_device_proxy(&control).expect("proxy cleared");
+        assert_eq!(device.proxy().as_deref(), Some(":0"));
+    }
+
+    #[test]
+    fn a_proxy_that_does_not_take_effect_is_reported_not_assumed() {
+        let control: Arc<dyn SandboxControl> = SettingsDevice::new(true);
+        let error = set_device_proxy(&control, "127.0.0.1:8080").expect_err("not applied");
+        assert!(error.contains("reads back"), "{error}");
+    }
 
     #[test]
     fn parses_adb_devices_listing_states() {

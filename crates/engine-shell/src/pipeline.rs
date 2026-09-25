@@ -1476,6 +1476,37 @@ fn observed_host_summary(runtime: &SessionRuntime, package: &str) -> Diagnostic 
     diagnostic
 }
 
+/// Runs only the static stages (intake, routing, extraction, static pass) on an
+/// APK and returns its static document, with the same run-scoped scratch
+/// cleanup as the full pipeline. Used to give a live-driven app (the Android
+/// target) the static model the analysis pipeline would have fused.
+///
+/// # Errors
+///
+/// Returns the failing stage's diagnostics.
+pub(crate) fn static_document_for_apk(
+    apk: &std::path::Path,
+) -> Result<apiaxess_api_model::ApiDocument, Vec<Diagnostic>> {
+    let intake = ApkIntakeConfig::default();
+    let target = ApkTarget::new(
+        Arc::new(apiaxess_external_tools::ProcessToolRunner),
+        intake.clone(),
+    );
+    let normalized = target
+        .intake(apk)
+        .map_err(|failure| vec![failure.diagnostic])?;
+    let _intake_scratch = IntakeScratchGuard::new(
+        intake.output_root.clone(),
+        normalized.workspace_root.clone(),
+    );
+    let routed = apiaxess_network_routing::NetworkingRouter::default().route(&normalized);
+    let extraction = apiaxess_network_extraction::extract(&normalized, &routed)
+        .map_err(|failure| vec![failure.diagnostic])?;
+    let report = apiaxess_static_pass::normalize(&normalized, &routed, &extraction)
+        .map_err(|failure| vec![failure.diagnostic])?;
+    Ok(report.document)
+}
+
 fn commit_api_document(
     runtime: &SessionRuntime,
     document: apiaxess_api_model::ApiDocument,

@@ -96,6 +96,9 @@ pub struct Engine {
     android_status: Arc<RwLock<AndroidTargetStatus>>,
     /// Guards against a second concurrent launch while one is in flight.
     android_launching: Arc<AtomicBool>,
+    /// Static analysis of the APK installed onto the Android target, keyed by
+    /// the session it was installed in, so Fuse can fuse it with the live drive.
+    android_static: Arc<std::sync::Mutex<Option<(String, AndroidStaticAnalysis)>>>,
     /// The id of the active discovery job (see [`Engine::start_discovery`]),
     /// while one is running. Single-flighted: a second run is refused until this
     /// one finishes or is cancelled, so no un-cancellable ffuf orphan is ever
@@ -121,6 +124,11 @@ pub struct AndroidTargetLaunchReport {
     /// Whether the loopback ws-scrcpy screen stream started (Phase D2). The engine
     /// reverse-proxies it behind the workbench gate; D3 wires the view.
     pub streaming: bool,
+    /// The device-wide proxy the target's traffic is captured through, when
+    /// capture routing is active.
+    pub capture_proxy: Option<String>,
+    /// Why capture routing is not active, when it was attempted and failed.
+    pub capture_issue: Option<String>,
     /// Ordered step diagnostics (info plus any non-fatal warnings).
     pub diagnostics: Vec<apiaxess_diagnostics::Diagnostic>,
 }
@@ -142,6 +150,26 @@ pub enum AndroidTargetPhase {
     Ready,
     /// The launch failed; `diagnostics` carries the actionable what/why/fix.
     Error,
+}
+
+/// Static analysis of the APK installed onto the Android target.
+#[derive(Clone, Debug)]
+enum AndroidStaticAnalysis {
+    Running,
+    Ready(Box<apiaxess_api_model::ApiDocument>),
+    Failed(String),
+}
+
+/// The Android target panel's view of that static analysis.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidStaticAnalysisStatus {
+    /// `running`, `ready`, or `failed`.
+    pub state: &'static str,
+    /// Endpoints the static pass recovered, when ready.
+    pub endpoint_count: Option<usize>,
+    /// Why it failed, when it did.
+    pub message: Option<String>,
 }
 
 /// A snapshot of the GUI Android target's lifecycle for the workbench panel.
@@ -169,6 +197,14 @@ pub struct AndroidTargetStatus {
     pub frida_server_started: bool,
     /// Detected Android API level, once provisioning has read it.
     pub android_sdk: Option<u32>,
+    /// The device-wide proxy the target's app traffic is routed through to the
+    /// workbench MITM (`127.0.0.1:<port>`), when capture is active.
+    pub capture_proxy: Option<String>,
+    /// Why the target's traffic is not being captured, when routing was
+    /// attempted and failed. `None` with no `capture_proxy` means not yet set up.
+    pub capture_issue: Option<String>,
+    /// Static analysis of the installed APK, fused with the live drive on Fuse.
+    pub static_analysis: Option<AndroidStaticAnalysisStatus>,
     /// The latest step diagnostics (info, warnings, or the failure on `Error`).
     pub diagnostics: Vec<apiaxess_diagnostics::Diagnostic>,
 }
@@ -185,6 +221,9 @@ impl Default for AndroidTargetStatus {
             client_apk_installed: false,
             frida_server_started: false,
             android_sdk: None,
+            capture_proxy: None,
+            capture_issue: None,
+            static_analysis: None,
             diagnostics: Vec::new(),
         }
     }
@@ -336,6 +375,7 @@ impl Engine {
             android_stream: Arc::new(std::sync::Mutex::new(None)),
             android_status: Arc::new(RwLock::new(AndroidTargetStatus::default())),
             android_launching: Arc::new(AtomicBool::new(false)),
+            android_static: Arc::new(std::sync::Mutex::new(None)),
             active_discovery: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -830,6 +870,16 @@ impl Engine {
                 .trim_start_matches("session:")
         );
         let mut session = runtime.session_snapshot().map_err(|error| vec![error])?;
+        // An app driven on the Android target carries the static model of the APK
+        // installed onto it: rebuild from that static document on every Fuse, so
+        // its templates generalize the concrete observed paths and a previous
+        // fuse's concrete endpoints never compete with them.
+        let static_base = self.android_static_document(session.id().as_str());
+        if let Some(document) = &static_base {
+            session
+                .commit_api_document((**document).clone(), chrono::Utc::now())
+                .map_err(|error| vec![error])?;
+        }
         let config = apiaxess_dynamic_capture::DynamicCaptureConfig::new(run_id.clone())
             .map_err(|error| vec![error])?;
         apiaxess_dynamic_capture::capture_into_session(
@@ -838,6 +888,18 @@ impl Engine {
             &config,
             chrono::Utc::now(),
         )?;
+        if static_base.is_some() {
+            let fusion_config = apiaxess_fusion::FusionConfig::new(format!("{run_id}:fusion"))
+                .map_err(|error| vec![error])?;
+            let fused = apiaxess_fusion::fuse_document(
+                session.api_document(),
+                &fusion_config,
+                chrono::Utc::now(),
+            )?;
+            session
+                .commit_api_document(fused.document, chrono::Utc::now())
+                .map_err(|error| vec![error])?;
+        }
         let confidence_config =
             ConfidenceConfig::new(format!("{run_id}:confidence")).map_err(|error| vec![error])?;
         let confidence = apiaxess_confidence::recompute_document(
@@ -1121,6 +1183,9 @@ impl Engine {
                 .map_or_else(|_| "device".to_owned(), |id| id.as_str().to_owned()),
             start_frida_server,
             frida_server_path,
+            // A user's own paired device keeps its settings; it captures through
+            // the client app, not a device-wide proxy the workbench imposes.
+            route_device_proxy: false,
         };
         device_provisioner().provision(serial, &ca, &options)
     }
@@ -1308,6 +1373,9 @@ impl Engine {
                 .map_or_else(|_| "android-target".to_owned(), |id| id.as_str().to_owned()),
             start_frida_server,
             frida_server_path: start_frida_server.then(|| addon.frida_server_path()),
+            // The managed emulator is the workbench's own device: route all of its
+            // traffic through the MITM so a driven app is captured with no setup.
+            route_device_proxy: true,
         };
         let device = match provisioner.provision(&serial, &ca, &options) {
             Ok(device) => device,
@@ -1371,6 +1439,8 @@ impl Engine {
             client_apk_installed,
             frida_server_started: provision_report.frida_server_started,
             streaming,
+            capture_proxy: provision_report.device_proxy.clone(),
+            capture_issue: provision_report.capture_issue.clone(),
             diagnostics,
         })
     }
@@ -1421,6 +1491,30 @@ impl Engine {
         if let Some(stream) = stream {
             diagnostics.extend(stream.stop().err().unwrap_or_default());
         }
+        // Undo the target's provisioning (device proxy, CA trust, reverse tunnel)
+        // while the emulator is still running: its settings persist across boots,
+        // so a proxy left behind would outlive the tunnel it points at.
+        let target_serial = self
+            .android_status
+            .read()
+            .ok()
+            .and_then(|status| status.serial.clone());
+        if let Some(serial) = target_serial {
+            let provisioned = self
+                .provisioned_devices
+                .lock()
+                .map(|mut devices| {
+                    let (target, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *devices)
+                        .into_iter()
+                        .partition(|device| device.report().serial == serial);
+                    *devices = others;
+                    target
+                })
+                .unwrap_or_default();
+            for device in provisioned {
+                diagnostics.extend(device.teardown().err().unwrap_or_default());
+            }
+        }
         let target = self
             .android_target
             .lock()
@@ -1449,6 +1543,35 @@ impl Engine {
             .map(|status| status.clone())
             .unwrap_or_default();
         status.addon_present = apiaxess_sandbox::android_target::AndroidTargetAddon::is_present();
+        let session_id = self
+            .session_runtime()
+            .ok()
+            .flatten()
+            .and_then(|runtime| runtime.session_snapshot().ok())
+            .map(|session| session.id().as_str().to_owned());
+        status.static_analysis = self.android_static.lock().ok().and_then(|current| {
+            let (id, state) = current.as_ref()?;
+            if Some(id) != session_id.as_ref() {
+                return None;
+            }
+            Some(match state {
+                AndroidStaticAnalysis::Running => AndroidStaticAnalysisStatus {
+                    state: "running",
+                    endpoint_count: None,
+                    message: None,
+                },
+                AndroidStaticAnalysis::Ready(document) => AndroidStaticAnalysisStatus {
+                    state: "ready",
+                    endpoint_count: Some(document.surface.endpoints.len()),
+                    message: None,
+                },
+                AndroidStaticAnalysis::Failed(why) => AndroidStaticAnalysisStatus {
+                    state: "failed",
+                    endpoint_count: None,
+                    message: Some(why.clone()),
+                },
+            })
+        });
         status
     }
 
@@ -1477,6 +1600,65 @@ impl Engine {
     /// [`apiaxess_diagnostics::catalogue::ANDROID_TARGET_APK_INSTALL_FAILED`] when
     /// adb rejects the install.
     pub fn install_target_apk(
+        &self,
+        apk_path: &Path,
+    ) -> Result<(), Vec<apiaxess_diagnostics::Diagnostic>> {
+        self.install_target_apk_only(apk_path)?;
+        self.start_android_static_analysis(apk_path);
+        Ok(())
+    }
+
+    /// Runs static analysis of the just-installed APK in the background, keyed
+    /// to the current session, so a later Fuse can fuse it with the live drive.
+    fn start_android_static_analysis(&self, apk_path: &Path) {
+        let Some(session_id) = self
+            .session_runtime()
+            .ok()
+            .flatten()
+            .and_then(|runtime| runtime.session_snapshot().ok())
+            .map(|session| session.id().as_str().to_owned())
+        else {
+            return;
+        };
+        let slot = Arc::clone(&self.android_static);
+        if let Ok(mut current) = slot.lock() {
+            *current = Some((session_id.clone(), AndroidStaticAnalysis::Running));
+        }
+        let apk = apk_path.to_path_buf();
+        std::thread::spawn(move || {
+            let outcome = match pipeline::static_document_for_apk(&apk) {
+                Ok(document) => AndroidStaticAnalysis::Ready(Box::new(document)),
+                Err(diagnostics) => AndroidStaticAnalysis::Failed(diagnostics.first().map_or_else(
+                    || "static analysis failed".to_owned(),
+                    |d| d.what.to_string(),
+                )),
+            };
+            if let Ok(mut current) = slot.lock() {
+                // A newer install (or session) superseded this run: keep it.
+                if current.as_ref().is_some_and(|(id, state)| {
+                    *id == session_id && matches!(state, AndroidStaticAnalysis::Running)
+                }) {
+                    *current = Some((session_id, outcome));
+                }
+            }
+        });
+    }
+
+    /// The static document of the APK installed in `session_id`, when ready.
+    fn android_static_document(
+        &self,
+        session_id: &str,
+    ) -> Option<Box<apiaxess_api_model::ApiDocument>> {
+        let current = self.android_static.lock().ok()?;
+        match current.as_ref()? {
+            (id, AndroidStaticAnalysis::Ready(document)) if id == session_id => {
+                Some(document.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn install_target_apk_only(
         &self,
         apk_path: &Path,
     ) -> Result<(), Vec<apiaxess_diagnostics::Diagnostic>> {
@@ -1540,6 +1722,8 @@ impl Engine {
             status.client_apk_installed = report.client_apk_installed;
             status.frida_server_started = report.frida_server_started;
             status.android_sdk = Some(report.android_sdk);
+            status.capture_proxy.clone_from(&report.capture_proxy);
+            status.capture_issue.clone_from(&report.capture_issue);
             status.diagnostics.clone_from(&report.diagnostics);
         }
     }

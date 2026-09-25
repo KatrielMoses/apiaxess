@@ -22,7 +22,8 @@ pub use party::FirstPartyHints;
 pub struct UnifiedSurfaceConfig {
     /// Stable assembly run identifier.
     pub run_id: String,
-    /// Emit low-coverage guidance below this confirmed-surface threshold.
+    /// Emit low-coverage guidance when fewer than this share of endpoints (in
+    /// basis points) carry dynamic evidence, i.e. were observed being hit.
     pub minimum_confirmed_basis_points: u16,
     /// Explicit API-wide or endpoint-specific signer attachments.
     pub signer_bindings: Vec<SignerBinding>,
@@ -167,7 +168,7 @@ pub fn assemble_document(
             diagnostics.push(signer_review_diagnostic(signer, binding));
         }
     }
-    if confidence.coverage.confirmed_basis_points < config.minimum_confirmed_basis_points {
+    if low_dynamic_corroboration(&confidence.coverage, config.minimum_confirmed_basis_points) {
         diagnostics.push(coverage_diagnostic(&confidence));
     }
 
@@ -317,8 +318,39 @@ fn endpoint_auth_diagnostic(identity: &EndpointIdentity) -> Diagnostic {
     catalogue::SURFACE_ENDPOINT_NO_RECOVERED_AUTH.instantiate(context)
 }
 
+/// Share of endpoints with dynamic evidence (observed being hit), in basis
+/// points. Counts every observed endpoint, whether or not static analysis also
+/// found it: static-and-dynamic agreement is structurally zero on a
+/// capture-only surface, so it cannot measure corroboration.
+fn dynamically_corroborated_basis_points(coverage: &apiaxess_api_model::CoveragePicture) -> u16 {
+    if coverage.endpoint_count == 0 {
+        return 0;
+    }
+    let share = coverage
+        .dynamic_ground_truth_endpoint_count
+        .min(coverage.endpoint_count)
+        .saturating_mul(10_000)
+        / coverage.endpoint_count;
+    u16::try_from(share).unwrap_or(10_000)
+}
+
+/// Whether the surface has too little dynamic corroboration: most of it is
+/// static-only or otherwise unobserved (or nothing was recovered at all).
+fn low_dynamic_corroboration(
+    coverage: &apiaxess_api_model::CoveragePicture,
+    minimum_basis_points: u16,
+) -> bool {
+    dynamically_corroborated_basis_points(coverage) < minimum_basis_points
+}
+
 fn coverage_diagnostic(confidence: &apiaxess_api_model::ConfidenceSummary) -> Diagnostic {
     let mut context = DiagnosticContext::new();
+    context.insert(
+        "dynamically_corroborated_basis_points".to_owned(),
+        DiagnosticValue::Integer(i64::from(dynamically_corroborated_basis_points(
+            &confidence.coverage,
+        ))),
+    );
     context.insert(
         "confirmed_basis_points".to_owned(),
         DiagnosticValue::Integer(i64::from(confidence.coverage.confirmed_basis_points)),
@@ -351,6 +383,48 @@ fn simple_diagnostic(
 
 #[cfg(test)]
 mod tests {
+    fn coverage(
+        endpoints: u64,
+        dynamic: u64,
+        confirmed: u64,
+    ) -> apiaxess_api_model::CoveragePicture {
+        let bp = |count: u64| u16::try_from(count * 10_000 / endpoints.max(1)).unwrap();
+        apiaxess_api_model::CoveragePicture {
+            endpoint_count: endpoints,
+            confirmed_endpoint_count: confirmed,
+            inferred_endpoint_count: dynamic - confirmed,
+            static_only_endpoint_count: endpoints - dynamic,
+            dynamic_ground_truth_endpoint_count: dynamic,
+            confirmed_basis_points: bp(confirmed),
+            inferred_basis_points: bp(dynamic - confirmed),
+            static_only_basis_points: bp(endpoints - dynamic),
+            handoff_count: 0,
+            resolved_handoff_count: 0,
+            open_handoff_count: 0,
+            low_confidence_fact_count: 0,
+            true_conflict_fact_count: 0,
+        }
+    }
+
+    #[test]
+    fn a_fully_observed_capture_only_surface_is_not_low_coverage() {
+        // 17 endpoints, all observed, none with static evidence: agreement is
+        // structurally zero, but every endpoint is dynamically corroborated.
+        assert!(!low_dynamic_corroboration(&coverage(17, 17, 0), 5_000));
+        // The same when static analysis also found them.
+        assert!(!low_dynamic_corroboration(&coverage(17, 17, 17), 5_000));
+    }
+
+    #[test]
+    fn a_mostly_unobserved_surface_still_warns() {
+        // 17 static endpoints, 3 of them observed.
+        assert!(low_dynamic_corroboration(&coverage(17, 3, 3), 5_000));
+        // A static-only analysis with no dynamic run at all.
+        assert!(low_dynamic_corroboration(&coverage(17, 0, 0), 5_000));
+        // Nothing recovered.
+        assert!(low_dynamic_corroboration(&coverage(0, 0, 0), 5_000));
+    }
+
     use super::*;
     use std::num::NonZeroU64;
 

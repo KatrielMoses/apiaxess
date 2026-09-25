@@ -2159,6 +2159,26 @@ pub mod catalogue {
         fix: "Confirm the device is still connected and the workbench proxy port is bound, then retry; no other transport is used.",
     };
 
+    /// The device's traffic is routed through the workbench MITM.
+    pub const DEVICE_CAPTURE_ROUTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.capture-routed",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Info,
+        what: "The device's app traffic now routes through the workbench capture proxy.",
+        why: "The device-wide HTTP proxy points at the adb-reverse tunnel to the workbench MITM, so apps that honor the system proxy are captured and, with the session CA trusted, decrypted.",
+        fix: "Drive the app; its requests appear in Live traffic. The proxy is cleared when the target stops.",
+    };
+
+    /// The device's traffic could not be routed through the workbench MITM.
+    pub const DEVICE_CAPTURE_NOT_ROUTED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "device.capture-not-routed",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Warning,
+        what: "The device's app traffic is not routed through the workbench capture proxy.",
+        why: "Setting or verifying the device-wide HTTP proxy failed, so apps on the device reach the network directly and nothing is captured.",
+        fix: "Stop and relaunch the target. If it persists, check the target's adb connection; the context names the failing step.",
+    };
+
     /// The adb-reverse tunnel is set and the device loopback reaches the workbench.
     pub const DEVICE_TUNNEL_READY: DiagnosticDefinition = DiagnosticDefinition {
         id: "device.tunnel-ready",
@@ -2294,6 +2314,8 @@ pub mod catalogue {
         DEVICE_DETECTED,
         DEVICE_REVERSE_TUNNEL_FAILED,
         DEVICE_TUNNEL_READY,
+        DEVICE_CAPTURE_ROUTED,
+        DEVICE_CAPTURE_NOT_ROUTED,
         DEVICE_ANDROID_VERSION_UNSUPPORTED,
         DEVICE_TRUST_PATH_SELECTED,
         DEVICE_ROOT_REFUSED,

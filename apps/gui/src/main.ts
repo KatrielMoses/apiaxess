@@ -145,6 +145,12 @@ interface AndroidTargetStatus {
   readonly clientApkInstalled: boolean;
   readonly fridaServerStarted: boolean;
   readonly androidSdk: number | null;
+  /** Device-wide proxy the target's traffic is captured through, when active. */
+  readonly captureProxy?: string | null;
+  /** Why capture routing failed, when it was attempted. */
+  readonly captureIssue?: string | null;
+  /** Static analysis of the installed APK, fused with the live drive on Fuse. */
+  readonly staticAnalysis?: { readonly state: "running" | "ready" | "failed"; readonly endpointCount?: number | null; readonly message?: string | null } | null;
   readonly diagnostics: readonly Diagnostic[];
 }
 
@@ -324,6 +330,8 @@ let flowsLoaded = false;
 let latestHealth: WorkbenchHealth | null = null;
 let latestBrowser: BrowserLaunchStatus | null = null;
 let lastSessionStatus: SessionStatus | null = null;
+/** The latest Android target status, so Live traffic can explain an empty list. */
+let lastAndroidStatus: AndroidTargetStatus | null = null;
 /** GUI-observed hold start per intercepted flow, for the auto-forward countdown. */
 const heldSince = new Map<number, number>();
 let queueTicker: number | undefined;
@@ -448,6 +456,18 @@ function decodeForDisplay(value: string): string {
   }
 }
 
+/** Why Live traffic is empty, in terms of what is running. */
+function emptyTrafficBody(): string {
+  const android = lastAndroidStatus;
+  if (android !== null && android.phase === "ready") {
+    if ((android.captureProxy ?? null) !== null) {
+      return "The Android target is capturing. Open and drive the app on its screen; its requests appear here as they are observed.";
+    }
+    return `The Android target is running, but its traffic is not routed through the capture proxy${android.captureIssue ? ` (${android.captureIssue})` : ""}, so nothing is captured. Stop and relaunch the target.`;
+  }
+  return "Launch the capture browser or point a client at the session proxy. Requests appear here as they are observed.";
+}
+
 function renderFlows(): void {
   if (flowList === null) return;
   if (flows.size === 0) {
@@ -455,7 +475,7 @@ function renderFlows(): void {
       ? stateBlock({
           icon: "traffic",
           title: "No traffic yet",
-          body: "Launch the capture browser or point a client at the session proxy. Requests appear here as they are observed.",
+          body: emptyTrafficBody(),
         })
       : `<div class="state state--compact"><span class="state__icon">${icon("refresh", { size: 26, className: "spinner" })}</span><p class="state__body">Loading captured flows…</p></div>`;
     updateWorkbenchCounts();
@@ -6445,7 +6465,7 @@ function androidStatusBody(status: AndroidTargetStatus): string {
       status.streaming ? "streaming" : "no stream",
     ].filter((fact): fact is string => fact !== null).join(" · ");
     const banner = `<div class="notice notice--success"><span class="notice__icon">${icon("check", { size: 18 })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(status.message)}</p><p class="t-small t-subtle">${facts}</p></div></div>`;
-    return `${banner}${androidDiagnosticNotices(status)}`;
+    return `${banner}${androidCaptureNotice(status)}${androidStaticNotice(status)}${androidDiagnosticNotices(status)}`;
   }
   const progress = `<div class="notice"><span class="notice__icon">${icon("refresh", { size: 18, className: "spinner" })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(status.message)}</p><p class="t-small t-subtle">This can take a few minutes, especially in software mode.</p></div></div>`;
   return `${progress}${androidStepsMarkup(status)}${androidDiagnosticNotices(status)}`;
@@ -6516,7 +6536,34 @@ function updateAndroidScreen(status: AndroidTargetStatus): void {
   androidScreen.innerHTML = stateBlock({ icon: "traffic", title: "Screen", body });
 }
 
+/** Static analysis of the installed app, which Fuse combines with the drive. */
+function androidStaticNotice(status: AndroidTargetStatus): string {
+  const analysis = status.staticAnalysis ?? null;
+  if (analysis === null) return "";
+  if (analysis.state === "running") {
+    return `<div class="notice"><span class="notice__icon">${icon("refresh", { size: 18, className: "spinner" })}</span><div class="notice__body"><p class="notice__title">Analyzing the installed app</p><p class="t-small t-subtle">Static analysis of the APK runs alongside the drive; Fuse then combines its endpoint templates with the observed traffic.</p></div></div>`;
+  }
+  if (analysis.state === "ready") {
+    const count = analysis.endpointCount ?? 0;
+    return `<div class="notice"><span class="notice__icon">${icon("check", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Static analysis ready · ${count} ${count === 1 ? "endpoint" : "endpoints"}</p><p class="t-small t-subtle">Fuse combines them with the live drive, so observed paths take the app's own templates.</p></div></div>`;
+  }
+  return `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Static analysis of the installed app failed</p><p>${escapeHtml(analysis.message ?? "The APK could not be analyzed.")} Fuse still builds the surface from the live drive alone.</p></div></div>`;
+}
+
+/** Whether the target's app traffic is being captured, and if not, why. */
+function androidCaptureNotice(status: AndroidTargetStatus): string {
+  const proxy = status.captureProxy ?? null;
+  if (proxy !== null) {
+    const captured = flows.size === 1 ? "1 flow captured" : `${flows.size} flows captured`;
+    return `<div class="notice"><span class="notice__icon">${icon("traffic", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Capture active</p><p class="t-small t-subtle">App traffic on the target routes through the workbench proxy (device proxy ${escapeHtml(proxy)}) and is decrypted with the session CA · ${captured}. Only in-scope hosts reach the fused surface.</p></div></div>`;
+  }
+  const why = status.captureIssue ?? "the device proxy was not set up for this launch";
+  return `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Capture not active</p><p>The target's traffic is not routed through the capture proxy (${escapeHtml(why)}), so apps on it reach the network directly and nothing is captured.</p><p class="t-small t-subtle">Stop and relaunch the target to set up capture again.</p></div></div>`;
+}
+
 function renderAndroidStatus(status: AndroidTargetStatus): void {
+  lastAndroidStatus = status;
+  if (flows.size === 0) renderFlows();
   if (androidPhaseBadge !== null) androidPhaseBadge.textContent = status.phase;
   const inFlight = status.phase === "booting" || status.phase === "provisioning" || status.phase === "streaming";
   if (androidLaunch !== null) {
