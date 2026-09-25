@@ -25,7 +25,7 @@ use apiaxess_diagnostics::{
     catalogue::{
         ARTIFACT_BUNDLE_RESOLUTION_FAILED, ARTIFACT_DECOMPILATION_FAILED,
         ARTIFACT_DECOMPILATION_PARTIAL, ARTIFACT_DEX_ACCESS_UNAVAILABLE,
-        ARTIFACT_MALFORMED_ARCHIVE, ARTIFACT_PROTECTION_DETECTOR_UNAVAILABLE,
+        ARTIFACT_MALFORMED_ARCHIVE, ARTIFACT_NOT_FOUND, ARTIFACT_PROTECTION_DETECTOR_UNAVAILABLE,
         ARTIFACT_UNPACK_FAILED, ARTIFACT_UNSUPPORTED_FORMAT, EXTERNAL_TOOL_INVOCATION_FAILED,
         EXTERNAL_TOOL_MISSING, EXTERNAL_TOOL_VERSION_INCOMPATIBLE, INSTALL_COMPONENT_MISSING,
     },
@@ -884,8 +884,10 @@ fn probe_request(
 
 fn detect_format(input: &Path) -> Result<ArtifactFormat, IntakeFailure> {
     if !input.is_file() {
+        // A missing (or non-file) path is a not-found problem, not an
+        // unsupported-format one; the headline must say so.
         return Err(failure(
-            ARTIFACT_UNSUPPORTED_FORMAT,
+            ARTIFACT_NOT_FOUND,
             format!("input {} is not a regular file", input.display()),
         ));
     }
@@ -1484,13 +1486,14 @@ mod tests {
     #[test]
     fn missing_input_is_not_misclassified_as_an_apk() {
         let result = detect_format(Path::new("does-not-exist.apk"));
+        // A non-existent path is reported as not-found, not as a format problem.
         assert_eq!(
             result
                 .expect_err("missing input must fail")
                 .diagnostic
                 .id
                 .as_ref(),
-            "artifact.unsupported-format"
+            "artifact.not-found"
         );
     }
 

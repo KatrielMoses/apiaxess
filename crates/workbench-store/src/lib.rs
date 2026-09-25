@@ -1130,6 +1130,23 @@ pub struct FuzzerJob {
     pub results: Vec<FuzzerResult>,
     /// Job-level diagnostics.
     pub diagnostics: Vec<Diagnostic>,
+    /// Live attempt-level progress for a running job whose result rows do not
+    /// arrive one-per-attempt. The ffuf tier reports only matched hits, at
+    /// completion, so its result count alone reads "Sent 0" the whole run; this
+    /// carries the true sent/total from the tool's progress. In-memory only — it
+    /// is not persisted (a finished job's progress is its result set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<FuzzerProgress>,
+}
+
+/// Attempt-level progress for a running fuzz job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FuzzerProgress {
+    /// Requests sent so far, as reported by the executing tier.
+    pub sent: u64,
+    /// Total requests planned for the run.
+    pub total: u64,
 }
 
 /// Redacts sensitive values from a captured flow immediately before it is
@@ -1987,6 +2004,8 @@ impl TrafficStore {
                     .collect::<Result<Vec<_>, _>>()?,
                 diagnostics: serde_json::from_str(&diagnostics)
                     .map_err(|e| serialization_diag("fuzzer.diagnostics", &e.to_string()))?,
+                // A stored job is finished; live progress is not persisted.
+                progress: None,
             });
         }
         Ok(jobs)
@@ -3682,6 +3701,7 @@ mod tests {
                 retry_count: 0,
             }],
             diagnostics: Vec::new(),
+            progress: None,
         };
         store.upsert_fuzzer(&job).expect("fuzzer persisted");
         assert_eq!(store.fuzzer_jobs().expect("fuzzer loaded"), vec![job]);

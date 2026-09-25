@@ -74,7 +74,7 @@ const KNOBS: &[Knob] = &[
         key: "APIAXESS_DISCOVERY_RATE",
         label: "Discovery rate (requests/second)",
         group: "Discovery",
-        default_display: "20",
+        default_display: "5",
         advanced: false,
         restart_required: true,
         description: "Request rate for ffuf discovery sweeps.",

@@ -899,6 +899,9 @@ impl HttpHandler for ObserveHandler {
                     }
                 }
                 InterceptDecision::Drop => {
+                    // Record the outcome so the Live row shows 403 rather than
+                    // hanging at a pending "…" forever (#19b).
+                    self.observe_synthetic_response(ctx, flow_id, StatusCode::FORBIDDEN);
                     return RequestOrResponse::Response(
                         Response::builder()
                             .status(StatusCode::FORBIDDEN)
@@ -1132,10 +1135,28 @@ impl ObserveHandler {
         self.observer.observe(FlowEvent::Diagnostic(
             catalogue::PROXY_UPSTREAM_UNREACHABLE.instantiate(context),
         ));
+        // Record the 502 against the in-flight flow so its Live row settles on a
+        // real status instead of hanging at a pending "…" (#19b).
+        if let Some(flow_id) = self.current_flow_id {
+            self.observe_synthetic_response(ctx, flow_id, StatusCode::BAD_GATEWAY);
+        }
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .body(Body::empty())
             .expect("static proxy error response is valid")
+    }
+
+    /// Emits a `Response` event for a proxy-generated answer (a dropped request
+    /// or an unreachable upstream) that never had a real upstream response, so
+    /// the flow's Live row reflects the outcome rather than staying pending.
+    fn observe_synthetic_response(&self, ctx: &HttpContext, flow_id: u64, status: StatusCode) {
+        self.observer.observe(FlowEvent::Response {
+            flow_id,
+            client_addr: ctx.client_addr,
+            status: status.as_u16(),
+            version: format!("{:?}", Version::HTTP_11),
+            headers: Vec::new(),
+        });
     }
 }
 

@@ -21,8 +21,8 @@ use apiaxess_session::{
 };
 use apiaxess_workbench_store::{
     DelayPolicy, ExtractLocator, FlowOrigin, FuzzerAttackType, FuzzerConfig, FuzzerJob,
-    FuzzerJobState, FuzzerPositionLocation, FuzzerResponseDiff, FuzzerResult, FuzzerTier,
-    FuzzerTokenExtractor, GrepConfig, GrepReflectedConfig, PayloadPosition, PayloadSet,
+    FuzzerJobState, FuzzerPositionLocation, FuzzerProgress, FuzzerResponseDiff, FuzzerResult,
+    FuzzerTier, FuzzerTokenExtractor, GrepConfig, GrepReflectedConfig, PayloadPosition, PayloadSet,
     PayloadSource, RedirectMode, ResendRequest, ResendResponse, TrafficStore,
 };
 use regex::{Regex, RegexBuilder};
@@ -288,6 +288,7 @@ impl FuzzerWorkbench {
             config,
             results: Vec::new(),
             diagnostics: Vec::new(),
+            progress: None,
         };
         self.persist(&job)?;
         if let Ok(mut jobs) = self.jobs.lock() {
@@ -959,6 +960,17 @@ impl FuzzerWorkbench {
         let mut completed = job;
         let mut seen = 0;
         let mut cadence = PersistCadence::new();
+        // ffuf reports only matched hits (at completion), so its result count
+        // alone reads "Sent 0" the whole run. Parse the tool's own live progress
+        // line from stderr and surface it as attempt-level progress instead (#16b).
+        let total_candidates = u64::try_from(
+            completed
+                .config
+                .payload_sets
+                .first()
+                .map_or(0, |set| simple_values(set).len()),
+        )
+        .unwrap_or(u64::MAX);
         loop {
             if control.cancelled.load(Ordering::Acquire) {
                 process
@@ -980,6 +992,14 @@ impl FuzzerWorkbench {
                 self.append_ffuf_results(&mut completed, &parsed, &mut seen, &mut cadence)
                     .await?;
             }
+            if let Some(sent) = parse_ffuf_progress(&process.stderr()) {
+                let progress = FuzzerProgress {
+                    sent: sent.min(total_candidates),
+                    total: total_candidates,
+                };
+                completed.progress = Some(progress);
+                self.set_live_progress(&completed.id, progress);
+            }
             if !process.is_running() {
                 break;
             }
@@ -996,6 +1016,9 @@ impl FuzzerWorkbench {
         self.append_ffuf_results(&mut completed, &parsed, &mut seen, &mut cadence)
             .await?;
         completed.state = FuzzerJobState::Completed;
+        // A finished sweep sent every candidate; the result set now stands on its
+        // own, so progress is cleared rather than left mid-count.
+        completed.progress = None;
         // Report the actual achieved request rate so the pre-run estimate can be
         // judged honestly against reality (the estimate is latency-bound and
         // often lower than an unrouted ffuf; this closes that gap).
@@ -1207,6 +1230,17 @@ impl FuzzerWorkbench {
         {
             live.results.push(result.clone());
             live.diagnostics.extend(new_diagnostics.iter().cloned());
+        }
+    }
+
+    /// Updates a running job's live progress in place, so the polling GUI shows
+    /// a truthful "Sent N of M" for a tier (ffuf) whose result rows do not
+    /// arrive one-per-attempt.
+    fn set_live_progress(&self, job_id: &str, progress: FuzzerProgress) {
+        if let Ok(mut jobs) = self.jobs.lock()
+            && let Some(live) = jobs.get_mut(job_id)
+        {
+            live.progress = Some(progress);
         }
     }
 
@@ -2439,6 +2473,20 @@ fn request_with_ffuf_payload(
     }
 }
 
+/// Parses the request count from ffuf's most recent stderr progress line,
+/// which looks like `:: Progress: [1234/5000] :: Job [1/1] :: 456 req/sec ...`.
+/// Returns the completed count from the last such line, or `None` if none yet.
+fn parse_ffuf_progress(stderr: &str) -> Option<u64> {
+    stderr
+        .rmatch_indices("Progress: [")
+        .next()
+        .and_then(|(index, marker)| {
+            let rest = &stderr[index + marker.len()..];
+            let count = rest.split('/').next()?;
+            count.trim().parse::<u64>().ok()
+        })
+}
+
 fn ffuf_payload(entry: &serde_json::Value) -> Option<String> {
     entry
         .get("input")
@@ -3480,6 +3528,19 @@ mod tests {
         let (name, value) = header.split_once(": ").expect("well-formed header");
         assert!(name.eq_ignore_ascii_case(ORIGIN_MARKER_HEADER));
         assert_eq!(FlowOrigin::from_db_str(value), FlowOrigin::Fuzz);
+    }
+
+    #[test]
+    fn ffuf_progress_line_is_parsed_for_live_count() {
+        // The last progress line wins; a stream with no progress line yet is None.
+        let stream = ":: Progress: [10/500] :: Job [1/1] :: 40 req/sec ::\n\
+             :: Progress: [123/500] :: Job [1/1] :: 60 req/sec :: Duration: [0:00:02] ::\n";
+        assert_eq!(super::parse_ffuf_progress(stream), Some(123));
+        assert_eq!(
+            super::parse_ffuf_progress("starting up, no progress yet"),
+            None
+        );
+        assert_eq!(super::parse_ffuf_progress(""), None);
     }
 
     #[test]

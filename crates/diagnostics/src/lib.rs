@@ -360,6 +360,16 @@ pub mod catalogue {
         fix: "Provide a valid APK, AAB, APKS, APKM, XAPK, or split ZIP artifact, or choose a target handler that supports this format.",
     };
 
+    /// The supplied artifact path does not point at a readable file.
+    pub const ARTIFACT_NOT_FOUND: DiagnosticDefinition = DiagnosticDefinition {
+        id: "artifact.not-found",
+        category: DiagnosticCategory::ExternalTool,
+        severity: DiagnosticSeverity::Error,
+        what: "The artifact file was not found.",
+        why: "No regular file exists at the supplied path — it is missing, a directory, or not readable.",
+        fix: "Check the path and provide an existing APK, AAB, APKS, APKM, XAPK, or split ZIP file.",
+    };
+
     /// The input archive is corrupt or unsafe to unpack.
     pub const ARTIFACT_MALFORMED_ARCHIVE: DiagnosticDefinition = DiagnosticDefinition {
         id: "artifact.malformed-archive",
@@ -1138,6 +1148,7 @@ pub mod catalogue {
     /// Every Phase 1.1 artifact-intake definition.
     pub const PHASE_1_1: &[DiagnosticDefinition] = &[
         ARTIFACT_UNSUPPORTED_FORMAT,
+        ARTIFACT_NOT_FOUND,
         ARTIFACT_MALFORMED_ARCHIVE,
         ARTIFACT_BUNDLE_RESOLUTION_FAILED,
         EXTERNAL_TOOL_MISSING,

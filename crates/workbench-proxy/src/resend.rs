@@ -861,6 +861,11 @@ async fn send_core(
         .proxy(proxy)
         .add_root_certificate(root)
         .http2_adaptive_window(true)
+        // A refused/unroutable upstream should surface promptly rather than sit
+        // in "Sending…" until the 30s send deadline; the connect phase is bounded
+        // so a loopback ECONNREFUSED fails fast while a slow-but-live TLS handshake
+        // still has ample room.
+        .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| request_diagnostic("client", &error.to_string()))?;

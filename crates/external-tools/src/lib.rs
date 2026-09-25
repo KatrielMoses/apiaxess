@@ -473,12 +473,24 @@ impl ExternalToolRunner for ProcessToolRunner {
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_pipe = child.stderr.take();
         let stderr_capture = Arc::clone(&stderr);
-        if let Some(stderr_pipe) = stderr_pipe {
+        if let Some(mut stderr_pipe) = stderr_pipe {
+            // Append incrementally rather than once at EOF, so a long-running tool's
+            // live progress (e.g. ffuf's periodic `:: Progress:` line) is readable
+            // via `stderr()` while it runs — not only after it exits. Still bounded.
             std::thread::spawn(move || {
-                if let Ok(bytes) = read_limited(stderr_pipe)
-                    && let Ok(mut captured) = stderr_capture.lock()
-                {
-                    *captured = bytes;
+                let mut buffer = [0_u8; 8 * 1024];
+                loop {
+                    match stderr_pipe.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if let Ok(mut captured) = stderr_capture.lock() {
+                                let room = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
+                                if room > 0 {
+                                    captured.extend_from_slice(&buffer[..read.min(room)]);
+                                }
+                            }
+                        }
+                    }
                 }
             });
         }
