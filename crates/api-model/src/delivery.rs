@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::{
-    Endpoint, EndpointIdentity, GraphQlOperationType, SamplePayload, SourceType, UnifiedApiSurface,
-    UnifiedEndpoint, parse_graphql_operations,
+    Endpoint, EndpointIdentity, GraphQlOperationType, SamplePayload, SchemaShape, SourceType,
+    UnifiedApiSurface, UnifiedEndpoint, parse_graphql_operations,
 };
 
 /// The evidence behind one endpoint, in the product's vocabulary.
@@ -196,6 +196,82 @@ pub fn is_transport_header(name: &str) -> bool {
         || name.starts_with("proxy-")
         || name.starts_with("sec-")
         || name.starts_with("x-apiaxess-")
+}
+
+/// How a request body is encoded on the wire, from its observed media type
+/// (and, for text, whether the body read as structured data). Every emitter
+/// renders a request body by this one rule; an unobserved media type stays
+/// `Unknown` rather than being assumed to be JSON.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestEncoding {
+    /// JSON (`application/json`, `*+json`).
+    Json(String),
+    /// `application/x-www-form-urlencoded` fields.
+    Form(String),
+    /// `multipart/form-data` parts.
+    Multipart(String),
+    /// A text media type (`text/plain`, ...) whose body is JSON-structured,
+    /// as analytics beacons send it.
+    TextJson(String),
+    /// Text that is not structured data.
+    Text(String),
+    /// Any other media type: bytes.
+    Binary(String),
+    /// No media type was observed (static analysis, older documents).
+    Unknown,
+}
+
+impl RequestEncoding {
+    /// The encoding of an endpoint's request body.
+    #[must_use]
+    pub fn of(endpoint: &Endpoint) -> Self {
+        let Some(media) = endpoint.request_media_type.clone() else {
+            return Self::Unknown;
+        };
+        let structured = endpoint
+            .request_body
+            .as_ref()
+            .and_then(|slot| slot.shape.selected_candidate())
+            .is_some_and(|candidate| {
+                !matches!(
+                    candidate.value,
+                    SchemaShape::String { .. } | SchemaShape::Unknown
+                )
+            });
+        if media.contains("json") {
+            Self::Json(media)
+        } else if media == "application/x-www-form-urlencoded" {
+            Self::Form(media)
+        } else if media == "multipart/form-data" {
+            Self::Multipart(media)
+        } else if media.starts_with("text/")
+            || media.contains("xml")
+            || media.contains("javascript")
+            || media.contains("graphql")
+        {
+            if structured {
+                Self::TextJson(media)
+            } else {
+                Self::Text(media)
+            }
+        } else {
+            Self::Binary(media)
+        }
+    }
+
+    /// The observed media type, when there is one.
+    #[must_use]
+    pub fn media_type(&self) -> Option<&str> {
+        match self {
+            Self::Json(media)
+            | Self::Form(media)
+            | Self::Multipart(media)
+            | Self::TextJson(media)
+            | Self::Text(media)
+            | Self::Binary(media) => Some(media),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// One GraphQL operation captured on an endpoint, with the document and

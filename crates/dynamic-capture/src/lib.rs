@@ -370,10 +370,24 @@ pub fn capture_into_document(
         }
         collect_parameters(entry, &path, raw_path, &flow.request_headers);
         entry.auth = entry.auth.clone().or_else(|| observed_auth(flow));
-        if let Some(body) = &flow.request_body {
-            if let Some(sample) = parse_payload(
-                body,
-                &flow.request_headers,
+        if let Some(body) = flow.request_body.as_ref().filter(|body| !body.is_empty()) {
+            let media = media_type(&flow.request_headers);
+            if entry.request_media.is_none() {
+                entry.request_media.clone_from(&media);
+            }
+            // A form body is structured data too: its fields are the sample.
+            let form = (media.as_deref() == Some("application/x-www-form-urlencoded"))
+                .then(|| form_body_as_json(body));
+            let (payload, headers) = match &form {
+                Some(json) => (
+                    json.as_slice(),
+                    vec![("content-type".to_owned(), "application/json".to_owned())],
+                ),
+                None => (body.as_slice(), flow.request_headers.clone()),
+            };
+            match parse_payload(
+                payload,
+                &headers,
                 &entity_id,
                 flow,
                 false,
@@ -384,7 +398,8 @@ pub fn capture_into_document(
                 &run_id,
                 &mut document.surface.provenance,
             ) {
-                entry.request_samples.push(sample);
+                Some(sample) => entry.request_samples.push(sample),
+                None => entry.request_opaque = true,
             }
         }
         if let Some(status) = flow.status {
@@ -572,6 +587,10 @@ struct Accumulator {
     path: BTreeMap<String, Vec<Value>>,
     headers: BTreeMap<String, Vec<Value>>,
     request_samples: Vec<Sample>,
+    /// The request media type observed with a body (the first one seen).
+    request_media: Option<String>,
+    /// A request body was observed that is not structured data (text, bytes).
+    request_opaque: bool,
     response_samples: BTreeMap<u16, Vec<Sample>>,
     /// Every observed response status, with the media type seen for it (the
     /// first one observed). A status whose body is not structured data has no
@@ -592,6 +611,8 @@ impl Accumulator {
             path: BTreeMap::new(),
             headers: BTreeMap::new(),
             request_samples: Vec::new(),
+            request_media: None,
+            request_opaque: false,
             response_samples: BTreeMap::new(),
             response_media: BTreeMap::new(),
             auth: None,
@@ -918,6 +939,7 @@ fn new_endpoint(
         headers: Vec::new(),
         authentication: None,
         request_body: None,
+        request_media_type: None,
         responses: Vec::new(),
         pagination_signals: Vec::new(),
     };
@@ -946,9 +968,8 @@ fn new_endpoint(
             activity,
         )
     });
-    if !entry.request_samples.is_empty() {
-        endpoint.request_body = Some(schema_slot(&entry.request_samples, ids, activity));
-    }
+    endpoint.request_body = observed_request_body(entry, ids, activity);
+    endpoint.request_media_type.clone_from(&entry.request_media);
     for (status, media) in &entry.response_media {
         let body = match entry.response_samples.get(status) {
             Some(samples) => schema_slot(samples, ids, activity),
@@ -1088,6 +1109,16 @@ fn apply_existing_parameters(
         } else {
             endpoint.request_body = Some(schema_slot(samples, ids, activity));
         }
+    } else if entry.request_opaque && endpoint.request_body.is_none() {
+        endpoint.request_body = Some(opaque_slot(
+            entry.request_media.as_deref(),
+            &entry.flow_entities,
+            ids,
+            activity,
+        ));
+    }
+    if endpoint.request_media_type.is_none() {
+        endpoint.request_media_type.clone_from(&entry.request_media);
     }
     for (status, media) in &entry.response_media {
         let samples = entry.response_samples.get(status);
@@ -1383,6 +1414,42 @@ fn schema_slot(
         .collect();
     slot
 }
+/// The request body a route was observed with: the schema of its structured
+/// samples, or an opaque slot for a body that is not structured data.
+fn observed_request_body(
+    entry: &Accumulator,
+    ids: &mut IdFactory,
+    activity: &apiaxess_api_model::ActivityId,
+) -> Option<SchemaSlot> {
+    if !entry.request_samples.is_empty() {
+        Some(schema_slot(&entry.request_samples, ids, activity))
+    } else if entry.request_opaque {
+        Some(opaque_slot(
+            entry.request_media.as_deref(),
+            &entry.flow_entities,
+            ids,
+            activity,
+        ))
+    } else {
+        None
+    }
+}
+
+/// An `application/x-www-form-urlencoded` body as a JSON object of its
+/// (percent-decoded) fields, so its field names become the request schema.
+fn form_body_as_json(body: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(body);
+    let fields = text
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(name), Value::String(percent_decode(value)))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::to_vec(&Value::Object(fields)).unwrap_or_default()
+}
+
 /// The media type of a message, lowercased and without parameters.
 fn media_type(headers: &[(String, String)]) -> Option<String> {
     headers
@@ -2532,6 +2599,96 @@ mod tests {
         assert_eq!(
             paths(&second.document),
             vec!["/v1/kept", "/v1/still-observed"]
+        );
+    }
+
+    #[test]
+    fn request_bodies_keep_their_media_type_and_forms_their_fields() {
+        let with_body = |id: u64, path: &str, media: &str, body: &[u8]| {
+            let mut flow = post(id, path, body);
+            flow.request_headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
+            flow.request_headers
+                .push(("Content-Type".to_owned(), media.to_owned()));
+            flow
+        };
+        let report = capture(
+            &empty_document(),
+            &[
+                with_body(
+                    1,
+                    "/v1/collect",
+                    "text/plain;charset=UTF-8",
+                    br#"{"event":"page_view","page":"/"}"#,
+                ),
+                with_body(
+                    2,
+                    "/v1/login",
+                    "application/x-www-form-urlencoded",
+                    b"user=ada&remember=on&next=%2Fhome",
+                ),
+                with_body(
+                    3,
+                    "/v1/upload",
+                    "application/octet-stream",
+                    &[0, 159, 146, 150],
+                ),
+                with_body(4, "/v1/items", "application/json", br#"{"name":"lamp"}"#),
+            ],
+        );
+        let endpoint = |path: &str| {
+            report
+                .document
+                .surface
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.identity.path_template.as_str() == path)
+                .expect("endpoint")
+                .clone()
+        };
+        let fields = |endpoint: &Endpoint| match endpoint
+            .request_body
+            .as_ref()
+            .and_then(|slot| slot.shape.selected_candidate())
+            .map(|candidate| candidate.value.clone())
+        {
+            Some(SchemaShape::Object { properties, .. }) => {
+                let mut names = properties
+                    .iter()
+                    .map(|p| p.name.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            }
+            other => panic!("not an object: {other:?}"),
+        };
+        let beacon = endpoint("/v1/collect");
+        assert_eq!(beacon.request_media_type.as_deref(), Some("text/plain"));
+        assert_eq!(fields(&beacon), vec!["event", "page"]);
+        let form = endpoint("/v1/login");
+        assert_eq!(
+            form.request_media_type.as_deref(),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(fields(&form), vec!["next", "remember", "user"]);
+        let upload = endpoint("/v1/upload");
+        assert_eq!(
+            upload.request_media_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            upload
+                .request_body
+                .as_ref()
+                .and_then(|slot| slot.shape.selected_candidate())
+                .map(|c| c.value.clone()),
+            Some(SchemaShape::String {
+                format: Some("binary".to_owned())
+            })
+        );
+        assert_eq!(
+            endpoint("/v1/items").request_media_type.as_deref(),
+            Some("application/json")
         );
     }
 

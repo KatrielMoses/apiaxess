@@ -11,10 +11,10 @@ use std::{
 
 use apiaxess_api_model::{
     ApiKeyLocation, AuthenticationScheme, Endpoint, EndpointIdentity, FactConfidence,
-    GraphQlOperationType, ObjectOpenness, RequirednessAssessment, ResponseSelector, SchemaShape,
-    SchemaSlot, SignerArtifact, SignerBinding, SignerKeySource, SignerMode, SignerPrimitive,
-    SignerScheme, SourceType, UnifiedApiSurface, captured_graphql_operations, endpoint_base_url,
-    is_transport_header,
+    GraphQlOperationType, ObjectOpenness, RequestEncoding, RequirednessAssessment,
+    ResponseSelector, SchemaShape, SchemaSlot, SignerArtifact, SignerBinding, SignerKeySource,
+    SignerMode, SignerPrimitive, SignerScheme, SourceType, UnifiedApiSurface,
+    captured_graphql_operations, endpoint_base_url, is_transport_header,
 };
 use apiaxess_diagnostics::{
     Diagnostic, DiagnosticContext, DiagnosticSeverity, DiagnosticValue, catalogue,
@@ -465,7 +465,20 @@ fn emit_operation(
     if let Some(body) = &endpoint.request_body {
         let body_path = format!("{model_path}.request_body");
         let reference = builder.schema_ref(body, &body_path);
-        let mut media = json!({"schema": reference});
+        // The body is keyed by its observed media type. A text body carrying
+        // JSON (an analytics beacon) is a string whose content is that JSON;
+        // an unobserved media type is the `*/*` range, never assumed JSON.
+        let encoding = RequestEncoding::of(endpoint);
+        let schema = match &encoding {
+            RequestEncoding::TextJson(_) => json!({
+                "type": "string",
+                "contentMediaType": "application/json",
+                "contentSchema": reference
+            }),
+            _ => reference,
+        };
+        let media_key = encoding.media_type().unwrap_or("*/*").to_owned();
+        let mut media = json!({"schema": schema});
         // A GraphQL endpoint keeps the operations it was seen running, with
         // their documents and variables exactly as captured.
         let graphql = captured_graphql_operations(endpoint);
@@ -498,11 +511,21 @@ fn emit_operation(
                 ),
             );
         }
+        let mut content = Map::new();
+        content.insert(media_key, media);
+        let description = match encoding {
+            RequestEncoding::Unknown => {
+                "The request media type was not observed; the schema is the recovered body shape."
+            }
+            RequestEncoding::TextJson(_) => "A text body whose content is JSON, as captured.",
+            _ => "Recovered request body.",
+        };
         operation.insert(
             "requestBody".to_owned(),
             json!({
+                "description": description,
                 "required": false,
-                "content": {"application/json": media},
+                "content": Value::Object(content),
                 "x-apiaxess-confidence": builder.confidence_extension(&format!("{body_path}.shape")),
                 "x-apiaxess-provenance": builder.provenance_extension(&format!("{body_path}.shape")),
                 "x-apiaxess-requiredness": "unknown"

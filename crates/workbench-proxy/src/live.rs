@@ -382,6 +382,9 @@ pub struct LiveWorkbench {
     /// scope declared yet). Once a scope is known they are re-classified
     /// against it, so browsing before declaring a target leaves no phantoms.
     admitted_without_scope: Mutex<std::collections::BTreeSet<u64>>,
+    /// WebSocket connections admitted in scope only because of admit-all;
+    /// re-classified with the flows once a scope is known.
+    admitted_ws_without_scope: Mutex<std::collections::BTreeSet<u64>>,
     provenance: RwLock<String>,
     prompt_pending: Mutex<HashMap<u64, mpsc::Sender<CredentialPromptAnswer>>>,
     prompt_next_id: AtomicU64,
@@ -424,6 +427,7 @@ impl LiveWorkbench {
             engagement_scope: RwLock::new(None),
             admit_all_observed: AtomicBool::new(false),
             admitted_without_scope: Mutex::new(std::collections::BTreeSet::new()),
+            admitted_ws_without_scope: Mutex::new(std::collections::BTreeSet::new()),
             provenance: RwLock::new("proxy.observer".to_owned()),
             prompt_pending: Mutex::new(HashMap::new()),
             prompt_next_id: AtomicU64::new(1),
@@ -497,17 +501,70 @@ impl LiveWorkbench {
             .lock()
             .map(|mut ids| std::mem::take(&mut *ids))
             .unwrap_or_default();
+        let ws_ids = self
+            .admitted_ws_without_scope
+            .lock()
+            .map(|mut ids| std::mem::take(&mut *ids))
+            .unwrap_or_default();
         let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
             return Ok(0);
         };
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        store.reclassify_flows(&ids.into_iter().collect::<Vec<_>>(), |host, url| {
+        let classify = |host: Option<&str>, url: Option<&str>| {
             host.map_or(ScopeDisposition::Undetermined, |host| {
                 self.classify_scope(host, url)
             })
-        })
+        };
+        if !ws_ids.is_empty() {
+            self.relabel_ws_connections(&store, &ws_ids, &classify)?;
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        store.reclassify_flows(&ids.into_iter().collect::<Vec<_>>(), classify)
+    }
+
+    /// Re-classifies the WebSocket connections with `ids`. The relabelled
+    /// record goes through the ordered stream writer, after any message
+    /// writes already queued with the old label, so the new label is the one
+    /// that persists; the writer then announces it to the WebSocket tab. An
+    /// open connection's in-memory record is updated too, so its later
+    /// messages carry the new label.
+    fn relabel_ws_connections(
+        &self,
+        store: &Arc<TrafficStore>,
+        ids: &std::collections::BTreeSet<u64>,
+        classify: &dyn Fn(Option<&str>, Option<&str>) -> ScopeDisposition,
+    ) -> Result<(), Diagnostic> {
+        let mut records = store
+            .ws_connections()?
+            .into_iter()
+            .filter(|record| ids.contains(&record.id))
+            .map(|record| (record.id, record))
+            .collect::<BTreeMap<_, _>>();
+        let mut relabelled = Vec::new();
+        if let Ok(mut websockets) = self.websockets.lock() {
+            for live in websockets.values_mut() {
+                if ids.contains(&live.record.id) {
+                    let scope = classify(live.record.host.as_deref(), Some(&live.record.url));
+                    if scope != live.record.scope {
+                        live.record.scope = scope;
+                        relabelled.push(live.record.clone());
+                    }
+                    records.remove(&live.record.id);
+                }
+            }
+        }
+        for mut record in records.into_values() {
+            let scope = classify(record.host.as_deref(), Some(&record.url));
+            if scope != record.scope {
+                record.scope = scope;
+                relabelled.push(record);
+            }
+        }
+        for record in relabelled {
+            self.enqueue_stream(StreamWrite::Connection(Arc::clone(store), record));
+        }
+        Ok(())
     }
 
     /// Pauses admit-all (the unscoped browser stopped): no new flow is
@@ -523,6 +580,9 @@ impl LiveWorkbench {
     pub fn reset_admit_all(&self) {
         self.admit_all_observed.store(false, Ordering::SeqCst);
         if let Ok(mut ids) = self.admitted_without_scope.lock() {
+            ids.clear();
+        }
+        if let Ok(mut ids) = self.admitted_ws_without_scope.lock() {
             ids.clear();
         }
     }
@@ -1055,6 +1115,11 @@ impl LiveWorkbench {
                     server_closed: false,
                 }
             });
+            if self.admit_all_observed.load(Ordering::SeqCst) {
+                if let Ok(mut ids) = self.admitted_ws_without_scope.lock() {
+                    ids.insert(live.record.id);
+                }
+            }
             let sequence = live.next_sequence;
             live.next_sequence += 1;
             live.record.message_count = sequence;
@@ -1548,6 +1613,105 @@ mod tests {
         assert!(!live.admits_all_observed());
         assert_eq!(live.end_admit_all_for_scope().expect("reclassify"), 0);
         assert_eq!(scope_of(unscoped), ScopeDisposition::InScope);
+    }
+
+    #[test]
+    fn websocket_connections_admitted_before_scope_are_relabelled_when_it_is_declared() {
+        let root = std::env::temp_dir().join(format!(
+            "apiaxess-live-ws-admit-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = Arc::new(TrafficStore::open(&root, "session:ws-admit").expect("store"));
+        let live = LiveWorkbench::new();
+        live.attach_store(Arc::clone(&store));
+        let key = |url: &str| crate::WebSocketConnectionKey {
+            client: "127.0.0.1:50150".parse().expect("address"),
+            url: url.to_owned(),
+        };
+        let send = |url: &str| {
+            live.observe(FlowEvent::WebSocketMessage {
+                connection: key(url),
+                direction: crate::WebSocketDirection::ClientToServer,
+                kind: crate::WebSocketMessageKind::Text,
+                payload: b"hi".to_vec(),
+                payload_bytes: 2,
+                close_code: None,
+                observed_at: chrono::Utc::now(),
+            });
+        };
+        let wait_for = |check: &dyn Fn(&[apiaxess_workbench_store::WsConnectionRecord]) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let connections = store.ws_connections().expect("connections");
+                if check(&connections) || std::time::Instant::now() > deadline {
+                    return connections;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let scope_of = |connections: &[apiaxess_workbench_store::WsConnectionRecord], url: &str| {
+            connections
+                .iter()
+                .find(|connection| connection.url == url)
+                .map(|connection| connection.scope)
+        };
+        let target = "ws://127.0.0.1:9201/ws?room=ref";
+        let tracker = "wss://live.tracker.test/socket";
+
+        live.set_admit_all_observed(true);
+        send(target);
+        send(tracker);
+        let admitted = wait_for(&|connections| connections.len() == 2);
+        assert_eq!(
+            scope_of(&admitted, tracker),
+            Some(ScopeDisposition::InScope)
+        );
+
+        let mut updates = live.subscribe();
+        live.set_engagement_scope(web_scope("127.0.0.1", 9201));
+        live.end_admit_all_for_scope().expect("reclassify");
+        // The relabel lands through the ordered writer, after any queued writes.
+        let relabelled = wait_for(&|connections| {
+            scope_of(connections, tracker) == Some(ScopeDisposition::OutsideDeclaredScope)
+        });
+        assert_eq!(
+            scope_of(&relabelled, target),
+            Some(ScopeDisposition::InScope)
+        );
+        assert_eq!(
+            scope_of(&relabelled, tracker),
+            Some(ScopeDisposition::OutsideDeclaredScope)
+        );
+        // The tab is told, with the connection as now classified.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut announced = None;
+        while announced.is_none() && std::time::Instant::now() < deadline {
+            match updates.try_recv() {
+                Ok(update) => {
+                    announced = update.websocket.into_iter().find(|event| {
+                        event.message.is_none()
+                            && event.connection.url == tracker
+                            && event.connection.scope == ScopeDisposition::OutsideDeclaredScope
+                    });
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert!(announced.is_some(), "the relabel is announced");
+
+        // The still-open connection keeps its new label as messages flow.
+        send(tracker);
+        let after = wait_for(&|connections| {
+            connections
+                .iter()
+                .any(|connection| connection.url == tracker && connection.message_count == 2)
+        });
+        assert_eq!(
+            scope_of(&after, tracker),
+            Some(ScopeDisposition::OutsideDeclaredScope)
+        );
     }
 
     #[test]

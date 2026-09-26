@@ -45,12 +45,22 @@ class Client:
     def __init__(self, base_url="", headers=None, transport=None):
         self.base_url, self.headers, self.transport = str(base_url or ""), dict(headers or {}), transport
 
-    def request(self, method, url, params=None, json=None, auth=None):
+    def request(self, method, url, params=None, json=None, data=None, content=None, headers=None, auth=None):
         full = url if "://" in url else self.base_url.rstrip("/") + url
         if params:
             full += "?" + "&".join(f"{key}={value}" for key, value in params.items())
-        content = b"" if json is None else _json.dumps(json).encode()
-        request = Request(method, full, self.headers, content)
+        merged = {**self.headers, **(headers or {})}
+        if json is not None:
+            body = _json.dumps(json).encode()
+            merged.setdefault("content-type", "application/json")
+        elif data is not None:
+            body = "&".join(f"{key}={value}" for key, value in data.items()).encode()
+            merged.setdefault("content-type", "application/x-www-form-urlencoded")
+        elif content is not None:
+            body = content.encode() if isinstance(content, str) else bytes(content)
+        else:
+            body = b""
+        request = Request(method, full, merged, body)
         if auth is not None:
             request = next(auth.auth_flow(request))
         return self.transport.handler(request)

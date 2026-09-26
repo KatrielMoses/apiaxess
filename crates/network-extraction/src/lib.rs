@@ -770,6 +770,7 @@ impl ModelBuilder {
             headers,
             authentication: None,
             request_body,
+            request_media_type: None,
             responses: Vec::new(),
             pagination_signals: Vec::new(),
         });
@@ -1536,6 +1537,11 @@ fn merge_schema(target: &mut SchemaSlot, source: SchemaSlot) {
 
 fn merge_endpoint(target: &mut Endpoint, source: Endpoint) {
     merge_fact(&mut target.presence, source.presence);
+    if target.request_media_type.is_none() {
+        target
+            .request_media_type
+            .clone_from(&source.request_media_type);
+    }
     merge_fact(&mut target.path_template, source.path_template);
     match (&mut target.base_url, source.base_url) {
         (Some(target), Some(source)) => merge_fact(target, source),

@@ -298,6 +298,7 @@ fn document() -> ApiDocument {
             headers: vec![],
             authentication: Some(authentication),
             request_body: None,
+            request_media_type: None,
             responses: vec![ResponseBody {
                 selector: ResponseSelector::Exact(200),
                 presence: fact(

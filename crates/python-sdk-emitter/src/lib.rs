@@ -14,9 +14,9 @@ use std::{
 
 use apiaxess_api_model::{
     CanonicalizationOperation, CapturedGraphQlOperation, Endpoint, EndpointIdentity,
-    GraphQlOperationType, RequirednessAssessment, SchemaShape, SchemaSlot, SignerArtifact,
-    SignerKeySource, SignerMode, SignerPrimitive, UnifiedApiSurface, captured_graphql_operations,
-    endpoint_base_url,
+    GraphQlOperationType, RequestEncoding, RequirednessAssessment, SchemaShape, SchemaSlot,
+    SignerArtifact, SignerKeySource, SignerMode, SignerPrimitive, UnifiedApiSurface,
+    captured_graphql_operations, endpoint_base_url,
 };
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 
@@ -519,15 +519,27 @@ fn render_method(
         });
         query_entries.push(format!("{}: {field}", py_str(parameter.name.as_str())));
     }
-    let body_type = endpoint.request_body.as_ref().map(|body| {
-        models.slot_type(
-            body,
-            &format!("{model_path}.request_body"),
-            &format!("{method_name}Request"),
-        )
+    // The body is sent as its observed media type (see `body_call`); only a
+    // structured body is typed as a model.
+    let encoding = RequestEncoding::of(endpoint);
+    let body_type = endpoint.request_body.as_ref().map(|body| match &encoding {
+        RequestEncoding::Json(_) | RequestEncoding::Form(_) | RequestEncoding::TextJson(_) => {
+            models.slot_type(
+                body,
+                &format!("{model_path}.request_body"),
+                &format!("{method_name}Request"),
+            )
+        }
+        RequestEncoding::Text(_) => "str".to_owned(),
+        RequestEncoding::Binary(_) | RequestEncoding::Multipart(_) => "bytes".to_owned(),
+        RequestEncoding::Unknown => "bytes | str".to_owned(),
     });
     if let Some(body_type) = &body_type {
         args.push(format!("body: {body_type} | None = None"));
+        if matches!(encoding, RequestEncoding::Multipart(_)) {
+            // A multipart body's boundary lives in its Content-Type.
+            args.push("content_type: str".to_owned());
+        }
     }
     // Only a structured (JSON) body is decoded into a model; an HTML page,
     // an event stream, or bytes come back as the raw httpx.Response.
@@ -616,12 +628,12 @@ fn render_method(
     }
     let _ = writeln!(
         source,
-        "        response = self._request({method}, path, params=params, json={json}, signer_ids={signer_ids}, origin={origin})",
+        "        response = self._request({method}, path, params=params, {body}, signer_ids={signer_ids}, origin={origin})",
         method = py_str(endpoint.identity.method.as_str()),
-        json = if body_type.is_some() {
-            "_to_json(body)"
+        body = if body_type.is_some() {
+            body_call(&encoding)
         } else {
-            "None"
+            "json=None".to_owned()
         },
         signer_ids = py_str_list(&signer_list),
         origin = py_opt_str(origin)
@@ -665,6 +677,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any
+import json as _json
 import httpx
 from .auth import CompositeAuth, CredentialProvider
 from . import auth as _auth
@@ -753,9 +766,10 @@ def _decode_response(response: httpx.Response, model_type: Any) -> Any:
         if signer_ids and self._auth is None: raise RuntimeError("Supply signer_credentials or auth for this recovered signer")
         return self._auth
 
-    def _request(self, method: str, path: str, *, params: dict[str, Any] | None, json: Any, signer_ids: list[str], origin: str | None = None) -> httpx.Response:
+    def _request(self, method: str, path: str, *, params: dict[str, Any] | None, json: Any = None, data: Any = None, content: Any = None, content_type: str | None = None, signer_ids: list[str], origin: str | None = None) -> httpx.Response:
         url = path if origin is None else self._origins.get(origin, origin).rstrip("/") + path
-        return self._client.request(method, url, params=params, json=json, auth=self._auth_for(signer_ids))
+        headers = {"content-type": content_type} if content_type is not None else None
+        return self._client.request(method, url, params=params, json=json, data=data, content=content, headers=headers, auth=self._auth_for(signer_ids))
 
 "#,
     );
@@ -1248,6 +1262,25 @@ fn path_parameter_names(path: &str) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// The `_request` keyword arguments that send `body` as its encoding: JSON
+/// as JSON, a form as form fields, text as text with its media type, and an
+/// unobserved media type as raw content with no Content-Type.
+fn body_call(encoding: &RequestEncoding) -> String {
+    match encoding {
+        RequestEncoding::Json(_) => "json=_to_json(body)".to_owned(),
+        RequestEncoding::Form(_) => "data=_to_json(body)".to_owned(),
+        RequestEncoding::TextJson(media) => format!(
+            "content=None if body is None else _json.dumps(_to_json(body)), content_type={}",
+            py_str(media)
+        ),
+        RequestEncoding::Text(media) | RequestEncoding::Binary(media) => {
+            format!("content=body, content_type={}", py_str(media))
+        }
+        RequestEncoding::Multipart(_) => "content=body, content_type=content_type".to_owned(),
+        RequestEncoding::Unknown => "content=body".to_owned(),
+    }
 }
 
 /// A Python string literal. JSON string escapes are a subset of Python's, so

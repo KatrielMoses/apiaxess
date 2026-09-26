@@ -123,6 +123,11 @@ pub struct Endpoint {
     /// Request-body schema when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body: Option<SchemaSlot>,
+    /// Observed request media type (`application/json`, `text/plain`,
+    /// `application/x-www-form-urlencoded`, ...), without parameters; absent
+    /// when none was observed (static analysis, older documents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_media_type: Option<String>,
     /// Response schemas keyed by selector.
     pub responses: Vec<ResponseBody>,
     /// Observable pagination conventions such as page, cursor, or Link.

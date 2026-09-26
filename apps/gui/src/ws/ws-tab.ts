@@ -106,8 +106,10 @@ export async function loadWsConnections(): Promise<void> {
 export function ingestWsEvents(events: readonly LiveWsEvent[]): void {
   if (events.length === 0) return;
   for (const event of events) {
-    // A connection first seen live has no party yet: re-read the list once.
-    if (!connections.some((known) => known.id === event.connection.id)) scheduleListRefresh();
+    // A connection first seen live has no party yet, and a connection-only
+    // event on a known one means its state or scope changed (a scope was
+    // declared): re-read the list, which also recomputes party labels.
+    if (!connections.some((known) => known.id === event.connection.id) || event.message === undefined) scheduleListRefresh();
     connections = upsertConnection(connections, event.connection);
     const message = event.message;
     if (message === undefined) continue;

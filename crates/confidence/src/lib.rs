@@ -939,6 +939,7 @@ mod tests {
             headers: vec![],
             authentication: None,
             request_body: None,
+            request_media_type: None,
             responses: vec![],
             pagination_signals: vec![],
         }

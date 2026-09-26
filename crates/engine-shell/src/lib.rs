@@ -4025,6 +4025,192 @@ print("RESULT " + json.dumps({"sent": sent, "results": results}))
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn request_bodies_export_with_their_captured_media_type() {
+        let engine = engine_with_session(&["127.0.0.1"]);
+        let runtime = engine.session_runtime().expect("runtime").expect("session");
+        let store = runtime.store();
+        for (path, media, body) in [
+            (
+                "/v1/collect",
+                "text/plain;charset=UTF-8",
+                &br#"{"event":"page_view","page":"/"}"#[..],
+            ),
+            (
+                "/v1/login",
+                "application/x-www-form-urlencoded",
+                &b"user=ada&remember=on"[..],
+            ),
+            (
+                "/v1/upload",
+                "application/octet-stream",
+                &[0_u8, 159, 146, 150][..],
+            ),
+            (
+                "/v1/items",
+                "application/json",
+                &br#"{"name":"lamp","price":2.5}"#[..],
+            ),
+        ] {
+            store
+                .upsert(&apiaxess_workbench_store::FlowCapture {
+                    id: store.allocate_flow_id(),
+                    captured_at: chrono::Utc::now(),
+                    protocol: "h1".to_owned(),
+                    method: Some("POST".to_owned()),
+                    host: Some("127.0.0.1".to_owned()),
+                    url: Some(format!("http://127.0.0.1:9201{path}")),
+                    path: Some(path.to_owned()),
+                    status: Some(200),
+                    duration_ms: Some(2),
+                    request_headers: vec![("content-type".to_owned(), media.to_owned())],
+                    response_headers: vec![(
+                        "content-type".to_owned(),
+                        "application/json".to_owned(),
+                    )],
+                    request_body: Some(body.to_vec()),
+                    response_body: Some(br#"{"ok":true}"#.to_vec()),
+                    scope: apiaxess_session::ScopeDisposition::InScope,
+                    provenance: "proxy.observer".to_owned(),
+                    origin: apiaxess_workbench_store::FlowOrigin::Capture,
+                })
+                .expect("flow");
+        }
+        let surface = engine.fuse_web_capture().expect("fuse");
+
+        let openapi = apiaxess_openapi_emitter::OpenApiEmitter::default()
+            .emit(&surface)
+            .expect("openapi")
+            .document;
+        let content = |path: &str| openapi["paths"][path]["post"]["requestBody"]["content"].clone();
+        assert_eq!(
+            content("/v1/collect")["text/plain"]["schema"]["contentMediaType"],
+            "application/json"
+        );
+        assert!(content("/v1/collect")["text/plain"]["schema"]["contentSchema"].is_object());
+        assert!(content("/v1/login")["application/x-www-form-urlencoded"]["schema"].is_object());
+        assert!(content("/v1/upload")["application/octet-stream"]["schema"].is_object());
+        assert!(content("/v1/items")["application/json"]["schema"].is_object());
+        for path in ["/v1/collect", "/v1/login", "/v1/upload"] {
+            assert!(
+                content(path).get("application/json").is_none(),
+                "{path} exported as JSON"
+            );
+        }
+
+        let postman = apiaxess_collections_emitter::CollectionsEmitter::default()
+            .emit_collection(&surface)
+            .expect("postman")
+            .document;
+        let request = |name: &str| {
+            postman["item"]
+                .as_array()
+                .expect("folders")
+                .iter()
+                .flat_map(|folder| folder["item"].as_array().expect("items").clone())
+                .find(|item| item["name"] == name)
+                .unwrap_or_else(|| panic!("{name}"))["request"]
+                .clone()
+        };
+        let content_type = |request: &serde_json::Value| {
+            request["header"]
+                .as_array()
+                .expect("headers")
+                .iter()
+                .find(|header| {
+                    header["key"]
+                        .as_str()
+                        .is_some_and(|key| key.eq_ignore_ascii_case("content-type"))
+                })
+                .map(|header| header["value"].clone())
+        };
+        let beacon = request("POST /v1/collect");
+        assert_eq!(content_type(&beacon), Some(serde_json::json!("text/plain")));
+        assert_eq!(beacon["body"]["mode"], "raw");
+        let login = request("POST /v1/login");
+        assert_eq!(login["body"]["mode"], "urlencoded");
+        let keys = login["body"]["urlencoded"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .map(|field| field["key"].as_str().expect("key").to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["remember".to_owned(), "user".to_owned()])
+        );
+        let upload = request("POST /v1/upload");
+        assert_eq!(upload["body"]["mode"], "file");
+        assert_eq!(
+            content_type(&upload),
+            Some(serde_json::json!("application/octet-stream"))
+        );
+        assert_eq!(
+            content_type(&request("POST /v1/items")),
+            Some(serde_json::json!("application/json"))
+        );
+
+        let sdk = apiaxess_python_sdk_emitter::PythonSdkEmitter::default()
+            .generate(&surface)
+            .expect("sdk");
+        let script = r#"
+import json, httpx
+from apiaxess_client.client import ApiClient, DEFAULT_BASE_URL
+sent = {}
+def handler(request):
+    body = request.content if isinstance(request.content, (bytes, bytearray)) else b""
+    sent[str(request.url).split("9201", 1)[1]] = (request.headers.get("content-type"), body.decode("latin-1"))
+    return httpx.Response(200, content=b'{"ok":true}', headers={"content-type": "application/json"})
+client = ApiClient(http_client=httpx.Client(base_url=DEFAULT_BASE_URL, transport=httpx.MockTransport(handler)))
+client.post_v1_collect(body={"event": "page_view", "page": "/"})
+client.post_v1_login(body={"user": "ada", "remember": "on"})
+client.post_v1_upload(body=bytes([0, 159, 146, 150]))
+client.post_v1_items(body={"name": "lamp", "price": 2.5})
+print("RESULT " + json.dumps(sent))
+"#;
+        let output =
+            match apiaxess_python_sdk_emitter::testing::run_generated_python(&sdk.files, script) {
+                Ok(Some(output)) => output,
+                Ok(None) => return,
+                Err(output) => panic!("the generated SDK does not run:\n{output}"),
+            };
+        let sent: serde_json::Value = serde_json::from_str(
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("RESULT "))
+                .expect("result"),
+        )
+        .expect("json");
+        let media = |path: &str| {
+            sent[path][0]
+                .as_str()
+                .expect("content-type")
+                .split(';')
+                .next()
+                .expect("media")
+                .to_owned()
+        };
+        assert_eq!(media("/v1/collect"), "text/plain");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                sent["/v1/collect"][1].as_str().expect("body")
+            )
+            .expect("json body")["event"],
+            "page_view"
+        );
+        assert_eq!(media("/v1/login"), "application/x-www-form-urlencoded");
+        assert!(
+            sent["/v1/login"][1]
+                .as_str()
+                .expect("body")
+                .contains("user=ada")
+        );
+        assert_eq!(media("/v1/upload"), "application/octet-stream");
+        assert_eq!(sent["/v1/upload"][1], "\u{0}\u{9f}\u{92}\u{96}");
+        assert_eq!(media("/v1/items"), "application/json");
+    }
+
+    #[test]
     fn android_target_status_starts_idle() {
         let engine = super::Engine::new();
         let status = engine.android_target_status();

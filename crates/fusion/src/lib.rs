@@ -1178,6 +1178,7 @@ mod tests {
                 shape,
                 observations: vec![],
             }),
+            request_media_type: None,
             responses: vec![],
             pagination_signals: vec![],
         };

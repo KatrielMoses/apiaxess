@@ -12,9 +12,9 @@ use std::{
 
 use apiaxess_api_model::{
     ApiKeyLocation, AuthenticationScheme, CanonicalizationOperation, CapturedGraphQlOperation,
-    Endpoint, EndpointIdentity, GraphQlOperationType, SchemaShape, SchemaSlot, SignerArtifact,
-    SignerFixture, SignerMode, SignerPrimitive, UnifiedApiSurface, captured_graphql_operations,
-    endpoint_base_url, is_transport_header,
+    Endpoint, EndpointIdentity, GraphQlOperationType, RequestEncoding, SchemaShape, SchemaSlot,
+    SignerArtifact, SignerFixture, SignerMode, SignerPrimitive, UnifiedApiSurface,
+    captured_graphql_operations, endpoint_base_url, is_transport_header,
 };
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -424,15 +424,26 @@ fn postman_request(
             "description": parameter_confidence(surface, endpoint, header.name.as_str())
         }));
     }
-    if endpoint.request_body.is_some()
-        && !headers.iter().any(|header| {
+    // The body's own media type; Postman writes a multipart boundary itself,
+    // and an unobserved media type is not assumed.
+    let encoding = RequestEncoding::of(endpoint);
+    let content_type = if graphql.is_some() {
+        Some("application/json")
+    } else {
+        match &encoding {
+            RequestEncoding::Multipart(_) | RequestEncoding::Unknown => None,
+            other => other.media_type(),
+        }
+    };
+    if let Some(content_type) = content_type.filter(|_| endpoint.request_body.is_some()) {
+        if !headers.iter().any(|header| {
             header
                 .get("key")
                 .and_then(Value::as_str)
                 .is_some_and(|key| key.eq_ignore_ascii_case("content-type"))
-        })
-    {
-        headers.push(json!({"key": "Content-Type", "value": "application/json", "type": "text"}));
+        }) {
+            headers.push(json!({"key": "Content-Type", "value": content_type, "type": "text"}));
+        }
     }
 
     let mut request = Map::new();
@@ -482,12 +493,9 @@ Body: GraphQL {} {} with its document and variables as captured.",
                     operation.name
                 );
             } else if let Some(slot) = endpoint.request_body.as_ref() {
-                request_data.insert("body".to_owned(), json!({
-                "mode": "raw",
-                "raw": serde_json::to_string_pretty(&schema_example(slot)).expect("example JSON is serializable"),
-                "options": {"raw": {"language": "json"}}
-                }));
-                description.push_str("\nBody: placeholder values generated from the recovered schema (strings \"example\", numbers 0, booleans false), not captured data. Replace them before sending.");
+                let (body, note) = postman_body(slot, &encoding);
+                request_data.insert("body".to_owned(), body);
+                description.push_str(note);
             }
             request_data.insert("url".to_owned(), Value::Object(url));
             request_data.insert("description".to_owned(), Value::String(description));
@@ -547,6 +555,51 @@ fn endpoint_description(
         }
     }
     lines.join("\n")
+}
+
+/// A request body in the Postman mode its encoding calls for, with the note
+/// that says which values are placeholders.
+fn postman_body(slot: &SchemaSlot, encoding: &RequestEncoding) -> (Value, &'static str) {
+    const PLACEHOLDERS: &str = "\nBody: placeholder values generated from the recovered schema (strings \"example\", numbers 0, booleans false), not captured data. Replace them before sending.";
+    let example = schema_example(slot);
+    let fields = || {
+        example
+            .as_object()
+            .map(|object| {
+                object
+                    .keys()
+                    .map(|key| json!({"key": key, "value": "example", "type": "text", "description": "Placeholder value (not captured)."}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let raw_json = || serde_json::to_string_pretty(&example).expect("example JSON is serializable");
+    match encoding {
+        RequestEncoding::Json(_) | RequestEncoding::TextJson(_) => (
+            json!({"mode": "raw", "raw": raw_json(), "options": {"raw": {"language": "json"}}}),
+            PLACEHOLDERS,
+        ),
+        RequestEncoding::Form(_) => (
+            json!({"mode": "urlencoded", "urlencoded": fields()}),
+            PLACEHOLDERS,
+        ),
+        RequestEncoding::Multipart(_) => (
+            json!({"mode": "formdata", "formdata": fields()}),
+            PLACEHOLDERS,
+        ),
+        RequestEncoding::Text(_) => (
+            json!({"mode": "raw", "raw": "example", "options": {"raw": {"language": "text"}}}),
+            "\nBody: placeholder text, not captured data. Replace it before sending.",
+        ),
+        RequestEncoding::Binary(_) => (
+            json!({"mode": "file", "file": {"src": ""}}),
+            "\nBody: binary; choose the file to send.",
+        ),
+        RequestEncoding::Unknown => (
+            json!({"mode": "raw", "raw": raw_json()}),
+            "\nBody: the request media type was not observed, so no Content-Type is set; the body shows the recovered fields as placeholder values (not captured data).",
+        ),
+    }
 }
 
 fn graphql_type_name(operation_type: GraphQlOperationType) -> &'static str {
