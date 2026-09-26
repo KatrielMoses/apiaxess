@@ -1971,6 +1971,59 @@ impl TrafficStore {
         })
     }
 
+    /// Re-classifies the flows with `ids` against `classify_scope`, in either
+    /// direction: flows admitted without a scope must be able to leave it once
+    /// a scope is known. Returns how many changed; unknown ids are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the store cannot be read or updated.
+    pub fn reclassify_flows(
+        &self,
+        ids: &[u64],
+        classify_scope: impl Fn(Option<&str>, Option<&str>) -> ScopeDisposition,
+    ) -> Result<usize, Diagnostic> {
+        let connection = self.lock_connection()?;
+        let corrupt = |step: &str, error: &rusqlite::Error| {
+            storage_diag(
+                catalogue::PROXY_STORE_CORRUPT,
+                step,
+                &self.root,
+                &error.to_string(),
+            )
+        };
+        let mut changed = 0;
+        for id in ids {
+            let id = i64::try_from(*id).unwrap_or(i64::MAX);
+            let row = connection
+                .query_row(
+                    "SELECT host,url,scope FROM flows WHERE id=?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| corrupt("query", &e))?;
+            let Some((host, url, current)) = row else {
+                continue;
+            };
+            let scope = serde_json::to_string(&classify_scope(host.as_deref(), url.as_deref()))
+                .map_err(|e| serialization_diag("scope", &e.to_string()))?;
+            if scope != current {
+                connection
+                    .execute("UPDATE flows SET scope=?1 WHERE id=?2", params![scope, id])
+                    .map_err(|e| corrupt("write", &e))?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
     /// Re-classifies stored flows against a scope that was declared or widened
     /// after they were captured, promoting each flow the classifier now puts in
     /// scope to `InScope`. Upgrade-only: an `InScope` flow is never demoted, so

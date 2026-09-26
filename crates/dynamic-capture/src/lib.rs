@@ -76,6 +76,48 @@ pub struct DynamicCaptureReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Retracts, before a new capture run, what earlier runs whose ID starts with
+/// `run_prefix` alone asserted: every endpoint and protocol operation whose
+/// presence rests only on those runs' evidence. A capture run re-reads every
+/// stored flow, so what is still observed and in scope is asserted again by
+/// the new run, while an assertion whose flows have since left the scope (or
+/// were never meant to be in it) does not linger in the surface. Anything also
+/// backed by other evidence (static analysis, another source) is kept.
+/// Returns how many entries were retracted.
+pub fn retract_previous_runs(document: &mut ApiDocument, run_prefix: &str) -> usize {
+    let prior = document
+        .surface
+        .provenance
+        .entities
+        .iter()
+        .filter(|entity| entity.run_id.as_str().starts_with(run_prefix))
+        .map(|entity| entity.id.clone())
+        .collect::<BTreeSet<_>>();
+    if prior.is_empty() {
+        return 0;
+    }
+    let only_prior = |fact: &Fact<PresenceAssertion>| {
+        !fact.candidates.is_empty()
+            && fact.candidates.iter().all(|candidate| {
+                !candidate.evidence.is_empty()
+                    && candidate
+                        .evidence
+                        .iter()
+                        .all(|entity| prior.contains(entity))
+            })
+    };
+    let before = document.surface.endpoints.len() + document.surface.protocol_operations.len();
+    document
+        .surface
+        .endpoints
+        .retain(|endpoint| !only_prior(&endpoint.presence));
+    document
+        .surface
+        .protocol_operations
+        .retain(|operation| !only_prior(&operation.presence));
+    before - document.surface.endpoints.len() - document.surface.protocol_operations.len()
+}
+
 /// Reads the durable Phase-2 traffic store and commits dynamic facts to a
 /// live session. A source read or canonical commit failure is returned; flow-
 /// local problems remain in the report so evidence is not silently dropped.
@@ -2443,6 +2485,53 @@ mod tests {
                 "Me".to_owned(),
                 1
             )]
+        );
+    }
+
+    #[test]
+    fn a_new_run_retracts_what_only_earlier_runs_asserted_and_keeps_other_evidence() {
+        let paths = |document: &ApiDocument| {
+            let mut paths = document
+                .surface
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.identity.path_template.as_str().to_owned())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        // Another source's run (standing in for static knowledge) is kept.
+        let other = DynamicCaptureConfig::new("other:run").expect("config");
+        let base = capture_into_document(
+            &empty_document(),
+            &[on_host(1, "api.one.test", "/v1/kept")],
+            &other,
+            Utc::now(),
+        )
+        .expect("report")
+        .document;
+        let first = capture(
+            &base,
+            &[
+                on_host(2, "api.one.test", "/v1/still-observed"),
+                on_host(3, "noise.test", "/v1/left-scope"),
+            ],
+        );
+        assert_eq!(
+            paths(&first.document),
+            vec!["/v1/kept", "/v1/left-scope", "/v1/still-observed"]
+        );
+        let mut document = first.document;
+        assert_eq!(retract_previous_runs(&mut document, "run:test:"), 2);
+        assert_eq!(paths(&document), vec!["/v1/kept"]);
+        // The next run re-asserts only what is still observed.
+        let second = capture(
+            &document,
+            &[on_host(2, "api.one.test", "/v1/still-observed")],
+        );
+        assert_eq!(
+            paths(&second.document),
+            vec!["/v1/kept", "/v1/still-observed"]
         );
     }
 

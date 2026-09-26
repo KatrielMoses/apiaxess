@@ -378,6 +378,10 @@ pub struct LiveWorkbench {
     /// honesty guarantee, so every host the app is seen contacting — first-party
     /// backend and third-party SDK/telemetry alike — is real surface to fuse.
     admit_all_observed: AtomicBool,
+    /// Flows admitted in scope only because `admit_all_observed` was on (no
+    /// scope declared yet). Once a scope is known they are re-classified
+    /// against it, so browsing before declaring a target leaves no phantoms.
+    admitted_without_scope: Mutex<std::collections::BTreeSet<u64>>,
     provenance: RwLock<String>,
     prompt_pending: Mutex<HashMap<u64, mpsc::Sender<CredentialPromptAnswer>>>,
     prompt_next_id: AtomicU64,
@@ -419,6 +423,7 @@ impl LiveWorkbench {
             store: RwLock::new(None),
             engagement_scope: RwLock::new(None),
             admit_all_observed: AtomicBool::new(false),
+            admitted_without_scope: Mutex::new(std::collections::BTreeSet::new()),
             provenance: RwLock::new("proxy.observer".to_owned()),
             prompt_pending: Mutex::new(HashMap::new()),
             prompt_next_id: AtomicU64::new(1),
@@ -469,6 +474,57 @@ impl LiveWorkbench {
     /// see [`Self::admit_all_observed`].
     pub fn set_admit_all_observed(&self, admit: bool) {
         self.admit_all_observed.store(admit, Ordering::SeqCst);
+    }
+
+    /// Whether every observed flow is currently admitted in scope.
+    #[must_use]
+    pub fn admits_all_observed(&self) -> bool {
+        self.admit_all_observed.load(Ordering::SeqCst)
+    }
+
+    /// Ends admit-all because a scope is now known: turns it off and
+    /// re-classifies every flow it admitted against the current scope, so
+    /// browser background traffic and hosts outside the target leave the
+    /// surface. Returns how many flows changed classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the store cannot be updated.
+    pub fn end_admit_all_for_scope(&self) -> Result<usize, Diagnostic> {
+        self.admit_all_observed.store(false, Ordering::SeqCst);
+        let ids = self
+            .admitted_without_scope
+            .lock()
+            .map(|mut ids| std::mem::take(&mut *ids))
+            .unwrap_or_default();
+        let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
+            return Ok(0);
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        store.reclassify_flows(&ids.into_iter().collect::<Vec<_>>(), |host, url| {
+            host.map_or(ScopeDisposition::Undetermined, |host| {
+                self.classify_scope(host, url)
+            })
+        })
+    }
+
+    /// Pauses admit-all (the unscoped browser stopped): no new flow is
+    /// admitted, but those already captured keep their admission until a
+    /// scope is known, so browsing without a scope and fusing afterwards
+    /// still works.
+    pub fn pause_admit_all(&self) {
+        self.admit_all_observed.store(false, Ordering::SeqCst);
+    }
+
+    /// Clears admit-all for a new session: its store starts with no flows
+    /// admitted without a scope.
+    pub fn reset_admit_all(&self) {
+        self.admit_all_observed.store(false, Ordering::SeqCst);
+        if let Ok(mut ids) = self.admitted_without_scope.lock() {
+            ids.clear();
+        }
     }
 
     /// Sets the provenance label retained with every subsequently persisted flow.
@@ -1087,6 +1143,11 @@ impl LiveWorkbench {
             .map_or(ScopeDisposition::Undetermined, |host| {
                 self.classify_scope(host, record.detail.summary.url.as_deref())
             });
+        if self.admit_all_observed.load(Ordering::SeqCst) {
+            if let Ok(mut ids) = self.admitted_without_scope.lock() {
+                ids.insert(flow_id);
+            }
+        }
         let provenance = self.provenance.read().map_or_else(
             |_| "proxy.observer".to_owned(),
             |provenance| provenance.clone(),
@@ -1398,6 +1459,95 @@ mod tests {
         assert_eq!(detail.response_body, None);
         assert_eq!(detail.summary.sse, state);
         assert_eq!(detail.summary.method.as_deref(), Some("GET"));
+    }
+
+    /// A captured GET with a response, observed through the live path.
+    fn observe_get(live: &LiveWorkbench, url: &str) -> u64 {
+        let flow_id = live.allocate_flow_id();
+        live.observe(FlowEvent::Request {
+            flow_id,
+            method: "GET".to_owned(),
+            uri: url.to_owned(),
+            version: "HTTP/1.1".to_owned(),
+            headers: Vec::new(),
+            origin: FlowOrigin::Capture,
+        });
+        live.observe(FlowEvent::Response {
+            flow_id,
+            client_addr: "127.0.0.1:50130".parse().expect("address"),
+            status: 200,
+            version: "HTTP/1.1".to_owned(),
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+        });
+        flow_id
+    }
+
+    fn web_scope(host: &str, port: u16) -> EngagementScope {
+        EngagementScope {
+            declared_at: chrono::Utc::now(),
+            target: apiaxess_session::TargetIdentity {
+                target_type: "web.url".to_owned(),
+                primary: apiaxess_session::TargetIdentifier {
+                    kind: "url.origin".to_owned(),
+                    value: format!("http://{host}:{port}"),
+                },
+                aliases: Vec::new(),
+            },
+            allowed_targets: vec![apiaxess_session::AllowedNetworkTarget {
+                id: "web.target-domain".to_owned(),
+                host: apiaxess_session::HostMatch::Exact {
+                    host: host.to_owned(),
+                },
+                ports: vec![port],
+            }],
+        }
+    }
+
+    #[test]
+    fn admit_all_ends_when_a_scope_is_known_and_what_it_admitted_is_reclassified() {
+        let root = std::env::temp_dir().join(format!(
+            "apiaxess-live-admit-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = Arc::new(TrafficStore::open(&root, "session:admit-test").expect("store"));
+        let live = LiveWorkbench::new();
+        live.attach_store(Arc::clone(&store));
+        let scope_of = |id: u64| store.get(id).expect("get").expect("flow").scope;
+
+        // Browsing before any target is declared: every observed host is admitted.
+        live.set_admit_all_observed(true);
+        let target = observe_get(&live, "http://127.0.0.1:9201/api/v1/status");
+        let noise = observe_get(&live, "https://update.googleapis.com/service/update2/json");
+        assert_eq!(scope_of(target), ScopeDisposition::InScope);
+        assert_eq!(scope_of(noise), ScopeDisposition::InScope);
+
+        // The browser stops: nothing new is admitted, but what was captured
+        // keeps its admission until a scope is known.
+        live.pause_admit_all();
+        assert!(!live.admits_all_observed());
+        let after_stop = observe_get(&live, "https://www.google.com/async/folae");
+        assert_eq!(scope_of(after_stop), ScopeDisposition::Undetermined);
+        assert_eq!(scope_of(noise), ScopeDisposition::InScope);
+
+        // A target is declared: the admitted flows are classified against it.
+        live.set_engagement_scope(web_scope("127.0.0.1", 9201));
+        assert_eq!(live.end_admit_all_for_scope().expect("reclassify"), 1);
+        assert_eq!(scope_of(target), ScopeDisposition::InScope);
+        assert_eq!(scope_of(noise), ScopeDisposition::OutsideDeclaredScope);
+        // Nothing is left to re-classify, and new traffic follows the scope.
+        assert_eq!(live.end_admit_all_for_scope().expect("reclassify"), 0);
+        let later = observe_get(&live, "https://accounts.google.com/ListAccounts");
+        assert_eq!(scope_of(later), ScopeDisposition::OutsideDeclaredScope);
+
+        // A new session clears the record without touching this store.
+        live.set_admit_all_observed(true);
+        let unscoped = observe_get(&live, "https://mtalk.google.com/");
+        live.reset_admit_all();
+        assert!(!live.admits_all_observed());
+        assert_eq!(live.end_admit_all_for_scope().expect("reclassify"), 0);
+        assert_eq!(scope_of(unscoped), ScopeDisposition::InScope);
     }
 
     #[test]

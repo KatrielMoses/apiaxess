@@ -460,6 +460,9 @@ impl Engine {
     ) -> Result<(), apiaxess_diagnostics::Diagnostic> {
         runtime.ensure_baseline()?;
         let session = runtime.session_snapshot()?;
+        // A new session starts with no flows admitted without a scope, and
+        // admit-all off: the old session's browsing does not carry over.
+        self.live_workbench.reset_admit_all();
         self.set_engagement_scope(session.engagement_scope().clone());
         self.attach_traffic_store(&runtime.store());
         self.session_runtime
@@ -1101,6 +1104,17 @@ impl Engine {
             session
                 .commit_api_document((**document).clone(), chrono::Utc::now())
                 .map_err(|error| vec![error])?;
+        } else {
+            // Every web fuse re-reads all stored flows, so what earlier fuses
+            // alone asserted is retracted first and re-asserted only if still
+            // observed in scope: an endpoint fused while browsing without a
+            // scope (or before a host left the scope) does not linger.
+            let mut document = session.api_document().clone();
+            if apiaxess_dynamic_capture::retract_previous_runs(&mut document, "web:capture:") > 0 {
+                session
+                    .commit_api_document(document, chrono::Utc::now())
+                    .map_err(|error| vec![error])?;
+            }
         }
         let config = apiaxess_dynamic_capture::DynamicCaptureConfig::new(run_id.clone())
             .map_err(|error| vec![error])?;
@@ -1314,6 +1328,13 @@ impl Engine {
     /// Applies the active session's advisory scope to every workbench sender.
     pub fn set_engagement_scope(&self, scope: EngagementScope) {
         self.live_workbench.set_engagement_scope(scope.clone());
+        // A scope is now known: admit-all (browsing before any target was
+        // declared) ends, and what it admitted is re-classified against this
+        // scope. Covers target declaration, scope edits, HAR-derived scope,
+        // and session attach.
+        if let Err(diagnostic) = self.live_workbench.end_admit_all_for_scope() {
+            self.live_workbench.publish_diagnostic(diagnostic);
+        }
         self.resend.set_engagement_scope(scope.clone());
         self.fuzzer.set_engagement_scope(scope);
     }
@@ -2336,6 +2357,8 @@ impl Engine {
             .lock()
             .map_err(|_| browser_launch_diagnostic("browser launch state is unavailable"))?
             .take();
+        // No browser, no unscoped browsing to admit.
+        self.live_workbench.pause_admit_all();
         if let Some(mut active) = active {
             if active
                 .child
@@ -2403,6 +2426,7 @@ impl Engine {
                 .is_some_and(|launch| launch.child.try_wait().ok().flatten().is_some())
         };
         if exited {
+            self.live_workbench.pause_admit_all();
             let active = self
                 .browser_launch
                 .lock()
@@ -3596,6 +3620,105 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// A captured JSON GET observed through the live proxy path.
+    fn observe_capture(engine: &super::Engine, url: &str) {
+        use apiaxess_workbench_proxy::{FlowEvent, FlowObserver};
+        let live = engine.live_workbench();
+        let flow_id = live.allocate_flow_id();
+        live.observe(FlowEvent::Request {
+            flow_id,
+            method: "GET".to_owned(),
+            uri: url.to_owned(),
+            version: "HTTP/1.1".to_owned(),
+            headers: Vec::new(),
+            origin: apiaxess_workbench_store::FlowOrigin::Capture,
+        });
+        live.observe(FlowEvent::Response {
+            flow_id,
+            client_addr: "127.0.0.1:50140".parse().expect("address"),
+            status: 200,
+            version: "HTTP/1.1".to_owned(),
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+        });
+        live.observe(FlowEvent::BodyChunk {
+            flow_id,
+            direction: apiaxess_workbench_proxy::BodyDirection::Response,
+            bytes: br#"{"ok":true}"#.to_vec(),
+        });
+    }
+
+    fn fused_hosts(engine: &super::Engine) -> std::collections::BTreeSet<String> {
+        engine
+            .fuse_web_capture()
+            .expect("fuse")
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.endpoint.identity.host.clone())
+            .collect()
+    }
+
+    const NOISE: &[&str] = &[
+        "https://update.googleapis.com/service/update2/json",
+        "https://android.clients.google.com/c2dm/register3",
+        "https://accounts.google.com/ListAccounts",
+        "https://www.google.com/async/folae",
+        "http://localhost:9202/v1/geo",
+    ];
+
+    #[test]
+    fn browsing_before_declaring_a_target_leaves_no_phantoms_once_scope_is_declared() {
+        // Launching the browser with no target declared turns admit-all on,
+        // exactly as `launch_browser` does.
+        let engine = engine_with_session(&[]);
+        engine.live_workbench().set_admit_all_observed(true);
+        observe_capture(&engine, "http://127.0.0.1:9201/api/v1/status");
+        for url in NOISE {
+            observe_capture(&engine, url);
+        }
+        // While browsing unscoped, every observed host is admitted.
+        assert!(fused_hosts(&engine).contains("update.googleapis.com"));
+
+        // Declaring the target (port-bound, as the GUI does) ends admit-all and
+        // takes the browser's background traffic and other hosts back out.
+        let mut scope = engine.session_scope().expect("scope");
+        scope.allowed_targets = vec![apiaxess_session::AllowedNetworkTarget {
+            id: "web.target-domain".to_owned(),
+            host: apiaxess_session::HostMatch::Exact {
+                host: "127.0.0.1".to_owned(),
+            },
+            ports: vec![9201],
+        }];
+        engine.update_session_scope(scope).expect("declare scope");
+        assert!(!engine.live_workbench().admits_all_observed());
+        for url in NOISE {
+            observe_capture(&engine, url);
+        }
+        assert_eq!(
+            fused_hosts(&engine),
+            std::collections::BTreeSet::from(["127.0.0.1:9201".to_owned()]),
+            "no background or third-party phantoms"
+        );
+    }
+
+    #[test]
+    fn stopping_the_browser_or_starting_a_new_session_turns_admit_all_off() {
+        let engine = engine_with_session(&[]);
+        engine.live_workbench().set_admit_all_observed(true);
+        engine.stop_browser().expect("stop");
+        assert!(!engine.live_workbench().admits_all_observed());
+
+        engine.live_workbench().set_admit_all_observed(true);
+        observe_capture(
+            &engine,
+            "https://update.googleapis.com/service/update2/json",
+        );
+        engine.new_session().expect("new session");
+        assert!(!engine.live_workbench().admits_all_observed());
+        // Nothing from the old session's browsing is admitted in the new one.
+        observe_capture(&engine, "https://www.google.com/async/folae");
+        assert!(fused_hosts(&engine).is_empty());
     }
 
     #[test]
