@@ -89,6 +89,9 @@ catalogue test.
 | `proxy.store-write-failed` | persistence | Captured traffic could not be committed to the durable store. |
 | `proxy.store-session-commit-failed` | persistence | Traffic could not be committed to the canonical JSON session. |
 | `proxy.har-interchange-failed` | persistence | HAR traffic interchange failed. |
+| `proxy.har-import-too-large` | persistence | The HAR file is too large to import. |
+| `proxy.har-import-unreadable` | persistence | The HAR file could not be read. |
+| `proxy.har-import-malformed` | persistence | The file is not a HAR log APIaxess can import. |
 | `proxy.store-resume-failed` | persistence | The traffic runtime could not resume from the canonical session. |
 | `proxy.resend-request-failed` | session | The resend request was rejected or could not be sent. |
 | `proxy.resend-history-failed` | persistence | The resend revision could not be saved. |

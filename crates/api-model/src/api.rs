@@ -742,8 +742,15 @@ pub struct ResponseBody {
     pub selector: ResponseSelector,
     /// Positive-only evidence that this response selector exists.
     pub presence: Fact<PresenceAssertion>,
-    /// Candidate response-body schema.
+    /// Candidate response-body schema. A body that is not structured data
+    /// (an HTML document, an event stream, text, bytes) is a string shape
+    /// with no retained samples; a response with no body has an unknown shape.
     pub body: SchemaSlot,
+    /// Observed media type (`application/json`, `text/html`,
+    /// `text/event-stream`, ...), without parameters; absent when no
+    /// content type was observed (older documents also omit it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
 }
 
 /// Response status selector independent of `OpenAPI` keys.

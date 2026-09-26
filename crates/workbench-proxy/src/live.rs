@@ -1167,7 +1167,11 @@ impl LiveWorkbench {
     ///
     /// Returns a diagnostic when no store is attached or HAR parsing or
     /// persistence fails.
-    pub fn import_har(&self, bytes: &[u8], provenance: &str) -> Result<usize, Diagnostic> {
+    pub fn import_har(
+        &self,
+        bytes: &[u8],
+        provenance: &str,
+    ) -> Result<apiaxess_workbench_store::HarImportOutcome, Diagnostic> {
         let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
             return Err(catalogue::PROXY_STORE_OPEN_FAILED.instantiate(DiagnosticContext::new()));
         };

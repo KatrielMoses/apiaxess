@@ -5065,25 +5065,40 @@ async function importHar(file: File): Promise<void> {
     await requireOk(response, "HAR import failed");
     const report = (await response.json()) as HarImportReport;
     const imported = report.imported;
-    toast(`Imported ${imported} flow${imported === 1 ? "" : "s"} from ${file.name}`, "success");
-    harScope = report.derivedScope ?? null;
+    const outsideHosts = Object.keys(report.outsideScope ?? {});
+    const outside = Object.values(report.outsideScope ?? {}).reduce((sum, count) => sum + count, 0);
+    // Flows outside the scope are imported but will not fuse: say so, not
+    // just "imported".
+    const flowsLabel = `${imported} flow${imported === 1 ? "" : "s"}`;
+    if (outside === 0) toast(`Imported ${flowsLabel} from ${file.name}`, "success");
+    else if (report.inScope === 0) toast(`Imported ${flowsLabel} from ${file.name}, but none are in scope, so nothing will fuse`, "danger");
+    else toast(`Imported ${flowsLabel} from ${file.name}; ${outside} outside the scope won't fuse`, "info");
+    harScope = report.derivedScope !== undefined && report.derivedScope !== null
+      ? { ...report.derivedScope, derived: true, imported, outside, outsideCounts: report.outsideScope ?? {} }
+      : outside > 0 ? { hosts: [], excludedHosts: outsideHosts, derived: false, imported, outside, outsideCounts: report.outsideScope ?? {} } : null;
     renderHarScopeNotice();
-    if (harScope !== null) await refreshSession();
+    if (report.derivedScope !== undefined && report.derivedScope !== null) await refreshSession();
     // Fold the imported flows into the live list immediately.
     try {
       const flowsResponse = await fetch("/api/v1/workbench/flows");
       if (flowsResponse.ok) { ((await flowsResponse.json()) as FlowSummary[]).forEach((flow) => ingestFlow(flow)); renderFlows(); }
     } catch { /* the telemetry stream also carries new flows */ }
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.har-import-failed", what: "The HAR file could not be imported.", why: "", fix: "Confirm the file is a valid HAR export and that a session is active, then retry." });
+    // The engine names the real reason (too large, unreadable, malformed);
+    // show it rather than guessing the file is invalid.
+    if (error instanceof ApiRequestError && error.diagnostic !== undefined) toast(error.diagnostic.what, "danger");
+    else reportUnexpected(error, { id: "proxy.har-import-failed", what: "The HAR file could not be imported.", why: "", fix: "Confirm a session is active, then retry." });
   }
 }
 
 interface HarDerivedScope { hosts: string[]; excludedHosts: string[]; }
-interface HarImportReport { readonly imported: number; readonly derivedScope?: HarDerivedScope | null; }
+interface HarImportReport { readonly imported: number; readonly inScope?: number; readonly outsideScope?: Record<string, number>; readonly derivedScope?: HarDerivedScope | null; }
+/** What the last HAR import left for the operator to act on. */
+interface HarScopeNotice extends HarDerivedScope { derived: boolean; imported: number; outside: number; outsideCounts: Record<string, number>; }
 
-/** The scope the last HAR import derived, shown until dismissed. */
-let harScope: HarDerivedScope | null = null;
+/** The scope the last HAR import derived (or the flows it left outside the
+ *  declared scope), shown until dismissed. */
+let harScope: HarScopeNotice | null = null;
 
 /** Tells the operator the scope a HAR import set, and lets them narrow it
  *  (remove a host) or widen it to a host the HAR left out. */
@@ -5099,9 +5114,11 @@ function renderHarScopeNotice(): void {
   notice.innerHTML = `<div class="notice notice--caution">
   <span class="notice__icon">${icon("alert", { size: 18 })}</span>
   <div class="notice__body">
-    <p class="notice__title">No scope was set — scoped to ${scope.hosts.length} host${scope.hosts.length === 1 ? "" : "s"} from the HAR</p>
-    <div class="har-scope__hosts">${scope.hosts.map((host) => chip(host, "remove")).join("")}</div>
-    ${scope.excludedHosts.length === 0 ? "" : `<p class="t-small">Also in the HAR, not in scope: ${scope.excludedHosts.map((host) => chip(host, "add")).join(" ")}</p>`}
+    <p class="notice__title">${scope.derived
+      ? `No scope was set — scoped to ${scope.hosts.length} host${scope.hosts.length === 1 ? "" : "s"} from the HAR`
+      : `${scope.outside} of ${scope.imported} imported flow${scope.imported === 1 ? "" : "s"} are outside the declared scope and won't fuse`}</p>
+    ${scope.hosts.length === 0 ? "" : `<div class="har-scope__hosts">${scope.hosts.map((host) => chip(host, "remove")).join("")}</div>`}
+    ${scope.excludedHosts.length === 0 ? "" : `<p class="t-small">${scope.derived ? "Also in the HAR, not in scope" : "Hosts outside the scope"}: ${scope.excludedHosts.map((host) => chip(host, "add")).join(" ")}</p>`}
     <p class="t-small t-subtle">Only in-scope traffic fuses into the surface. Remove a host to narrow the scope, or add one the HAR also used.</p>
   </div>
   <button class="btn btn--sm btn--quiet" type="button" data-har-dismiss aria-label="Dismiss">Dismiss</button>
@@ -5118,7 +5135,7 @@ async function removeHarScopeHost(host: string): Promise<void> {
     const scope = await current.json() as { allowed_targets?: ScopeRule[] };
     const rule = (scope.allowed_targets ?? []).find((candidate) => candidate.host.kind === "exact" && candidate.host.host === host);
     if (rule !== undefined) await removeScopeRule(rule.id, host);
-    if (harScope !== null) harScope = { hosts: harScope.hosts.filter((value) => value !== host), excludedHosts: [...harScope.excludedHosts, host] };
+    if (harScope !== null) harScope = { ...harScope, hosts: harScope.hosts.filter((value) => value !== host), excludedHosts: [...harScope.excludedHosts, host], outside: harScope.outside + (harScope.outsideCounts[host] ?? 0) };
     renderHarScopeNotice();
   } catch (error) {
     reportUnexpected(error, { id: "web.scope-remove-failed", what: "Could not remove the host from scope.", why: "", fix: "Confirm a session is active, then retry." });
@@ -5127,7 +5144,7 @@ async function removeHarScopeHost(host: string): Promise<void> {
 
 async function addHarScopeHost(host: string): Promise<void> {
   await addHostToScope(host, true);
-  if (harScope !== null) harScope = { hosts: [...harScope.hosts, host], excludedHosts: harScope.excludedHosts.filter((value) => value !== host) };
+  if (harScope !== null) harScope = { ...harScope, hosts: [...harScope.hosts, host], excludedHosts: harScope.excludedHosts.filter((value) => value !== host), outside: Math.max(0, harScope.outside - (harScope.outsideCounts[host] ?? 0)) };
   renderHarScopeNotice();
 }
 

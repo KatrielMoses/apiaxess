@@ -312,6 +312,7 @@ fn document() -> ApiDocument {
                     &ids.fusion_activity,
                 ),
                 body: schema(&ids),
+                media_type: Some("application/json".to_owned()),
             }],
             pagination_signals: Vec::new(),
         }],

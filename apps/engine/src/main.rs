@@ -966,14 +966,21 @@ fn print_surface_summary(
     );
     println!("loose findings: {}", surface.surface.loose_findings.len());
     println!("signers: {}", surface.surface.signers.len());
+    // The product's vocabulary (as the GUI and exports show it), then the
+    // fusion split behind it under its own names.
+    let tally = surface.evidence_tally();
     println!(
-        "coverage: {} endpoints, {} confirmed, {} inferred, {} static-only; handoffs {} open / {} total",
-        surface.confidence.coverage.endpoint_count,
-        surface.confidence.coverage.confirmed_endpoint_count,
-        surface.confidence.coverage.inferred_endpoint_count,
-        surface.confidence.coverage.static_only_endpoint_count,
+        "coverage: {} endpoints, {}; handoffs {} open / {} total",
+        tally.endpoints,
+        tally.describe(),
         surface.confidence.coverage.open_handoff_count,
         surface.confidence.coverage.handoff_count
+    );
+    println!(
+        "fusion: {} static+dynamic, {} dynamic only, {} static only",
+        surface.confidence.coverage.confirmed_endpoint_count,
+        surface.confidence.coverage.inferred_endpoint_count,
+        surface.confidence.coverage.static_only_endpoint_count
     );
     println!("diagnostics: {}", surface.diagnostics.len());
     Ok(())

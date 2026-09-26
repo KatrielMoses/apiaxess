@@ -11,9 +11,10 @@ use std::{
 
 use apiaxess_api_model::{
     ApiKeyLocation, AuthenticationScheme, Endpoint, EndpointIdentity, FactConfidence,
-    ObjectOpenness, RequirednessAssessment, ResponseSelector, SchemaShape, SchemaSlot,
-    SignerArtifact, SignerBinding, SignerKeySource, SignerMode, SignerPrimitive, SignerScheme,
-    SourceType, UnifiedApiSurface,
+    GraphQlOperationType, ObjectOpenness, RequirednessAssessment, ResponseSelector, SchemaShape,
+    SchemaSlot, SignerArtifact, SignerBinding, SignerKeySource, SignerMode, SignerPrimitive,
+    SignerScheme, SourceType, UnifiedApiSurface, captured_graphql_operations, endpoint_base_url,
+    is_transport_header,
 };
 use apiaxess_diagnostics::{
     Diagnostic, DiagnosticContext, DiagnosticSeverity, DiagnosticValue, catalogue,
@@ -97,8 +98,12 @@ impl OpenApiEmitter {
             SchemaBuilder::new(surface, self.minimum_dynamic_samples, &mut diagnostics);
         let mut paths = BTreeMap::<String, Value>::new();
         let mut security_schemes = BTreeMap::<String, Value>::new();
-        // Operation key -> host of the endpoint that claimed it.
-        let mut seen_operations = BTreeMap::<String, Option<String>>::new();
+        // Operation key -> host and origin of the endpoint that claimed it.
+        let mut seen_operations = BTreeMap::<String, (Option<String>, Option<String>)>::new();
+        // Every operation is emitted against its own endpoint's origin: the
+        // origin most endpoints share is the document's server, and an
+        // operation served from any other origin carries its own `servers`.
+        let primary_base = surface.primary_base_url();
         let mut seen_operation_ids = BTreeSet::new();
         let endpoint_indices = surface
             .surface
@@ -133,7 +138,7 @@ impl OpenApiEmitter {
                 continue;
             };
             let operation_key = format!("{} {path}", endpoint.identity.method.as_str());
-            if let Some(claimed_host) = seen_operations.get(&operation_key) {
+            if let Some((claimed_host, claimed_base)) = seen_operations.get(&operation_key) {
                 // The same route on another host is a distinct endpoint, but
                 // an OpenAPI path item holds one operation per method: record
                 // the extra host on the existing operation instead.
@@ -141,7 +146,12 @@ impl OpenApiEmitter {
                     if let Some(Value::Object(operation)) = paths.get_mut(&path).and_then(|item| {
                         item.get_mut(endpoint.identity.method.as_str().to_ascii_lowercase())
                     }) {
-                        add_operation_host(operation, claimed_host.as_deref(), endpoint);
+                        add_operation_host(
+                            operation,
+                            claimed_host.as_deref(),
+                            claimed_base.as_deref(),
+                            endpoint,
+                        );
                     }
                     continue;
                 }
@@ -151,7 +161,10 @@ impl OpenApiEmitter {
                 ));
                 continue;
             }
-            seen_operations.insert(operation_key, endpoint.identity.host.clone());
+            seen_operations.insert(
+                operation_key,
+                (endpoint.identity.host.clone(), endpoint_base_url(endpoint)),
+            );
             let path_item = paths
                 .entry(path.clone())
                 .or_insert_with(|| Value::Object(Map::new()));
@@ -179,13 +192,20 @@ impl OpenApiEmitter {
                 ));
                 continue;
             }
-            let operation = emit_operation(
+            let mut operation = emit_operation(
                 endpoint,
                 surface,
                 &model_path,
                 &mut builder,
                 &mut security_schemes,
             );
+            if let (Some(base), Value::Object(fields)) =
+                (endpoint_base_url(endpoint), &mut operation)
+            {
+                if primary_base.as_deref() != Some(base.as_str()) {
+                    fields.insert("servers".to_owned(), json!([{"url": base}]));
+                }
+            }
             let base_operation_id = operation_id(&endpoint.identity);
             let mut unique_operation_id = base_operation_id.clone();
             let mut operation_id_suffix = 2_u32;
@@ -212,24 +232,26 @@ impl OpenApiEmitter {
             "paths".to_owned(),
             Value::Object(paths.into_iter().collect()),
         );
-        let servers = surface
-            .surface
-            .endpoints
-            .iter()
-            .enumerate()
-            .filter_map(|(index, endpoint)| {
-                endpoint.base_url.as_ref().and_then(|fact| {
-                    fact.selected_candidate().map(|candidate| {
-                        let model_path = format!("endpoints[{index}].base_url");
+        // The document server is the primary origin, described by the first
+        // endpoint that is served from it.
+        let servers = primary_base
+            .as_deref()
+            .and_then(|primary| {
+                surface
+                    .surface
+                    .endpoints
+                    .iter()
+                    .position(|endpoint| endpoint_base_url(endpoint).as_deref() == Some(primary))
+                    .map(|index| {
                         server_value(
-                            candidate.value.as_str(),
-                            &model_path,
+                            primary,
+                            &format!("endpoints[{index}].base_url"),
                             surface,
                             builder.diagnostics,
                         )
                     })
-                })
             })
+            .into_iter()
             .collect::<Vec<_>>();
         if !servers.is_empty() {
             document.insert("servers".to_owned(), Value::Array(servers));
@@ -414,6 +436,17 @@ fn emit_operation(
             .cmp(&right.1.name.as_str().to_ascii_lowercase())
     });
     for (parameter_index, header) in headers {
+        // Transport and browser mechanics are not API parameters, and OpenAPI
+        // ignores header parameters named Accept, Content-Type, or
+        // Authorization (media types and security schemes carry those).
+        let name = header.name.as_str();
+        if is_transport_header(name)
+            || ["accept", "content-type", "authorization"]
+                .iter()
+                .any(|ignored| name.eq_ignore_ascii_case(ignored))
+        {
+            continue;
+        }
         parameters.push(emit_parameter(
             "header",
             header.name.as_str(),
@@ -432,11 +465,44 @@ fn emit_operation(
     if let Some(body) = &endpoint.request_body {
         let body_path = format!("{model_path}.request_body");
         let reference = builder.schema_ref(body, &body_path);
+        let mut media = json!({"schema": reference});
+        // A GraphQL endpoint keeps the operations it was seen running, with
+        // their documents and variables exactly as captured.
+        let graphql = captured_graphql_operations(endpoint);
+        if !graphql.is_empty() {
+            media["examples"] = Value::Object(
+                graphql
+                    .iter()
+                    .map(|operation| {
+                        (
+                            operation.name.clone(),
+                            json!({
+                                "summary": format!("{} {} (as captured)", graphql_type_name(operation.operation_type), operation.name),
+                                "value": {
+                                    "operationName": operation.name,
+                                    "query": operation.query,
+                                    "variables": operation.variables
+                                }
+                            }),
+                        )
+                    })
+                    .collect(),
+            );
+            operation.insert(
+                format!("{X_PREFIX}graphql-operations"),
+                Value::Array(
+                    graphql
+                        .iter()
+                        .map(|operation| json!({"type": graphql_type_name(operation.operation_type), "name": operation.name}))
+                        .collect(),
+                ),
+            );
+        }
         operation.insert(
             "requestBody".to_owned(),
             json!({
                 "required": false,
-                "content": {"application/json": {"schema": reference}},
+                "content": {"application/json": media},
                 "x-apiaxess-confidence": builder.confidence_extension(&format!("{body_path}.shape")),
                 "x-apiaxess-provenance": builder.provenance_extension(&format!("{body_path}.shape")),
                 "x-apiaxess-requiredness": "unknown"
@@ -452,14 +518,34 @@ fn emit_operation(
         let body_path = format!("{response_path}.body");
         let key = response_key(response.selector);
         let mut response_value = Map::new();
+        let media = response.media_type.as_deref();
+        let unknown_body = matches!(
+            response
+                .body
+                .shape
+                .selected_candidate()
+                .map(|candidate| &candidate.value),
+            None | Some(SchemaShape::Unknown)
+        );
         response_value.insert(
             "description".to_owned(),
-            Value::String(format!("Recovered response {key}")),
+            Value::String(match media {
+                Some("text/event-stream") => format!("Recovered response {key}: a Server-Sent Events stream (text/event-stream). Its events are captured per flow, not as one body."),
+                Some("text/html") => format!("Recovered response {key}: an HTML document."),
+                None if unknown_body => format!("Recovered response {key}; no body or content type was observed."),
+                _ => format!("Recovered response {key}"),
+            }),
         );
-        response_value.insert(
-            "content".to_owned(),
-            json!({"application/json": {"schema": builder.schema_ref(&response.body, &body_path)}}),
-        );
+        // A response is emitted with its observed media type; JSON is only
+        // assumed for a structured body recorded before media types were.
+        if media.is_some() || !unknown_body {
+            let mut content = Map::new();
+            content.insert(
+                media.unwrap_or("application/json").to_owned(),
+                json!({"schema": builder.schema_ref(&response.body, &body_path)}),
+            );
+            response_value.insert("content".to_owned(), Value::Object(content));
+        }
         response_value.insert(
             format!("{X_PREFIX}confidence"),
             builder.confidence_extension(&format!("{response_path}.presence")),
@@ -968,6 +1054,7 @@ fn add_root_extensions(
     surface: &UnifiedApiSurface,
     diagnostics: &[Diagnostic],
 ) {
+    let tally = surface.evidence_tally();
     document.insert(
         format!("{X_PREFIX}unified-surface-schema-version"),
         json!(surface.schema_version),
@@ -983,14 +1070,23 @@ fn add_root_extensions(
     document.insert(
         format!("{X_PREFIX}coverage"),
         json!({
-            "endpoint_count": surface.confidence.coverage.endpoint_count,
-            "confirmed_endpoint_count": surface.confidence.coverage.confirmed_endpoint_count,
-            "inferred_endpoint_count": surface.confidence.coverage.inferred_endpoint_count,
-            "static_only_endpoint_count": surface.confidence.coverage.static_only_endpoint_count,
-            "dynamic_ground_truth_endpoint_count": surface.confidence.coverage.dynamic_ground_truth_endpoint_count,
-            "confirmed_basis_points": surface.confidence.coverage.confirmed_basis_points,
-            "inferred_basis_points": surface.confidence.coverage.inferred_basis_points,
-            "static_only_basis_points": surface.confidence.coverage.static_only_basis_points,
+            // Product vocabulary, as the GUI shows it: confirmed = observed in
+            // live traffic; inferred = recovered from code only.
+            "vocabulary": "confirmed = observed in live traffic; inferred = recovered from code only, not observed",
+            "endpoint_count": tally.endpoints,
+            "confirmed_endpoint_count": tally.confirmed,
+            "also_in_code_endpoint_count": tally.also_in_code,
+            "inferred_endpoint_count": tally.inferred,
+            // The fusion split behind it: which sources agree on each endpoint.
+            "fusion": {
+                "static_and_dynamic_endpoint_count": surface.confidence.coverage.confirmed_endpoint_count,
+                "dynamic_only_endpoint_count": surface.confidence.coverage.inferred_endpoint_count,
+                "static_only_endpoint_count": surface.confidence.coverage.static_only_endpoint_count,
+                "dynamic_ground_truth_endpoint_count": surface.confidence.coverage.dynamic_ground_truth_endpoint_count,
+                "static_and_dynamic_basis_points": surface.confidence.coverage.confirmed_basis_points,
+                "dynamic_only_basis_points": surface.confidence.coverage.inferred_basis_points,
+                "static_only_basis_points": surface.confidence.coverage.static_only_basis_points
+            },
             "handoff_count": surface.confidence.coverage.handoff_count,
             "resolved_handoff_count": surface.confidence.coverage.resolved_handoff_count,
             "open_handoff_count": surface.confidence.coverage.open_handoff_count,
@@ -1129,22 +1225,25 @@ fn endpoint_presence_provenance(surface: &UnifiedApiSurface, identity: &Endpoint
 }
 
 fn endpoint_coverage(surface: &UnifiedApiSurface, identity: &EndpointIdentity) -> Value {
+    let evidence = surface.endpoint_evidence(identity);
     let presence =
         surface.confidence.facts.iter().find(|fact| {
             fact.endpoint.as_ref() == Some(identity) && fact.path.ends_with(".presence")
         });
-    let status = presence.map_or("unscored", |fact| {
+    let fusion = presence.map_or("unscored", |fact| {
         match (fact.static_sample_count > 0, fact.dynamic_sample_count > 0) {
-            (true, true) => "confirmed",
-            (false, true) => "inferred",
+            (true, true) => "static_and_dynamic",
+            (false, true) => "dynamic_only",
             (true, false) => "static_only",
             (false, false) => "unscored",
         }
     });
     json!({
-        "status": status,
-        "confirmed": status == "confirmed",
-        "dynamic_ground_truth": status == "confirmed" || status == "inferred"
+        "status": evidence.label(),
+        "confirmed": evidence.observed,
+        "also_in_code": evidence.in_code,
+        "dynamic_ground_truth": evidence.observed,
+        "fusion": fusion
     })
 }
 
@@ -1373,6 +1472,7 @@ fn set_operation_id(mut operation: Value, operation_id: String) -> Value {
 fn add_operation_host(
     operation: &mut Map<String, Value>,
     claimed: Option<&str>,
+    claimed_base: Option<&str>,
     endpoint: &Endpoint,
 ) {
     let hosts = operation
@@ -1390,14 +1490,29 @@ fn add_operation_host(
         .map(|candidate| candidate.value.clone())
         .filter(|value| value.contains("://"));
     if let Some(base) = base {
-        let servers = operation
-            .entry("servers".to_owned())
-            .or_insert_with(|| Value::Array(Vec::new()));
+        // The operation keeps the origin that first claimed it alongside the
+        // new one, so neither host is dropped from its servers.
+        let servers = operation.entry("servers".to_owned()).or_insert_with(|| {
+            Value::Array(
+                claimed_base
+                    .map(|claimed| json!({"url": claimed}))
+                    .into_iter()
+                    .collect(),
+            )
+        });
         if let Value::Array(servers) = servers {
             if !servers.iter().any(|server| server["url"] == base.as_str()) {
                 servers.push(json!({"url": base}));
             }
         }
+    }
+}
+
+fn graphql_type_name(operation_type: GraphQlOperationType) -> &'static str {
+    match operation_type {
+        GraphQlOperationType::Query => "query",
+        GraphQlOperationType::Mutation => "mutation",
+        GraphQlOperationType::Subscription => "subscription",
     }
 }
 

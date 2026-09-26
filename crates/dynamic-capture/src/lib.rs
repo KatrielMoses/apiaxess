@@ -345,6 +345,13 @@ pub fn capture_into_document(
                 entry.request_samples.push(sample);
             }
         }
+        if let Some(status) = flow.status {
+            let media = media_type(&flow.response_headers);
+            let seen = entry.response_media.entry(status).or_insert(None);
+            if seen.is_none() {
+                *seen = media;
+            }
+        }
         if let (Some(status), Some(body)) = (flow.status, flow.response_body.as_ref()) {
             if let Some(sample) = parse_payload(
                 body,
@@ -524,6 +531,10 @@ struct Accumulator {
     headers: BTreeMap<String, Vec<Value>>,
     request_samples: Vec<Sample>,
     response_samples: BTreeMap<u16, Vec<Sample>>,
+    /// Every observed response status, with the media type seen for it (the
+    /// first one observed). A status whose body is not structured data has no
+    /// JSON sample but is still a real response.
+    response_media: BTreeMap<u16, Option<String>>,
     auth: Option<AuthenticationScheme>,
     pagination: BTreeSet<PaginationSignal>,
 }
@@ -540,6 +551,7 @@ impl Accumulator {
             headers: BTreeMap::new(),
             request_samples: Vec::new(),
             response_samples: BTreeMap::new(),
+            response_media: BTreeMap::new(),
             auth: None,
             pagination: BTreeSet::new(),
         }
@@ -895,7 +907,11 @@ fn new_endpoint(
     if !entry.request_samples.is_empty() {
         endpoint.request_body = Some(schema_slot(&entry.request_samples, ids, activity));
     }
-    for (status, samples) in &entry.response_samples {
+    for (status, media) in &entry.response_media {
+        let body = match entry.response_samples.get(status) {
+            Some(samples) => schema_slot(samples, ids, activity),
+            None => opaque_slot(media.as_deref(), &entry.flow_entities, ids, activity),
+        };
         endpoint.responses.push(ResponseBody {
             selector: ResponseSelector::Exact(*status),
             presence: dynamic_fact(
@@ -906,7 +922,8 @@ fn new_endpoint(
                 ids.candidate(),
                 activity,
             ),
-            body: schema_slot(samples, ids, activity),
+            body,
+            media_type: media.clone(),
         });
     }
     endpoint.pagination_signals = entry
@@ -1030,7 +1047,8 @@ fn apply_existing_parameters(
             endpoint.request_body = Some(schema_slot(samples, ids, activity));
         }
     }
-    for (status, samples) in &entry.response_samples {
+    for (status, media) in &entry.response_media {
+        let samples = entry.response_samples.get(status);
         if let Some(response) = endpoint
             .responses
             .iter_mut()
@@ -1044,7 +1062,12 @@ fn apply_existing_parameters(
                 false,
                 activity,
             );
-            append_schema(&mut response.body, samples, ids, activity);
+            if let Some(samples) = samples {
+                append_schema(&mut response.body, samples, ids, activity);
+            }
+            if response.media_type.is_none() {
+                response.media_type.clone_from(media);
+            }
         } else {
             endpoint.responses.push(ResponseBody {
                 selector: ResponseSelector::Exact(*status),
@@ -1056,7 +1079,11 @@ fn apply_existing_parameters(
                     ids.candidate(),
                     activity,
                 ),
-                body: schema_slot(samples, ids, activity),
+                body: match samples {
+                    Some(samples) => schema_slot(samples, ids, activity),
+                    None => opaque_slot(media.as_deref(), &entry.flow_entities, ids, activity),
+                },
+                media_type: media.clone(),
             });
         }
     }
@@ -1314,6 +1341,56 @@ fn schema_slot(
         .collect();
     slot
 }
+/// The media type of a message, lowercased and without parameters.
+fn media_type(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .and_then(|(_, value)| value.split(';').next())
+        .map(|media| media.trim().to_ascii_lowercase())
+        .filter(|media| !media.is_empty())
+}
+
+/// The schema of a response body that is not structured data: an HTML
+/// document, an event stream, or other text is a string; bytes are a binary
+/// string. Nothing is sampled, so nothing is invented. With no media type
+/// observed the shape stays unknown.
+fn opaque_slot(
+    media: Option<&str>,
+    evidence: &[EntityId],
+    ids: &mut IdFactory,
+    activity: &apiaxess_api_model::ActivityId,
+) -> SchemaSlot {
+    let shape = match media {
+        None => SchemaShape::Unknown,
+        Some(media) if is_textual_media(media) => SchemaShape::String { format: None },
+        Some(_) => SchemaShape::String {
+            format: Some("binary".to_owned()),
+        },
+    };
+    SchemaSlot {
+        shape: dynamic_fact(
+            FieldClass::TypeShape,
+            ResolutionPolicy::UnionOrWiden,
+            shape,
+            evidence,
+            ids.candidate(),
+            activity,
+        ),
+        observations: Vec::new(),
+    }
+}
+
+/// Whether a media type carries text rather than bytes.
+fn is_textual_media(media: &str) -> bool {
+    media.starts_with("text/")
+        || media.contains("json")
+        || media.contains("xml")
+        || media.contains("javascript")
+        || media.contains("graphql")
+        || media == "application/x-www-form-urlencoded"
+}
+
 fn schema_from_values(
     values: &[Value],
     evidence: &[EntityId],
@@ -2210,6 +2287,69 @@ mod tests {
                 ("shop.v1.CartService".to_owned(), "AddItem".to_owned(), 2),
             ]
         );
+    }
+
+    #[test]
+    fn non_json_responses_are_recorded_with_their_media_type_and_no_invented_schema() {
+        let mut page = flow(1, "/", b"<!doctype html><title>x</title>");
+        page.response_headers = vec![(
+            "content-type".to_owned(),
+            "text/html; charset=utf-8".to_owned(),
+        )];
+        // An event stream's events are stored apart from the flow: no body.
+        let mut stream = flow(2, "/api/v1/stream", b"");
+        stream.response_body = None;
+        stream.response_headers = vec![("content-type".to_owned(), "text/event-stream".to_owned())];
+        let mut empty = flow(3, "/api/v1/ping", b"");
+        empty.response_body = None;
+        empty.status = Some(204);
+        empty.response_headers = Vec::new();
+        let json = flow(4, "/api/v1/status", br#"{"ok":true}"#);
+        let report = capture(&empty_document(), &[page, stream, empty, json]);
+        let response = |path: &str| {
+            let endpoint = report
+                .document
+                .surface
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.identity.path_template.as_str() == path)
+                .expect("endpoint");
+            assert_eq!(endpoint.responses.len(), 1, "{path}");
+            let response = &endpoint.responses[0];
+            (
+                response.media_type.clone(),
+                response
+                    .body
+                    .shape
+                    .selected_candidate()
+                    .map(|c| c.value.clone()),
+                response.body.observations.len(),
+            )
+        };
+        assert_eq!(
+            response("/"),
+            (
+                Some("text/html".to_owned()),
+                Some(SchemaShape::String { format: None }),
+                0
+            )
+        );
+        assert_eq!(
+            response("/api/v1/stream"),
+            (
+                Some("text/event-stream".to_owned()),
+                Some(SchemaShape::String { format: None }),
+                0
+            )
+        );
+        assert_eq!(
+            response("/api/v1/ping"),
+            (None, Some(SchemaShape::Unknown), 0)
+        );
+        let (media, shape, samples) = response("/api/v1/status");
+        assert_eq!(media.as_deref(), Some("application/json"));
+        assert!(matches!(shape, Some(SchemaShape::Object { .. })));
+        assert_eq!(samples, 1);
     }
 
     #[test]

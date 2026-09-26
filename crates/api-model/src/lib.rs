@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod confidence;
+pub mod delivery;
 pub mod document;
 pub mod error;
 pub mod fact;
@@ -27,6 +28,10 @@ pub use api::{
 pub use confidence::{
     CONFIDENCE_SCHEMA_VERSION, ConfidenceSummary, CoveragePicture, FactConfidence,
     HandoffResolution, MergeCounts,
+};
+pub use delivery::{
+    CapturedGraphQlOperation, EndpointEvidence, EvidenceTally, captured_graphql_operations,
+    endpoint_base_url, is_transport_header,
 };
 pub use document::{ApiDocument, CURRENT_FORMAT_VERSION};
 pub use error::{ModelError, ModelResult};

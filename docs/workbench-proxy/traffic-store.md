@@ -31,9 +31,21 @@ still hydrates a new or empty store. See
 
 The local API exposes HAR only as an interchange adapter:
 
-- `GET /api/v1/workbench/har` exports stored flows.
-- `POST /api/v1/workbench/har` imports a HAR log with explicit
-  `har.import` provenance and returns `{ imported, derivedScope? }`. When the
+- `GET /api/v1/workbench/har` exports the captured flows as HAR 1.2: every
+  entry keeps its recorded URL (scheme and port included) and carries every
+  field the format requires. Sizes the capture did not measure are `-1`, the
+  single recorded duration is `timings.wait`, and entries note what HAR cannot
+  hold (an event stream's events, a WebSocket's messages). Resend/Fuzz traffic
+  and CONNECT tunnels are not exported: re-imported as captures they would
+  fuse into endpoints nobody observed.
+- `POST /api/v1/workbench/har` imports a HAR log (up to 512 MiB) with explicit
+  `har.import` provenance and returns `{ imported, inScope, outsideScope,
+  derivedScope? }`. `outsideScope` counts, by host, the imported flows that
+  are outside the declared scope and so will not fuse; the GUI says so instead
+  of reporting bare success. A failed import names its reason:
+  `proxy.har-import-too-large` (413), `proxy.har-import-unreadable`, or
+  `proxy.har-import-malformed` (422, with the parse error). Entries saved
+  without bodies (as browsers often do) import without them. When the
   session has no declared scope, one is derived first from the HAR's own
   hosts (exact-host rules for the first-party hosts, or every HAR host when
   none dominates), audited as `session.scope.derive-from-har`, so the

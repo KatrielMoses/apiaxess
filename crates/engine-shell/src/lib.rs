@@ -170,6 +170,10 @@ pub struct WsConnectionView {
 pub struct HarImportReport {
     /// Flows imported.
     pub imported: usize,
+    /// Flows that landed in scope (only these fuse).
+    pub in_scope: usize,
+    /// Flows outside the declared scope, by host: imported but not fused.
+    pub outside_scope: std::collections::BTreeMap<String, usize>,
     /// The scope derived from the HAR, when the session had none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_scope: Option<HarDerivedScope>,
@@ -971,9 +975,11 @@ impl Engine {
             }
             None => None,
         };
-        let imported = self.live_workbench.import_har(bytes, "har.import")?;
+        let outcome = self.live_workbench.import_har(bytes, "har.import")?;
         Ok(HarImportReport {
-            imported,
+            imported: outcome.imported,
+            in_scope: outcome.in_scope,
+            outside_scope: outcome.outside_scope,
             derived_scope,
         })
     }
@@ -3206,14 +3212,21 @@ mod tests {
                 },
                 aliases: Vec::new(),
             },
+            // `host:port` is port-bound, as a web session declares its target.
             allowed_targets: hosts
                 .iter()
-                .map(|host| AllowedNetworkTarget {
-                    id: format!("test:{host}"),
-                    host: HostMatch::Exact {
-                        host: (*host).to_owned(),
-                    },
-                    ports: Vec::new(),
+                .map(|host| {
+                    let (name, ports) = match host.split_once(':') {
+                        Some((name, port)) => (name, vec![port.parse().expect("port")]),
+                        None => (*host, Vec::new()),
+                    };
+                    AllowedNetworkTarget {
+                        id: format!("test:{}", host.replace(':', "-")),
+                        host: HostMatch::Exact {
+                            host: name.to_owned(),
+                        },
+                        ports,
+                    }
                 })
                 .collect(),
         };
@@ -3435,6 +3448,457 @@ mod tests {
                 .as_str()
                 != "/shop.v1.CartService/Checkout")
         );
+    }
+
+    const PROFILE_QUERY: &str = "query GetProfile($id: ID!) { profile(id: $id) { id name } }";
+
+    /// A fused web surface with the shapes every emitter has to get right:
+    /// two origins (one third-party), browser/proxy headers next to an app
+    /// header, a JSON body, an HTML page, an event stream, and GraphQL.
+    fn fused_reference_surface() -> apiaxess_api_model::UnifiedApiSurface {
+        reference_engine(&["127.0.0.1", "localhost"])
+            .fuse_web_capture()
+            .expect("fuse")
+    }
+
+    /// An engine whose session (scoped to `hosts`) holds the reference flows.
+    fn reference_engine(hosts: &[&str]) -> super::Engine {
+        let engine = engine_with_session(hosts);
+        let runtime = engine.session_runtime().expect("runtime").expect("session");
+        let store = runtime.store();
+        let browser_headers = |extra: &[(&str, &str)]| {
+            let mut headers = vec![
+                ("host".to_owned(), "127.0.0.1:9201".to_owned()),
+                ("proxy-connection".to_owned(), "keep-alive".to_owned()),
+                ("sec-fetch-mode".to_owned(), "cors".to_owned()),
+                ("sec-ch-ua".to_owned(), "\"Chromium\"".to_owned()),
+                ("accept-encoding".to_owned(), "gzip".to_owned()),
+                ("user-agent".to_owned(), "Mozilla/5.0".to_owned()),
+                ("accept".to_owned(), "*/*".to_owned()),
+            ];
+            headers.extend(
+                extra
+                    .iter()
+                    .map(|(n, v)| ((*n).to_owned(), (*v).to_owned())),
+            );
+            headers
+        };
+        let flow = |method: &str,
+                    url: &str,
+                    request_headers: Vec<(String, String)>,
+                    request_body: Option<&[u8]>,
+                    status: u16,
+                    content_type: &str,
+                    response_body: Option<&[u8]>| {
+            let rest = url.split_once("://").expect("absolute url").1;
+            let (authority, path) = rest.split_once('/').expect("path");
+            let host = authority.split(':').next().expect("host");
+            let path = format!("/{path}");
+            apiaxess_workbench_store::FlowCapture {
+                id: store.allocate_flow_id(),
+                captured_at: chrono::Utc::now(),
+                protocol: "HTTP/1.1".to_owned(),
+                method: Some(method.to_owned()),
+                host: Some(host.to_owned()),
+                url: Some(url.to_owned()),
+                path: Some(path),
+                status: Some(status),
+                duration_ms: Some(3),
+                request_headers,
+                response_headers: vec![("content-type".to_owned(), content_type.to_owned())],
+                request_body: request_body.map(<[u8]>::to_vec),
+                response_body: response_body.map(<[u8]>::to_vec),
+                scope: apiaxess_session::ScopeDisposition::InScope,
+                provenance: "proxy.observer".to_owned(),
+                origin: apiaxess_workbench_store::FlowOrigin::Capture,
+            }
+        };
+        let json = "application/json";
+        let graphql_body = serde_json::json!({
+            "operationName": "GetProfile",
+            "query": PROFILE_QUERY,
+            "variables": {"id": "u_7"}
+        })
+        .to_string();
+        for captured in [
+            flow(
+                "GET",
+                "http://127.0.0.1:9201/",
+                browser_headers(&[]),
+                None,
+                200,
+                "text/html; charset=utf-8",
+                Some(b"<!doctype html><title>x</title>"),
+            ),
+            flow(
+                "GET",
+                "http://127.0.0.1:9201/api/v1/items/42",
+                browser_headers(&[("x-client-version", "1.4.0")]),
+                None,
+                200,
+                json,
+                Some(br#"{"id":42,"name":"lamp"}"#),
+            ),
+            flow(
+                "POST",
+                "http://127.0.0.1:9201/api/v1/items",
+                browser_headers(&[("content-type", json), ("content-length", "57")]),
+                Some(br#"{"name":"lamp","price":2.5,"tags":["a"],"active":true}"#),
+                201,
+                json,
+                Some(br#"{"id":44}"#),
+            ),
+            flow(
+                "GET",
+                "http://127.0.0.1:9201/api/v1/stream?topic=prices",
+                browser_headers(&[]),
+                None,
+                200,
+                "text/event-stream",
+                None,
+            ),
+            flow(
+                "POST",
+                "http://127.0.0.1:9201/graphql",
+                browser_headers(&[("content-type", json)]),
+                Some(graphql_body.as_bytes()),
+                200,
+                json,
+                Some(br#"{"data":{"profile":{"id":"u_7","name":"Ada"}}}"#),
+            ),
+            flow(
+                "GET",
+                "http://localhost:9202/v1/geo?client=ref",
+                browser_headers(&[]),
+                None,
+                200,
+                json,
+                Some(br#"{"country":"IN"}"#),
+            ),
+        ] {
+            store.upsert(&captured).expect("flow");
+        }
+        engine
+    }
+
+    fn endpoint_set(
+        surface: &apiaxess_api_model::UnifiedApiSurface,
+    ) -> std::collections::BTreeSet<(String, String, String)> {
+        surface
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                let identity = &endpoint.endpoint.identity;
+                (
+                    identity.method.as_str().to_owned(),
+                    identity.host.clone().unwrap_or_default(),
+                    identity.path_template.as_str().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_self_exported_har_reimports_on_its_real_origins_and_fuses_to_the_same_surface() {
+        // Captured under a port-bound web-session scope, as the GUI declares it.
+        let source = reference_engine(&["127.0.0.1:9201", "localhost:9202"]);
+        let original = source.fuse_web_capture().expect("fuse");
+        let original_endpoints = endpoint_set(&original);
+        assert_eq!(original_endpoints.len(), 6);
+        let har = source.live_workbench().export_har().expect("export");
+
+        // Into a session with the same port-bound scope: everything is in
+        // scope again, and the surface is the same endpoint set.
+        let scoped = engine_with_session(&["127.0.0.1:9201", "localhost:9202"]);
+        let report = scoped.import_har(&har).expect("import");
+        assert_eq!((report.imported, report.in_scope), (6, 6));
+        assert!(report.outside_scope.is_empty());
+        let reimported = scoped.fuse_web_capture().expect("fuse");
+        assert_eq!(endpoint_set(&reimported), original_endpoints);
+        assert_eq!(
+            reimported.surface.protocol_operations.len(),
+            original.surface.protocol_operations.len()
+        );
+
+        // Into a fresh session with no scope: scoped from the HAR's own
+        // first-party host; the third-party host is reported, not dropped
+        // silently, and everything in scope fuses as before.
+        let fresh = engine_with_session(&[]);
+        let report = fresh.import_har(&har).expect("import");
+        assert_eq!(
+            report.derived_scope.as_ref().expect("derived").hosts,
+            vec!["127.0.0.1"]
+        );
+        assert_eq!(report.in_scope, 5);
+        assert_eq!(
+            report.outside_scope.clone().into_iter().collect::<Vec<_>>(),
+            vec![("localhost".to_owned(), 1)]
+        );
+        let fused = endpoint_set(&fresh.fuse_web_capture().expect("fuse"));
+        let first_party = original_endpoints
+            .iter()
+            .filter(|(_, host, _)| host.starts_with("127.0.0.1"))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(fused, first_party);
+
+        // Into a session scoped to another target: nothing fuses, and the
+        // report says so for every host.
+        let elsewhere = engine_with_session(&["other.example.test"]);
+        let report = elsewhere.import_har(&har).expect("import");
+        assert_eq!(report.in_scope, 0);
+        assert_eq!(
+            report.outside_scope.into_iter().collect::<Vec<_>>(),
+            vec![("127.0.0.1".to_owned(), 5), ("localhost".to_owned(), 1)]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exports_are_faithful_to_the_fused_surface() {
+        let surface = fused_reference_surface();
+        let tally = surface.evidence_tally();
+        assert_eq!((tally.confirmed, tally.inferred), (6, 0));
+
+        // OpenAPI: each operation on its own origin, no transport headers,
+        // the GUI's evidence vocabulary, real media types, GraphQL examples.
+        let openapi = apiaxess_openapi_emitter::OpenApiEmitter::default()
+            .emit(&surface)
+            .expect("openapi")
+            .document;
+        let servers = openapi["servers"].as_array().expect("servers");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["url"], "http://127.0.0.1:9201");
+        let operation = |path: &str, method: &str| openapi["paths"][path][method].clone();
+        assert_eq!(
+            operation("/v1/geo", "get")["servers"],
+            serde_json::json!([{"url": "http://localhost:9202"}])
+        );
+        assert!(
+            operation("/api/v1/items/{id}", "get")
+                .get("servers")
+                .is_none()
+        );
+        for path in ["/api/v1/items/{id}", "/api/v1/items", "/v1/geo", "/"] {
+            for (method, op) in openapi["paths"][path].as_object().expect("path item") {
+                if method.starts_with("x-") {
+                    continue;
+                }
+                for parameter in op["parameters"].as_array().expect("parameters") {
+                    let name = parameter["name"]
+                        .as_str()
+                        .expect("name")
+                        .to_ascii_lowercase();
+                    assert!(
+                        parameter["in"] != "header"
+                            || !(apiaxess_api_model::is_transport_header(&name)
+                                || ["accept", "content-type", "authorization"]
+                                    .contains(&name.as_str())),
+                        "{method} {path} exports header parameter {name}"
+                    );
+                }
+            }
+        }
+        assert!(
+            operation("/api/v1/items/{id}", "get")["parameters"]
+                .as_array()
+                .expect("parameters")
+                .iter()
+                .any(|parameter| parameter["name"] == "x-client-version")
+        );
+        assert_eq!(
+            openapi["x-apiaxess-coverage"]["confirmed_endpoint_count"],
+            6
+        );
+        assert_eq!(openapi["x-apiaxess-coverage"]["inferred_endpoint_count"], 0);
+        assert_eq!(
+            operation("/api/v1/items", "post")["x-apiaxess-coverage"]["status"],
+            "confirmed"
+        );
+        assert!(operation("/", "get")["responses"]["200"]["content"]["text/html"].is_object());
+        assert!(
+            operation("/api/v1/stream", "get")["responses"]["200"]["content"]["text/event-stream"]
+                .is_object()
+        );
+        assert!(
+            operation("/api/v1/items", "post")["responses"]["201"]["content"]["application/json"]
+                .is_object()
+        );
+        assert_eq!(
+            operation("/graphql", "post")["requestBody"]["content"]["application/json"]["examples"]
+                ["GetProfile"]["value"]["query"],
+            PROFILE_QUERY
+        );
+
+        // Postman: per-origin variables, no empty transport headers, the
+        // captured GraphQL operation, labelled placeholders, GUI vocabulary.
+        let postman = apiaxess_collections_emitter::CollectionsEmitter::default()
+            .emit_collection(&surface)
+            .expect("postman")
+            .document;
+        let variable = |key: &str| {
+            postman["variable"]
+                .as_array()
+                .expect("variables")
+                .iter()
+                .find(|variable| variable["key"] == key)
+                .map(|variable| variable["value"].clone())
+        };
+        assert_eq!(
+            variable("baseUrl"),
+            Some(serde_json::json!("http://127.0.0.1:9201"))
+        );
+        assert_eq!(
+            variable("baseUrl_localhost_9202"),
+            Some(serde_json::json!("http://localhost:9202"))
+        );
+        let requests = postman["item"]
+            .as_array()
+            .expect("folders")
+            .iter()
+            .flat_map(|folder| folder["item"].as_array().expect("requests").clone())
+            .collect::<Vec<_>>();
+        let request = |name: &str| {
+            requests
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap_or_else(|| panic!("request {name}"))["request"]
+                .clone()
+        };
+        assert!(
+            request("GET /v1/geo")["url"]["raw"]
+                .as_str()
+                .expect("raw")
+                .starts_with("{{baseUrl_localhost_9202}}/")
+        );
+        assert!(
+            request("GET /api/v1/items/{id}")["url"]["raw"]
+                .as_str()
+                .expect("raw")
+                .starts_with("{{baseUrl}}/")
+        );
+        for item in &requests {
+            for header in item["request"]["header"].as_array().expect("headers") {
+                let key = header["key"].as_str().expect("key");
+                assert!(
+                    !apiaxess_api_model::is_transport_header(key),
+                    "Postman header {key}"
+                );
+                assert_ne!(header["value"], "", "empty header {key}");
+                if key.eq_ignore_ascii_case("content-type") {
+                    assert_eq!(header["value"], "application/json");
+                }
+            }
+        }
+        let profile = request("query GetProfile");
+        assert_eq!(profile["body"]["mode"], "graphql");
+        assert_eq!(profile["body"]["graphql"]["query"], PROFILE_QUERY);
+        assert!(
+            request("POST /api/v1/items")["description"]
+                .as_str()
+                .expect("description")
+                .contains("placeholder values")
+        );
+        assert!(
+            request("GET /api/v1/items/{id}")["description"]
+                .as_str()
+                .expect("description")
+                .contains("Evidence: confirmed")
+        );
+        assert!(
+            postman["info"]["description"]
+                .as_str()
+                .expect("description")
+                .contains("6 confirmed")
+        );
+
+        // Python SDK: it imports and every method runs, each against its own
+        // origin; the GraphQL method sends the captured document.
+        let sdk = apiaxess_python_sdk_emitter::PythonSdkEmitter::default()
+            .generate(&surface)
+            .expect("sdk");
+        let client = sdk.file("apiaxess_client/client.py").expect("client.py");
+        for literal in [" if false", " if true", "Some(", "_auth::"] {
+            assert!(!client.contains(literal), "client.py contains {literal:?}");
+        }
+        let script = r#"
+import inspect, json, httpx
+from apiaxess_client.client import ApiClient, DEFAULT_BASE_URL, OTHER_ORIGINS
+assert DEFAULT_BASE_URL == "http://127.0.0.1:9201", DEFAULT_BASE_URL
+assert OTHER_ORIGINS == ("http://localhost:9202",), OTHER_ORIGINS
+bodies = {
+    "/api/v1/items/7": (200, "application/json", b'{"id":42,"name":"lamp"}'),
+    "/api/v1/items": (201, "application/json", b'{"id":44}'),
+    "/graphql": (200, "application/json", b'{"data":{"profile":{"id":"u_7","name":"Ada"}}}'),
+    "/v1/geo": (200, "application/json", b'{"country":"IN"}'),
+    "/api/v1/stream": (200, "text/event-stream", b"data: x\n\n"),
+    "/": (200, "text/html", b"<!doctype html>"),
+}
+sent = []
+def handler(request):
+    url = str(request.url)
+    path = "/" + url.split("://", 1)[1].split("/", 1)[1].split("?", 1)[0] if "/" in url.split("://", 1)[1] else "/"
+    content = request.content if isinstance(request.content, (bytes, bytearray)) else b""
+    sent.append({"method": request.method, "url": url, "body": content.decode()})
+    status, media, body = bodies[path]
+    return httpx.Response(status, content=body, headers={"content-type": media})
+client = ApiClient(http_client=httpx.Client(base_url=DEFAULT_BASE_URL, transport=httpx.MockTransport(handler)))
+names = [name for name, _ in inspect.getmembers(ApiClient, inspect.isfunction) if not name.startswith("_") and name != "close"]
+results = {}
+for name in names:
+    method = getattr(client, name)
+    required = {p.name: "7" for p in list(inspect.signature(method).parameters.values()) if p.default is inspect.Parameter.empty and p.kind == p.KEYWORD_ONLY}
+    results[name] = type(method(**required)).__name__
+print("RESULT " + json.dumps({"sent": sent, "results": results}))
+"#;
+        let output =
+            match apiaxess_python_sdk_emitter::testing::run_generated_python(&sdk.files, script) {
+                Ok(Some(output)) => output,
+                Ok(None) => return,
+                Err(output) => {
+                    panic!("the generated SDK does not run:\n{output}\n--- client.py ---\n{client}")
+                }
+            };
+        let result: serde_json::Value = serde_json::from_str(
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("RESULT "))
+                .expect("result line"),
+        )
+        .expect("result json");
+        let sent = result["sent"].as_array().expect("sent");
+        let url_of = |needle: &str| {
+            sent.iter()
+                .find(|request| {
+                    request["url"]
+                        .as_str()
+                        .is_some_and(|url| url.contains(needle))
+                })
+                .map_or_else(
+                    || panic!("no request to {needle}: {sent:?}"),
+                    |request| request["url"].as_str().expect("url").to_owned(),
+                )
+        };
+        assert!(url_of("/v1/geo").starts_with("http://localhost:9202/v1/geo"));
+        assert!(url_of("/api/v1/items/7").starts_with("http://127.0.0.1:9201/"));
+        let graphql = sent
+            .iter()
+            .find(|request| {
+                request["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("GetProfile"))
+            })
+            .expect("graphql request");
+        let body: serde_json::Value =
+            serde_json::from_str(graphql["body"].as_str().expect("body")).expect("graphql body");
+        assert_eq!(body["query"], PROFILE_QUERY);
+        assert_eq!(body["operationName"], "GetProfile");
+        assert_eq!(
+            result["results"]["get_"], "Response",
+            "the HTML page returns the raw response"
+        );
+        assert_eq!(result["results"]["get_api_v1_stream"], "Response");
+        assert_eq!(result["results"].as_object().expect("results").len(), 7);
     }
 
     #[test]

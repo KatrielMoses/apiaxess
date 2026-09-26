@@ -38,6 +38,7 @@ process-wrap.workspace = true
 
 [dev-dependencies]
 apiaxess-host-capabilities = { path = "../host-capabilities" }
+apiaxess-python-sdk-emitter = { path = "../python-sdk-emitter", features = ["testing"] }
 
 [features]
 # Forwards the linked-frida-core build to the sandbox crate for the packaging

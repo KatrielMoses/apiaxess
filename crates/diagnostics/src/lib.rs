@@ -1278,6 +1278,36 @@ pub mod catalogue {
         fix: "Validate the HAR log and retry; HAR is an interchange adapter, never the primary session store.",
     };
 
+    /// A HAR file was larger than the import accepts.
+    pub const PROXY_HAR_IMPORT_TOO_LARGE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.har-import-too-large",
+        category: DiagnosticCategory::Persistence,
+        severity: DiagnosticSeverity::Error,
+        what: "The HAR file is too large to import.",
+        why: "It exceeds the HAR import size limit (see the limit in the diagnostic context). The file itself may be valid.",
+        fix: "Export a smaller HAR (fewer requests or without large response bodies), or split it into several files and import each.",
+    };
+
+    /// A HAR upload could not be read.
+    pub const PROXY_HAR_IMPORT_UNREADABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.har-import-unreadable",
+        category: DiagnosticCategory::Persistence,
+        severity: DiagnosticSeverity::Error,
+        what: "The HAR file could not be read.",
+        why: "The upload did not arrive in full, so its contents were never parsed.",
+        fix: "Retry the import; if it keeps failing, check the file can be opened and is not still being written.",
+    };
+
+    /// A HAR upload was not a HAR log.
+    pub const PROXY_HAR_IMPORT_MALFORMED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "proxy.har-import-malformed",
+        category: DiagnosticCategory::Persistence,
+        severity: DiagnosticSeverity::Error,
+        what: "The file is not a HAR log APIaxess can import.",
+        why: "It is not valid JSON, or it lacks the HAR log shape (log.entries with request and response); the parse error in the diagnostic context names where.",
+        fix: "Export the HAR again from the browser or tool, or correct the file at the reported location, then import it.",
+    };
+
     /// The canonical session did not contain a compatible traffic payload.
     pub const PROXY_STORE_RESUME_FAILED: DiagnosticDefinition = DiagnosticDefinition {
         id: "proxy.store-resume-failed",
@@ -1345,6 +1375,9 @@ pub mod catalogue {
         PROXY_STORE_WRITE_FAILED,
         PROXY_STORE_SESSION_COMMIT_FAILED,
         PROXY_HAR_INTERCHANGE_FAILED,
+        PROXY_HAR_IMPORT_TOO_LARGE,
+        PROXY_HAR_IMPORT_UNREADABLE,
+        PROXY_HAR_IMPORT_MALFORMED,
         PROXY_STORE_RESUME_FAILED,
         PROXY_SESSION_ARTIFACT_NOT_FOUND,
         PROXY_SESSION_SAVE_FAILED,

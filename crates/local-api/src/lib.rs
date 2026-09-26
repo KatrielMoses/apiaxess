@@ -184,7 +184,12 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             get(list_ws_messages),
         )
         .route("/api/v1/workbench/intercept/pending", get(pending_flows))
-        .route("/api/v1/workbench/har", get(export_har).post(import_har))
+        .route(
+            "/api/v1/workbench/har",
+            get(export_har)
+                .post(import_har)
+                .layer(axum::extract::DefaultBodyLimit::max(HAR_IMPORT_MAX_BYTES)),
+        )
         .route(
             "/api/v1/workbench/resend",
             get(list_resend).post(create_resend),
@@ -1602,18 +1607,49 @@ async fn export_har(
         .map_err(storage_response)
 }
 
+/// Largest HAR accepted for import. Real browser HARs run to tens or hundreds
+/// of megabytes; the framework's 2 MiB default rejected them.
+const HAR_IMPORT_MAX_BYTES: usize = 512 * 1024 * 1024;
+
 async fn import_har(
     State(state): State<ApiState>,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Result<
     Json<apiaxess_engine_shell::HarImportReport>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
+    // An oversized or truncated upload is reported for what it is, never as
+    // an invalid file.
+    let body = body.map_err(|rejection| {
+        let status = rejection.status();
+        let mut context = DiagnosticContext::new();
+        context.insert(
+            "detail".to_owned(),
+            DiagnosticValue::String(rejection.body_text()),
+        );
+        let definition = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            context.insert(
+                "limit_bytes".to_owned(),
+                DiagnosticValue::Integer(i64::try_from(HAR_IMPORT_MAX_BYTES).unwrap_or(i64::MAX)),
+            );
+            catalogue::PROXY_HAR_IMPORT_TOO_LARGE
+        } else {
+            catalogue::PROXY_HAR_IMPORT_UNREADABLE
+        };
+        (status, Json(definition.instantiate(context)))
+    })?;
     state
         .engine
         .import_har(&body)
         .map(Json)
-        .map_err(storage_response)
+        .map_err(|diagnostic| {
+            let status = if &*diagnostic.id == catalogue::PROXY_HAR_IMPORT_MALFORMED.id {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(diagnostic))
+        })
 }
 
 #[derive(Deserialize)]
@@ -2838,6 +2874,147 @@ async fn telemetry_loop(mut socket: axum::extract::ws::WebSocket, live: Arc<Live
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An API state whose engine has a fresh, unscoped session attached.
+    fn har_test_state(root: &Path) -> ApiState {
+        let now = chrono::Utc::now();
+        let session_id = apiaxess_session::SessionId::new(format!(
+            "session:har-api-test-{}",
+            now.timestamp_nanos_opt().unwrap_or_default()
+        ))
+        .expect("session ID");
+        let mut session = apiaxess_session::Session::new(
+            session_id,
+            test_scope(),
+            apiaxess_api_model::ApiDocument::new(apiaxess_api_model::ApiSurface {
+                provenance: apiaxess_api_model::ProvenanceRegistry::default(),
+                endpoints: Vec::new(),
+                protocol_operations: Vec::new(),
+                loose_findings: Vec::new(),
+                signers: Vec::new(),
+            }),
+            now,
+        );
+        session.activate(now).expect("activate session");
+        let store = Arc::new(
+            apiaxess_workbench_store::TrafficStore::open(root, session.id().as_str())
+                .expect("open test store"),
+        );
+        let engine = Engine::new();
+        engine
+            .attach_session_runtime(Arc::new(apiaxess_engine_shell::SessionRuntime::new(
+                session,
+                store,
+                root.join("session.json"),
+            )))
+            .expect("attach runtime");
+        ApiState {
+            engine,
+            expected_origin: Arc::from("http://127.0.0.1:7777"),
+            pipeline_runs: PipelineRegistry::default(),
+            pairing: DevicePairingRegistry::default(),
+            pending_pairing: PendingPairingRegistry::default(),
+            gui_port: 7777,
+        }
+    }
+
+    /// A valid HAR of about `bytes` bytes (one large response body).
+    fn large_har(bytes: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"log": {"version": "1.2", "creator": {"name": "test", "version": "1"}, "entries": [{
+            "startedDateTime": "2026-09-26T10:00:00.000Z", "time": 1,
+            "request": {"method": "GET", "url": "http://127.0.0.1:9201/api/v1/report", "httpVersion": "HTTP/1.1", "headers": []},
+            "response": {"status": 200, "headers": [{"name": "content-type", "value": "text/plain"}],
+                         "content": {"size": bytes, "mimeType": "text/plain", "text": "x".repeat(bytes)}}
+        }]}}))
+        .expect("har")
+    }
+
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_har_over_two_mib_imports_and_failures_report_their_real_reason() {
+        let root = std::env::temp_dir().join(format!(
+            "apiaxess-har-api-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(root.join("gui")).expect("gui dir");
+        std::fs::write(root.join("gui").join("index.html"), "<!doctype html>").expect("index");
+        let state = har_test_state(&root);
+        let base =
+            serve(router_with_port(state.engine.clone(), &root.join("gui"), 7777).expect("router"))
+                .await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/workbench/har");
+
+        // Larger than the framework's 2 MiB default, which used to reject it.
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(large_har(3 * 1024 * 1024))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{:?}",
+            response.text().await
+        );
+        let report: serde_json::Value = serde_json::from_str(
+            &client
+                .post(&url)
+                .body(large_har(10))
+                .send()
+                .await
+                .expect("send")
+                .text()
+                .await
+                .expect("text"),
+        )
+        .expect("json");
+        assert_eq!(report["imported"], 1);
+
+        // Not a HAR: malformed, with the parse error, never a generic failure.
+        let response = client
+            .post(&url)
+            .body("{\"not\": \"a har\"}")
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&response.text().await.expect("text")).expect("json");
+        assert_eq!(diagnostic["id"], "proxy.har-import-malformed");
+
+        // Over the limit: "too large", not "invalid". (A small limit stands in
+        // for the real one so the test need not send half a gigabyte.)
+        let small = Router::new()
+            .route(
+                "/har",
+                axum::routing::post(import_har).layer(axum::extract::DefaultBodyLimit::max(1024)),
+            )
+            .with_state(state);
+        let small_base = serve(small).await;
+        let response = client
+            .post(format!("{small_base}/har"))
+            .body(large_har(4096))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&response.text().await.expect("text")).expect("json");
+        assert_eq!(diagnostic["id"], "proxy.har-import-too-large");
+    }
 
     fn test_scope() -> EngagementScope {
         EngagementScope {

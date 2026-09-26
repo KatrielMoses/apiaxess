@@ -2297,10 +2297,13 @@ impl TrafficStore {
         bytes: &[u8],
         provenance: &str,
         classify_scope: impl Fn(Option<&str>, Option<&str>) -> ScopeDisposition,
-    ) -> Result<usize, Diagnostic> {
-        let document: HarDocument = serde_json::from_slice(bytes)
-            .map_err(|e| interchange_diag("import", &e.to_string()))?;
-        let mut count = 0;
+    ) -> Result<HarImportOutcome, Diagnostic> {
+        let document: HarDocument = serde_json::from_slice(bytes).map_err(|e| {
+            let mut context = DiagnosticContext::new();
+            context.insert("error".to_owned(), DiagnosticValue::String(e.to_string()));
+            catalogue::PROXY_HAR_IMPORT_MALFORMED.instantiate(context)
+        })?;
+        let mut outcome = HarImportOutcome::default();
         for entry in document.log.entries {
             // Draw each id from the store's single authoritative allocator so a
             // concurrent import and live capture can never collide on an id.
@@ -2311,6 +2314,14 @@ impl TrafficStore {
             // fusion only consumes in-scope flows, so an unclassified import fuses
             // into zero endpoints — the "import a HAR, get nothing" bug.
             let scope = classify_scope(host.as_deref(), Some(entry.request.url.as_str()));
+            if scope == ScopeDisposition::InScope {
+                outcome.in_scope += 1;
+            } else {
+                *outcome
+                    .outside_scope
+                    .entry(host.clone().unwrap_or_default())
+                    .or_default() += 1;
+            }
             let flow = FlowCapture {
                 id,
                 captured_at: entry
@@ -2321,12 +2332,14 @@ impl TrafficStore {
                 protocol: entry
                     .request
                     .http_version
-                    .unwrap_or_else(|| "HTTP/1.1".to_owned()),
+                    .as_deref()
+                    .map_or_else(|| "h1".to_owned(), protocol_from_har_version),
                 method: Some(entry.request.method),
                 host,
                 url: Some(entry.request.url),
                 path,
-                status: Some(entry.response.status),
+                // HAR records a request that got no response as status 0.
+                status: Some(entry.response.status).filter(|status| *status != 0),
                 duration_ms: entry.time.and_then(har_duration_ms),
                 request_headers: entry
                     .request
@@ -2344,6 +2357,9 @@ impl TrafficStore {
                     Some(value) => decode_har_body(&value)?,
                     None => None,
                 },
+                // A response whose content carries no text (a browser HAR
+                // saved without bodies, or a body that was not retained) has
+                // no body to restore.
                 response_body: match entry.response.content {
                     Some(value) => decode_har_body(&value)?,
                     None => None,
@@ -2353,9 +2369,9 @@ impl TrafficStore {
                 origin: FlowOrigin::Capture,
             };
             self.upsert(&flow)?;
-            count += 1;
+            outcome.imported += 1;
         }
-        Ok(count)
+        Ok(outcome)
     }
 
     /// Exports stored flows as HAR interchange bytes.
@@ -2367,8 +2383,21 @@ impl TrafficStore {
     pub fn export_har(&self) -> Result<Vec<u8>, Diagnostic> {
         let mut entries = Vec::new();
         for summary in self.summaries()? {
+            // Observed traffic only: Resend/Fuzz requests are tool-synthesized,
+            // and re-imported as captures they would fuse into endpoints nobody
+            // observed. A CONNECT tunnel is transport setup with no absolute
+            // URL, so it cannot be a HAR entry.
+            if summary.origin != FlowOrigin::Capture
+                || summary
+                    .method
+                    .as_deref()
+                    .is_some_and(|method| method.eq_ignore_ascii_case("CONNECT"))
+            {
+                continue;
+            }
             if let Some(flow) = self.get(summary.id)? {
-                entries.push(HarEntryOut::from_capture(&flow));
+                let sse_events = summary.sse.map(|state| state.event_count);
+                entries.push(HarEntryOut::from_capture(&flow, sse_events));
             }
         }
         serde_json::to_vec_pretty(&HarDocumentOut {
@@ -2376,9 +2405,10 @@ impl TrafficStore {
                 version: "1.2".to_owned(),
                 creator: HarCreator {
                     name: "APIaxess".to_owned(),
-                    version: "0.1.0".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
                 },
                 entries,
+                comment: "Exported by APIaxess from captured traffic. Resend/Fuzz traffic and CONNECT tunnels are not included. Header and body sizes the capture did not measure are -1; each exchange's single recorded duration is reported as timings.wait.".to_owned(),
             },
         })
         .map_err(|e| interchange_diag("export", &e.to_string()))
@@ -3569,7 +3599,10 @@ struct HarResponse {
 }
 #[derive(Deserialize)]
 struct HarContent {
-    text: String,
+    /// Absent when a HAR was saved without bodies.
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default, alias = "_encoding")]
     encoding: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
@@ -3577,6 +3610,24 @@ struct HarHeader {
     name: String,
     value: String,
 }
+
+/// What a HAR import did: how many entries it imported, and how many landed
+/// in scope. Entries outside the declared scope are imported but do not fuse,
+/// so the caller must say so rather than report bare success.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarImportOutcome {
+    /// Entries imported.
+    pub imported: usize,
+    /// Entries classified in scope (these fuse).
+    pub in_scope: usize,
+    /// Entries not in scope, by host.
+    pub outside_scope: std::collections::BTreeMap<String, usize>,
+}
+
+// HAR 1.2 export (http://www.softwareishard.com/blog/har-12-spec/): every
+// field the format requires is present. Values the capture did not measure
+// use the format's "unknown" (-1) or are explained in `comment`.
 #[derive(Serialize)]
 struct HarDocumentOut {
     log: HarLogOut,
@@ -3586,6 +3637,7 @@ struct HarLogOut {
     version: String,
     creator: HarCreator,
     entries: Vec<HarEntryOut>,
+    comment: String,
 }
 #[derive(Serialize)]
 struct HarCreator {
@@ -3599,6 +3651,27 @@ struct HarEntryOut {
     time: f64,
     request: HarRequestOut,
     response: HarResponseOut,
+    cache: HarCacheOut,
+    timings: HarTimingsOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
+}
+#[derive(Serialize)]
+struct HarCacheOut {}
+#[derive(Serialize)]
+struct HarTimingsOut {
+    blocked: f64,
+    dns: f64,
+    connect: f64,
+    send: f64,
+    wait: f64,
+    receive: f64,
+    ssl: f64,
+}
+#[derive(Serialize)]
+struct HarNameValue {
+    name: String,
+    value: String,
 }
 #[derive(Serialize)]
 struct HarRequestOut {
@@ -3606,94 +3679,363 @@ struct HarRequestOut {
     url: String,
     #[serde(rename = "httpVersion")]
     http_version: String,
+    cookies: Vec<HarNameValue>,
     headers: Vec<HarHeader>,
+    #[serde(rename = "queryString")]
+    query_string: Vec<HarNameValue>,
     #[serde(rename = "postData", skip_serializing_if = "Option::is_none")]
-    post_data: Option<HarContentOut>,
+    post_data: Option<HarPostDataOut>,
+    #[serde(rename = "headersSize")]
+    headers_size: i64,
+    #[serde(rename = "bodySize")]
+    body_size: i64,
+}
+#[derive(Serialize)]
+struct HarPostDataOut {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    text: String,
+    /// Non-standard (custom fields start with `_`): set when `text` holds a
+    /// base64-encoded binary body.
+    #[serde(rename = "_encoding", skip_serializing_if = "Option::is_none")]
+    encoding: Option<String>,
 }
 #[derive(Serialize)]
 struct HarResponseOut {
     status: u16,
+    #[serde(rename = "statusText")]
+    status_text: String,
     #[serde(rename = "httpVersion")]
     http_version: String,
+    cookies: Vec<HarNameValue>,
     headers: Vec<HarHeader>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<HarContentOut>,
+    content: HarContentOut,
+    #[serde(rename = "redirectURL")]
+    redirect_url: String,
+    #[serde(rename = "headersSize")]
+    headers_size: i64,
+    #[serde(rename = "bodySize")]
+    body_size: i64,
 }
 #[derive(Serialize)]
 struct HarContentOut {
-    text: String,
+    size: i64,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
 }
 
 impl HarEntryOut {
-    fn from_capture(flow: &FlowCapture) -> Self {
+    /// One HAR entry for a captured flow. `sse_events` is the event count of a
+    /// flow whose response was an event stream (its events are stored apart
+    /// from the flow, not as one body).
+    fn from_capture(flow: &FlowCapture, sse_events: Option<u64>) -> Self {
+        let header = |headers: &[(String, String)], name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        let duration = flow
+            .duration_ms
+            .map(|ms| f64::from(u32::try_from(ms.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)));
+        let mut notes = Vec::new();
+        let url = har_url(flow, &mut notes);
+        if duration.is_none() {
+            notes.push("No duration was recorded for this exchange.");
+        }
+        let content = har_response_content(flow, sse_events);
+        if flow.status.is_none() {
+            notes.push(
+                if header(&flow.request_headers, "upgrade")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+                {
+                    "WebSocket upgrade: the connection's messages are in APIaxess's WebSocket view, not in HAR."
+                } else {
+                    "No response was recorded for this request."
+                },
+            );
+        }
+        let http_version = har_http_version(&flow.protocol);
         Self {
             started_date_time: flow.captured_at.to_rfc3339(),
-            time: f64::from(
-                u32::try_from(
-                    flow.duration_ms
-                        .unwrap_or_default()
-                        .min(u64::from(u32::MAX)),
-                )
-                .unwrap_or(u32::MAX),
-            ),
+            time: duration.unwrap_or(0.0),
             request: HarRequestOut {
                 method: flow.method.clone().unwrap_or_else(|| "GET".to_owned()),
-                url: format!(
-                    "https://{}{}",
-                    flow.host.as_deref().unwrap_or("unknown"),
-                    flow.path.as_deref().unwrap_or("/")
-                ),
-                http_version: flow.protocol.clone(),
-                headers: flow
-                    .request_headers
-                    .iter()
-                    .map(|(n, v)| HarHeader {
-                        name: n.clone(),
-                        value: v.clone(),
-                    })
-                    .collect(),
-                post_data: flow.request_body.as_deref().map(encode_har_body),
+                query_string: har_query(&url),
+                url,
+                http_version: http_version.clone(),
+                cookies: header(&flow.request_headers, "cookie")
+                    .map(|value| har_cookies(&value))
+                    .unwrap_or_default(),
+                headers: har_headers(&flow.request_headers),
+                post_data: flow.request_body.as_deref().map(|body| {
+                    let (text, encoding) = har_text(body);
+                    HarPostDataOut {
+                        mime_type: header(&flow.request_headers, "content-type")
+                            .unwrap_or_default(),
+                        text,
+                        encoding,
+                    }
+                }),
+                headers_size: -1,
+                body_size: flow
+                    .request_body
+                    .as_ref()
+                    .map_or(0, |body| i64::try_from(body.len()).unwrap_or(i64::MAX)),
             },
             response: HarResponseOut {
-                status: flow.status.unwrap_or_default(),
-                http_version: flow.protocol.clone(),
-                headers: flow
+                status: flow.status.unwrap_or(0),
+                status_text: flow
+                    .status
+                    .map_or_else(String::new, |status| reason_phrase(status).to_owned()),
+                http_version,
+                cookies: flow
                     .response_headers
                     .iter()
-                    .map(|(n, v)| HarHeader {
-                        name: n.clone(),
-                        value: v.clone(),
-                    })
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                    .flat_map(|(_, value)| har_cookies(value.split(';').next().unwrap_or_default()))
                     .collect(),
-                content: flow.response_body.as_deref().map(encode_har_body),
+                headers: har_headers(&flow.response_headers),
+                redirect_url: header(&flow.response_headers, "location").unwrap_or_default(),
+                headers_size: -1,
+                body_size: match (&flow.response_body, sse_events) {
+                    (Some(body), _) => i64::try_from(body.len()).unwrap_or(i64::MAX),
+                    (None, Some(_)) => -1,
+                    (None, None) => 0,
+                },
+                content,
             },
+            cache: HarCacheOut {},
+            timings: HarTimingsOut {
+                blocked: -1.0,
+                dns: -1.0,
+                connect: -1.0,
+                send: 0.0,
+                wait: duration.unwrap_or(0.0),
+                receive: 0.0,
+                ssl: -1.0,
+            },
+            comment: (!notes.is_empty()).then(|| notes.join(" ")),
         }
     }
 }
 
-fn encode_har_body(body: &[u8]) -> HarContentOut {
-    match String::from_utf8(body.to_vec()) {
-        Ok(text) => HarContentOut {
-            text,
+/// The entry URL: the recorded one, which keeps its scheme and port. Only a
+/// flow recorded without one falls back to host + path, and says so.
+fn har_url(flow: &FlowCapture, notes: &mut Vec<&'static str>) -> String {
+    if let Some(url) = flow.url.as_deref().filter(|url| url.contains("://")) {
+        return url.to_owned();
+    }
+    notes.push("URL reconstructed from host and path: the capture recorded no scheme or port.");
+    format!(
+        "https://{}{}",
+        flow.host.as_deref().unwrap_or("unknown"),
+        flow.path.as_deref().unwrap_or("/")
+    )
+}
+
+/// The response content: the retained body, or a note on why there is none.
+fn har_response_content(flow: &FlowCapture, sse_events: Option<u64>) -> HarContentOut {
+    let response_type = flow
+        .response_headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone());
+    match (&flow.response_body, sse_events) {
+        (Some(body), _) => {
+            let (text, encoding) = har_text(body);
+            HarContentOut {
+                size: i64::try_from(body.len()).unwrap_or(i64::MAX),
+                mime_type: response_type
+                    .clone()
+                    .unwrap_or_else(|| "x-unknown".to_owned()),
+                text: Some(text),
+                encoding,
+                comment: None,
+            }
+        }
+        (None, Some(count)) => HarContentOut {
+            size: -1,
+            mime_type: response_type
+                .clone()
+                .unwrap_or_else(|| "text/event-stream".to_owned()),
+            text: None,
             encoding: None,
+            comment: Some(format!(
+                "Server-Sent Events stream: its {count} event(s) are captured per flow in APIaxess, not as one body."
+            )),
         },
-        Err(_) => HarContentOut {
-            text: BASE64.encode(body),
-            encoding: Some("base64".to_owned()),
+        (None, None) => HarContentOut {
+            size: 0,
+            mime_type: response_type
+                .clone()
+                .unwrap_or_else(|| "x-unknown".to_owned()),
+            text: None,
+            encoding: None,
+            comment: flow
+                .status
+                .is_some()
+                .then(|| "No response body was retained.".to_owned()),
         },
     }
 }
 
+fn har_headers(headers: &[(String, String)]) -> Vec<HarHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| HarHeader {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// `name=value` pairs of a `Cookie` header (or one `Set-Cookie` pair).
+fn har_cookies(value: &str) -> Vec<HarNameValue> {
+    value
+        .split(';')
+        .filter_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (!name.is_empty()).then(|| HarNameValue {
+                name: name.trim().to_owned(),
+                value: value.trim().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The URL's query parameters, percent-decoded, in order.
+fn har_query(url: &str) -> Vec<HarNameValue> {
+    let Some((_, query)) = url.split_once('?') else {
+        return Vec::new();
+    };
+    let query = query.split('#').next().unwrap_or_default();
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            HarNameValue {
+                name: percent_decode(name),
+                value: percent_decode(value),
+            }
+        })
+        .collect()
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let hex = |byte: u8| {
+        char::from(byte)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let decoded = match bytes[index] {
+            b'+' => Some((b' ', 1)),
+            b'%' => bytes
+                .get(index + 1)
+                .copied()
+                .and_then(hex)
+                .zip(bytes.get(index + 2).copied().and_then(hex))
+                .map(|(high, low)| (high * 16 + low, 3)),
+            _ => None,
+        };
+        let (byte, width) = decoded.unwrap_or((bytes[index], 1));
+        out.push(byte);
+        index += width;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A body as HAR text: UTF-8 as-is, anything else base64.
+fn har_text(body: &[u8]) -> (String, Option<String>) {
+    match std::str::from_utf8(body) {
+        Ok(text) => (text.to_owned(), None),
+        Err(_) => (BASE64.encode(body), Some("base64".to_owned())),
+    }
+}
+
+/// HAR `httpVersion` for a flow's protocol label (`h1` -> `HTTP/1.1`).
+fn har_http_version(protocol: &str) -> String {
+    match protocol.to_ascii_lowercase().as_str() {
+        "h1" | "http/1.1" => "HTTP/1.1".to_owned(),
+        "h2" | "http/2" | "http/2.0" => "HTTP/2".to_owned(),
+        "h3" | "http/3" => "HTTP/3".to_owned(),
+        "http/1.0" => "HTTP/1.0".to_owned(),
+        _ => protocol.to_owned(),
+    }
+}
+
+/// A flow protocol label for a HAR `httpVersion` (`HTTP/1.1` -> `h1`).
+fn protocol_from_har_version(version: &str) -> String {
+    let lower = version.to_ascii_lowercase();
+    if lower.contains("/2") || lower == "h2" {
+        "h2".to_owned()
+    } else if lower.contains("/3") || lower == "h3" {
+        "h3".to_owned()
+    } else if lower.contains("/1") || lower == "h1" {
+        "h1".to_owned()
+    } else {
+        lower
+    }
+}
+
+/// The standard reason phrase for a status code ("" when it has none).
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        410 => "Gone",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
+}
+
 fn decode_har_body(content: &HarContent) -> Result<Option<Vec<u8>>, Diagnostic> {
+    let Some(text) = &content.text else {
+        return Ok(None);
+    };
     if content.encoding.as_deref() == Some("base64") {
         BASE64
-            .decode(&content.text)
+            .decode(text)
             .map(Some)
             .map_err(|error| interchange_diag("import-body", &error.to_string()))
     } else {
-        Ok(Some(content.text.as_bytes().to_vec()))
+        Ok(Some(text.as_bytes().to_vec()))
     }
 }
 
@@ -4406,6 +4748,316 @@ mod tests {
         );
     }
 
+    /// Asserts every field HAR 1.2 requires is present with the right JSON
+    /// type (<http://www.softwareishard.com/blog/har-12-spec/>).
+    #[allow(clippy::too_many_lines)]
+    fn assert_valid_har_1_2(har: &serde_json::Value) {
+        use serde_json::Value;
+        type IsType = fn(&Value) -> bool;
+        let fields = |value: &Value, path: &str, required: &[(&str, IsType)]| {
+            for (name, is_type) in required {
+                let field = value
+                    .get(*name)
+                    .unwrap_or_else(|| panic!("{path}.{name} missing"));
+                assert!(is_type(field), "{path}.{name} has the wrong type: {field}");
+            }
+        };
+        let array = Value::is_array as fn(&Value) -> bool;
+        let object = Value::is_object as fn(&Value) -> bool;
+        let string = Value::is_string as fn(&Value) -> bool;
+        let number = Value::is_number as fn(&Value) -> bool;
+        let log = &har["log"];
+        fields(
+            log,
+            "log",
+            &[("version", string), ("creator", object), ("entries", array)],
+        );
+        fields(
+            &log["creator"],
+            "log.creator",
+            &[("name", string), ("version", string)],
+        );
+        for (index, entry) in log["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .enumerate()
+        {
+            let path = format!("log.entries[{index}]");
+            fields(
+                entry,
+                &path,
+                &[
+                    ("startedDateTime", string),
+                    ("time", number),
+                    ("request", object),
+                    ("response", object),
+                    ("cache", object),
+                    ("timings", object),
+                ],
+            );
+            assert!(
+                DateTime::parse_from_rfc3339(entry["startedDateTime"].as_str().expect("date"))
+                    .is_ok(),
+                "{path}.startedDateTime is not ISO 8601"
+            );
+            let request = &entry["request"];
+            fields(
+                request,
+                &format!("{path}.request"),
+                &[
+                    ("method", string),
+                    ("url", string),
+                    ("httpVersion", string),
+                    ("cookies", array),
+                    ("headers", array),
+                    ("queryString", array),
+                    ("headersSize", number),
+                    ("bodySize", number),
+                ],
+            );
+            let url = request["url"].as_str().expect("url");
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "{path} url {url} is not absolute"
+            );
+            if let Some(post) = request.get("postData") {
+                fields(
+                    post,
+                    &format!("{path}.request.postData"),
+                    &[("mimeType", string), ("text", string)],
+                );
+            }
+            let response = &entry["response"];
+            fields(
+                response,
+                &format!("{path}.response"),
+                &[
+                    ("status", number),
+                    ("statusText", string),
+                    ("httpVersion", string),
+                    ("cookies", array),
+                    ("headers", array),
+                    ("content", object),
+                    ("redirectURL", string),
+                    ("headersSize", number),
+                    ("bodySize", number),
+                ],
+            );
+            fields(
+                &response["content"],
+                &format!("{path}.response.content"),
+                &[("size", number), ("mimeType", string)],
+            );
+            let timings = &entry["timings"];
+            fields(
+                timings,
+                &format!("{path}.timings"),
+                &[("send", number), ("wait", number), ("receive", number)],
+            );
+            for list in [
+                &request["headers"],
+                &request["cookies"],
+                &request["queryString"],
+                &response["headers"],
+                &response["cookies"],
+            ] {
+                for pair in list.as_array().expect("list") {
+                    fields(pair, &path, &[("name", string), ("value", string)]);
+                }
+            }
+            let time = entry["time"].as_f64().expect("time");
+            let sum = [
+                "blocked", "dns", "connect", "send", "wait", "receive", "ssl",
+            ]
+            .iter()
+            .filter_map(|name| timings.get(*name).and_then(Value::as_f64))
+            .filter(|value| *value >= 0.0)
+            .sum::<f64>();
+            assert!(
+                (time - sum).abs() < 0.001,
+                "{path}.time {time} != sum of timings {sum}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn har_export_is_valid_har_1_2_and_round_trips_scheme_port_and_bodies() {
+        let source = store();
+        let mut api = flow(source.allocate_flow_id());
+        api.url = Some("http://127.0.0.1:9201/api/v1/items?page=1&q=desk%20lamp".to_owned());
+        api.host = Some("127.0.0.1".to_owned());
+        api.path = Some("/api/v1/items?page=1&q=desk%20lamp".to_owned());
+        api.protocol = "h1".to_owned();
+        api.request_headers
+            .push(("cookie".to_owned(), "sid=abc; theme=dark".to_owned()));
+        api.response_headers.push((
+            "set-cookie".to_owned(),
+            "sid=def; Path=/; HttpOnly".to_owned(),
+        ));
+        source.upsert(&api).expect("api flow");
+        let mut binary = flow(source.allocate_flow_id());
+        binary.url = Some("https://cdn.example.test:8443/blob".to_owned());
+        binary.host = Some("cdn.example.test".to_owned());
+        binary.path = Some("/blob".to_owned());
+        binary.method = Some("GET".to_owned());
+        binary.request_body = None;
+        binary.response_body = Some(vec![0, 159, 146, 150, 255]);
+        source.upsert(&binary).expect("binary flow");
+        let mut stream = flow(source.allocate_flow_id());
+        stream.url = Some("http://127.0.0.1:9201/api/v1/stream".to_owned());
+        stream.host = Some("127.0.0.1".to_owned());
+        stream.path = Some("/api/v1/stream".to_owned());
+        stream.method = Some("GET".to_owned());
+        stream.request_body = None;
+        stream.response_body = None;
+        stream.response_headers = vec![("content-type".to_owned(), "text/event-stream".to_owned())];
+        source.upsert(&stream).expect("stream flow");
+        source
+            .open_sse_stream(stream.id, Utc::now())
+            .expect("stream");
+        let mut upgrade = flow(source.allocate_flow_id());
+        upgrade.url = Some("http://127.0.0.1:9201/ws?room=ref".to_owned());
+        upgrade.host = Some("127.0.0.1".to_owned());
+        upgrade.path = Some("/ws?room=ref".to_owned());
+        upgrade.method = Some("GET".to_owned());
+        upgrade.status = None;
+        upgrade.duration_ms = None;
+        upgrade.request_body = None;
+        upgrade.response_body = None;
+        upgrade
+            .request_headers
+            .push(("upgrade".to_owned(), "websocket".to_owned()));
+        source.upsert(&upgrade).expect("upgrade flow");
+        let mut tunnel = flow(source.allocate_flow_id());
+        tunnel.method = Some("CONNECT".to_owned());
+        tunnel.url = Some("127.0.0.1:9201".to_owned());
+        source.upsert(&tunnel).expect("tunnel flow");
+        let mut fuzz = flow(source.allocate_flow_id());
+        fuzz.origin = FlowOrigin::Fuzz;
+        source.upsert(&fuzz).expect("fuzz flow");
+
+        let bytes = source.export_har().expect("export");
+        let har: serde_json::Value = serde_json::from_slice(&bytes).expect("har json");
+        assert_valid_har_1_2(&har);
+        let entries = har["log"]["entries"].as_array().expect("entries");
+        // Observed traffic only: no CONNECT tunnel, no Fuzz request.
+        let urls = entries
+            .iter()
+            .map(|entry| entry["request"]["url"].as_str().expect("url"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "http://127.0.0.1:9201/api/v1/items?page=1&q=desk%20lamp",
+                "https://cdn.example.test:8443/blob",
+                "http://127.0.0.1:9201/api/v1/stream",
+                "http://127.0.0.1:9201/ws?room=ref",
+            ]
+        );
+        let api_entry = &entries[0];
+        assert_eq!(api_entry["request"]["httpVersion"], "HTTP/1.1");
+        assert_eq!(api_entry["request"]["queryString"][1]["value"], "desk lamp");
+        assert_eq!(api_entry["request"]["cookies"][0]["name"], "sid");
+        assert_eq!(api_entry["response"]["cookies"][0]["value"], "def");
+        assert_eq!(api_entry["response"]["statusText"], "OK");
+        assert_eq!(api_entry["request"]["postData"]["mimeType"], "");
+        assert_eq!(entries[1]["response"]["content"]["encoding"], "base64");
+        assert_eq!(entries[2]["response"]["bodySize"], -1);
+        assert!(
+            entries[2]["response"]["content"]["comment"]
+                .as_str()
+                .expect("comment")
+                .contains("Server-Sent Events")
+        );
+        assert_eq!(entries[3]["response"]["status"], 0);
+        assert!(
+            entries[3]["comment"]
+                .as_str()
+                .expect("comment")
+                .contains("WebSocket")
+        );
+
+        // Re-imported, every flow keeps its exact URL (scheme and port), its
+        // host, status, and bodies.
+        let target = store();
+        let outcome = target
+            .import_har(&bytes, "har.import", |_, _| ScopeDisposition::InScope)
+            .expect("import");
+        assert_eq!((outcome.imported, outcome.in_scope), (4, 4));
+        let restored = target
+            .summaries()
+            .expect("summaries")
+            .into_iter()
+            .map(|summary| target.get(summary.id).expect("get").expect("flow"))
+            .collect::<Vec<_>>();
+        let pick = |url: &str| {
+            restored
+                .iter()
+                .find(|flow| flow.url.as_deref() == Some(url))
+                .expect(url)
+        };
+        let back = pick("http://127.0.0.1:9201/api/v1/items?page=1&q=desk%20lamp");
+        assert_eq!(back.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(back.path, api.path);
+        assert_eq!(back.status, api.status);
+        assert_eq!(back.protocol, "h1");
+        assert_eq!(back.request_body, api.request_body);
+        assert_eq!(back.response_body, api.response_body);
+        assert_eq!(
+            pick("https://cdn.example.test:8443/blob").response_body,
+            binary.response_body
+        );
+        assert_eq!(
+            pick("http://127.0.0.1:9201/ws?room=ref").status,
+            None,
+            "status 0 means no response"
+        );
+    }
+
+    #[test]
+    fn a_har_saved_without_bodies_imports_and_scope_is_reported_per_host() {
+        let har = br#"{"log":{"version":"1.2","creator":{"name":"Chrome","version":"1"},"entries":[
+            {"startedDateTime":"2026-09-26T10:00:00.000Z","time":5,"request":{"method":"GET","url":"https://app.example.test/a","httpVersion":"http/2.0","headers":[]},
+             "response":{"status":200,"headers":[],"content":{"size":120,"mimeType":"application/json"}}},
+            {"startedDateTime":"2026-09-26T10:00:01.000Z","time":5,"request":{"method":"GET","url":"https://cdn.other.test/b.js","httpVersion":"http/2.0","headers":[]},
+             "response":{"status":200,"headers":[],"content":{"size":10,"mimeType":"text/javascript"}}}
+        ]}}"#;
+        let target = store();
+        let outcome = target
+            .import_har(har, "har.import", |host, _| {
+                if host == Some("app.example.test") {
+                    ScopeDisposition::InScope
+                } else {
+                    ScopeDisposition::OutsideDeclaredScope
+                }
+            })
+            .expect("a HAR without bodies imports");
+        assert_eq!(outcome.imported, 2);
+        assert_eq!(outcome.in_scope, 1);
+        assert_eq!(
+            outcome.outside_scope.into_iter().collect::<Vec<_>>(),
+            vec![("cdn.other.test".to_owned(), 1)]
+        );
+        let flow = target
+            .get(target.summaries().expect("summaries")[0].id)
+            .expect("get")
+            .expect("flow");
+        assert_eq!(flow.response_body, None);
+        assert_eq!(flow.protocol, "h2");
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_har_is_reported_as_malformed() {
+        let error = store()
+            .import_har(b"{\"not\": \"a har\"}", "har.import", |_, _| {
+                ScopeDisposition::InScope
+            })
+            .expect_err("not a HAR");
+        assert_eq!(&*error.id, catalogue::PROXY_HAR_IMPORT_MALFORMED.id);
+    }
+
     #[test]
     fn har_round_trip_uses_interchange_only() {
         let database = store();
@@ -4425,7 +5077,8 @@ mod tests {
         assert_eq!(
             other
                 .import_har(&har, "har.import", classify)
-                .expect("import"),
+                .expect("import")
+                .imported,
             1
         );
         let summaries = other.summaries().expect("summaries");

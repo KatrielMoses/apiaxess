@@ -9,6 +9,17 @@ license.workspace = true
 [dependencies]
 apiaxess-api-model = { path = "../api-model" }
 apiaxess-diagnostics = { path = "../diagnostics" }
+serde_json.workspace = true
+# Only for the `testing` feature: generated Python runs through the central
+# process boundary.
+apiaxess-external-tools = { path = "../external-tools", optional = true }
+
+[features]
+# Test support that executes generated Python (see `testing`).
+testing = ["dep:apiaxess-external-tools"]
+
+[dev-dependencies]
+apiaxess-external-tools = { path = "../external-tools" }
 
 [lints]
 workspace = true

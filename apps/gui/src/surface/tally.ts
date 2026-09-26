@@ -10,6 +10,10 @@
 //! (its "confirmed" = static AND dynamic, "inferred" = dynamic only, "static
 //! only" = static only). Those counts stay in the evidence export; the GUI
 //! derives its own from each endpoint's evidence rather than relabeling them.
+//!
+//! Every export (OpenAPI, Postman, Python SDK) and the CLI apply this same
+//! rule through `apiaxess_api_model::delivery::EndpointEvidence`; change both
+//! together so the GUI and the exported artifacts never disagree.
 
 /** The evidence behind one endpoint, as the surface summary reports it. */
 export interface EndpointEvidence {

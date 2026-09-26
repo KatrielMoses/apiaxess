@@ -377,6 +377,8 @@ version = "0.1.0"
 dependencies = [
  "apiaxess-api-model",
  "apiaxess-diagnostics",
+ "apiaxess-external-tools",
+ "serde_json",
 ]
 
 [[package]]
