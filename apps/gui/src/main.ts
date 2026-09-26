@@ -132,7 +132,9 @@ interface AuditActionDescriptor { readonly kind: string; readonly summary: strin
 interface AuditRecord { readonly id: string; readonly occurred_at: string; readonly action: AuditActionDescriptor; readonly outcome: string; readonly diagnostics: (Diagnostic | null)[]; }
 
 /* Device pairing (Phase C5). These mirror the local API's pairing shapes. */
-interface PairingDevice { readonly serial: string; readonly state: string; readonly description: string; }
+interface PairingDevice { readonly serial: string; readonly state: string; readonly description: string; readonly managed?: boolean; }
+/** What happened to the armed pairing token (engine `pairing/token-state`). */
+type PairingTokenState = "armed" | "used" | "expired" | "unknown";
 interface PairingQrPayload { readonly host: string; readonly controlPort: number; readonly proxyPort: number; readonly pairingToken: string; readonly caFingerprintSha256: string; readonly expiresAtMs: number; }
 interface PendingPairing { readonly id: string; readonly deviceName: string; readonly serial?: string | null; readonly requestedAgoMs: number; }
 
@@ -356,6 +358,11 @@ let operatorToken = "";
 let armedPairing: PairingQrPayload | null = null;
 /** Verbatim JSON bytes of the armed payload; the QR must encode these unchanged. */
 let armedPairingRaw: string | null = null;
+/** The armed token's real state, polled while its QR is on screen. */
+let armedTokenState: PairingTokenState = "armed";
+let armedTokenPoll: number | undefined;
+/** The token state the pairing panel currently shows. */
+let renderedTokenState: PairingTokenState | null = null;
 /** Poll handle for the pending-pairing list; live only while the Devices view is shown. */
 let pairingPoll: number | undefined;
 /** Poll handle for the Android target status; live only while that view is shown. */
@@ -6451,20 +6458,26 @@ function renderDevices(devices: readonly PairingDevice[]): void {
     // an authorized, online device. Arming an OFFLINE/UNAUTHORIZED device (e.g.
     // the app's own managed emulator while it boots) just fails the tunnel, so
     // the control is disabled with a reason rather than offered and failing (#10).
+    // The app's own managed Android target is never offered for manual
+    // pairing, in any state: APIaxess provisions it itself.
+    const managed = device.managed === true;
     const ready = device.state.toLowerCase() === "ready";
-    const reason = ready
-      ? ""
-      : device.state.toLowerCase() === "offline"
-        ? "Device is offline (booting, asleep, or a managed target) — it can't be paired yet."
-        : device.state.toLowerCase() === "unauthorized"
-          ? "Authorize this host's adb key on the device, then refresh."
-          : `Device is not ready (${device.state}).`;
-    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(device.serial)}</b> <span class="badge${ready ? "" : " badge--caution"}">${escapeHtml(device.state)}</span><br><span class="t-small t-subtle">${escapeHtml(device.description)}</span></span>`;
+    const reason = managed
+      ? "This is APIaxess's own Android target. The app provisions it itself, so it is never paired manually; drive it from the Android target view."
+      : ready
+        ? ""
+        : device.state.toLowerCase() === "offline"
+          ? "Device is offline (booting or asleep) — it can't be paired yet."
+          : device.state.toLowerCase() === "unauthorized"
+            ? "Authorize this host's adb key on the device, then refresh."
+            : `Device is not ready (${device.state}).`;
+    const managedBadge = managed ? ` <span class="badge">managed target</span>` : "";
+    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(device.serial)}</b> <span class="badge${ready ? "" : " badge--caution"}">${escapeHtml(device.state)}</span>${managedBadge}<br><span class="t-small t-subtle">${escapeHtml(managed ? reason : device.description)}</span></span>`;
     const arm = document.createElement("button");
     arm.type = "button";
     arm.className = "btn btn--sm btn--primary";
-    arm.disabled = !ready;
-    if (!ready) arm.title = reason;
+    arm.disabled = managed || !ready;
+    if (reason !== "") arm.title = reason;
     arm.innerHTML = `${icon("shield", { size: 14 })}<span>Arm pairing</span>`;
     arm.addEventListener("click", () => void armDevice(device.serial, arm));
     row.append(arm);
@@ -6490,11 +6503,11 @@ async function refreshDevices(): Promise<void> {
       devicesList.innerHTML = stateBlock({
         icon: "apk",
         title: "No devices attached",
-        body: "Connect a rooted Android device over adb, then refresh. If a device is connected but not listed, confirm adb is on PATH and the device is authorized.",
+        body: "Connect a rooted Android device over USB or adb, then refresh. APIaxess lists devices with its own adb, bundled with the analysis runtime (not one on PATH): if a device is connected but not listed, check that the analysis runtime is installed (Settings → Bundled tools) and that the device has authorized this computer.",
       });
     }
     if (!(error instanceof ApiRequestError)) {
-      showDiagnostic({ id: "pairing.devices-unavailable", what: "Attached devices could not be listed.", why: String(error), fix: "Confirm adb is on PATH and a device is connected and authorized, then refresh." });
+      showDiagnostic({ id: "pairing.devices-unavailable", what: "Attached devices could not be listed.", why: String(error), fix: "Check that the analysis runtime (which includes APIaxess's adb) is installed in Settings → Bundled tools, and that the device is connected and authorized, then refresh." });
     }
   }
 }
@@ -6511,13 +6524,63 @@ async function armDevice(serial: string, button: HTMLButtonElement): Promise<voi
       await requireOk(response, "device arm failed");
       armedPairingRaw = await response.text();
       armedPairing = JSON.parse(armedPairingRaw) as PairingQrPayload;
+      armedTokenState = "armed";
       await renderArmed();
+      watchArmedToken();
       revealDrawer(pairingArmResult);
       toast(`Armed ${serial}. Scan the pairing code on the device.`, "success");
     } catch (error) {
       reportUnexpected(error, { id: "pairing.arm-failed", what: "The device could not be armed for pairing.", why: "", fix: "Confirm the device is authorized over adb and that the reverse tunnel can be established, then retry." });
     }
   });
+}
+
+/** The armed token's state: the engine's answer, or expired once the
+ *  expiry time has passed even if the engine has not been asked yet. */
+function currentArmedTokenState(payload: PairingQrPayload): PairingTokenState {
+  if (armedTokenState === "armed" && Date.now() >= payload.expiresAtMs) return "expired";
+  return armedTokenState;
+}
+
+/** Polls the armed token's state while its QR is shown, re-rendering when it
+ *  is used or expires; stops once the state is final. */
+function watchArmedToken(): void {
+  if (armedTokenPoll !== undefined) window.clearInterval(armedTokenPoll);
+  armedTokenPoll = window.setInterval(() => void refreshArmedTokenState(), 2000);
+}
+
+async function refreshArmedTokenState(): Promise<void> {
+  const payload = armedPairing;
+  if (payload === null) {
+    if (armedTokenPoll !== undefined) window.clearInterval(armedTokenPoll);
+    armedTokenPoll = undefined;
+    return;
+  }
+  try {
+    const response = await fetch("/api/v1/pairing/token-state", {
+      method: "POST",
+      headers: pairingHeaders(true),
+      body: JSON.stringify({ pairingToken: payload.pairingToken }),
+    });
+    if (response.ok) {
+      const next = ((await response.json()) as { state: PairingTokenState }).state;
+      // A response for a token since replaced by a re-arm says nothing about
+      // the QR now on screen.
+      if (armedPairing !== payload) return;
+      armedTokenState = next;
+    }
+  } catch {
+    // Transient; the next poll retries. Expiry still shows from the clock.
+  }
+  if (armedPairing !== payload) return;
+  // Compare with what the panel shows, not the previous poll: the clock can
+  // turn the state to expired between polls.
+  const current = currentArmedTokenState(payload);
+  if (current !== renderedTokenState) await renderArmed();
+  if (current !== "armed" && armedTokenPoll !== undefined) {
+    window.clearInterval(armedTokenPoll);
+    armedTokenPoll = undefined;
+  }
 }
 
 /** Renders the armed payload as a scannable QR plus a manual-entry fallback. */
@@ -6534,9 +6597,22 @@ async function renderArmed(): Promise<void> {
     });
     return;
   }
-  if (pairingArmBadge !== null) pairingArmBadge.textContent = "armed";
   const expires = new Date(payload.expiresAtMs);
   const expiresText = Number.isNaN(expires.getTime()) ? String(payload.expiresAtMs) : expires.toLocaleTimeString();
+  // The badge says what actually happened to the token, not a stale "armed".
+  const state = currentArmedTokenState(payload);
+  renderedTokenState = state;
+  if (pairingArmBadge !== null) pairingArmBadge.textContent = state === "armed" ? "armed" : state === "used" ? "used" : state === "expired" ? "expired" : "no longer valid";
+  if (state !== "armed") {
+    const title = state === "used" ? "This pairing code was used" : state === "expired" ? "This pairing code expired" : "This pairing code is no longer valid";
+    const body = state === "used"
+      ? "A device presented this one-time code, so it can't be used again. Accept or decline its request below; arm the device again for a new code."
+      : state === "expired"
+        ? `It expired at ${expiresText} before any device used it. Arm the device again for a new code.`
+        : "The engine no longer recognises this code (it may have restarted). Arm the device again for a new code.";
+    pairingArmResult.innerHTML = stateBlock({ icon: "shield", title, body });
+    return;
+  }
   pairingArmResult.innerHTML = `<div class="stack">
   <div style="align-self:center;background:#ffffff;padding:12px;border-radius:var(--radius-2);line-height:0">
     <img id="pairing-qr" width="232" height="232" alt="Pairing QR code" />

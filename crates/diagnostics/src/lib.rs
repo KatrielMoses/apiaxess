@@ -1134,11 +1134,22 @@ pub mod catalogue {
         fix: "Re-run device pairing to obtain a current session token; a device cannot open the control channel without one.",
     };
 
+    /// Manual pairing was requested for the app's own managed Android target.
+    pub const PAIRING_MANAGED_TARGET: DiagnosticDefinition = DiagnosticDefinition {
+        id: "pairing.managed-target",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "The app's own Android target can't be paired manually.",
+        why: "This device is the Android target APIaxess manages; APIaxess provisions it itself, so it is never armed for manual pairing.",
+        fix: "Use the Android target view to drive and capture it, or arm a different device.",
+    };
+
     /// Every device-pairing (phase C1) definition, used by conformance tests.
     pub const PHASE_C1: &[DiagnosticDefinition] = &[
         PAIRING_CA_UNAVAILABLE,
         PAIRING_TOKEN_REJECTED,
         PAIRING_DEVICE_AUTH_REJECTED,
+        PAIRING_MANAGED_TARGET,
     ];
 
     /// Every phase 0.4 definition, used by catalogue conformance tests.

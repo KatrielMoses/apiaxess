@@ -621,6 +621,38 @@ impl Engine {
         self.apply_session_scope(scope, AuditActor::User, "session.scope.update", summary)
     }
 
+    /// Appends a completed session action to the audit trail and saves the
+    /// session. A no-op without an active session (nothing to audit into).
+    fn record_session_action(
+        &self,
+        actor: AuditActor,
+        kind: &str,
+        summary: String,
+    ) -> Result<(), apiaxess_diagnostics::Diagnostic> {
+        let Some(runtime) = self.session_runtime()? else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now();
+        let mut session = runtime.session_snapshot()?;
+        session.record_action(ActionRecordInput {
+            id: format!(
+                "{kind}:{}",
+                fresh_session_id()?.as_str().trim_start_matches("session:")
+            ),
+            occurred_at: now,
+            actor,
+            action: ActionDescriptor {
+                kind: kind.to_owned(),
+                summary,
+            },
+            target: ActionTarget::SessionTarget,
+            outcome: ActionOutcome::Completed,
+            diagnostics: Vec::new(),
+        })?;
+        runtime.replace_session(session)?;
+        runtime.save().map(|_| ())
+    }
+
     /// Declares `scope` on the session, audits it as `kind` by `actor`, and
     /// re-classifies stored traffic against it.
     fn apply_session_scope(
@@ -1045,6 +1077,28 @@ impl Engine {
             None => None,
         };
         let outcome = self.live_workbench.import_har(bytes, "har.import")?;
+        let outside = outcome.outside_scope.values().sum::<usize>();
+        let summary = format!(
+            "Imported {} flow(s) from {} host(s) in a HAR file: {} in scope, {} outside the scope{}",
+            outcome.imported,
+            outcome.hosts,
+            outcome.in_scope,
+            outside,
+            if outcome.outside_scope.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    outcome
+                        .outside_scope
+                        .iter()
+                        .map(|(host, count)| format!("{host}: {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+        self.record_session_action(AuditActor::User, "har.import", summary)?;
         Ok(HarImportReport {
             imported: outcome.imported,
             in_scope: outcome.in_scope,
@@ -1441,6 +1495,32 @@ impl Engine {
         Vec<apiaxess_sandbox::device_provision::DetectedDevice>,
         apiaxess_diagnostics::Diagnostic,
     > {
+        // Devices are listed with the adb bundled with the analysis runtime,
+        // never one on PATH: name that requirement when it is missing.
+        let adb = apiaxess_sandbox::BundledEmulatorConfig::resolve(
+            apiaxess_sandbox::AccelerationMode::Software,
+        )
+        .adb_executable;
+        if !adb.is_file() {
+            let mut context = apiaxess_diagnostics::DiagnosticContext::new();
+            context.insert(
+                "tool".to_owned(),
+                apiaxess_diagnostics::DiagnosticValue::String("adb".to_owned()),
+            );
+            context.insert(
+                "path".to_owned(),
+                apiaxess_diagnostics::DiagnosticValue::String(adb.display().to_string()),
+            );
+            let mut diagnostic =
+                apiaxess_diagnostics::catalogue::EXTERNAL_TOOL_MISSING.instantiate(context);
+            diagnostic.why = format!(
+                "APIaxess lists attached devices with the adb bundled with its analysis runtime, which is not installed at {}.",
+                adb.display()
+            )
+            .into_boxed_str();
+            diagnostic.fix = "Install the optional analysis runtime (it includes adb; Settings → Bundled tools shows where it is looked for), or point the analysis-runtime location setting at an existing one, then refresh.".into();
+            return Err(diagnostic);
+        }
         device_provisioner().detect_devices()
     }
 
@@ -1516,6 +1596,9 @@ impl Engine {
         proxy_port: u16,
     ) -> Result<(), Vec<apiaxess_diagnostics::Diagnostic>> {
         use apiaxess_sandbox::device_provision::PortMapping;
+        if self.is_managed_android_serial(serial) {
+            return Err(vec![managed_target_pairing_diagnostic(serial)]);
+        }
         let mappings = [
             PortMapping {
                 device_port: control_port,
@@ -1527,6 +1610,38 @@ impl Engine {
             },
         ];
         device_provisioner().establish_tunnel(serial, &mappings)
+    }
+
+    /// The adb serials of the app's own managed Android target: the one this
+    /// run booted, and the fixed serial the installed add-on always boots on
+    /// (so a target left running by an earlier run is recognised too).
+    #[must_use]
+    pub fn managed_android_serials(&self) -> Vec<String> {
+        let mut serials = Vec::new();
+        if let Some(serial) = self
+            .android_status
+            .read()
+            .ok()
+            .and_then(|status| status.serial.clone())
+        {
+            serials.push(serial);
+        }
+        if let Ok(addon) = apiaxess_sandbox::android_target::AndroidTargetAddon::resolve() {
+            let serial = addon.device_serial();
+            if !serials.contains(&serial) {
+                serials.push(serial);
+            }
+        }
+        serials
+    }
+
+    /// Whether `serial` is the app's own managed Android target, which is
+    /// never offered for manual pairing: the app provisions it itself.
+    #[must_use]
+    pub fn is_managed_android_serial(&self, serial: &str) -> bool {
+        self.managed_android_serials()
+            .iter()
+            .any(|managed| managed == serial)
     }
 
     /// Provisions a device (Phase C2) and retains the handle for the session so its
@@ -2844,7 +2959,61 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
         optional: true,
     });
 
+    push_device_tool_status(&mut statuses, &runtime);
+
     statuses
+}
+
+/// The device-side tools in the bundled-tools panel: adb (Devices view) and
+/// Frida (frida-core linked into the build, frida-server pushed to devices).
+fn push_device_tool_status(
+    statuses: &mut Vec<BundledToolStatus>,
+    runtime: &apiaxess_sandbox::BundledEmulatorConfig,
+) {
+    // adb for attached devices (Devices view) ships with the analysis runtime.
+    statuses.push(BundledToolStatus {
+        label: "adb".to_owned(),
+        group: "dynamic".to_owned(),
+        present: runtime.adb_executable.is_file(),
+        path: runtime.adb_executable.display().to_string(),
+        overridden: env::var_os("APIAXESS_ANALYSIS_RUNTIME").is_some(),
+        optional: true,
+    });
+    // Frida: frida-core is linked in only by the frida-embedded build, and
+    // frida-server (pushed to the device) ships with the analysis runtime and,
+    // separately, with the Android target add-on.
+    statuses.push(BundledToolStatus {
+        label: "frida-core".to_owned(),
+        group: "dynamic".to_owned(),
+        present: cfg!(feature = "frida-embedded"),
+        path: if cfg!(feature = "frida-embedded") {
+            "linked into this build".to_owned()
+        } else {
+            "not included in this build (frida-embedded variant only)".to_owned()
+        },
+        overridden: false,
+        optional: true,
+    });
+    let frida_server = apiaxess_sandbox::bundled_frida_server_path();
+    statuses.push(BundledToolStatus {
+        label: "frida-server".to_owned(),
+        group: "dynamic".to_owned(),
+        present: frida_server.is_file(),
+        path: frida_server.display().to_string(),
+        overridden: env::var_os("APIAXESS_ANALYSIS_RUNTIME").is_some(),
+        optional: true,
+    });
+    if let Ok(addon) = apiaxess_sandbox::android_target::AndroidTargetAddon::resolve() {
+        let addon_frida = addon.frida_server_path();
+        statuses.push(BundledToolStatus {
+            label: "frida-server (android-target)".to_owned(),
+            group: "dynamic".to_owned(),
+            present: addon_frida.is_file(),
+            path: addon_frida.display().to_string(),
+            overridden: env::var_os("APIAXESS_ANDROID_TARGET").is_some(),
+            optional: true,
+        });
+    }
 }
 
 /// Diagnostic context carrying the target device serial.
@@ -3041,6 +3210,16 @@ fn browser_teardown_diagnostic(reason: &str) -> apiaxess_diagnostics::Diagnostic
         apiaxess_diagnostics::catalogue::PROXY_TEARDOWN_INCOMPLETE,
         reason,
     )
+}
+
+/// Refuses manual pairing of the app's own managed Android target.
+fn managed_target_pairing_diagnostic(serial: &str) -> apiaxess_diagnostics::Diagnostic {
+    let mut context = apiaxess_diagnostics::DiagnosticContext::new();
+    context.insert(
+        "serial".to_owned(),
+        apiaxess_diagnostics::DiagnosticValue::String(serial.to_owned()),
+    );
+    apiaxess_diagnostics::catalogue::PAIRING_MANAGED_TARGET.instantiate(context)
 }
 
 fn browser_diagnostic(
@@ -3785,6 +3964,63 @@ mod tests {
         // Nothing from the old session's browsing is admitted in the new one.
         observe_capture(&engine, "https://www.google.com/async/folae");
         assert!(fused_hosts(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_har_import_is_recorded_in_the_audit_trail() {
+        let source = reference_engine(&["127.0.0.1:9201", "localhost:9202"]);
+        let har = source.live_workbench().export_har().expect("export");
+        let engine = engine_with_session(&["127.0.0.1:9201"]);
+        let report = engine.import_har(&har).expect("import");
+        let audit = engine.session_audit().expect("audit");
+        let record = audit
+            .iter()
+            .find(|record| record.action.kind == "har.import")
+            .expect("har.import audited");
+        let outside = report.outside_scope.values().sum::<usize>();
+        assert!(outside > 0, "the fixture has an out-of-scope host");
+        let summary = &record.action.summary;
+        assert!(
+            summary.contains(&format!(
+                "Imported {} flow(s) from 2 host(s)",
+                report.imported
+            )),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!(
+                "{} in scope, {outside} outside the scope",
+                report.in_scope
+            )),
+            "{summary}"
+        );
+        assert!(summary.contains("localhost"), "{summary}");
+    }
+
+    #[test]
+    fn the_managed_android_target_is_never_armed_for_pairing() {
+        let engine = engine_with_session(&[]);
+        engine.android_status.write().expect("status").serial = Some("emulator-5570".to_owned());
+        assert!(engine.is_managed_android_serial("emulator-5570"));
+        assert!(!engine.is_managed_android_serial("R58M123ABC"));
+        let refused = engine
+            .arm_device_tunnel("emulator-5570", 7777, 8080)
+            .expect_err("managed target refused");
+        assert_eq!(&*refused[0].id, "pairing.managed-target");
+    }
+
+    #[test]
+    fn frida_and_adb_are_listed_among_the_bundled_tools() {
+        let labels = super::bundled_tool_status()
+            .into_iter()
+            .map(|tool| tool.label)
+            .collect::<Vec<_>>();
+        for expected in ["frida-core", "frida-server", "adb"] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "{expected} in {labels:?}"
+            );
+        }
     }
 
     #[test]

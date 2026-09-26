@@ -129,7 +129,17 @@ fn unsupported_format(found: u32) -> Diagnostic {
         "supported_version".to_owned(),
         DiagnosticValue::Integer(i64::from(CURRENT_SESSION_FORMAT_VERSION)),
     );
-    SESSION_FORMAT_UNSUPPORTED.instantiate(context)
+    let mut diagnostic = SESSION_FORMAT_UNSUPPORTED.instantiate(context);
+    diagnostic.why = format!(
+        "The session artifact is format version {found}; this build reads only version {CURRENT_SESSION_FORMAT_VERSION}{}.",
+        if found > CURRENT_SESSION_FORMAT_VERSION {
+            " (it was written by a newer APIaxess)"
+        } else {
+            " (it was written by an older APIaxess)"
+        }
+    )
+    .into_boxed_str();
+    diagnostic
 }
 
 fn json_diagnostic(error: &serde_json::Error) -> Diagnostic {

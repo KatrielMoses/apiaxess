@@ -61,6 +61,24 @@ struct PairingTokenEntry {
     serial: Option<String>,
 }
 
+/// How long a used or expired pairing token's outcome is remembered, so the
+/// GUI can report what happened to the QR it is still showing.
+const TOKEN_OUTCOME_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// What happened to a pairing token the operator armed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PairingTokenState {
+    /// Issued and still valid: a device can present it.
+    Armed,
+    /// A device presented it (it is single-use, so it can't be used again).
+    Used,
+    /// It expired before any device presented it.
+    Expired,
+    /// Never issued by this engine run, or forgotten long after its outcome.
+    Unknown,
+}
+
 /// Session-scoped registry of live pairing and device session tokens.
 #[derive(Clone, Default)]
 pub(crate) struct DevicePairingRegistry {
@@ -74,6 +92,9 @@ struct PairingState {
     pairing_tokens: HashMap<String, PairingTokenEntry>,
     /// Issued device session bearer tokens → their monotonic expiry instant.
     session_tokens: HashMap<String, Instant>,
+    /// Pairing tokens no longer valid → how they ended and when, kept for
+    /// [`TOKEN_OUTCOME_TTL`] so their state can be reported.
+    token_outcomes: HashMap<String, (PairingTokenState, Instant)>,
 }
 
 impl DevicePairingRegistry {
@@ -113,8 +134,14 @@ impl DevicePairingRegistry {
         // an expired-but-not-yet-pruned entry must not be accepted.
         let entry = state.pairing_tokens.remove(pairing_token)?;
         if entry.expiry <= now {
+            state
+                .token_outcomes
+                .insert(pairing_token.to_owned(), (PairingTokenState::Expired, now));
             return None;
         }
+        state
+            .token_outcomes
+            .insert(pairing_token.to_owned(), (PairingTokenState::Used, now));
         Some(PairingClaim {
             serial: entry.serial,
         })
@@ -146,6 +173,23 @@ impl DevicePairingRegistry {
             .and_then(|_claim| self.issue_session_token())
     }
 
+    /// The current state of a pairing token: still armed, used by a device,
+    /// expired unused, or unknown.
+    pub fn pairing_token_state(&self, pairing_token: &str) -> PairingTokenState {
+        let now = Instant::now();
+        let Ok(mut state) = self.inner.lock() else {
+            return PairingTokenState::Unknown;
+        };
+        state.prune(now);
+        if state.pairing_tokens.contains_key(pairing_token) {
+            return PairingTokenState::Armed;
+        }
+        state
+            .token_outcomes
+            .get(pairing_token)
+            .map_or(PairingTokenState::Unknown, |(outcome, _)| *outcome)
+    }
+
     /// Returns whether a device session bearer token is currently valid.
     pub fn validate_session_token(&self, token: &str) -> bool {
         if token.is_empty() {
@@ -166,7 +210,19 @@ impl DevicePairingRegistry {
 impl PairingState {
     /// Drops every expired token so the maps cannot grow without bound.
     fn prune(&mut self, now: Instant) {
-        self.pairing_tokens.retain(|_, entry| entry.expiry > now);
+        let expired = self
+            .pairing_tokens
+            .iter()
+            .filter(|(_, entry)| entry.expiry <= now)
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in expired {
+            self.pairing_tokens.remove(&token);
+            self.token_outcomes
+                .insert(token, (PairingTokenState::Expired, now));
+        }
+        self.token_outcomes
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < TOKEN_OUTCOME_TTL);
         self.session_tokens.retain(|_, expiry| *expiry > now);
     }
 }
@@ -417,6 +473,48 @@ mod tests {
                 .expect("test clock supports one second in the past");
         }
         assert!(registry.consume_pairing_token(&pairing.token).is_none());
+        assert_eq!(
+            registry.pairing_token_state(&pairing.token),
+            PairingTokenState::Expired
+        );
+    }
+
+    #[test]
+    fn a_pairing_token_reports_armed_then_used_or_expired() {
+        let registry = DevicePairingRegistry::default();
+        let used = registry.issue_pairing_token(None).expect("pairing token");
+        assert_eq!(
+            registry.pairing_token_state(&used.token),
+            PairingTokenState::Armed
+        );
+        registry
+            .consume_pairing_token(&used.token)
+            .expect("consumed");
+        assert_eq!(
+            registry.pairing_token_state(&used.token),
+            PairingTokenState::Used
+        );
+
+        // Expired unused: reported as expired once pruned, not armed.
+        let unused = registry.issue_pairing_token(None).expect("pairing token");
+        {
+            let mut state = registry.inner.lock().expect("lock");
+            state
+                .pairing_tokens
+                .get_mut(&unused.token)
+                .expect("present")
+                .expiry = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test clock supports one second in the past");
+        }
+        assert_eq!(
+            registry.pairing_token_state(&unused.token),
+            PairingTokenState::Expired
+        );
+        assert_eq!(
+            registry.pairing_token_state("never-issued"),
+            PairingTokenState::Unknown
+        );
     }
 
     #[test]

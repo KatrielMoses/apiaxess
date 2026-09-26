@@ -2382,7 +2382,10 @@ impl TrafficStore {
             return Ok(0);
         };
         if slot.schema_id != TRAFFIC_SCHEMA_ID || slot.format_version != TRAFFIC_SCHEMA_VERSION {
-            return Err(catalogue::PROXY_STORE_RESUME_FAILED.instantiate(DiagnosticContext::new()));
+            return Err(traffic_version_diagnostic(
+                &slot.schema_id,
+                slot.format_version,
+            ));
         }
         let snapshot: TrafficSnapshot =
             serde_json::from_value(slot.payload.clone()).map_err(|e| {
@@ -2391,16 +2394,10 @@ impl TrafficStore {
                 catalogue::PROXY_STORE_RESUME_FAILED.instantiate(context)
             })?;
         if snapshot.schema_version != TRAFFIC_SCHEMA_VERSION {
-            let mut context = DiagnosticContext::new();
-            context.insert(
-                "found_version".to_owned(),
-                DiagnosticValue::Integer(i64::from(snapshot.schema_version)),
-            );
-            context.insert(
-                "supported_version".to_owned(),
-                DiagnosticValue::Integer(i64::from(TRAFFIC_SCHEMA_VERSION)),
-            );
-            return Err(catalogue::PROXY_STORE_RESUME_FAILED.instantiate(context));
+            return Err(traffic_version_diagnostic(
+                TRAFFIC_SCHEMA_ID,
+                snapshot.schema_version,
+            ));
         }
         let mut count = 0;
         for flow in snapshot.flows {
@@ -2435,6 +2432,7 @@ impl TrafficStore {
             catalogue::PROXY_HAR_IMPORT_MALFORMED.instantiate(context)
         })?;
         let mut outcome = HarImportOutcome::default();
+        let mut hosts = std::collections::BTreeSet::new();
         for entry in document.log.entries {
             // Draw each id from the store's single authoritative allocator so a
             // concurrent import and live capture can never collide on an id.
@@ -2445,6 +2443,7 @@ impl TrafficStore {
             // fusion only consumes in-scope flows, so an unclassified import fuses
             // into zero endpoints — the "import a HAR, get nothing" bug.
             let scope = classify_scope(host.as_deref(), Some(entry.request.url.as_str()));
+            hosts.insert(host.clone().unwrap_or_default());
             if scope == ScopeDisposition::InScope {
                 outcome.in_scope += 1;
             } else {
@@ -2502,6 +2501,7 @@ impl TrafficStore {
             self.upsert(&flow)?;
             outcome.imported += 1;
         }
+        outcome.hosts = hosts.len();
         Ok(outcome)
     }
 
@@ -3442,6 +3442,36 @@ fn seed_next_flow_id(connection: &Connection, database: &Path) -> Result<u64, Di
     Ok(u64::try_from(max_id).unwrap_or(0).saturating_add(1))
 }
 
+/// The session's traffic slot is a schema or version this build can't resume,
+/// naming what was found against what this build reads.
+fn traffic_version_diagnostic(schema_id: &str, found: u32) -> Diagnostic {
+    let mut context = DiagnosticContext::new();
+    context.insert(
+        "schema_id".to_owned(),
+        DiagnosticValue::String(schema_id.to_owned()),
+    );
+    context.insert(
+        "found_version".to_owned(),
+        DiagnosticValue::Integer(i64::from(found)),
+    );
+    context.insert(
+        "supported_version".to_owned(),
+        DiagnosticValue::Integer(i64::from(TRAFFIC_SCHEMA_VERSION)),
+    );
+    let mut diagnostic = catalogue::PROXY_STORE_RESUME_FAILED.instantiate(context);
+    diagnostic.why = if schema_id == TRAFFIC_SCHEMA_ID {
+        format!(
+            "The session's captured traffic is format version {found}; this build reads only version {TRAFFIC_SCHEMA_VERSION}."
+        )
+    } else {
+        format!(
+            "The session's captured traffic is in format \"{schema_id}\" version {found}; this build reads only \"{TRAFFIC_SCHEMA_ID}\" version {TRAFFIC_SCHEMA_VERSION}."
+        )
+    }
+    .into_boxed_str();
+    diagnostic
+}
+
 /// The body to store and the size of a body withheld instead: an
 /// out-of-scope body over [`OUT_OF_SCOPE_BODY_LIMIT`] is not stored, and a
 /// body already withheld keeps its `previously` recorded size.
@@ -3799,6 +3829,8 @@ pub struct HarImportOutcome {
     pub in_scope: usize,
     /// Entries not in scope, by host.
     pub outside_scope: std::collections::BTreeMap<String, usize>,
+    /// Distinct hosts across every imported entry.
+    pub hosts: usize,
 }
 
 // HAR 1.2 export (http://www.softwareishard.com/blog/har-12-spec/): every
@@ -4789,6 +4821,25 @@ mod tests {
         assert_eq!(scope_of(2), ScopeDisposition::InScope);
         assert_eq!(scope_of(3), ScopeDisposition::OutsideDeclaredScope);
         assert_eq!(scope_of(4), ScopeDisposition::InScope);
+    }
+
+    #[test]
+    fn traffic_version_errors_name_the_found_and_supported_version() {
+        let newer = traffic_version_diagnostic(TRAFFIC_SCHEMA_ID, 7);
+        assert!(newer.why.contains("format version 7"), "{}", newer.why);
+        assert!(
+            newer
+                .why
+                .contains(&format!("only version {TRAFFIC_SCHEMA_VERSION}")),
+            "{}",
+            newer.why
+        );
+        let foreign = traffic_version_diagnostic("other.traffic", 1);
+        assert!(
+            foreign.why.contains("\"other.traffic\" version 1"),
+            "{}",
+            foreign.why
+        );
     }
 
     #[test]

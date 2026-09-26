@@ -830,7 +830,12 @@ fn checkpoint_version_diagnostic(found: u32) -> Diagnostic {
         "supported_version".to_owned(),
         DiagnosticValue::Integer(i64::from(CURRENT_SESSION_CHECKPOINT_FORMAT_VERSION)),
     );
-    SESSION_FORMAT_UNSUPPORTED.instantiate(context)
+    let mut diagnostic = SESSION_FORMAT_UNSUPPORTED.instantiate(context);
+    diagnostic.why = format!(
+        "The session checkpoint is format version {found}; this build reads only version {CURRENT_SESSION_CHECKPOINT_FORMAT_VERSION}."
+    )
+    .into_boxed_str();
+    diagnostic
 }
 
 fn checkpoint_json_diagnostic(error: &serde_json::Error) -> Diagnostic {

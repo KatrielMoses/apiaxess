@@ -113,6 +113,10 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         )
         .route("/api/v1/pairing/devices", get(pairing_devices))
         .route("/api/v1/pairing/arm", axum::routing::post(arm_pairing))
+        .route(
+            "/api/v1/pairing/token-state",
+            axum::routing::post(pairing_token_state),
+        )
         .route("/api/v1/pairing/pending", get(list_pending_pairing))
         .route(
             "/api/v1/pairing/pending/{request_id}/accept",
@@ -568,6 +572,24 @@ struct PairingDeviceView {
     serial: String,
     state: String,
     description: String,
+    /// The app's own managed Android target: never armed for manual pairing.
+    managed: bool,
+}
+
+/// Request body for `POST /api/v1/pairing/token-state` (operator): the token
+/// of the QR the GUI is showing. Sent in the body, not the URL, so it is not
+/// written to request logs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingTokenStateRequest {
+    pairing_token: String,
+}
+
+/// What happened to an armed pairing token.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingTokenStateView {
+    state: pairing::PairingTokenState,
 }
 
 /// One device awaiting the operator's accept/decline decision.
@@ -2283,16 +2305,32 @@ async fn pairing_devices(
         .engine
         .detect_adb_devices()
         .map_err(|diagnostic| (StatusCode::INTERNAL_SERVER_ERROR, Json(diagnostic)))?;
+    let managed = state.engine.managed_android_serials();
     Ok(Json(
         devices
             .into_iter()
             .map(|device| PairingDeviceView {
+                managed: managed.contains(&device.serial),
                 serial: device.serial,
                 state: format!("{:?}", device.state),
                 description: device.description,
             })
             .collect(),
     ))
+}
+
+/// Reports whether an armed pairing token is still armed, was used by a
+/// device, or expired unused (operator-gated), so the QR on screen is honest.
+async fn pairing_token_state(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<PairingTokenStateRequest>,
+) -> Result<Json<PairingTokenStateView>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let live = state.engine.live_workbench();
+    require_operator(&state, &headers, &live)?;
+    Ok(Json(PairingTokenStateView {
+        state: state.pairing.pairing_token_state(&request.pairing_token),
+    }))
 }
 
 /// Arms pairing for a device (operator-gated): establishes the reverse tunnel so

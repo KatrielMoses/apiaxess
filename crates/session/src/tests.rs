@@ -352,6 +352,10 @@ fn unsupported_versions_and_unknown_fields_fail_with_stable_diagnostics() {
     value["format_version"] = serde_json::json!(99);
     let error = SessionDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
     assert_eq!(error.id.as_ref(), SESSION_FORMAT_UNSUPPORTED.id);
+    // The message names the version found and the one this build reads.
+    assert!(error.why.contains("format version 99"), "{}", error.why);
+    assert!(error.why.contains("only version 1"), "{}", error.why);
+    assert!(error.why.contains("newer APIaxess"), "{}", error.why);
 
     let mut value = serde_json::to_value(&document).unwrap();
     value["discard_me"] = serde_json::json!(true);
@@ -419,6 +423,11 @@ fn checkpoint_versions_and_unknown_fields_fail_explicitly() {
     value["format_version"] = serde_json::json!(99);
     let error = SessionCheckpoint::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
     assert_eq!(error.id.as_ref(), SESSION_FORMAT_UNSUPPORTED.id);
+    assert!(
+        error.why.contains("checkpoint is format version 99"),
+        "{}",
+        error.why
+    );
 
     let mut value = serde_json::to_value(&checkpoint).unwrap();
     value["discard_me"] = serde_json::json!(true);
