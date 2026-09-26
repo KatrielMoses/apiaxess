@@ -1,0 +1,57 @@
+{
+  "target": "reference-web-target",
+  "version": "1.0.0",
+  "origins": {
+    "first_party": "http://127.0.0.1:9201",
+    "third_party": "http://localhost:9202"
+  },
+  "endpoints": [
+    { "id": "W00", "method": "GET",    "party": "first", "path": "/",                              "sample_path": "/",                                "query": [],               "headers": [],                   "body": null,                                                   "response": "html",         "protocol": "document", "surface": "endpoint",  "trigger": "load" },
+    { "id": "W01", "method": "GET",    "party": "first", "path": "/api/v1/status",                 "sample_path": "/api/v1/status",                   "query": [],               "headers": [],                   "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "load" },
+    { "id": "W02", "method": "GET",    "party": "first", "path": "/api/v1/items",                  "sample_path": "/api/v1/items?page=1&q=lamp",      "query": ["page", "q"],    "headers": [],                   "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "load" },
+    { "id": "W03", "method": "GET",    "party": "first", "path": "/api/v1/items/{id}",             "sample_path": "/api/v1/items/42",                 "query": [],               "headers": ["X-Client-Version"], "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "load" },
+    { "id": "W04", "method": "GET",    "party": "first", "path": "/api/v1/users/{userId}/orders",  "sample_path": "/api/v1/users/7/orders?limit=5",   "query": ["limit"],        "headers": [],                   "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "load" },
+    { "id": "W05", "method": "POST",   "party": "first", "path": "/api/v1/items",                  "sample_path": "/api/v1/items",                    "query": [],               "headers": ["X-Request-Id"],     "body": { "name": "string", "price": "number", "tags": "array" }, "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "click:btn-create" },
+    { "id": "W06", "method": "PUT",    "party": "first", "path": "/api/v1/items/{id}",             "sample_path": "/api/v1/items/42",                 "query": [],               "headers": [],                   "body": { "name": "string", "price": "number" },                 "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "click:btn-update" },
+    { "id": "W07", "method": "DELETE", "party": "first", "path": "/api/v1/items/{id}",             "sample_path": "/api/v1/items/42",                 "query": [],               "headers": [],                   "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "click:btn-delete" },
+    { "id": "W08", "method": "GET",    "party": "first", "path": "/api/v1/orders/{orderId}",       "sample_path": "/api/v1/orders/ord_9f2c",          "query": [],               "headers": [],                   "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "click:btn-order" },
+    { "id": "W09", "method": "GET",    "party": "first", "path": "/api/v1/search",                 "sample_path": "/api/v1/search?q=invoice&page=2",  "query": ["page", "q"],    "headers": ["X-Client-Version"], "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "click:btn-search" },
+    { "id": "W10", "method": "POST",   "party": "first", "path": "/graphql",                       "sample_path": "/graphql",                         "query": [],               "headers": [],                   "body": { "operationName": "string", "query": "string", "variables": "object" }, "response": "json", "protocol": "graphql", "surface": "endpoint", "trigger": "load" },
+    { "id": "W11", "method": "GET",    "party": "first", "path": "/api/v1/stream",                 "sample_path": "/api/v1/stream?topic=prices",      "query": ["topic"],        "headers": [],                   "body": null,                                                   "response": "event-stream", "protocol": "sse",      "surface": "endpoint",  "trigger": "load" },
+    { "id": "W12", "method": "POST",   "party": "first", "path": "/shop.v1.CartService/Checkout",  "sample_path": "/shop.v1.CartService/Checkout",    "query": [],               "headers": ["X-Grpc-Web"],       "body": null,                                                   "response": "grpc-web",     "protocol": "grpc-web", "surface": "operation", "trigger": "click:btn-checkout" },
+    { "id": "W13", "method": "GET",    "party": "first", "path": "/ws",                            "sample_path": "/ws?room=ref",                     "query": ["room"],         "headers": [],                   "body": null,                                                   "response": "websocket",    "protocol": "websocket","surface": "websocket", "trigger": "load" },
+    { "id": "W14", "method": "GET",    "party": "third", "path": "/v1/geo",                        "sample_path": "/v1/geo?client=ref-web",           "query": ["client"],       "headers": [],                   "body": null,                                                   "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "load" },
+    { "id": "W15", "method": "POST",   "party": "third", "path": "/v1/collect",                    "sample_path": "/v1/collect",                      "query": [],               "headers": [],                   "body": { "event": "string", "page": "string" },                 "response": "json",         "protocol": "rest",     "surface": "endpoint",  "trigger": "load" }
+  ],
+  "graphql_operations": [
+    { "id": "G01", "type": "query",    "name": "GetProfile", "endpoint": "W10", "trigger": "load" },
+    { "id": "G02", "type": "mutation", "name": "AddToCart",  "endpoint": "W10", "trigger": "click:btn-cart" }
+  ],
+  "grpc_operations": [
+    { "id": "R01", "service": "shop.v1.CartService", "method": "Checkout", "endpoint": "W12", "trigger": "click:btn-checkout" }
+  ],
+  "websocket": {
+    "endpoint": "W13",
+    "messages": [
+      { "seq": 1, "direction": "server_to_client", "kind": "text",   "payload": "{\"type\":\"welcome\",\"v\":1}" },
+      { "seq": 2, "direction": "client_to_server", "kind": "text",   "payload": "hello" },
+      { "seq": 3, "direction": "server_to_client", "kind": "text",   "payload": "hello back" },
+      { "seq": 4, "direction": "client_to_server", "kind": "binary", "payload_hex": "000102fdfeff" },
+      { "seq": 5, "direction": "server_to_client", "kind": "binary", "payload_hex": "fffefd020100" },
+      { "seq": 6, "direction": "client_to_server", "kind": "text",   "payload": "{\"op\":\"subscribe\",\"channel\":\"orders\"}" },
+      { "seq": 7, "direction": "server_to_client", "kind": "text",   "payload": "{\"type\":\"subscribed\",\"channel\":\"orders\"}" },
+      { "seq": 8, "direction": "client_to_server", "kind": "close",  "close_code": 1000 },
+      { "seq": 9, "direction": "server_to_client", "kind": "close",  "close_code": 1000 }
+    ]
+  },
+  "sse": {
+    "endpoint": "W11",
+    "events": [
+      { "seq": 1, "event": "price",  "id": "1", "data": "{\"sku\":\"A1\",\"price\":101}" },
+      { "seq": 2, "event": "price",  "id": "2", "data": "{\"sku\":\"A1\",\"price\":102}" },
+      { "seq": 3, "event": null,     "id": "3", "data": "line one\nline two" },
+      { "seq": 4, "event": "price",  "id": "4", "data": "{\"sku\":\"B2\",\"price\":55}" },
+      { "seq": 5, "event": "done",   "id": "5", "data": "{\"total\":4}" }
+    ]
+  }
+}

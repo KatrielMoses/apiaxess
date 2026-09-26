@@ -1,0 +1,381 @@
+{
+ "engine": "http://127.0.0.1:7777",
+ "flows": [
+  {
+   "id": 2,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/",
+   "path": "/",
+   "status": 200,
+   "durationMs": 12,
+   "contentType": "text/html; charset=utf-8",
+   "size": 4755,
+   "origin": "capture"
+  },
+  {
+   "id": 8,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/status",
+   "path": "/api/v1/status",
+   "status": 200,
+   "durationMs": 4,
+   "contentType": "application/json",
+   "size": 54,
+   "origin": "capture"
+  },
+  {
+   "id": 9,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/items/42",
+   "path": "/api/v1/items/42",
+   "status": 200,
+   "durationMs": 5,
+   "contentType": "application/json",
+   "size": 80,
+   "origin": "capture"
+  },
+  {
+   "id": 10,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/items?page=1&q=lamp",
+   "path": "/api/v1/items?page=1&q=lamp",
+   "status": 200,
+   "durationMs": 6,
+   "contentType": "application/json",
+   "size": 206,
+   "origin": "capture"
+  },
+  {
+   "id": 11,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/users/7/orders?limit=5",
+   "path": "/api/v1/users/7/orders?limit=5",
+   "status": 200,
+   "durationMs": 3,
+   "contentType": "application/json",
+   "size": 81,
+   "origin": "capture"
+  },
+  {
+   "id": 12,
+   "protocol": "h1",
+   "method": "POST",
+   "host": "localhost",
+   "url": "http://localhost:9202/v1/collect",
+   "path": "/v1/collect",
+   "status": 202,
+   "durationMs": 19,
+   "contentType": "application/json",
+   "size": 17,
+   "origin": "capture"
+  },
+  {
+   "id": 13,
+   "protocol": "h1",
+   "method": "POST",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/graphql",
+   "path": "/graphql",
+   "status": 200,
+   "durationMs": 18,
+   "contentType": "application/json",
+   "size": 73,
+   "origin": "capture"
+  },
+  {
+   "id": 14,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "localhost",
+   "url": "http://localhost:9202/v1/geo?client=ref-web",
+   "path": "/v1/geo?client=ref-web",
+   "status": 200,
+   "durationMs": 14,
+   "contentType": "application/json",
+   "size": 49,
+   "origin": "capture"
+  },
+  {
+   "id": 15,
+   "protocol": "h1",
+   "method": "CONNECT",
+   "host": "127.0.0.1",
+   "url": "127.0.0.1:9201",
+   "path": "//",
+   "origin": "capture"
+  },
+  {
+   "id": 16,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/ws?room=ref",
+   "path": "/ws?room=ref",
+   "origin": "capture"
+  },
+  {
+   "id": 17,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/stream?topic=prices",
+   "path": "/api/v1/stream?topic=prices",
+   "status": 200,
+   "durationMs": 2,
+   "contentType": "text/event-stream",
+   "origin": "capture",
+   "sse": {
+    "eventCount": 5,
+    "closed": true
+   }
+  },
+  {
+   "id": 34,
+   "protocol": "h1",
+   "method": "POST",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/items",
+   "path": "/api/v1/items",
+   "status": 201,
+   "durationMs": 4,
+   "contentType": "application/json",
+   "size": 80,
+   "origin": "capture"
+  },
+  {
+   "id": 35,
+   "protocol": "h1",
+   "method": "PUT",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/items/42",
+   "path": "/api/v1/items/42",
+   "status": 200,
+   "durationMs": 4,
+   "contentType": "application/json",
+   "size": 81,
+   "origin": "capture"
+  },
+  {
+   "id": 36,
+   "protocol": "h1",
+   "method": "DELETE",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/items/42",
+   "path": "/api/v1/items/42",
+   "status": 200,
+   "durationMs": 1,
+   "contentType": "application/json",
+   "size": 24,
+   "origin": "capture"
+  },
+  {
+   "id": 37,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/orders/ord_9f2c",
+   "path": "/api/v1/orders/ord_9f2c",
+   "status": 200,
+   "durationMs": 1,
+   "contentType": "application/json",
+   "size": 78,
+   "origin": "capture"
+  },
+  {
+   "id": 38,
+   "protocol": "h1",
+   "method": "GET",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/api/v1/search?q=invoice&page=2",
+   "path": "/api/v1/search?q=invoice&page=2",
+   "status": 200,
+   "durationMs": 1,
+   "contentType": "application/json",
+   "size": 69,
+   "origin": "capture"
+  },
+  {
+   "id": 39,
+   "protocol": "h1",
+   "method": "POST",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/graphql",
+   "path": "/graphql",
+   "status": 200,
+   "durationMs": 5,
+   "contentType": "application/json",
+   "size": 48,
+   "origin": "capture"
+  },
+  {
+   "id": 40,
+   "protocol": "h1",
+   "method": "POST",
+   "host": "127.0.0.1",
+   "url": "http://127.0.0.1:9201/shop.v1.CartService/Checkout",
+   "path": "/shop.v1.CartService/Checkout",
+   "status": 200,
+   "durationMs": 5,
+   "contentType": "application/grpc-web+proto",
+   "size": 42,
+   "origin": "capture"
+  }
+ ],
+ "sse_events": {
+  "17": [
+   {
+    "flowId": 17,
+    "sequence": 1,
+    "event": "price",
+    "data": "{\"sku\":\"A1\",\"price\":101}",
+    "dataBytes": 24,
+    "id": "1",
+    "observedAt": "2026-09-26T04:59:42.556668Z"
+   },
+   {
+    "flowId": 17,
+    "sequence": 2,
+    "event": "price",
+    "data": "{\"sku\":\"A1\",\"price\":102}",
+    "dataBytes": 24,
+    "id": "2",
+    "observedAt": "2026-09-26T04:59:42.712920400Z"
+   },
+   {
+    "flowId": 17,
+    "sequence": 3,
+    "data": "line one\nline two",
+    "dataBytes": 17,
+    "id": "3",
+    "observedAt": "2026-09-26T04:59:42.867907500Z"
+   },
+   {
+    "flowId": 17,
+    "sequence": 4,
+    "event": "price",
+    "data": "{\"sku\":\"B2\",\"price\":55}",
+    "dataBytes": 23,
+    "id": "4",
+    "observedAt": "2026-09-26T04:59:43.023087600Z"
+   },
+   {
+    "flowId": 17,
+    "sequence": 5,
+    "event": "done",
+    "data": "{\"total\":4}",
+    "dataBytes": 11,
+    "id": "5",
+    "observedAt": "2026-09-26T04:59:43.180591600Z"
+   }
+  ]
+ },
+ "ws_connections": [
+  {
+   "id": 1,
+   "url": "ws://127.0.0.1:9201/ws?room=ref",
+   "host": "127.0.0.1",
+   "path": "/ws?room=ref",
+   "scope": "in_scope",
+   "origin": "capture",
+   "openedAt": "2026-09-26T04:59:42.362626500Z",
+   "closedAt": "2026-09-26T04:59:42.418968100Z",
+   "closeCode": 1000,
+   "messageCount": 9,
+   "provenance": "proxy.observer",
+   "party": "first_party",
+   "messages": [
+    {
+     "sequence": 1,
+     "direction": "server_to_client",
+     "kind": "text",
+     "payloadBase64": "eyJ0eXBlIjoid2VsY29tZSIsInYiOjF9",
+     "retainedBytes": 24,
+     "payloadBytes": 24,
+     "observedAt": "2026-09-26T04:59:42.362626500Z"
+    },
+    {
+     "sequence": 2,
+     "direction": "client_to_server",
+     "kind": "text",
+     "payloadBase64": "aGVsbG8=",
+     "retainedBytes": 5,
+     "payloadBytes": 5,
+     "observedAt": "2026-09-26T04:59:42.413731400Z"
+    },
+    {
+     "sequence": 3,
+     "direction": "server_to_client",
+     "kind": "text",
+     "payloadBase64": "aGVsbG8gYmFjaw==",
+     "retainedBytes": 10,
+     "payloadBytes": 10,
+     "observedAt": "2026-09-26T04:59:42.414760400Z"
+    },
+    {
+     "sequence": 4,
+     "direction": "client_to_server",
+     "kind": "binary",
+     "payloadBase64": "AAEC/f7/",
+     "retainedBytes": 6,
+     "payloadBytes": 6,
+     "observedAt": "2026-09-26T04:59:42.416413500Z"
+    },
+    {
+     "sequence": 5,
+     "direction": "server_to_client",
+     "kind": "binary",
+     "payloadBase64": "//79AgEA",
+     "retainedBytes": 6,
+     "payloadBytes": 6,
+     "observedAt": "2026-09-26T04:59:42.416893300Z"
+    },
+    {
+     "sequence": 6,
+     "direction": "client_to_server",
+     "kind": "text",
+     "payloadBase64": "eyJvcCI6InN1YnNjcmliZSIsImNoYW5uZWwiOiJvcmRlcnMifQ==",
+     "retainedBytes": 37,
+     "payloadBytes": 37,
+     "observedAt": "2026-09-26T04:59:42.417531Z"
+    },
+    {
+     "sequence": 7,
+     "direction": "server_to_client",
+     "kind": "text",
+     "payloadBase64": "eyJ0eXBlIjoic3Vic2NyaWJlZCIsImNoYW5uZWwiOiJvcmRlcnMifQ==",
+     "retainedBytes": 40,
+     "payloadBytes": 40,
+     "observedAt": "2026-09-26T04:59:42.418040100Z"
+    },
+    {
+     "sequence": 8,
+     "direction": "client_to_server",
+     "kind": "close",
+     "payloadBase64": "",
+     "retainedBytes": 0,
+     "payloadBytes": 0,
+     "observedAt": "2026-09-26T04:59:42.418552800Z"
+    },
+    {
+     "sequence": 9,
+     "direction": "server_to_client",
+     "kind": "close",
+     "payloadBase64": "",
+     "retainedBytes": 0,
+     "payloadBytes": 0,
+     "observedAt": "2026-09-26T04:59:42.418960900Z"
+    }
+   ]
+  }
+ ]
+}

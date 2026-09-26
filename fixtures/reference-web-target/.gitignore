@@ -1,0 +1,6 @@
+# Run artifacts: fused surfaces, capture dumps and score reports from a run.
+# (Only the curated samples/ are committed.)
+/surface*.json
+/capture*.json
+/score*.json
+/out*.json
