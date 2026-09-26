@@ -23,6 +23,13 @@ use sha2::{Digest, Sha256};
 pub const TRAFFIC_SCHEMA_VERSION: u32 = 1;
 const TRAFFIC_SCHEMA_ID: &str = "workbench.traffic";
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Largest body kept for a flow outside the declared scope. Out-of-scope
+/// traffic never fuses, and the bulk of it is the capture browser's own
+/// background downloads (component updates, fonts): storing those in full made
+/// a small capture session save at 100+ MB. A larger body is not stored; its
+/// size is (see [`TrafficStore::withheld_body_sizes`]). Small bodies are kept so
+/// a host added to the scope later still fuses with its request/response shapes.
+pub const OUT_OF_SCOPE_BODY_LIMIT: usize = 64 * 1024;
 
 /// Process-wide sequence for unique content-addressed blob temp filenames, so
 /// concurrent writers of the same blob never share (and stomp) a temp path.
@@ -1363,7 +1370,9 @@ impl TrafficStore {
                scope TEXT NOT NULL,
                provenance TEXT NOT NULL,
                url TEXT,
-               origin TEXT NOT NULL DEFAULT 'capture'
+               origin TEXT NOT NULL DEFAULT 'capture',
+               request_body_withheld INTEGER,
+               response_body_withheld INTEGER
              );
              CREATE INDEX IF NOT EXISTS flows_captured_at ON flows(captured_at);
              CREATE TABLE IF NOT EXISTS resend_contexts (
@@ -1482,6 +1491,16 @@ impl TrafficStore {
     /// Returns a diagnostic when validation, blob durability, serialization,
     /// or the metadata transaction fails.
     pub fn upsert(&self, flow: &FlowCapture) -> Result<(), Diagnostic> {
+        self.upsert_flow(flow, (None, None))
+    }
+
+    /// [`Self::upsert`], carrying the sizes of bodies an earlier store already
+    /// withheld (a restored snapshot has no bytes for them, only their sizes).
+    fn upsert_flow(
+        &self,
+        flow: &FlowCapture,
+        previously_withheld: (Option<u64>, Option<u64>),
+    ) -> Result<(), Diagnostic> {
         // Redact registered credential values before anything touches disk: the
         // content-addressed body blobs and header JSON are written below, so
         // scrubbing must happen on an owned copy first. When no redactor is
@@ -1497,8 +1516,24 @@ impl TrafficStore {
             None => flow,
         };
         validate_flow(flow)?;
-        let request_hash = self.write_blob(flow.request_body.as_deref())?;
-        let response_hash = self.write_blob(flow.response_body.as_deref())?;
+        // An out-of-scope flow keeps its record but not a large body.
+        let out_of_scope = !matches!(
+            flow.scope,
+            ScopeDisposition::InScope | ScopeDisposition::NotApplicable
+        );
+        let (request_body, request_withheld) = body_to_store(
+            flow.request_body.as_deref(),
+            out_of_scope,
+            previously_withheld.0,
+        );
+        let (response_body, response_withheld) = body_to_store(
+            flow.response_body.as_deref(),
+            out_of_scope,
+            previously_withheld.1,
+        );
+        let request_hash = self.write_blob(request_body)?;
+        let response_hash = self.write_blob(response_body)?;
+        let to_db = |size: Option<u64>| size.map(|size| i64::try_from(size).unwrap_or(i64::MAX));
         let request_headers = serde_json::to_string(&flow.request_headers)
             .map_err(|e| serialization_diag("request_headers", &e.to_string()))?;
         let response_headers = serde_json::to_string(&flow.response_headers)
@@ -1514,14 +1549,15 @@ impl TrafficStore {
             )
         })?;
         connection.execute(
-            "INSERT INTO flows (id,captured_at,protocol,method,host,path,status,duration_ms,request_headers,response_headers,request_body_hash,response_body_hash,scope,provenance,url,origin)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
-             ON CONFLICT(id) DO UPDATE SET captured_at=excluded.captured_at,protocol=excluded.protocol,method=excluded.method,host=excluded.host,path=excluded.path,status=excluded.status,duration_ms=excluded.duration_ms,request_headers=excluded.request_headers,response_headers=excluded.response_headers,request_body_hash=excluded.request_body_hash,response_body_hash=excluded.response_body_hash,scope=excluded.scope,provenance=excluded.provenance,url=excluded.url,origin=excluded.origin",
+            "INSERT INTO flows (id,captured_at,protocol,method,host,path,status,duration_ms,request_headers,response_headers,request_body_hash,response_body_hash,scope,provenance,url,origin,request_body_withheld,response_body_withheld)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+             ON CONFLICT(id) DO UPDATE SET captured_at=excluded.captured_at,protocol=excluded.protocol,method=excluded.method,host=excluded.host,path=excluded.path,status=excluded.status,duration_ms=excluded.duration_ms,request_headers=excluded.request_headers,response_headers=excluded.response_headers,request_body_hash=excluded.request_body_hash,response_body_hash=excluded.response_body_hash,scope=excluded.scope,provenance=excluded.provenance,url=excluded.url,origin=excluded.origin,request_body_withheld=excluded.request_body_withheld,response_body_withheld=excluded.response_body_withheld",
             params![
                 i64::try_from(flow.id).unwrap_or(i64::MAX), flow.captured_at.to_rfc3339_opts(SecondsFormat::Nanos, true), flow.protocol,
                 flow.method, flow.host, flow.path, flow.status.map(i64::from),
                 flow.duration_ms.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 request_headers, response_headers, request_hash, response_hash, scope, flow.provenance, flow.url, flow.origin.as_db_str(),
+                to_db(request_withheld), to_db(response_withheld),
             ],
         ).map_err(|e| storage_diag(catalogue::PROXY_STORE_WRITE_FAILED, "flow", &self.root, &e.to_string()))?;
         Ok(())
@@ -2139,6 +2175,35 @@ impl TrafficStore {
         parts.map(|parts| self.resolve(parts)).transpose()
     }
 
+    /// The sizes of flow `id`'s request and response bodies that were not
+    /// stored because the flow was out of scope (see
+    /// [`OUT_OF_SCOPE_BODY_LIMIT`]); `None` for a body that was stored or absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the metadata query fails.
+    pub fn withheld_body_sizes(&self, id: u64) -> Result<(Option<u64>, Option<u64>), Diagnostic> {
+        let connection = self.lock_connection()?;
+        let sizes = connection
+            .query_row(
+                "SELECT request_body_withheld,response_body_withheld FROM flows WHERE id=?1",
+                params![i64::try_from(id).unwrap_or(i64::MAX)],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| {
+                storage_diag(
+                    catalogue::PROXY_STORE_CORRUPT,
+                    "read",
+                    &self.root,
+                    &e.to_string(),
+                )
+            })?
+            .unwrap_or_default();
+        let size = |value: Option<i64>| value.and_then(|value| u64::try_from(value).ok());
+        Ok((size(sizes.0), size(sizes.1)))
+    }
+
     /// Reads metadata-only rows ordered by capture time.
     ///
     /// # Errors
@@ -2154,7 +2219,7 @@ impl TrafficStore {
                 "database mutex poisoned",
             )
         })?;
-        let mut statement = connection.prepare("SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_body_hash,response_body_hash,response_headers,scope,provenance,url,origin,sse_streams.event_count,sse_streams.closed_at IS NOT NULL FROM flows LEFT JOIN sse_streams ON sse_streams.flow_id = flows.id ORDER BY captured_at,id")
+        let mut statement = connection.prepare("SELECT id,captured_at,protocol,method,host,path,status,duration_ms,request_body_hash,response_body_hash,response_headers,scope,provenance,url,origin,sse_streams.event_count,sse_streams.closed_at IS NOT NULL,request_body_withheld,response_body_withheld FROM flows LEFT JOIN sse_streams ON sse_streams.flow_id = flows.id ORDER BY captured_at,id")
             .map_err(|e| storage_diag(catalogue::PROXY_STORE_CORRUPT, "query", &self.root, &e.to_string()))?;
         let rows = statement
             .query_map([], |row| {
@@ -2181,12 +2246,19 @@ impl TrafficStore {
                                 name.eq_ignore_ascii_case("content-type").then_some(value)
                             })
                         }),
+                    // A withheld body still has its real size.
                     request_size: row
                         .get::<_, Option<String>>(8)?
-                        .and_then(|h| self.blob_size(&h)),
+                        .and_then(|h| self.blob_size(&h))
+                        .or(row
+                            .get::<_, Option<i64>>(17)?
+                            .and_then(|v| u64::try_from(v).ok())),
                     response_size: row
                         .get::<_, Option<String>>(9)?
-                        .and_then(|h| self.blob_size(&h)),
+                        .and_then(|h| self.blob_size(&h))
+                        .or(row
+                            .get::<_, Option<i64>>(18)?
+                            .and_then(|v| u64::try_from(v).ok())),
                     scope: serde_json::from_str(&scope).unwrap_or(ScopeDisposition::Undetermined),
                     provenance: row.get(12)?,
                     url: row.get(13)?,
@@ -2234,7 +2306,12 @@ impl TrafficStore {
                     "flow disappeared during snapshot",
                 ));
             };
-            flows.push(CanonicalFlow::from_capture(&flow));
+            let mut canonical = CanonicalFlow::from_capture(&flow);
+            (
+                canonical.request_body_withheld,
+                canonical.response_body_withheld,
+            ) = self.withheld_body_sizes(summary.id)?;
+            flows.push(canonical);
         }
         Ok(TrafficSnapshot {
             schema_version: TRAFFIC_SCHEMA_VERSION,
@@ -2327,7 +2404,8 @@ impl TrafficStore {
         }
         let mut count = 0;
         for flow in snapshot.flows {
-            self.upsert(&flow.into_capture()?)?;
+            let withheld = (flow.request_body_withheld, flow.response_body_withheld);
+            self.upsert_flow(&flow.into_capture()?, withheld)?;
             count += 1;
         }
         for context in snapshot.resend_contexts {
@@ -2450,7 +2528,8 @@ impl TrafficStore {
             }
             if let Some(flow) = self.get(summary.id)? {
                 let sse_events = summary.sse.map(|state| state.event_count);
-                entries.push(HarEntryOut::from_capture(&flow, sse_events));
+                let withheld = self.withheld_body_sizes(summary.id)?;
+                entries.push(HarEntryOut::from_capture(&flow, sse_events, withheld));
             }
         }
         serde_json::to_vec_pretty(&HarDocumentOut {
@@ -3363,6 +3442,23 @@ fn seed_next_flow_id(connection: &Connection, database: &Path) -> Result<u64, Di
     Ok(u64::try_from(max_id).unwrap_or(0).saturating_add(1))
 }
 
+/// The body to store and the size of a body withheld instead: an
+/// out-of-scope body over [`OUT_OF_SCOPE_BODY_LIMIT`] is not stored, and a
+/// body already withheld keeps its `previously` recorded size.
+fn body_to_store(
+    body: Option<&[u8]>,
+    out_of_scope: bool,
+    previously: Option<u64>,
+) -> (Option<&[u8]>, Option<u64>) {
+    match body {
+        Some(body) if out_of_scope && body.len() > OUT_OF_SCOPE_BODY_LIMIT => {
+            (None, Some(body.len() as u64))
+        }
+        Some(body) => (Some(body), None),
+        None => (None, previously),
+    }
+}
+
 /// Adds columns newer builds expect to tables created by older ones.
 fn ensure_columns(connection: &Connection, database: &Path) -> Result<(), Diagnostic> {
     ensure_flows_columns(connection, database)?;
@@ -3403,6 +3499,25 @@ fn ensure_flows_columns(connection: &Connection, database: &Path) -> Result<(), 
                     &error.to_string(),
                 )
             })?;
+    }
+    // Sizes of bodies not stored (out of scope and over the limit); legacy
+    // rows stored every body, so NULL is right for them.
+    for column in ["request_body_withheld", "response_body_withheld"] {
+        if !columns.iter().any(|name| name == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE flows ADD COLUMN {column} INTEGER"),
+                    [],
+                )
+                .map_err(|error| {
+                    storage_diag(
+                        catalogue::PROXY_STORE_OPEN_FAILED,
+                        "schema",
+                        database,
+                        &error.to_string(),
+                    )
+                })?;
+        }
     }
     // Legacy stores predate flow-origin tagging; every existing row is observed
     // capture traffic, so the added column defaults to `'capture'`.
@@ -3550,6 +3665,12 @@ pub struct CanonicalFlow {
     /// How this flow entered the store (capture vs. Resend/Fuzz-synthesized).
     #[serde(default)]
     pub origin: FlowOrigin,
+    /// Size of a request body not stored because the flow was out of scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_withheld: Option<u64>,
+    /// Size of a response body not stored because the flow was out of scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_withheld: Option<u64>,
 }
 
 impl CanonicalFlow {
@@ -3573,6 +3694,8 @@ impl CanonicalFlow {
             scope: flow.scope,
             provenance: flow.provenance.clone(),
             origin: flow.origin,
+            request_body_withheld: None,
+            response_body_withheld: None,
         }
     }
 
@@ -3786,8 +3909,15 @@ struct HarContentOut {
 impl HarEntryOut {
     /// One HAR entry for a captured flow. `sse_events` is the event count of a
     /// flow whose response was an event stream (its events are stored apart
-    /// from the flow, not as one body).
-    fn from_capture(flow: &FlowCapture, sse_events: Option<u64>) -> Self {
+    /// from the flow, not as one body). `withheld` are the sizes of request and
+    /// response bodies the store did not keep (out of scope): their sizes are
+    /// reported and the entry says why there is no text.
+    fn from_capture(
+        flow: &FlowCapture,
+        sse_events: Option<u64>,
+        withheld: (Option<u64>, Option<u64>),
+    ) -> Self {
+        let size = |bytes: u64| i64::try_from(bytes).unwrap_or(i64::MAX);
         let header = |headers: &[(String, String)], name: &str| {
             headers
                 .iter()
@@ -3802,7 +3932,16 @@ impl HarEntryOut {
         if duration.is_none() {
             notes.push("No duration was recorded for this exchange.");
         }
-        let content = har_response_content(flow, sse_events);
+        let mut content = har_response_content(flow, sse_events);
+        if let Some(bytes) = withheld.1 {
+            content.size = size(bytes);
+            content.comment = Some(format!(
+                "Body not stored ({bytes} bytes): the flow was outside the declared scope."
+            ));
+        }
+        if withheld.0.is_some() {
+            notes.push("Request body not stored: the flow was outside the declared scope.");
+        }
         if flow.status.is_none() {
             notes.push(
                 if header(&flow.request_headers, "upgrade")
@@ -3837,10 +3976,10 @@ impl HarEntryOut {
                     }
                 }),
                 headers_size: -1,
-                body_size: flow
-                    .request_body
-                    .as_ref()
-                    .map_or(0, |body| i64::try_from(body.len()).unwrap_or(i64::MAX)),
+                body_size: flow.request_body.as_ref().map_or_else(
+                    || withheld.0.map_or(0, size),
+                    |body| i64::try_from(body.len()).unwrap_or(i64::MAX),
+                ),
             },
             response: HarResponseOut {
                 status: flow.status.unwrap_or(0),
@@ -3857,10 +3996,11 @@ impl HarEntryOut {
                 headers: har_headers(&flow.response_headers),
                 redirect_url: header(&flow.response_headers, "location").unwrap_or_default(),
                 headers_size: -1,
-                body_size: match (&flow.response_body, sse_events) {
-                    (Some(body), _) => i64::try_from(body.len()).unwrap_or(i64::MAX),
-                    (None, Some(_)) => -1,
-                    (None, None) => 0,
+                body_size: match (&flow.response_body, sse_events, withheld.1) {
+                    (Some(body), _, _) => i64::try_from(body.len()).unwrap_or(i64::MAX),
+                    (None, _, Some(bytes)) => size(bytes),
+                    (None, Some(_), None) => -1,
+                    (None, None, None) => 0,
                 },
                 content,
             },
@@ -4649,6 +4789,78 @@ mod tests {
         assert_eq!(scope_of(2), ScopeDisposition::InScope);
         assert_eq!(scope_of(3), ScopeDisposition::OutsideDeclaredScope);
         assert_eq!(scope_of(4), ScopeDisposition::InScope);
+    }
+
+    #[test]
+    fn out_of_scope_flows_keep_their_record_but_not_large_bodies() {
+        let store = store();
+        let large = vec![b'x'; OUT_OF_SCOPE_BODY_LIMIT + 1];
+        // The capture browser's component download: out of scope and large.
+        let mut noise = flow(1);
+        noise.scope = ScopeDisposition::OutsideDeclaredScope;
+        noise.response_body = Some(large.clone());
+        store.upsert(&noise).expect("noise");
+        // A small out-of-scope body is kept (it fuses if the host is scoped later).
+        let mut small = flow(2);
+        small.scope = ScopeDisposition::OutsideDeclaredScope;
+        store.upsert(&small).expect("small");
+        // An in-scope body is kept whatever its size.
+        let mut scoped = flow(3);
+        scoped.response_body = Some(large.clone());
+        store.upsert(&scoped).expect("scoped");
+
+        let read = store.get(1).expect("read").expect("noise");
+        assert_eq!(read.response_body, None);
+        assert_eq!(
+            read.request_body, noise.request_body,
+            "small request body kept"
+        );
+        assert_eq!(read.status, Some(200));
+        assert_eq!(
+            store.withheld_body_sizes(1).expect("sizes"),
+            (None, Some(large.len() as u64))
+        );
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(
+            summaries[0].response_size,
+            Some(large.len() as u64),
+            "real size kept"
+        );
+        assert_eq!(store.get(2).expect("read"), Some(small));
+        assert_eq!(store.get(3).expect("read"), Some(scoped));
+        assert_eq!(store.withheld_body_sizes(3).expect("sizes"), (None, None));
+
+        // The saved snapshot carries the size, not the bytes, and restores it.
+        let snapshot = store.snapshot().expect("snapshot");
+        let json = serde_json::to_string(&snapshot).expect("json");
+        assert!(
+            json.len() < OUT_OF_SCOPE_BODY_LIMIT * 3,
+            "the large noise body is not in the save"
+        );
+        let restored = self::store();
+        for flow in snapshot.flows {
+            let withheld = (flow.request_body_withheld, flow.response_body_withheld);
+            restored
+                .upsert_flow(&flow.into_capture().expect("capture"), withheld)
+                .expect("restore");
+        }
+        assert_eq!(
+            restored.withheld_body_sizes(1).expect("sizes"),
+            (None, Some(large.len() as u64))
+        );
+
+        // HAR reports the real size and says why there is no text.
+        let har: serde_json::Value =
+            serde_json::from_slice(&store.export_har().expect("har")).expect("har json");
+        let response = &har["log"]["entries"][0]["response"];
+        assert_eq!(response["bodySize"], large.len());
+        assert_eq!(response["content"]["size"], large.len());
+        assert!(response["content"].get("text").is_none());
+        assert!(
+            response["content"]["comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("outside the declared scope"))
+        );
     }
 
     #[test]

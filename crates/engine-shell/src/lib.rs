@@ -600,12 +600,25 @@ impl Engine {
         &self,
         scope: EngagementScope,
     ) -> Result<SessionStatus, apiaxess_diagnostics::Diagnostic> {
-        self.apply_session_scope(
-            scope,
-            AuditActor::User,
-            "session.scope.update",
-            "Updated the declared engagement scope".to_owned(),
-        )
+        // The record names what the operator authorized, so an AUTHORIZED
+        // session always has a matching entry in its audit trail.
+        let hosts = scope
+            .allowed_targets
+            .iter()
+            .map(|target| match &target.host {
+                HostMatch::Exact { host } => host.clone(),
+                HostMatch::DomainSuffix { domain } => format!("*.{domain}"),
+            })
+            .collect::<Vec<_>>();
+        let summary = if hosts.is_empty() {
+            "Cleared the declared engagement scope: active work is not authorized".to_owned()
+        } else {
+            format!(
+                "Declared the engagement scope, authorizing active work against {}",
+                hosts.join(", ")
+            )
+        };
+        self.apply_session_scope(scope, AuditActor::User, "session.scope.update", summary)
     }
 
     /// Declares `scope` on the session, audits it as `kind` by `actor`, and
@@ -664,7 +677,8 @@ impl Engine {
         self.session_status()
     }
 
-    /// Starts a fresh active session using the current scope and API document.
+    /// Starts a fresh active session: no declared scope, no API surface, and
+    /// so not authorized until the operator declares a target.
     ///
     /// # Errors
     ///
@@ -674,7 +688,10 @@ impl Engine {
         self.new_session_with_scope(None)
     }
 
-    /// Starts a fresh active session, optionally replacing the inherited scope.
+    /// Starts a fresh active session with `requested_scope`, or with no
+    /// declared scope when none is given. Nothing carries over from the
+    /// previous session: not its scope (an authorization that belongs to that
+    /// session's audit trail), and not its API surface.
     ///
     /// # Errors
     ///
@@ -691,13 +708,62 @@ impl Engine {
         current.save()?;
         let previous = current.session_snapshot()?;
         let now = chrono::Utc::now();
+        let session_id = fresh_session_id()?;
+        let declared = requested_scope.is_some();
+        let scope = match requested_scope {
+            Some(scope) => scope,
+            None => EngagementScope {
+                declared_at: now,
+                target: TargetIdentity {
+                    target_type: "local-workbench".to_owned(),
+                    primary: TargetIdentifier {
+                        kind: "session.id".to_owned(),
+                        value: session_id.as_str().to_owned(),
+                    },
+                    aliases: Vec::new(),
+                },
+                allowed_targets: Vec::new(),
+            },
+        };
+        scope.validate()?;
         let mut session = Session::new(
-            fresh_session_id()?,
-            requested_scope.unwrap_or_else(|| previous.engagement_scope().clone()),
-            previous.api_document().clone(),
+            session_id,
+            scope,
+            apiaxess_api_model::ApiDocument::new(apiaxess_api_model::ApiSurface {
+                provenance: apiaxess_api_model::ProvenanceRegistry::default(),
+                endpoints: Vec::new(),
+                protocol_operations: Vec::new(),
+                loose_findings: Vec::new(),
+                signers: Vec::new(),
+            }),
             now,
         );
         session.activate(now)?;
+        session.record_action(ActionRecordInput {
+            id: format!(
+                "session.new:{}",
+                fresh_session_id()?.as_str().trim_start_matches("session:")
+            ),
+            occurred_at: now,
+            actor: AuditActor::User,
+            action: ActionDescriptor {
+                kind: "session.new".to_owned(),
+                summary: if declared {
+                    format!(
+                        "Started a new session (replacing {}) with a declared scope",
+                        previous.id().as_str()
+                    )
+                } else {
+                    format!(
+                        "Started a new session (replacing {}) with no declared scope",
+                        previous.id().as_str()
+                    )
+                },
+            },
+            target: ActionTarget::SessionTarget,
+            outcome: ActionOutcome::Completed,
+            diagnostics: Vec::new(),
+        })?;
         let store = Arc::new(TrafficStore::open(
             &session_store_root(),
             session.id().as_str(),
@@ -3719,6 +3785,51 @@ mod tests {
         // Nothing from the old session's browsing is admitted in the new one.
         observe_capture(&engine, "https://www.google.com/async/folae");
         assert!(fused_hosts(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_new_session_is_fresh_and_authorized_only_by_a_recorded_declaration() {
+        let engine = reference_engine(&["127.0.0.1:9201", "localhost:9202"]);
+        engine.fuse_web_capture().expect("fuse");
+        assert!(engine.session_surface().expect("surface").is_some());
+
+        let status = engine.new_session().expect("new session");
+        // No scope, no surface, not authorized.
+        assert!(!status.scope_configured);
+        assert!(status.scope.allowed_targets.is_empty());
+        assert_eq!(status.flow_count, 0);
+        assert!(engine.session_surface().expect("surface").is_none());
+        let audit = engine.session_audit().expect("audit");
+        let kinds = audit
+            .iter()
+            .map(|record| record.action.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["session.new"], "only the new-session event");
+
+        // Declaring a target authorizes it, and the audit says so.
+        let mut scope = status.scope.clone();
+        scope.allowed_targets = vec![apiaxess_session::AllowedNetworkTarget {
+            id: "gui.localhost".to_owned(),
+            host: apiaxess_session::HostMatch::Exact {
+                host: "localhost".to_owned(),
+            },
+            ports: Vec::new(),
+        }];
+        assert!(
+            engine
+                .update_session_scope(scope)
+                .expect("declare")
+                .scope_configured
+        );
+        let audit = engine.session_audit().expect("audit");
+        let declared = audit.last().expect("declaration");
+        assert_eq!(declared.action.kind, "session.scope.update");
+        assert!(
+            declared
+                .action
+                .summary
+                .contains("authorizing active work against localhost")
+        );
     }
 
     #[test]

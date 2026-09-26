@@ -1963,6 +1963,8 @@ mod tests {
             response_headers: Vec::new(),
             request_body: None,
             response_body: None,
+            request_body_withheld: None,
+            response_body_withheld: None,
         };
         let context = resend.create_from_flow(&flow).expect("flow enters resend");
         let names: Vec<&str> = context
@@ -1997,6 +1999,8 @@ mod tests {
             response_headers: Vec::new(),
             request_body: None,
             response_body: None,
+            request_body_withheld: None,
+            response_body_withheld: None,
         };
         let context = resend.create_from_flow(&flow).expect("flow enters resend");
         assert_eq!(

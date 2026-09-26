@@ -781,6 +781,16 @@ pub mod catalogue {
         fix: "Review the backend error context, close any previous session cleanly, and retry with the reported alternate route if one is approved.",
     };
 
+    /// A saved setting was invalid at startup and its default was used.
+    pub const SETTINGS_SAVED_VALUE_IGNORED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "settings.saved-value-ignored",
+        category: DiagnosticCategory::Persistence,
+        severity: DiagnosticSeverity::Warning,
+        what: "A saved setting was invalid, so APIaxess started with its default instead.",
+        why: "The value saved in the settings file would be refused at startup.",
+        fix: "Open Settings, correct the named setting (or clear it to use the default), save, and restart APIaxess.",
+    };
+
     /// A proxy was requested for a non-active session.
     pub const PROXY_SESSION_NOT_ACTIVE: DiagnosticDefinition = DiagnosticDefinition {
         id: "proxy.session-not-active",
@@ -1195,6 +1205,7 @@ pub mod catalogue {
     pub const PHASE_2_1: &[DiagnosticDefinition] = &[
         PROXY_PORT_IN_USE,
         PROXY_BACKEND_START_FAILED,
+        SETTINGS_SAVED_VALUE_IGNORED,
         PROXY_SESSION_NOT_ACTIVE,
         WEB_TARGET_REQUIRED,
         DISCOVERY_WORDLIST_UNKNOWN,

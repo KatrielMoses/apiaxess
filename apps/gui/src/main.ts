@@ -47,7 +47,7 @@ interface SystemStatus { readonly apiVersion: string; readonly service: string; 
 interface WorkbenchSession { readonly authToken: string; readonly interceptEnabled: boolean; }
 interface WorkbenchHealth { readonly proxyRunning: boolean; readonly backend?: { readonly hudsuckerAvailable: boolean }; }
 interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; readonly origin?: string | null; readonly sse?: SseState | null; }
-interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; }
+interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; readonly requestBodyWithheld?: number | null; readonly responseBodyWithheld?: number | null; }
 export interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
 interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; httpVersion?: string | null; reason?: string | null; }
 /** A diagnostic with the engine's typed context (`{ type, value }` per key). */
@@ -661,7 +661,11 @@ function renderDetailEmpty(): void {
 /** Renders a captured flow body: the retained bytes are shown, Pretty-printed
  *  for JSON and hex-dumped for binary, with a size note — not just "N B
  *  retained in memory" (#21). */
-function renderFlowBody(headers: readonly [string, string][], bytes: number[] | null | undefined): string {
+function renderFlowBody(headers: readonly [string, string][], bytes: number[] | null | undefined, withheld?: number | null): string {
+  // Out-of-scope flows keep their record but not a large body (it never fuses).
+  if ((bytes === null || bytes === undefined) && withheld !== null && withheld !== undefined) {
+    return `<p class="t-small t-subtle">${escapeHtml(`Body not stored (${formatBytes(withheld)}): this flow is outside the declared scope.`)}</p>`;
+  }
   if (bytes === null || bytes === undefined) return `<p class="t-small t-subtle">Body not retained by this backend.</p>`;
   if (bytes.length === 0) return `<p class="t-small t-subtle">Empty body (0 B).</p>`;
   const note = (label: string): string => `<p class="t-small t-subtle">${escapeHtml(`${formatBytes(bytes.length)}${label}`)}</p>`;
@@ -679,7 +683,7 @@ function renderDetail(flow: FlowDetail): string {
   const sse = summary.sse ?? null;
   const grpcNote = grpc === null ? "" : `<p class="t-small t-subtle">Protobuf body not decoded: without the service's .proto schema, a length-prefixed protobuf message yields only field numbers and wire types, so it is shown as bytes rather than with guessed field names.</p>`;
   const responseBody = sse === null
-    ? renderFlowBody(flow.responseHeaders, flow.responseBody)
+    ? renderFlowBody(flow.responseHeaders, flow.responseBody, flow.responseBodyWithheld)
     : `<div class="sse-events" id="flow-sse-events" aria-live="polite"><p class="t-small t-subtle">Loading events…</p></div>`;
   return `<div class="stack">
 <dl class="kv">
@@ -696,7 +700,7 @@ function renderDetail(flow: FlowDetail): string {
   <section class="reqres__col stack stack--tight">
     <p class="section-label">Request</p>
     <pre class="code">${escapeHtml(formatHeaders(flow.requestHeaders))}</pre>
-    ${renderFlowBody(flow.requestHeaders, flow.requestBody)}${grpcNote}
+    ${renderFlowBody(flow.requestHeaders, flow.requestBody, flow.requestBodyWithheld)}${grpcNote}
   </section>
   <section class="reqres__col stack stack--tight">
     <p class="section-label">${sse === null ? "Response" : "Response · events"}</p>
@@ -5770,6 +5774,32 @@ async function refreshSession(): Promise<void> {
   }
 }
 
+/**
+ * Drops what the GUI still shows from the replaced session: its flows, the
+ * selected flow, its surface, and a web target it had authorized. A new
+ * session starts unscoped, so the web form asks for authorization again.
+ */
+function resetForFreshSession(): void {
+  flows.clear();
+  selectedFlow = null;
+  if (editor !== null) editor.hidden = true;
+  if (selectedLabel !== null) selectedLabel.textContent = "";
+  detailActions?.replaceChildren();
+  renderDetailEmpty();
+  renderFlows();
+  lastFuseFailure = null;
+  announcedFuseFailure = "";
+  renderSurfaceEmpty();
+  harScope = null;
+  renderHarScopeNotice();
+  if (webTarget !== null) webTarget.value = "";
+  if (webAuthorize !== null) webAuthorize.checked = false;
+  if (webAuthorization !== null) webAuthorization.hidden = false;
+  if (webAuthorizedNote !== null) webAuthorizedNote.hidden = true;
+  if (webSessionBadge !== null) webSessionBadge.textContent = "not started";
+  if (webSessionStatus !== null) webSessionStatus.textContent = "Session active.";
+}
+
 async function newSession(): Promise<void> {
   const confirmed = await confirmDialog({
     eyebrow: "Session",
@@ -5784,10 +5814,12 @@ async function newSession(): Promise<void> {
     await withBusy(button, "Creating…", async () => {
       const response = await fetch("/api/v1/session/new", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
       await requireOk(response, "new session could not be created");
+      resetForFreshSession();
       renderSession((await response.json()) as SessionStatus);
       toast("New session created", "success");
     });
     await refreshSession();
+    await loadWsConnections();
   } catch (error) {
     reportUnexpected(error, { id: "session.new-failed", what: "A new session could not be created.", why: "", fix: "Check the local API and the session store directory, then retry." });
   }
@@ -5974,6 +6006,8 @@ interface SettingEntry {
   readonly restartRequired: boolean;
   readonly description: string;
   readonly choices: readonly string[];
+  /** Why the saved value is not in effect (refused at startup), if so. */
+  readonly invalid?: string;
 }
 
 interface ToolStatus {
@@ -6028,14 +6062,15 @@ function settingField(entry: SettingEntry): string {
     entry.source === "environment"
       ? " An environment variable set outside the app takes precedence over a saved value."
       : "";
-  return `<div class="field" data-field="${escapeHtml(entry.key)}">
+  const invalid = entry.invalid ?? null;
+  return `<div class="field${invalid === null ? "" : " is-invalid"}" data-field="${escapeHtml(entry.key)}">
     <div class="row row--between">
       <label class="field__label">${escapeHtml(entry.label)}</label>
       ${settingSourceBadge(entry.source)}
     </div>
     ${settingControl(entry)}
     <p class="field__hint">${escapeHtml(entry.description)}<span class="t-subtle">${escapeHtml(restart)}${escapeHtml(envNote)}</span></p>
-    <p class="field__error" data-error-for="${escapeHtml(entry.key)}" role="alert" hidden></p>
+    <p class="field__error" data-error-for="${escapeHtml(entry.key)}" role="alert"${invalid === null ? " hidden" : ""}>${escapeHtml(invalid ?? "")}</p>
   </div>`;
 }
 
@@ -6113,7 +6148,26 @@ function validateSettingValue(key: string, value: string): string | null {
   if (key === "APIAXESS_DISCOVERY_RATE") {
     return /^\d+$/.test(trimmed) && Number(trimmed) > 0 ? null : "Must be a positive number (requests per second).";
   }
+  if (key === "APIAXESS_GUI_ADDRESS" || key === "APIAXESS_PROXY_ADDRESS") return validateListenerAddress(trimmed);
   return null;
+}
+
+/** A listener must be a loopback IP and port, as the engine requires at
+ *  startup: a value it would refuse there must not be savable (it would stop
+ *  the next launch). Hostnames are refused too; the engine binds IPs only. */
+function validateListenerAddress(value: string): string | null {
+  const match = /^(?:(\d{1,3}(?:\.\d{1,3}){3})|\[([0-9a-fA-F:.]+)\]):(\d{1,5})$/.exec(value);
+  const port = match === null ? NaN : Number(match[3]);
+  if (match === null || !(port >= 0 && port <= 65535)) return "Must be an IP address and port, such as 127.0.0.1:8080.";
+  const ipv4 = match[1];
+  if (ipv4 !== undefined) {
+    const octets = ipv4.split(".").map(Number);
+    if (octets.some((octet) => octet > 255)) return "Must be an IP address and port, such as 127.0.0.1:8080.";
+    if (octets[0] === 127) return null;
+  } else if (match[2] === "::1" || match[2] === "0:0:0:0:0:0:0:1") {
+    return null;
+  }
+  return `Must be a loopback address (127.0.0.1 or [::1]); ${value} would be refused at startup.`;
 }
 
 /** Shows or clears the inline error under a settings field. */
@@ -6165,6 +6219,15 @@ async function saveSettings(): Promise<void> {
       toast("Settings saved — restart APIaxess to apply", "success");
     });
   } catch (error) {
+    // The engine names the setting it refused: show its reason on that field.
+    const diagnostic = error instanceof ApiRequestError ? error.diagnostic : undefined;
+    const rejected = diagnostic === undefined ? undefined : diagnosticText(diagnostic, "setting");
+    if (diagnostic !== undefined && rejected !== undefined) {
+      setSettingError(rejected, diagnostic.why);
+      document.querySelector<HTMLElement>(`#settings-body [data-setting="${CSS.escape(rejected)}"]`)?.focus();
+      toast("Fix the highlighted setting before saving", "danger");
+      return;
+    }
     reportUnexpected(error, {
       id: "settings.save",
       what: "Settings could not be saved",

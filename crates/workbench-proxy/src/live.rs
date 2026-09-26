@@ -87,6 +87,14 @@ pub struct FlowDetail {
     /// Response body, when the backend retained it within the session limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_body: Option<Vec<u8>>,
+    /// Size of a request body the store did not keep because the flow was
+    /// outside the declared scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_withheld: Option<u64>,
+    /// Size of a response body the store did not keep because the flow was
+    /// outside the declared scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_withheld: Option<u64>,
 }
 
 /// Internal record retained only for the active session.
@@ -608,6 +616,11 @@ impl LiveWorkbench {
             return Ok(None);
         };
         detail.summary.sse = store.sse_state(flow_id)?;
+        (detail.request_body_withheld, detail.response_body_withheld) =
+            store.withheld_body_sizes(flow_id)?;
+        if detail.response_body.is_none() {
+            detail.summary.size = detail.response_body_withheld;
+        }
         Ok(Some(detail))
     }
 
@@ -847,6 +860,8 @@ impl FlowObserver for LiveWorkbench {
                     response_headers: Vec::new(),
                     request_body: None,
                     response_body: None,
+                    request_body_withheld: None,
+                    response_body_withheld: None,
                 };
                 if let Ok(mut flows) = self.flows.lock() {
                     flows.insert(
@@ -1364,6 +1379,8 @@ fn flow_detail_from_capture(flow: FlowCapture) -> FlowDetail {
         response_headers: flow.response_headers,
         request_body: flow.request_body,
         response_body: flow.response_body,
+        request_body_withheld: None,
+        response_body_withheld: None,
     }
 }
 

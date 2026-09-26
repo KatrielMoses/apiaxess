@@ -186,6 +186,12 @@ async fn serve_workbench(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gui_directory = gui_directory();
     let engine = Engine::new();
+    // A saved setting that would have failed startup was skipped (its default
+    // is in use): say so in the GUI, which stays reachable to fix it.
+    for diagnostic in apiaxess_local_api::invalid_saved_settings() {
+        report_startup_diagnostic(&diagnostic);
+        engine.live_workbench().publish_diagnostic(diagnostic);
+    }
     let listener = tokio::net::TcpListener::bind(gui_address).await?;
     let bound_gui_address = listener.local_addr()?;
     let application = apiaxess_local_api::router_with_port(
@@ -1287,17 +1293,33 @@ fn address_diagnostic(variable: &str, address: &str, reason: &str) -> Diagnostic
         DiagnosticValue::String(reason.to_owned()),
     );
     let mut diagnostic = catalogue::PROXY_BACKEND_START_FAILED.instantiate(context);
-    diagnostic.why =
-        format!("`{variable}` is not a valid loopback socket address: {reason}").into_boxed_str();
-    diagnostic.fix = format!(
-        "Set `{variable}` to a free loopback address such as `{default}` and restart APIaxess.",
-        default = if variable == "APIAXESS_GUI_ADDRESS" {
-            DEFAULT_GUI_ADDRESS
-        } else {
-            DEFAULT_PROXY_ADDRESS
-        }
-    )
-    .into_boxed_str();
+    let default = if variable == "APIAXESS_GUI_ADDRESS" {
+        DEFAULT_GUI_ADDRESS
+    } else {
+        DEFAULT_PROXY_ADDRESS
+    };
+    // Name where the value came from: the saved setting (fixed in Settings)
+    // or an environment variable set outside the app.
+    let label = apiaxess_local_api::setting_label(variable).unwrap_or(variable);
+    if apiaxess_local_api::value_is_from_saved_settings(variable) {
+        diagnostic.why = format!(
+            "The saved \"{label}\" setting ({address}) is not a valid loopback socket address: {reason}"
+        )
+        .into_boxed_str();
+        diagnostic.fix = format!(
+            "Change \"{label}\" in Settings to a free loopback address such as `{default}` (or clear it), then restart APIaxess."
+        )
+        .into_boxed_str();
+    } else {
+        diagnostic.why = format!(
+            "The `{variable}` environment variable (\"{label}\") is not a valid loopback socket address: {reason}"
+        )
+        .into_boxed_str();
+        diagnostic.fix = format!(
+            "Set the `{variable}` environment variable to a free loopback address such as `{default}`, or unset it, and restart APIaxess."
+        )
+        .into_boxed_str();
+    }
     diagnostic
 }
 

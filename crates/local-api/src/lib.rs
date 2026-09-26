@@ -4,7 +4,9 @@ mod pairing;
 mod settings;
 mod stream_proxy;
 
-pub use settings::persisted_env_overrides;
+pub use settings::{
+    invalid_saved_settings, persisted_env_overrides, setting_label, value_is_from_saved_settings,
+};
 
 use pairing::{DevicePairingRegistry, PairingOutcome, PendingPairingRegistry};
 
@@ -697,8 +699,14 @@ async fn update_settings_handler(
         let mut diagnostic =
             catalogue::SESSION_INVARIANT_FAILED.instantiate(DiagnosticContext::new());
         diagnostic.what = "The settings change could not be saved".into();
-        diagnostic.why = error.into_boxed_str();
+        diagnostic.why = error.message.into_boxed_str();
         diagnostic.fix = "Correct the value and try again.".into();
+        // Names the rejected setting so the screen can show the error on it.
+        if let Some(key) = error.key {
+            diagnostic
+                .context
+                .insert("setting".to_owned(), DiagnosticValue::String(key));
+        }
         (StatusCode::BAD_REQUEST, Json(diagnostic))
     })?;
     Ok(Json(settings::settings_view()))
