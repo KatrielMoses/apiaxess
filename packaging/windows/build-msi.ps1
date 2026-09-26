@@ -556,8 +556,12 @@ if (-not (Test-Path -LiteralPath $licenseRtf -PathType Leaf)) {
     throw "The installer license is missing at $licenseRtf."
 }
 # Branded wizard graphics (identity-kit mark) referenced by Product.wxs as the
-# WixUIBannerBmp / WixUIDialogBmp variables. Regenerate with
-# scratchpad gen-installer-bmps if the mark changes.
+# WixUIBannerBmp / WixUIDialogBmp variables, plus the app icon the desktop shell
+# embeds. All three are rendered from the vector sources by
+# gen-installer-bmps.mjs; after changing the mark, palette, or fonts run
+#   node packaging/windows/gen-installer-bmps.mjs
+# and commit the results. The check below re-renders them with the same pinned
+# Chromium and refuses to package art that no longer matches its sources.
 $bannerBmp = Join-Path $PSScriptRoot "banner.bmp"
 $dialogBmp = Join-Path $PSScriptRoot "dialog.bmp"
 foreach ($brandBmp in @($bannerBmp, $dialogBmp)) {
@@ -565,6 +569,7 @@ foreach ($brandBmp in @($bannerBmp, $dialogBmp)) {
         throw "The branded installer bitmap is missing at $brandBmp."
     }
 }
+Invoke-Checked "node" (Join-Path $PSScriptRoot "gen-installer-bmps.mjs") "--check" "--chromium" $chromiumBinary
 Invoke-Checked $wix "build" (Join-Path $PSScriptRoot "Product.wxs") $payloadFragment "-arch" $Architecture "-ext" "WixToolset.UI.wixext" "-d" "ProductVersion=$productVersion" "-d" "ProductCode=$productCode" "-d" "LicenseRtf=$licenseRtf" "-d" "BannerBmp=$bannerBmp" "-d" "DialogBmp=$dialogBmp" "-bindpath" "Stage=$stageRoot" "-intermediateFolder" $intermediateRoot "-pdbtype" "none" "-out" $msiPath
 
 $msiHash = (Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash.ToLowerInvariant()

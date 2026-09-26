@@ -41,6 +41,29 @@ variant: it fetches the pinned Frida devkit, builds `apiaxess.exe` with
 bindgen), and stages the Frida host components under `frida/`. Build caches and
 staging stay under `target/`; release outputs stay under `artifacts/`.
 
+## Installer art and app icon
+
+The wizard's top banner (`banner.bmp`, 493×58) and Welcome/Exit art
+(`dialog.bmp`, 493×312), both 24-bit BMPs as WixUI requires, and the app icon
+(`apps/desktop/icons/icon.ico`, 16–256 px frames, embedded in
+`apiaxess-desktop.exe` and extracted for Add/Remove Programs and shortcuts) are
+generated, not hand-edited. `gen-installer-bmps.mjs` renders each one once, at
+its final pixel size, from the vector sources — the mark in
+`apps/desktop/icons/icon.svg`, the lockup ratios in `apps/gui/src/brand/logo.ts`,
+the palette in `apps/gui/src/styles/tokens.css`, and the bundled Outfit/Archivo
+fonts — using the same pinned Chromium the MSI ships. Icon frames below 64 px
+are optically sized (heavier stroke, larger mark) so they stay sharp at 16–48 px.
+
+After changing the mark, palette, or fonts:
+
+```powershell
+node packaging/windows/gen-installer-bmps.mjs              # rewrite all three
+node packaging/windows/gen-installer-bmps.mjs --preview d  # also dump PNGs to d/
+```
+
+and commit the results. `build-msi.ps1` runs the script with `--check` and fails
+if the committed art no longer matches a fresh render.
+
 ## Installed layout
 
 ```text
