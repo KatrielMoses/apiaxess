@@ -9,6 +9,7 @@ import {
   DiagnosticsLog,
   diagnosticListHtml,
   initDiagnosticsDrawer,
+  groupedSurfaceDiagnosticsHtml,
 } from "./ui/diagnostics";
 import {
   escapeHtml,
@@ -18,7 +19,8 @@ import {
   stateBlock,
 } from "./ui/dom";
 import { initNavigation, onViewChange, showView, trackNavOverflow } from "./ui/nav";
-import { initShell, refreshLayoutForSession } from "./ui/shell";
+import { initShell, refreshLayoutForSession, setDockQueueCount } from "./ui/shell";
+import { SHORTCUTS, shortcutLabel } from "./ui/keys";
 import { initTheme } from "./ui/theme";
 import { type CredentialDialogField, choiceDialog, confirmDialog, credentialDialog, promptDialog } from "./ui/overlay";
 import { toast } from "./ui/toast";
@@ -46,7 +48,7 @@ import { curlCommand, findAll, hexDump, inspectRequest, type InspectorItem, isBi
 interface SystemStatus { readonly apiVersion: string; readonly service: string; readonly state: "ready"; }
 interface WorkbenchSession { readonly authToken: string; readonly interceptEnabled: boolean; }
 interface WorkbenchHealth { readonly proxyRunning: boolean; readonly backend?: { readonly hudsuckerAvailable: boolean }; }
-interface FlowSummary { readonly id: number; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; readonly origin?: string | null; readonly sse?: SseState | null; }
+interface FlowSummary { readonly id: number; readonly protocol?: string | null; readonly method?: string | null; readonly host?: string | null; readonly url?: string | null; readonly path?: string | null; readonly status?: number | null; readonly durationMs?: number | null; readonly contentType?: string | null; readonly size?: number | null; readonly origin?: string | null; readonly sse?: SseState | null; }
 interface FlowDetail { readonly summary: FlowSummary; readonly requestHeaders: readonly [string, string][]; readonly responseHeaders: readonly [string, string][]; readonly requestBody?: number[] | null; readonly responseBody?: number[] | null; readonly requestBodyWithheld?: number | null; readonly responseBodyWithheld?: number | null; }
 export interface ResendRequest { method: string; url: string; headers: [string, string][]; body?: number[] | null; }
 interface ResendResponse { status: number; headers: readonly [string, string][]; body?: number[]; durationMs: number; httpVersion?: string | null; reason?: string | null; }
@@ -55,7 +57,7 @@ interface ContextDiagnostic extends Diagnostic { readonly context?: Record<strin
 interface ResendRevision { revision: number; sentAt: string; request: ResendRequest; response?: ResendResponse | null; diagnostic?: ContextDiagnostic | null; scope: string; redirectChain?: RedirectHop[]; followedFrom?: number | null; }
 interface ResendContext { id: string; sourceFlowId?: number; createdAt: string; current: ResendRequest; history: ResendRevision[]; name?: string | null; }
 interface ResendSendResult { context: ResendContext; revision: ResendRevision; diagnostics: (Diagnostic | null)[]; }
-interface FuzzerResult { ordinal: number; payloads: string[]; request: ResendRequest; response?: { status: number; headers: readonly [string, string][]; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: ContextDiagnostic | null; timeout?: boolean; comment?: string | null; grepMatchCounts?: number[]; grepExtracts?: (string | null)[]; reflectedCount?: number | null; redirectChain?: RedirectHop[]; retryCount?: number; }
+interface FuzzerResult { ordinal: number; payloads: string[]; request: ResendRequest; scope?: string; response?: { status: number; headers: readonly [string, string][]; body?: number[] | null; durationMs: number } | null; matched: boolean; filtered: boolean; diff: { statusChanged: boolean; sizeChanged: boolean; sizeDelta: number; contentChanged: boolean }; diagnostic?: ContextDiagnostic | null; timeout?: boolean; comment?: string | null; grepMatchCounts?: number[]; grepExtracts?: (string | null)[]; reflectedCount?: number | null; redirectChain?: RedirectHop[]; retryCount?: number; }
 export type FuzzerLocation = "url" | "header" | "body";
 interface FuzzerPosition { location: FuzzerLocation; headerName?: string | null; start: number; end: number; setIndex: number; }
 type CaseMode = "lower" | "upper" | "propercase" | "toggle";
@@ -125,7 +127,7 @@ type HostParty = "first_party" | "third_party";
 interface SurfaceEndpoint { readonly method: string; readonly pathTemplate: string; readonly baseUrl?: string | null; readonly host?: string | null; readonly party?: HostParty | null; readonly evidenceSource?: string | null; readonly staticEvidence?: boolean | null; readonly minimumFactConfidence?: number | null; readonly signerCount: number; readonly detail?: EndpointDetail }
 interface SurfaceSummary { readonly schemaVersion: number; readonly assemblyRunId: string; readonly endpoints: readonly SurfaceEndpoint[]; readonly coverage: { readonly endpointCount: number; readonly confirmedEndpointCount: number; readonly inferredEndpointCount: number; readonly staticOnlyEndpointCount: number; readonly openHandoffCount: number; readonly resolvedHandoffCount: number }; readonly signerCount: number; readonly diagnostics: (Diagnostic | null)[]; readonly protocolOperations?: readonly SurfaceOperation[]; }
 interface DiscoveryEstimate { target: string; requestCount: number; ratePerSecond: number; estimatedLabel: string; }
-interface BrowserLaunchStatus { running: boolean; browser?: string | null; target?: string | null; pid?: number | null; cdpConnected?: boolean; debugPort?: number | null; }
+interface BrowserLaunchStatus { running: boolean; browser?: string | null; target?: string | null; pid?: number | null; cdpConnected?: boolean; debugPort?: number | null; withheldBrowserTraffic?: readonly { readonly host: string; readonly count: number }[]; }
 interface TargetIdentifier { readonly kind: string; readonly value: string; }
 interface SessionStatus { readonly sessionId: string; readonly lifecycle: string; readonly artifactPath: string; readonly storePath: string; readonly flowCount: number; readonly resendCount: number; readonly fuzzerCount: number; readonly scopeConfigured: boolean; readonly recoveredFromCheckpoint: boolean; readonly lastCheckpointAt?: string | null; readonly scope?: { readonly declared_at?: string; readonly target?: { readonly target_type?: string; readonly primary?: TargetIdentifier }; readonly allowed_targets?: readonly ScopeRule[] }; readonly analysisPipeline?: { readonly run_id?: string; readonly artifact_path?: string } | null; }
 interface AuditActionDescriptor { readonly kind: string; readonly summary: string; }
@@ -144,6 +146,8 @@ interface AndroidTargetStatus {
   readonly phase: AndroidPhase;
   readonly message: string;
   readonly addonPresent: boolean;
+  /** Set when the installed add-on is older than this engine needs. */
+  readonly addonOutdated?: { readonly installed: string; readonly required: string } | null;
   readonly serial: string | null;
   readonly wsScrcpyPort: number | null;
   readonly streaming: boolean;
@@ -254,6 +258,7 @@ const androidInstalledTitle = document.querySelector<HTMLElement>("#android-inst
 const androidInstalledDetail = document.querySelector<HTMLElement>("#android-installed-detail");
 const androidOpenApp = document.querySelector<HTMLButtonElement>("#android-open-app");
 const androidScreen = document.querySelector<HTMLElement>("#android-screen");
+const androidScreenHint = document.querySelector<HTMLElement>("#android-screen-hint");
 
 /* ==================================================================== *
  * State
@@ -351,7 +356,17 @@ let lastAndroidStatus: AndroidTargetStatus | null = null;
 const heldSince = new Map<number, number>();
 let queueTicker: number | undefined;
 /** Auto-forward timeout the intercept toggle installs on the backend. */
-const INTERCEPT_TIMEOUT_MS = 30_000;
+/** Auto-forward choices for a held request, in seconds (engine cap: 600). */
+const INTERCEPT_TIMEOUT_CHOICES = [15, 30, 60, 120, 300, 600];
+const INTERCEPT_TIMEOUT_KEY = "apiaxess.intercept.timeoutSecs";
+/** How long a held request waits for a decision before the engine forwards it
+ *  unmodified: the operator's choice (Auto-forward after), 30 s by default. */
+function interceptTimeoutMs(): number {
+  try {
+    const stored = Number(localStorage.getItem(INTERCEPT_TIMEOUT_KEY));
+    return (INTERCEPT_TIMEOUT_CHOICES.includes(stored) ? stored : 30) * 1000;
+  } catch { return 30_000; }
+}
 /** Operator bearer token, shared with the control channel; gates pairing calls. */
 let operatorToken = "";
 /** The most recently armed pairing payload, kept so its QR survives re-renders. */
@@ -488,8 +503,36 @@ function emptyTrafficBody(): string {
   return "Launch the capture browser or point a client at the session proxy. Requests appear here as they are observed.";
 }
 
+/** `host:port` a flow went to (the port only when the URL states one), so
+ *  several local services are never ambiguous. */
+function flowAuthority(flow: FlowSummary): string {
+  if (flow.url !== null && flow.url !== undefined && flow.url.includes("://")) {
+    try { return new URL(flow.url).host; } catch { /* fall back to the host */ }
+  }
+  return flow.host ?? "unknown";
+}
+
+/** A CONNECT is tunnel setup: the requests inside the tunnel are the flows. */
+function isTunnelBookkeeping(flow: FlowSummary): boolean {
+  return (flow.method ?? "").toUpperCase() === "CONNECT" && (flow.protocol ?? "") !== "h2";
+}
+
+/** While the pointer is over the list, new flows are held back so the row
+ *  under it does not move; they appear when it leaves. */
+let flowListHovered = false;
+let flowListDeferred = 0;
+
 function renderFlows(): void {
   if (flowList === null) return;
+  if (flowListHovered && flowList.childElementCount > 0 && flows.size > 0) {
+    flowListDeferred += 1;
+    const hint = document.querySelector<HTMLElement>("#flow-paused");
+    if (hint !== null) { hint.hidden = false; hint.textContent = "New flows paused while the pointer is over the list"; }
+    updateWorkbenchCounts();
+    return;
+  }
+  flowListDeferred = 0;
+  document.querySelector<HTMLElement>("#flow-paused")?.setAttribute("hidden", "");
   if (flows.size === 0) {
     flowList.innerHTML = flowsLoaded
       ? stateBlock({
@@ -502,7 +545,7 @@ function renderFlows(): void {
     return;
   }
   flowList.replaceChildren();
-  [...flows.values()].sort((a, b) => b.id - a.id).forEach((flow) => {
+  [...flows.values()].filter((flow) => !isTunnelBookkeeping(flow)).sort((a, b) => b.id - a.id).forEach((flow) => {
     const item = document.createElement("button");
     item.className = `list-row${flow.id === selectedFlow?.summary.id ? " is-selected" : ""}`;
     item.type = "button";
@@ -510,7 +553,7 @@ function renderFlows(): void {
     const method = (flow.method ?? "").toUpperCase();
     item.dataset.method = method;
     item.dataset.statusClass = statusClass(flow.status);
-    item.innerHTML = `<span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method === "" ? "—" : method)}</span><span class="list-row__target"><b>${escapeHtml(flow.host ?? "unknown")}</b>${escapeHtml(decodeForDisplay(flow.path ?? ""))}${flowKindChipHtml(flow)}</span><span class="list-row__status" data-class="${statusClass(flow.status)}">${flow.status ?? "…"}</span>`;
+    item.innerHTML = `<span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method === "" ? "—" : method)}</span><span class="list-row__target"><b>${escapeHtml(flowAuthority(flow))}</b>${escapeHtml(decodeForDisplay(flow.path ?? ""))}${flowKindChipHtml(flow)}</span><span class="list-row__status" data-class="${statusClass(flow.status)}">${flow.status ?? "…"}</span>`;
     item.addEventListener("click", () => void selectFlow(flow.id));
     item.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -520,6 +563,24 @@ function renderFlows(): void {
   });
   applyFlowSearch();
   updateWorkbenchCounts();
+}
+
+/** The GraphQL operation a captured request runs (`mutation AddToCart`),
+ *  read from its JSON body, or null when it is not a GraphQL request. */
+function graphqlLabelOf(flow: FlowDetail): string | null {
+  const body = flow.requestBody;
+  if (body === null || body === undefined || body.length === 0) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(new TextDecoder().decode(new Uint8Array(body))); } catch { return null; }
+  const first = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (first === null || typeof first !== "object") return null;
+  const record = first as Record<string, unknown>;
+  if (typeof record.query !== "string") return null;
+  const header = /\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(record.query);
+  const name = typeof record.operationName === "string" ? record.operationName : header?.[2];
+  const kind = header?.[1] ?? "query";
+  const label = name === undefined ? `${kind} (anonymous)` : `${kind} ${name}`;
+  return Array.isArray(parsed) && parsed.length > 1 ? `${label} +${parsed.length - 1} batched` : label;
 }
 
 /** A chip naming what a flow is beyond request/response: an event stream
@@ -536,14 +597,20 @@ function flowKindChipHtml(flow: FlowSummary): string {
 function updateWorkbenchCounts(): void {
   if (workbenchCounts === null) return;
   const held = pending.size === 0 ? "" : ` · ${pending.size} held`;
-  workbenchCounts.textContent = `${flows.size} flow${flows.size === 1 ? "" : "s"}${held}`;
+  const total = [...flows.values()].filter((flow) => !isTunnelBookkeeping(flow)).length;
+  const rows = flowList === null ? [] : Array.from(flowList.querySelectorAll<HTMLElement>(".list-row"));
+  const shown = rows.filter((row) => !row.hidden).length;
+  const filtered = rows.length > 0 && shown !== rows.length;
+  workbenchCounts.textContent = filtered
+    ? `${shown} of ${total} flow${total === 1 ? "" : "s"}${held}`
+    : `${total} flow${total === 1 ? "" : "s"}${held}`;
 }
 
 /** Seconds until the backend auto-forwards a held flow, from GUI-observed hold. */
 function heldSecondsRemaining(flowId: number): number | null {
   const start = heldSince.get(flowId);
   if (start === undefined) return null;
-  return Math.max(0, Math.ceil((INTERCEPT_TIMEOUT_MS - (Date.now() - start)) / 1000));
+  return Math.max(0, Math.ceil((interceptTimeoutMs() - (Date.now() - start)) / 1000));
 }
 
 /**
@@ -572,6 +639,11 @@ function updateDecisionControls(): void {
   note.className = "t-small t-subtle";
   note.style.color = "";
   if (selectedFlow === null) { note.textContent = ""; return; }
+  if (!held && timedOutFlows.has(selectedFlow.summary.id)) {
+    note.textContent = "Timed out: the original request was forwarded unmodified. Any edits still in the editor were not sent.";
+    note.style.color = "var(--color-danger-ink)";
+    return;
+  }
   if (!held) {
     note.textContent = "This request is not held. Forward, modify, and drop apply only to requests paused by intercept.";
     return;
@@ -592,8 +664,10 @@ function renderQueue(): void {
       compact: true,
     });
     updateWorkbenchCounts();
+    setDockQueueCount(0);
     return;
   }
+  setDockQueueCount(pending.size);
   queueList.replaceChildren();
   [...pending].sort((a, b) => b - a).forEach((flowId) => {
     const flow = flows.get(flowId);
@@ -603,7 +677,7 @@ function renderQueue(): void {
     item.style.gridTemplateColumns = "minmax(0, 1fr) auto";
     const method = (flow?.method ?? "").toUpperCase();
     const remaining = heldSecondsRemaining(flowId);
-    const countdown = remaining === null ? "" : remaining === 0 ? " · forwarding…" : ` · ${remaining}s`;
+    const countdown = remaining === null ? "" : remaining === 0 ? " · forwarding…" : ` · auto-forwards in ${remaining}s`;
     const tone = remaining !== null && remaining <= 5 ? "badge--danger" : "badge--caution";
     item.innerHTML = `<span class="list-row__target"><b>${escapeHtml(method === "" ? "REQUEST" : method)}</b> ${escapeHtml(flow?.host ?? "")}${escapeHtml(decodeForDisplay(flow?.path ?? ""))}</span><span class="badge ${tone}">held #${flowId}${countdown}</span>`;
     item.addEventListener("click", () => void selectFlow(flowId));
@@ -661,7 +735,7 @@ function renderDetailEmpty(): void {
   detail.innerHTML = stateBlock({
     icon: "chevronRight",
     title: "No flow selected",
-    body: "Choose a row from live traffic to inspect its request and response, then resend it or send it to the Fuzzer.",
+    body: "Choose a row from live traffic to inspect its request and response, then resend it or send it to Fuzz.",
   });
 }
 
@@ -700,7 +774,8 @@ function renderDetail(flow: FlowDetail): string {
   <dt>Duration</dt><dd class="t-mono">${summary.durationMs === null || summary.durationMs === undefined ? "—" : `${summary.durationMs} ms`}${sse === null ? "" : " to headers"}</dd>
   <dt>Type</dt><dd class="t-mono">${escapeHtml(summary.contentType ?? "—")}</dd>${sse === null ? "" : `
   <dt>Stream</dt><dd class="t-mono" id="flow-sse-state">${escapeHtml(sseLabel(sse))}</dd>`}${grpc === null ? "" : `
-  <dt>Protocol</dt><dd class="t-mono">gRPC · ${escapeHtml(`${grpc.service} / ${grpc.method}`)}</dd>`}
+  <dt>Protocol</dt><dd class="t-mono">gRPC · ${escapeHtml(`${grpc.service} / ${grpc.method}`)}</dd>`}${graphqlLabelOf(flow) === null ? "" : `
+  <dt>Protocol</dt><dd class="t-mono">GraphQL · ${escapeHtml(graphqlLabelOf(flow) ?? "")}</dd>`}
 </dl>
 <hr class="rule" />
 <div class="reqres">
@@ -1504,11 +1579,13 @@ function renderFuzzer(): void {
 
   const editor = locked ? renderFuzzerLockedSummary(selectedFuzzer) : renderFuzzerDraftEditor(config, opt);
   const controls = renderFuzzerControls(selectedFuzzer, locked);
-  const stateBadge = `<span class="badge ${state === "running" ? "badge--accent" : state === "failed" ? "badge--danger" : state === "completed" ? "badge--success" : ""}">${escapeHtml(state)}</span>`;
+  const outOfScope = selectedFuzzer.results.some((result) => result.scope === "outside_declared_scope")
+    || selectedFuzzer.diagnostics.some((d) => d?.id === "proxy.fuzzer-outside-scope");
+  const stateBadge = `${outOfScope ? `<span class="badge badge--caution" title="These requests went to a target outside the declared scope">out of scope</span> ` : ""}<span class="badge ${state === "running" ? "badge--accent" : state === "failed" ? "badge--danger" : state === "completed" ? "badge--success" : ""}">${escapeHtml(state)}</span>`;
 
   fuzzerPanel.innerHTML = `<div class="panel__header">
   <div class="panel__heading">${icon("discovery", { size: 16 })}<h2 title="${escapeHtml(`${config.baseRequest.url}${selectedFuzzer.id === "" ? "" : ` · ${selectedFuzzer.id}`}`)}">${escapeHtml(fuzzTitle(selectedFuzzer))}</h2></div>
-  <div class="row">${stateBadge}<button class="btn btn--quiet btn--icon" type="button" data-close-fuzzer><span class="visually-hidden">Close Fuzz</span>${icon("close", { size: 16 })}</button></div>
+  <div class="row">${stateBadge}<button class="btn btn--quiet btn--icon" type="button" data-close-fuzzer title="Deselect this attack (it stays in the queue)"><span class="visually-hidden">Deselect this attack (it stays in the queue)</span>${icon("close", { size: 16 })}</button></div>
 </div>
 <div class="panel__body stack">
   ${editor}
@@ -1526,6 +1603,12 @@ function renderFuzzer(): void {
   fuzzerPanel.querySelector<HTMLTextAreaElement>("#fuzz-template")?.addEventListener("input", () => updateFuzzPreview());
   wireFuzzPayloadEditor(fuzzerPanel);
   wireGrepSettings(fuzzerPanel);
+  // The scope line is part of the editor: evaluate it whenever the draft is
+  // (re)drawn, not only after an edit — the render replaced its element.
+  if (!locked) {
+    fuzzScopeUrl = "";
+    scheduleFuzzScopeCheck(config.baseRequest.url);
+  }
 
   // Run controls.
   fuzzerPanel.querySelector("#fuzzer-launch")?.addEventListener("click", () => void launchFuzzer());
@@ -1787,6 +1870,7 @@ function renderFuzzerDraftEditor(config: FuzzerConfig, opt: (value: string, labe
     </div>
     <textarea class="textarea fuzzer-base" id="fuzz-template" spellcheck="false">${escapeHtml(fuzzTemplate)}</textarea>
     <p class="field__hint">Wrap each value to fuzz in <code class="t-mono">§…§</code> markers — select text and click <b>Add §</b> (or place the caret to add an empty pair), or <b>Auto §</b> to mark query/body parameters. <span id="fuzz-preview" class="${expected > 10000 ? "t-danger" : "t-subtle"}">${escapeHtml(fuzzPreviewText(positionCount, expected))}</span></p>
+    <div id="fuzz-scope" role="status"></div>
   </div>
 
   <div class="field">
@@ -1968,9 +2052,51 @@ async function setFuzzComment(ordinal: number, comment: string): Promise<void> {
 }
 
 /** Live-updates the request-count preview as the template or payloads change. */
+/** Engine verdict for a URL against the declared scope (`ScopeUrlAssessment`). */
+interface ScopeUrlAssessment { readonly disposition: string; readonly scopeDeclared: boolean; readonly target: string | null; readonly scope: readonly string[]; }
+let fuzzScopeTimer: number | undefined;
+let fuzzScopeUrl = "";
+
+/** Warns in the draft editor, before anything is sent, when the attack's
+ *  target is outside the declared scope — the same warning Resend gives. The
+ *  engine classifies it exactly as the senders will. Warned, never blocked. */
+function scheduleFuzzScopeCheck(url: string): void {
+  if (url === fuzzScopeUrl) return;
+  fuzzScopeUrl = url;
+  if (fuzzScopeTimer !== undefined) window.clearTimeout(fuzzScopeTimer);
+  fuzzScopeTimer = window.setTimeout(() => void renderFuzzScope(url), 250);
+}
+
+async function renderFuzzScope(url: string): Promise<void> {
+  const host = fuzzerPanel?.querySelector<HTMLElement>("#fuzz-scope");
+  if (host === null || host === undefined) return;
+  let verdict: ScopeUrlAssessment;
+  try {
+    const response = await fetch(`/api/v1/workbench/scope/assess?url=${encodeURIComponent(url)}`);
+    if (!response.ok) { host.replaceChildren(); return; }
+    verdict = (await response.json()) as ScopeUrlAssessment;
+  } catch { host.replaceChildren(); return; }
+  if (url !== fuzzScopeUrl) return;
+  const target = verdict.target ?? url;
+  if (verdict.disposition === "in_scope") {
+    host.innerHTML = `<p class="t-small t-subtle">${icon("shield", { size: 12 })} ${escapeHtml(target)} is in the declared scope.</p>`;
+    return;
+  }
+  const title = !verdict.scopeDeclared
+    ? "No scope is declared"
+    : verdict.disposition === "outside_declared_scope"
+      ? `${target} is out of scope`
+      : "The target's scope can't be determined";
+  const body = !verdict.scopeDeclared
+    ? "This session authorizes no target, so nothing this attack sends is covered by a declared scope."
+    : `The declared scope is ${verdict.scope.join(", ")}. This attack would send every request to ${target}, which it does not cover.`;
+  host.innerHTML = `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(title)}</p><p class="t-small">${escapeHtml(body)} Out-of-scope traffic is warned, never blocked: confirm you're authorized before starting.</p></div></div>`;
+}
+
 function updateFuzzPreview(): void {
   if (selectedFuzzer === null || fuzzerPanel === null || fuzzerConfigLocked()) return;
   readFuzzerForm();
+  scheduleFuzzScopeCheck(selectedFuzzer.config.baseRequest.url);
   const positionCount = countTemplatePositions(fuzzTemplate);
   const expected = estimateRequestCount(selectedFuzzer.config.attackType, positionCount, selectedFuzzer.config.payloadSets);
   const preview = fuzzerPanel.querySelector<HTMLElement>("#fuzz-preview");
@@ -2144,7 +2270,7 @@ function fuzzFailure(result: FuzzerResult): { label: string; detail: string } | 
 function failureLabel(diagnostic: ContextDiagnostic): string {
   const error = (diagnosticText(diagnostic, "error") ?? "").toLowerCase();
   if (diagnostic.id === "proxy.resend-timed-out" || diagnosticText(diagnostic, "timeout") === "true" || /timed out|10060/.test(error)) return "timed out";
-  if (diagnostic.id === "proxy.resend-cancelled" || diagnostic.id === "proxy.fuzzer-cancelled") return "cancelled";
+  if (diagnostic.id === "proxy.resend-cancelled" || diagnostic.id === "proxy.fuzzer-cancelled" || diagnostic.id === "web.discovery-stopped") return "cancelled";
   if (diagnostic.id === "proxy.upstream-unreachable" || diagnostic.id === "proxy.resend-request-failed") {
     if (/refused|10061|econnrefused/.test(error)) return "refused";
     if (/dns|no such host|11001|name or service not known|failed to lookup|nodename/.test(error)) return "DNS failed";
@@ -2202,7 +2328,7 @@ async function launchFuzzer(): Promise<void> {
     if (fuzzerPoll !== undefined) window.clearInterval(fuzzerPoll);
     fuzzerPoll = window.setInterval(() => void refreshFuzzer(), 500);
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer job could not start.", why: "", fix: "Check payload positions, payloads, and the session proxy/tool configuration." });
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzz attack could not start.", why: "", fix: "Check payload positions, payloads, and the session proxy/tool configuration." });
   }
 }
 
@@ -2218,7 +2344,7 @@ async function refreshFuzzer(): Promise<void> {
     if (["completed", "failed", "stopped"].includes(selectedFuzzer.state) && fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
   } catch (error) {
     if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
-    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer status could not be loaded.", why: "", fix: "Check the active session and retry." });
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzz attack status could not be loaded.", why: "", fix: "Check the active session and retry." });
   }
 }
 
@@ -2232,7 +2358,7 @@ async function stopFuzzer(): Promise<void> {
     // count reconciles to what actually reached the target.
     window.setTimeout(() => void refreshFuzzer(), 900);
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer job could not stop.", why: "", fix: "Check the active session and retry." });
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzz attack could not stop.", why: "", fix: "Check the active session and retry." });
   }
 }
 
@@ -2244,7 +2370,7 @@ async function pauseFuzzer(): Promise<void> {
     selectedFuzzer = (await response.json()) as FuzzerJob;
     renderFuzzer();
   } catch (error) {
-    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzzer job could not pause.", why: "", fix: "Pause only at a request boundary while the job is running." });
+    reportUnexpected(error, { id: "proxy.fuzzer-config-invalid", what: "The Fuzz attack could not pause.", why: "", fix: "Pause only at a request boundary while the job is running." });
   }
 }
 
@@ -2284,7 +2410,7 @@ function renderResend(): void {
   <div class="row">
     <button class="btn btn--sm btn--quiet" type="button" data-resend-copy-curl title="Copy the editor's request as a curl command (bash/zsh)">${icon("copy", { size: 14 })}<span>Copy curl</span></button>
     <button class="btn btn--sm btn--quiet" type="button" data-resend-copy-url title="Copy the editor's request URL">${icon("copy", { size: 14 })}<span>Copy URL</span></button>
-    <button class="btn btn--quiet btn--icon" type="button" data-close-resend><span class="visually-hidden">Close Resend</span>${icon("close", { size: 16 })}</button>
+    <button class="btn btn--quiet btn--icon" type="button" data-close-resend title="Deselect this request (it stays in the queue)"><span class="visually-hidden">Deselect this request (it stays in the queue)</span>${icon("close", { size: 16 })}</button>
   </div>
 </div>
 <div class="resend-split" data-resend-split>
@@ -3427,6 +3553,18 @@ async function startPipeline(): Promise<void> {
     apkPath?.focus();
     return;
   }
+  // Validate the path first: a missing or unsupported file is reported now,
+  // not after two confirmation dialogs and a "Pipeline started" toast.
+  try {
+    const check = await fetch("/api/v1/pipeline/check", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ artifactPath }) });
+    if (!check.ok) {
+      const diag = await check.json() as Diagnostic;
+      showDiagnostic(diag);
+      if (pipelineDiagnostics !== null) pipelineDiagnostics.innerHTML = diagnosticListHtml([diag], "");
+      apkPath?.focus();
+      return;
+    }
+  } catch { /* the run itself still reports any problem */ }
   const staticOnly = apkStaticOnly?.checked === true;
   const dynamic = !staticOnly && apkDynamic?.checked === true;
   const confirmed = await confirmDialog({
@@ -3540,11 +3678,74 @@ function showSurfaceSection(section: "app" | "web"): void {
   }
 }
 
+/** Content identity of a surface as rendered (not its assembly run id), so a
+ *  re-fuse that changed nothing does not rebuild the view under the reader. */
+function surfaceSignature(surface: SurfaceSummary): string {
+  return JSON.stringify([
+    surface.endpoints,
+    surface.coverage,
+    surface.signerCount,
+    surface.protocolOperations ?? [],
+    surface.diagnostics.length,
+  ]);
+}
+let renderedSurfaceSignature = "";
+
+/** Which endpoint rows are open, by endpoint identity (not row index). */
+function endpointKey(endpoint: SurfaceEndpoint): string {
+  return `${endpoint.method.toUpperCase()} ${endpointHostLabel(endpoint)}${endpoint.pathTemplate}`;
+}
+
+/** `host:port` the endpoint is served from, as the operator must read it. */
+function endpointHostLabel(endpoint: SurfaceEndpoint): string {
+  if (endpoint.host !== undefined && endpoint.host !== null && endpoint.host !== "") return endpoint.host;
+  const base = endpoint.detail?.baseUrl ?? endpoint.baseUrl ?? "";
+  try { return base === "" ? "" : new URL(base.includes("://") ? base : `https://${base}`).host; } catch { return base; }
+}
+
+/** The endpoint list's search and filters, kept across re-renders. */
+const surfaceFilter = { search: "", host: "", method: "", evidence: "", status: "" };
+
+function applySurfaceFilter(): void {
+  if (surfaceView === null) return;
+  const query = surfaceFilter.search.trim().toLowerCase();
+  let shown = 0;
+  const items = surfaceView.querySelectorAll<HTMLElement>(".endpoint-item");
+  items.forEach((item) => {
+    const visible = (query === "" || (item.dataset.text ?? "").includes(query))
+      && (surfaceFilter.host === "" || item.dataset.host === surfaceFilter.host)
+      && (surfaceFilter.method === "" || item.dataset.method === surfaceFilter.method)
+      && (surfaceFilter.evidence === "" || item.dataset.evidence === surfaceFilter.evidence)
+      && (surfaceFilter.status === "" || (item.dataset.statuses ?? "").split(" ").some((code) => code.startsWith(surfaceFilter.status)));
+    item.hidden = !visible;
+    if (visible) shown += 1;
+  });
+  const hint = surfaceView.querySelector<HTMLElement>("#surface-listed");
+  if (hint !== null) hint.textContent = shown === items.length ? `${items.length} listed` : `${shown} of ${items.length} listed`;
+}
+
 function renderSurface(surface: SurfaceSummary): void {
   if (surfaceView === null) return;
+  const signature = surfaceSignature(surface);
+  if (surfaceShown && signature === renderedSurfaceSignature && surfaceView.querySelector(".surface-endpoints") !== null) return;
+  // Keep what the reader had open and where they were.
+  const openKeys = new Set<string>();
+  surfaceView.querySelectorAll<HTMLElement>(".endpoint-item.is-open").forEach((item) => {
+    const endpoint = lastSurfaceEndpoints[Number(item.dataset.ep)];
+    if (endpoint !== undefined) openKeys.add(endpointKey(endpoint));
+  });
+  const scroller = surfaceView.closest<HTMLElement>(".view, .scroll-region, main") ?? document.scrollingElement as HTMLElement | null;
+  const scrollTop = scroller?.scrollTop ?? 0;
+  renderedSurfaceSignature = signature;
   surfaceShown = true;
   // Tag the surface by its source (web capture vs APK) and activate that section.
-  surfaceSource = lastSessionStatus?.scope?.target?.target_type === "web.url" ? "web" : "app";
+  // An app surface is one an APK produced: an APK session or pipeline run,
+  // or endpoints backed by code. Everything else — web capture, imported HAR
+  // traffic, in any session type — is a web surface.
+  const fromApp = lastSessionStatus?.scope?.target?.target_type === "android.apk"
+    || (lastSessionStatus?.analysisPipeline ?? null) !== null
+    || surface.endpoints.some((endpoint) => endpoint.staticEvidence === true || endpoint.evidenceSource === "static_inferred");
+  surfaceSource = fromApp ? "app" : "web";
   document.querySelectorAll<HTMLElement>(".surface-section").forEach((tab) => {
     const on = tab.dataset.surfaceSection === surfaceSource;
     tab.classList.toggle("is-active", on);
@@ -3566,15 +3767,19 @@ function renderSurface(surface: SurfaceSummary): void {
     const band = percent === null ? "" : percent >= 80 ? " confidence--high" : percent < 50 ? " confidence--low" : "";
     const confidenceHtml = percent === null
       ? '<span class="t-subtle">unscored</span>'
-      : `<span class="confidence${band}" title="Minimum supporting fact confidence"><span class="confidence__track"><span class="confidence__fill" style="width:${percent}%"></span></span>${percent}%</span>`;
+      : `<span class="confidence${band}" title="Confidence: the lowest score among this endpoint's supporting facts"><span class="t-small t-subtle">conf.</span><span class="confidence__track"><span class="confidence__fill" style="width:${percent}%"></span></span>${percent}%</span>`;
     const method = entry.method.toUpperCase();
+    const hostLabel = endpointHostLabel(entry);
+    const statuses = (entry.detail?.responses ?? []).map((response) => response.status).join(" ");
+    const evidence = isConfirmed(entry) ? "confirmed" : "inferred";
     // The row is a real button so it is keyboard-focusable and expands on
     // click/Enter; a right-click (contextmenu) offers send-to-resend/fuzzer,
     // matching Burp/Caido. The detail region fills lazily on first expand.
-    return `<div class="endpoint-item" data-ep="${index}">
-<button class="endpoint-row" type="button" data-ep-toggle="${index}" aria-expanded="false" title="Click to expand · right-click to send to resend or fuzzer">
+    return `<div class="endpoint-item" data-ep="${index}" data-host="${escapeHtml(hostLabel)}" data-method="${escapeHtml(method)}" data-evidence="${evidence}" data-statuses="${escapeHtml(statuses)}" data-text="${escapeHtml(`${method} ${hostLabel}${entry.pathTemplate}`.toLowerCase())}">
+<button class="endpoint-row" type="button" data-ep-toggle="${index}" aria-expanded="false" title="Click to expand · right-click to send to Resend or Fuzz">
 <span class="endpoint-row__caret" data-icon="chevronRight" aria-hidden="true"></span>
 <span class="list-row__method" data-method="${escapeHtml(method)}">${escapeHtml(method)}</span>
+<span class="endpoint-row__host t-mono t-small t-subtle" title="${escapeHtml(hostLabel)}">${escapeHtml(hostLabel)}</span>
 <span class="endpoint-row__path" title="${escapeHtml(entry.pathTemplate)}">${escapeHtml(entry.pathTemplate)}</span>
 <span class="endpoint-row__meta">${graphqlChipHtml(entry, surface.protocolOperations ?? [])}${evidenceChipHtml(entry)}${partyChipHtml(entry)}${confidenceHtml}<span class="badge">${entry.signerCount} signer${entry.signerCount === 1 ? "" : "s"}</span></span>
 </button>
@@ -3605,8 +3810,9 @@ function renderSurface(surface: SurfaceSummary): void {
 <article class="panel">
   <div class="panel__header">
     <div class="panel__heading">${icon("surface", { size: 16 })}<h2>Endpoints</h2></div>
-    <span class="panel__hint">${surface.endpoints.length} listed</span>
+    <span class="panel__hint" id="surface-listed">${surface.endpoints.length} listed</span>
   </div>
+  ${surface.endpoints.length === 0 ? "" : surfaceFiltersHtml(lastSurfaceEndpoints)}
   <div class="panel__body panel__body--flush surface-endpoints">${endpointRows === "" ? stateBlock({ icon: "surface", title: "No endpoints were produced", body: "Run the APK pipeline or fuse captured web traffic to assemble a surface.", compact: true }) : endpointRows}</div>
 </article>
 
@@ -3627,14 +3833,58 @@ ${protocolOperationsPanelHtml(surface.protocolOperations ?? [])}
 <article class="panel">
   <div class="panel__header">
     <div class="panel__heading">${icon("alert", { size: 16 })}<h2>Surface diagnostics</h2></div>
-    <span class="panel__hint">${surface.diagnostics.length === 0 ? "none" : `${surface.diagnostics.length} reported`}</span>
+    <span class="panel__hint">${surfaceDiagnosticsHint(surface.diagnostics)}</span>
   </div>
-  <div class="panel__body panel__body--flush scroll-region">${diagnosticListHtml(surface.diagnostics, "The assembled surface reported no boundaries or warnings.")}</div>
+  <div class="panel__body panel__body--flush scroll-region">${groupedSurfaceDiagnosticsHtml(surface.diagnostics as readonly (ContextDiagnostic | null)[], "The assembled surface reported no boundaries or warnings.")}</div>
 </article>
 </div>`;
   hydrateIcons(surfaceView);
   wireSurfaceEndpoints();
+  wireSurfaceFilters();
+  applySurfaceFilter();
+  // Reopen what was open, then put the reader back where they were.
+  lastSurfaceEndpoints.forEach((endpoint, index) => {
+    if (!openKeys.has(endpointKey(endpoint))) return;
+    const button = surfaceView?.querySelector<HTMLButtonElement>(`[data-ep-toggle="${index}"]`);
+    if (button !== null && button !== undefined) toggleEndpointDetail(index, button);
+  });
+  if (scroller !== null && scroller !== undefined) scroller.scrollTop = scrollTop;
   surface.diagnostics.forEach(showDiagnostic);
+}
+
+/** "N reported · K kinds" for the surface diagnostics panel. */
+function surfaceDiagnosticsHint(diagnostics: readonly (Diagnostic | null)[]): string {
+  const present = diagnostics.filter((entry): entry is Diagnostic => entry !== null);
+  if (present.length === 0) return "none";
+  const kinds = new Set(present.map((entry) => entry.id)).size;
+  return `${present.length} reported · ${kinds} kind${kinds === 1 ? "" : "s"}`;
+}
+
+/** Search plus host / method / evidence / status filters for the endpoints. */
+function surfaceFiltersHtml(endpoints: readonly SurfaceEndpoint[]): string {
+  const hosts = [...new Set(endpoints.map(endpointHostLabel).filter((host) => host !== ""))].sort();
+  const methods = [...new Set(endpoints.map((endpoint) => endpoint.method.toUpperCase()))].sort();
+  const option = (value: string, label: string, selected: string): string => `<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  return `<div class="surface-filters row">
+  <input class="input input--mono" id="surface-search" type="search" placeholder="Filter by path or host" spellcheck="false" aria-label="Filter endpoints" value="${escapeHtml(surfaceFilter.search)}" />
+  <select class="input input--sm" id="surface-filter-host" aria-label="Filter by host">${option("", "All hosts", surfaceFilter.host)}${hosts.map((host) => option(host, host, surfaceFilter.host)).join("")}</select>
+  <select class="input input--sm" id="surface-filter-method" aria-label="Filter by method">${option("", "Any method", surfaceFilter.method)}${methods.map((method) => option(method, method, surfaceFilter.method)).join("")}</select>
+  <select class="input input--sm" id="surface-filter-evidence" aria-label="Filter by evidence">${option("", "Any evidence", surfaceFilter.evidence)}${option("confirmed", "Confirmed", surfaceFilter.evidence)}${option("inferred", "Inferred", surfaceFilter.evidence)}</select>
+  <select class="input input--sm" id="surface-filter-status" aria-label="Filter by observed response status">${option("", "Any status", surfaceFilter.status)}${["2", "3", "4", "5"].map((cls) => option(cls, `${cls}xx`, surfaceFilter.status)).join("")}</select>
+</div>`;
+}
+
+function wireSurfaceFilters(): void {
+  if (surfaceView === null) return;
+  const bind = (selector: string, key: keyof typeof surfaceFilter, event: "input" | "change"): void => {
+    const control = surfaceView?.querySelector<HTMLInputElement | HTMLSelectElement>(selector);
+    control?.addEventListener(event, () => { surfaceFilter[key] = control.value; applySurfaceFilter(); });
+  };
+  bind("#surface-search", "search", "input");
+  bind("#surface-filter-host", "host", "change");
+  bind("#surface-filter-method", "method", "change");
+  bind("#surface-filter-evidence", "evidence", "change");
+  bind("#surface-filter-status", "status", "change");
 }
 
 /** Wires each surface endpoint row: click/Enter expands its request/response
@@ -3722,10 +3972,15 @@ function showEndpointMenu(x: number, y: number, index: number): void {
 }
 
 /** Skeleton request built from an endpoint's shape: the operator fills header
- * values and body in Resend or the Fuzzer. */
+ * values and body in Resend or the Fuzzer. `Host` is the one value the surface
+ * already knows, and the raw request editor rebuilds the URL from it, so it is
+ * filled from the endpoint's URL rather than left blank. */
 function endpointRequest(endpoint: SurfaceEndpoint): ResendRequest {
-  const headers: [string, string][] = (endpoint.detail?.requestHeaders ?? []).map((name) => [name, ""]);
-  return { method: endpoint.method.toUpperCase() || "GET", url: endpointUrl(endpoint), headers, body: null };
+  const url = endpointUrl(endpoint);
+  let authority = "";
+  try { authority = new URL(url).host; } catch { /* relative URL: no host to fill */ }
+  const headers: [string, string][] = (endpoint.detail?.requestHeaders ?? []).map((name) => [name, name.toLowerCase() === "host" ? authority : ""]);
+  return { method: endpoint.method.toUpperCase() || "GET", url, headers, body: null };
 }
 
 /** Creates a Resend context from a surface endpoint and opens it in the workbench. */
@@ -4219,6 +4474,7 @@ function applyFlowSearch(): void {
     const matchesStatus = statusClassFilter === "" || row.dataset.statusClass === statusClassFilter;
     row.hidden = !(matchesText && matchesMethod && matchesStatus);
   });
+  updateWorkbenchCounts();
 }
 
 function initWorkbenchTools(): void {
@@ -4226,6 +4482,13 @@ function initWorkbenchTools(): void {
     tab.addEventListener("click", () => showWorkbenchTab((tab.dataset.wbtab as "live" | "resend" | "fuzz" | "ws") ?? "live"));
   });
   document.querySelector<HTMLInputElement>("#flow-search")?.addEventListener("input", applyFlowSearch);
+  // Hold new rows back while the pointer is over the list (they would shift
+  // the row under it); render them the moment it leaves.
+  flowList?.addEventListener("pointerenter", () => { flowListHovered = true; });
+  flowList?.addEventListener("pointerleave", () => {
+    flowListHovered = false;
+    if (flowListDeferred > 0) renderFlows();
+  });
   document.querySelector<HTMLSelectElement>("#flow-filter-method")?.addEventListener("change", applyFlowSearch);
   document.querySelector<HTMLSelectElement>("#flow-filter-status")?.addEventListener("change", applyFlowSearch);
   document.querySelectorAll<HTMLElement>("[data-wb-collapse]").forEach((button) => {
@@ -4300,6 +4563,28 @@ function scopeRuleLabel(rule: ScopeRule): string {
   return rule.host.kind === "exact" ? (rule.host.host ?? "") : (rule.host.domain ?? "");
 }
 
+/** Mirrors the scope/authorization state into the status bar, which carries it
+ *  at widths where the titlebar pill is hidden. */
+function renderStatusScope(text: string, authorized: boolean): void {
+  const cell = document.querySelector<HTMLElement>("#statusbar-scope");
+  const label = document.querySelector<HTMLElement>("#statusbar-scope-text");
+  if (cell === null || label === null) return;
+  label.textContent = text;
+  cell.title = text;
+  cell.classList.toggle("is-unscoped", !authorized);
+}
+
+/** A scope rule as the operator must read it: with its port restriction, so a
+ *  host is never mistaken as authorized on every port (mirrors the engine's
+ *  `AllowedNetworkTarget::label`). */
+function scopeRuleDisplay(rule: ScopeRule): string {
+  const raw = scopeRuleLabel(rule);
+  const host = rule.host.kind === "exact" ? (raw.includes(":") ? `[${raw}]` : raw) : `*.${raw}`;
+  if (rule.ports.length === 0) return `${host} (any port)`;
+  if (rule.ports.length === 1) return `${host}:${rule.ports[0]}`;
+  return `${host} (ports ${rule.ports.join(", ")})`;
+}
+
 /** Renders the declared scope on the Android target's Capture scope panel. */
 function renderAndroidScope(status: SessionStatus): void {
   if (androidScopeList === null) return;
@@ -4308,7 +4593,7 @@ function renderAndroidScope(status: SessionStatus): void {
     const item = document.createElement("li");
     item.className = "scope-list__item";
     const label = scopeRuleLabel(rule);
-    item.append(document.createTextNode(rule.host.kind === "exact" ? label : `*.${label}`));
+    item.append(document.createTextNode(scopeRuleDisplay(rule)));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "scope-list__remove";
@@ -4553,6 +4838,14 @@ function resolveFieldValue(field: unknown): string | null {
   return String(raw);
 }
 
+/** Header names from the model: plain strings (response headers) or named
+ *  field objects (request headers). */
+function headerNames(list: unknown): string[] {
+  return Array.isArray(list)
+    ? list.map((item) => (typeof item === "string" ? item : String((item as Record<string, unknown>).name ?? ""))).filter((name) => name !== "")
+    : [];
+}
+
 function fieldNames(list: unknown): string[] {
   return Array.isArray(list)
     ? list.map((item) => String((item as Record<string, unknown>).name ?? "")).filter((name) => name !== "")
@@ -4570,7 +4863,7 @@ function extractEndpointDetail(endpoint: Record<string, unknown>): EndpointDetai
       const selector = response.selector as Record<string, unknown> | undefined;
       return {
         status: String(selector?.value ?? selector?.kind ?? "?"),
-        headers: meaningfulHeaders(fieldNames(response.headers)),
+        headers: meaningfulHeaders(headerNames(response.headers)),
       };
     }),
   };
@@ -4784,20 +5077,63 @@ async function currentToken(): Promise<string | null> {
  * transient socket blip without the operator reloading — the channels come back
  * on their own and the status bar narrates the wait honestly.
  */
+/** When the engine connection was lost, while it stays lost. */
+let engineDownSince: number | null = null;
+/** How long to keep quietly reconnecting before saying the engine is gone. */
+const ENGINE_DOWN_GRACE_MS = 30_000;
+
 function scheduleReconnect(): void {
   if (reconnectTimer !== undefined) return;
-  setStatus("Reconnecting to the local engine…", "working");
+  engineDownSince ??= Date.now();
+  const down = Date.now() - engineDownSince;
+  if (down >= ENGINE_DOWN_GRACE_MS) {
+    // Bounded: an honest terminal state with an action, not an endless spinner.
+    // Retries continue in the background (the desktop app restarts a crashed
+    // engine), so recovery is still automatic if it comes back.
+    setStatus("The local engine stopped", "unavailable");
+    showEngineDown();
+  } else {
+    setStatus("Reconnecting to the local engine…", "working");
+  }
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = undefined;
     void currentToken().then((token) => {
       if (token === null) {
-        reconnectDelay = Math.min(reconnectDelay * 2, 15_000);
+        reconnectDelay = Math.min(reconnectDelay * 2, 5_000);
         scheduleReconnect();
         return;
       }
+      // A restarted engine issues a new operator token: the Android and
+      // Devices views use it, so adopt it along with the new sockets.
+      operatorToken = token;
       connect({ authToken: token, interceptEnabled: false });
     });
   }, reconnectDelay);
+}
+
+/** The terminal "engine stopped" notice, with a retry and the way out. */
+function showEngineDown(): void {
+  if (document.querySelector("#engine-down") !== null) return;
+  const notice = document.createElement("div");
+  notice.id = "engine-down";
+  notice.className = "engine-down notice notice--danger";
+  notice.setAttribute("role", "alert");
+  notice.innerHTML = `<span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">The local APIaxess engine stopped</p><p>This window can't reach it, and it has not come back on its own. Your session is saved on disk and reopens with the engine.</p><p class="t-small t-subtle">Retry, or close APIaxess and open it again to restart the engine.</p></div><button class="btn btn--sm" type="button" data-engine-retry>Retry now</button>`;
+  notice.querySelector<HTMLButtonElement>("[data-engine-retry]")?.addEventListener("click", () => {
+    if (reconnectTimer !== undefined) { window.clearTimeout(reconnectTimer); reconnectTimer = undefined; }
+    reconnectDelay = 250;
+    setStatus("Reconnecting to the local engine…", "working");
+    scheduleReconnect();
+  });
+  document.body.append(notice);
+}
+
+/** The engine is reachable again: drop the terminal notice. */
+function engineRecovered(): void {
+  const wasDown = engineDownSince !== null && Date.now() - engineDownSince >= ENGINE_DOWN_GRACE_MS;
+  engineDownSince = null;
+  document.querySelector("#engine-down")?.remove();
+  if (wasDown) toast("Reconnected to the local engine", "success");
 }
 
 function connect(session: WorkbenchSession): void {
@@ -4817,6 +5153,7 @@ function connect(session: WorkbenchSession): void {
   telemetry = new WebSocket(`${scheme}://${location.host}/api/v1/workbench/ws/telemetry?token=${encodeURIComponent(session.authToken)}`);
   control.onopen = () => {
     reconnectDelay = 1000;
+    engineRecovered();
     setStatus("Live control connected", "ready");
   };
   control.onclose = () => {
@@ -4824,8 +5161,9 @@ function connect(session: WorkbenchSession): void {
     scheduleReconnect();
   };
   control.onmessage = (event) => {
-    const message = JSON.parse(event.data) as { type?: string; diagnostic?: Diagnostic };
+    const message = JSON.parse(event.data) as { type?: string; diagnostic?: Diagnostic; flow_id?: number };
     if (message.diagnostic !== undefined) showDiagnostic(message.diagnostic);
+    if (message.type === "accepted" && typeof message.flow_id === "number") confirmDecision(message.flow_id);
   };
   telemetry.onmessage = (event) => {
     const update = JSON.parse(event.data) as LiveUpdate;
@@ -4835,11 +5173,29 @@ function connect(session: WorkbenchSession): void {
     // Event-stream events belong to their HTTP flow's detail.
     ingestSseEvents(update.sse ?? []);
     update.diagnostics.forEach(showDiagnostic);
+    update.diagnostics.forEach(announceInterceptTimeout);
     (update.prompts ?? []).forEach((prompt) => void handleCredentialPrompt(prompt));
     renderFlows();
   };
   telemetry.onclose = () => scheduleReconnect();
 }
+
+/** A held request that timed out went upstream unmodified: say so where the
+ *  operator is looking, and keep any edit they had in progress visible. */
+function announceInterceptTimeout(diagnostic: Diagnostic | null): void {
+  if (diagnostic === null || diagnostic.id !== "proxy.intercept-timeout") return;
+  const flowId = Number(diagnosticText(diagnostic as ContextDiagnostic, "flow_id"));
+  const editing = selectedFlow !== null && selectedFlow.summary.id === flowId;
+  toast(
+    `Held request${Number.isFinite(flowId) ? ` #${flowId}` : ""} timed out and was forwarded unmodified${editing ? " — your edits were not applied" : ""}`,
+    "danger",
+  );
+  if (Number.isFinite(flowId)) timedOutFlows.add(flowId);
+  updateDecisionControls();
+}
+
+/** Held requests that timed out (forwarded unmodified), for the editor note. */
+const timedOutFlows = new Set<number>();
 
 const handledPrompts = new Set<number>();
 
@@ -4888,7 +5244,25 @@ function editAction(action: "forward" | "drop" | "forward_modified"): void {
     const text = bodyInput?.value ?? "";
     message.body = text === bytesToText(held) ? [...held] : [...new TextEncoder().encode(text)];
   }
+  // Confirmed when the engine accepts it (see the control channel handler).
+  sentDecisions.set(selectedFlow.summary.id, action);
   sendControl(message);
+}
+
+/** Intercept decisions sent and not yet acknowledged, by flow id. */
+const sentDecisions = new Map<number, "forward" | "drop" | "forward_modified">();
+
+/** Says what an accepted intercept decision did. */
+function confirmDecision(flowId: number): void {
+  const action = sentDecisions.get(flowId);
+  if (action === undefined) return;
+  sentDecisions.delete(flowId);
+  const text = action === "forward"
+    ? `Forwarded #${flowId} unchanged`
+    : action === "forward_modified"
+      ? `Forwarded #${flowId} with your edits`
+      : `Dropped #${flowId} — the client received 403`;
+  toast(text, action === "drop" ? "info" : "success");
 }
 
 /* ==================================================================== *
@@ -5007,11 +5381,17 @@ function renderCaptureHealth(): void {
     : flowCount > 0
       ? `${flowCount} flow${flowCount === 1 ? "" : "s"} captured so far.`
       : "Browser is up but no traffic captured yet. Browse the target; if pages load but nothing appears here, TLS is not being intercepted.";
+  // The browser's own service calls are relayed but deliberately not
+  // captured; say how many and to where, so nothing is left out silently.
+  const withheld = running ? (latestBrowser?.withheldBrowserTraffic ?? []) : [];
+  const withheldTotal = withheld.reduce((sum, entry) => sum + entry.count, 0);
+  const withheldLine = withheldTotal === 0 ? "" : `<div class="stack stack--tight"><div class="row"><span class="t-small">Browser's own traffic</span><span class="spacer"></span><span class="badge">${withheldTotal} not captured</span></div><p class="t-small t-subtle">Chromium's own update, sign-in and messaging calls, not made by any page: relayed, never recorded, scoped or exported (${escapeHtml(withheld.slice(0, 4).map((entry) => `${entry.host} ×${entry.count}`).join(", "))}${withheld.length > 4 ? ", …" : ""}).</p></div>`;
   captureHealth.innerHTML = `<div class="stack stack--tight" style="border:1px solid var(--border);border-radius:var(--radius-2);padding:var(--space-3)">
 <p class="section-label">Capture health</p>
 ${line(proxyOk, "Session proxy", proxyDetail)}
 ${line(running ? routed : null, "Capture browser", browserDetail)}
 ${line(!running ? null : flowCount > 0, "Captured traffic", trafficDetail)}
+${withheldLine}
 </div>`;
 }
 
@@ -5038,7 +5418,12 @@ async function refreshBrowserStatus(): Promise<void> {
     // hit "Fuse" to see what has been observed — it is already assembled.
     if (status.running) {
       autoFuseTick += 1;
-      if (autoFuseTick % 3 === 0) void autoFuseWebTraffic();
+      // Re-assemble only when new traffic arrived since the last fuse: a
+      // surface that has not changed is not rebuilt under the reader.
+      if (autoFuseTick % 3 === 0 && flows.size !== lastAutoFusedFlowCount) {
+        lastAutoFusedFlowCount = flows.size;
+        void autoFuseWebTraffic();
+      }
     }
   } catch {
     // Transient; the next poll re-reads the real process state.
@@ -5081,14 +5466,21 @@ async function importHar(file: File): Promise<void> {
     // Flows outside the scope are imported but will not fuse: say so, not
     // just "imported".
     const flowsLabel = `${imported} flow${imported === 1 ? "" : "s"}`;
-    if (outside === 0) toast(`Imported ${flowsLabel} from ${file.name}`, "success");
-    else if (report.inScope === 0) toast(`Imported ${flowsLabel} from ${file.name}, but none are in scope, so nothing will fuse`, "danger");
-    else toast(`Imported ${flowsLabel} from ${file.name}; ${outside} outside the scope won't fuse`, "info");
-    harScope = report.derivedScope !== undefined && report.derivedScope !== null
-      ? { ...report.derivedScope, derived: true, imported, outside, outsideCounts: report.outsideScope ?? {} }
-      : outside > 0 ? { hosts: [], excludedHosts: outsideHosts, derived: false, imported, outside, outsideCounts: report.outsideScope ?? {} } : null;
+    const proposal = report.scopeProposal ?? null;
+    if (proposal !== null) {
+      // No scope is declared: the HAR only proposes one. Nothing is
+      // authorized until the operator confirms it below.
+      harProposal = { ...proposal, imported, selected: new Set(proposal.suggested.map(originKey)) };
+      harScope = null;
+      toast(`Imported ${flowsLabel} from ${file.name}. Nothing is authorized yet: confirm the target to fuse it`, "info");
+    } else {
+      harProposal = null;
+      if (outside === 0) toast(`Imported ${flowsLabel} from ${file.name}`, "success");
+      else if (report.inScope === 0) toast(`Imported ${flowsLabel} from ${file.name}, but none are in scope, so nothing will fuse`, "danger");
+      else toast(`Imported ${flowsLabel} from ${file.name}; ${outside} outside the scope won't fuse`, "info");
+      harScope = outside > 0 ? { hosts: [], excludedHosts: outsideHosts, imported, outside, outsideCounts: report.outsideScope ?? {} } : null;
+    }
     renderHarScopeNotice();
-    if (report.derivedScope !== undefined && report.derivedScope !== null) await refreshSession();
     // Fold the imported flows into the live list immediately.
     try {
       const flowsResponse = await fetch("/api/v1/workbench/flows");
@@ -5102,20 +5494,95 @@ async function importHar(file: File): Promise<void> {
   }
 }
 
-interface HarDerivedScope { hosts: string[]; excludedHosts: string[]; }
-interface HarImportReport { readonly imported: number; readonly inScope?: number; readonly outsideScope?: Record<string, number>; readonly derivedScope?: HarDerivedScope | null; }
-/** What the last HAR import left for the operator to act on. */
-interface HarScopeNotice extends HarDerivedScope { derived: boolean; imported: number; outside: number; outsideCounts: Record<string, number>; }
+/** One origin an imported HAR contains (engine `HarProposedOrigin`). */
+interface HarProposedOrigin { readonly host: string; readonly port: number; readonly entries: number; readonly navigations: number; readonly party?: string; }
+interface HarScopeProposal { readonly suggested: readonly HarProposedOrigin[]; readonly origins: readonly HarProposedOrigin[]; }
+interface HarImportReport { readonly imported: number; readonly inScope?: number; readonly outsideScope?: Record<string, number>; readonly scopeProposal?: HarScopeProposal | null; }
+/** Flows a HAR import left outside a declared scope, for the operator to act on. */
+interface HarScopeNotice { hosts: string[]; excludedHosts: string[]; imported: number; outside: number; outsideCounts: Record<string, number>; }
+/** A scope a HAR import proposed into an unscoped session, awaiting confirmation. */
+interface HarProposalNotice extends HarScopeProposal { imported: number; selected: Set<string>; }
 
-/** The scope the last HAR import derived (or the flows it left outside the
- *  declared scope), shown until dismissed. */
+/** Flows the last HAR import left outside the declared scope, shown until dismissed. */
 let harScope: HarScopeNotice | null = null;
+/** The scope the last HAR import proposed, until confirmed or dismissed. */
+let harProposal: HarProposalNotice | null = null;
 
-/** Tells the operator the scope a HAR import set, and lets them narrow it
- *  (remove a host) or widen it to a host the HAR left out. */
+function originKey(origin: HarProposedOrigin): string {
+  return `${origin.host}:${origin.port}`;
+}
+
+/** Asks the operator to confirm (or adjust) the target a HAR import proposed.
+ *  The session stays unauthorized until they do. */
+function renderHarProposal(notice: HTMLElement, proposal: HarProposalNotice): void {
+  const row = (origin: HarProposedOrigin): string => {
+    const key = originKey(origin);
+    const facts = [
+      `${origin.entries} flow${origin.entries === 1 ? "" : "s"}`,
+      origin.navigations > 0 ? `${origin.navigations} page load${origin.navigations === 1 ? "" : "s"}` : "",
+      origin.party === "third_party" ? "3rd party" : "",
+    ].filter((fact) => fact !== "").join(" · ");
+    return `<label class="check"><input type="checkbox" data-har-origin="${escapeHtml(key)}"${proposal.selected.has(key) ? " checked" : ""} /><span><span class="t-mono">${escapeHtml(key)}</span> <span class="t-small t-subtle">${escapeHtml(facts)}</span></span></label>`;
+  };
+  const suggestion = proposal.suggested.length === 0
+    ? "The HAR records no page load, so there is nothing to suggest: choose the target yourself."
+    : "Pre-selected: the origin(s) the HAR's own page loads went to, which is what was being browsed.";
+  notice.hidden = false;
+  notice.innerHTML = `<div class="notice notice--caution">
+  <span class="notice__icon">${icon("alert", { size: 18 })}</span>
+  <div class="notice__body">
+    <p class="notice__title">No scope is declared: nothing from this HAR is authorized or will fuse until you choose the target</p>
+    <p class="t-small">${escapeHtml(suggestion)} Authorizing adds each selected origin as an exact host on that port.</p>
+    <div class="stack stack--tight har-scope__hosts">${proposal.origins.map(row).join("")}</div>
+    <div class="row"><button class="btn btn--sm btn--primary" type="button" data-har-authorize${proposal.selected.size === 0 ? " disabled" : ""}>Authorize selected</button><button class="btn btn--sm btn--quiet" type="button" data-har-dismiss>Not now</button></div>
+  </div>
+</div>`;
+  notice.querySelectorAll<HTMLInputElement>("[data-har-origin]").forEach((box) => box.addEventListener("change", () => {
+    const key = box.dataset.harOrigin ?? "";
+    if (box.checked) proposal.selected.add(key); else proposal.selected.delete(key);
+    const authorize = notice.querySelector<HTMLButtonElement>("[data-har-authorize]");
+    if (authorize !== null) authorize.disabled = proposal.selected.size === 0;
+  }));
+  notice.querySelector<HTMLButtonElement>("[data-har-authorize]")?.addEventListener("click", (event) => void authorizeHarProposal(event.currentTarget as HTMLButtonElement));
+  notice.querySelector<HTMLButtonElement>("[data-har-dismiss]")?.addEventListener("click", () => { harProposal = null; renderHarScopeNotice(); });
+}
+
+/** Declares the origins the operator confirmed as the session scope (an
+ *  audited user action), then re-reads what now fuses. */
+async function authorizeHarProposal(button: HTMLButtonElement): Promise<void> {
+  const proposal = harProposal;
+  if (proposal === null) return;
+  const chosen = proposal.origins.filter((origin) => proposal.selected.has(originKey(origin)));
+  if (chosen.length === 0) return;
+  try {
+    const current = await fetch("/api/v1/session/scope");
+    await requireOk(current, "scope read failed");
+    const scope = await current.json() as { allowed_targets?: ScopeRule[] };
+    const rules = scope.allowed_targets ?? [];
+    for (const origin of chosen) {
+      const id = `har:${origin.host}-${origin.port}`.replace(/[^a-z0-9._:-]/gi, "-");
+      if (!rules.some((rule) => rule.id === id)) rules.push({ id, host: { kind: "exact", host: origin.host }, ports: [origin.port] });
+    }
+    scope.allowed_targets = rules;
+    const put = await withBusy(button, "Authorizing…", () => fetch("/api/v1/session/scope", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(scope) }));
+    await requireOk(put, "scope update failed");
+    harProposal = null;
+    renderHarScopeNotice();
+    toast(`Authorized ${chosen.map(originKey).join(", ")}; the matching imported flows now fuse`, "success");
+    await refreshSession();
+    const flowsResponse = await fetch("/api/v1/workbench/flows");
+    if (flowsResponse.ok) { ((await flowsResponse.json()) as FlowSummary[]).forEach((flow) => ingestFlow(flow)); renderFlows(); }
+  } catch (error) {
+    reportUnexpected(error, { id: "web.scope-add-failed", what: "Could not authorize the selected origins.", why: "", fix: "Confirm a session is active, then retry." });
+  }
+}
+
+/** Tells the operator which imported flows sit outside the declared scope,
+ *  and lets them narrow it (remove a host) or widen it to a host the HAR used. */
 function renderHarScopeNotice(): void {
   const notice = document.querySelector<HTMLElement>("#har-scope-notice");
   if (notice === null) return;
+  if (harProposal !== null) { renderHarProposal(notice, harProposal); return; }
   if (harScope === null) { notice.hidden = true; notice.replaceChildren(); return; }
   const scope = harScope;
   const chip = (host: string, action: "remove" | "add"): string => action === "remove"
@@ -5125,11 +5592,9 @@ function renderHarScopeNotice(): void {
   notice.innerHTML = `<div class="notice notice--caution">
   <span class="notice__icon">${icon("alert", { size: 18 })}</span>
   <div class="notice__body">
-    <p class="notice__title">${scope.derived
-      ? `No scope was set — scoped to ${scope.hosts.length} host${scope.hosts.length === 1 ? "" : "s"} from the HAR`
-      : `${scope.outside} of ${scope.imported} imported flow${scope.imported === 1 ? "" : "s"} are outside the declared scope and won't fuse`}</p>
+    <p class="notice__title">${scope.outside} of ${scope.imported} imported flow${scope.imported === 1 ? "" : "s"} are outside the declared scope and won't fuse</p>
     ${scope.hosts.length === 0 ? "" : `<div class="har-scope__hosts">${scope.hosts.map((host) => chip(host, "remove")).join("")}</div>`}
-    ${scope.excludedHosts.length === 0 ? "" : `<p class="t-small">${scope.derived ? "Also in the HAR, not in scope" : "Hosts outside the scope"}: ${scope.excludedHosts.map((host) => chip(host, "add")).join(" ")}</p>`}
+    ${scope.excludedHosts.length === 0 ? "" : `<p class="t-small">Hosts outside the scope: ${scope.excludedHosts.map((host) => chip(host, "add")).join(" ")}</p>`}
     <p class="t-small t-subtle">Only in-scope traffic fuses into the surface. Remove a host to narrow the scope, or add one the HAR also used.</p>
   </div>
   <button class="btn btn--sm btn--quiet" type="button" data-har-dismiss aria-label="Dismiss">Dismiss</button>
@@ -5160,8 +5625,24 @@ async function addHarScopeHost(host: string): Promise<void> {
 }
 
 async function exportHar(): Promise<void> {
+  // With a scope declared, the target's own traffic can be exported without
+  // third-party and background calls.
+  let inScopeOnly = false;
+  if (lastSessionStatus?.scopeConfigured === true) {
+    const choice = await choiceDialog({
+      eyebrow: "Export HAR",
+      title: "Which traffic should the HAR contain?",
+      message: "In scope only keeps the flows the declared scope covers. All captured traffic also includes third-party and out-of-scope calls. Resend and Fuzz requests are never included.",
+      choices: [
+        { key: "in", label: "In scope only", tone: "primary" },
+        { key: "all", label: "All captured traffic" },
+      ],
+    });
+    if (choice === null) return;
+    inScopeOnly = choice === "in";
+  }
   try {
-    const response = await fetch("/api/v1/workbench/har");
+    const response = await fetch(`/api/v1/workbench/har${inScopeOnly ? "?scope=in" : ""}`);
     await requireOk(response, "HAR export failed");
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
@@ -5172,7 +5653,7 @@ async function exportHar(): Promise<void> {
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(url);
-    toast("Session traffic exported as HAR", "success");
+    toast(inScopeOnly ? "In-scope traffic exported as HAR" : "Session traffic exported as HAR", "success");
   } catch (error) {
     reportUnexpected(error, { id: "proxy.har-export-failed", what: "The session HAR could not be exported.", why: "", fix: "Confirm a session is active with captured traffic, then retry." });
   }
@@ -5418,7 +5899,11 @@ function renderDiscovery(): void {
       } else {
         percent = 100;
         tone = outcome;
-        label = `${hits} hit${hits === 1 ? "" : "s"}${candidates > 0 ? ` · ${candidates.toLocaleString()} candidates` : ""}`;
+        const sentCount = job.progress?.sent;
+        const reach = job.state === "stopped" && candidates > 0
+          ? (sentCount === undefined || sentCount === null ? ` · ${candidates.toLocaleString()} candidates (sent count not reported)` : ` · ${sentCount.toLocaleString()} of ${candidates.toLocaleString()} sent`)
+          : candidates > 0 ? ` · ${candidates.toLocaleString()} candidates` : "";
+        label = `${hits} hit${hits === 1 ? "" : "s"}${reach}`;
         value = job.state;
       }
     }
@@ -5541,6 +6026,8 @@ async function fuseDiagnostic(response: Response): Promise<ContextDiagnostic> {
  *  navigation, so it is ready the instant the operator opens it. A failure is
  *  never swallowed — it is reported inline on the surface panel. */
 let autoFuseTick = 0;
+/** The captured-flow count the last live fuse saw. */
+let lastAutoFusedFlowCount = -1;
 async function autoFuseWebTraffic(): Promise<void> {
   let response: Response;
   try {
@@ -5606,15 +6093,21 @@ async function runExport(): Promise<void> {
     await withBusy(button, "Exporting…", async () => {
       const response = await fetch("/api/v1/export", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ formats, outputDir }) });
       await requireOk(response, "artifact export failed");
+      const report = (await response.json()) as ExportReport;
+      const files = report.files ?? [];
       setStatus("Artifacts exported", "ready");
       if (exportBadge !== null) exportBadge.textContent = "complete";
       if (exportResult !== null) {
+        // The resolved absolute paths, exactly as written — never the path as typed.
         exportResult.innerHTML = `<div class="stack">
-<div class="notice notice--success"><span class="notice__icon">${icon("check", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Export complete</p><p>${formats.length} artifact${formats.length === 1 ? "" : "s"} written.</p></div></div>
-<dl class="kv"><dt>Directory</dt><dd class="t-mono">${escapeHtml(outputDir)}</dd><dt>Formats</dt><dd class="t-mono">${escapeHtml(formats.join(", "))}</dd></dl>
+<div class="notice notice--success"><span class="notice__icon">${icon("check", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Export complete</p><p>${files.length} file${files.length === 1 ? "" : "s"} written for ${formats.length} format${formats.length === 1 ? "" : "s"}.</p></div></div>
+<dl class="kv"><dt>Directory</dt><dd class="t-mono">${escapeHtml(report.outputDir)}</dd><dt>Formats</dt><dd class="t-mono">${escapeHtml(formats.join(", "))}</dd></dl>
+<ul class="export-files t-mono t-small">${files.map((file) => `<li>${escapeHtml(file)}</li>`).join("")}</ul>
+<div class="row"><button class="btn btn--sm" type="button" data-export-open>${icon("export", { size: 14 })}<span>Open folder</span></button></div>
 </div>`;
+        exportResult.querySelector<HTMLButtonElement>("[data-export-open]")?.addEventListener("click", () => void openExportFolder());
       }
-      toast("Artifacts exported", "success");
+      toast(`Exported ${files.length} file${files.length === 1 ? "" : "s"} to ${report.outputDir}`, "success");
     });
   } catch (error) {
     if (exportBadge !== null) exportBadge.textContent = "failed";
@@ -5623,6 +6116,28 @@ async function runExport(): Promise<void> {
     }
     reportUnexpected(error, { id: "export.failed", what: "Artifacts could not be exported.", why: "", fix: "Assemble or fuse a surface first, then retry the export." });
   }
+}
+
+interface ExportReport { readonly outputDir: string; readonly files?: readonly string[]; }
+
+async function openExportFolder(): Promise<void> {
+  try {
+    await requireOk(await fetch("/api/v1/export/open-folder", { method: "POST" }), "the export folder could not be opened");
+  } catch (error) {
+    reportUnexpected(error, { id: "export.open-folder-failed", what: "The export folder could not be opened.", why: "", fix: "Open the directory shown above in your file manager." });
+  }
+}
+
+/** Fills the output directory with the engine's absolute per-user default, so
+ *  what is written never depends on where the app was started from. */
+async function loadExportDefaults(): Promise<void> {
+  if (exportDir === null || exportDir.value.trim() !== "") return;
+  try {
+    const response = await fetch("/api/v1/export/defaults");
+    if (!response.ok) return;
+    const defaults = (await response.json()) as { outputDir?: string };
+    if (exportDir.value.trim() === "" && typeof defaults.outputDir === "string") exportDir.value = defaults.outputDir;
+  } catch { /* the operator can type a directory */ }
 }
 
 function renderExportIdle(): void {
@@ -5663,7 +6178,7 @@ function renderSession(status: SessionStatus): void {
 <div class="metric-grid">
   <div class="metric"><span class="metric__value">${status.flowCount}</span><span class="metric__label">flows</span></div>
   <div class="metric"><span class="metric__value">${status.resendCount}</span><span class="metric__label">resends</span></div>
-  <div class="metric"><span class="metric__value">${status.fuzzerCount}</span><span class="metric__label">fuzzer jobs</span></div>
+  <div class="metric"><span class="metric__value">${status.fuzzerCount}</span><span class="metric__label">fuzz attacks</span></div>
 </div>
 <dl class="kv">
   <dt>Session</dt><dd class="t-mono">${escapeHtml(status.sessionId)}</dd>
@@ -5696,25 +6211,30 @@ function updateScopePill(status: SessionStatus): void {
     const primary = status.scope?.target?.primary?.value ?? "";
     const rules = status.scope?.allowed_targets ?? [];
     let shown = "";
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(primary)) {
+    let full = "";
+    if (rules.length > 0) {
+      // The rules are what is authorized: name the first with its port
+      // restriction and count the rest; the tooltip lists them all.
+      const first = scopeRuleDisplay(rules[0]!);
+      shown = rules.length > 1 ? `${first} +${rules.length - 1}` : first;
+      full = rules.map(scopeRuleDisplay).join(", ");
+    } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(primary)) {
       try {
         shown = new URL(primary).host;
       } catch {
         shown = primary;
       }
-    } else if (rules.length > 0) {
-      // A session without a URL target (Android target, workbench) is scoped by
-      // its host rules alone; name them rather than an internal session id.
-      const first = scopeRuleLabel(rules[0]!);
-      shown = rules.length > 1 ? `${first} +${rules.length - 1}` : first;
+      full = shown;
     }
     if (host !== null) host.textContent = shown;
-    pill.title = shown === "" ? "Active scope is authorized" : `Authorized scope: ${shown}`;
+    pill.title = full === "" ? "Active scope is authorized" : `Authorized scope: ${full}`;
+    renderStatusScope(`Authorized · ${full === "" ? "scope declared" : full}`, true);
   } else {
     pill.classList.add("is-unscoped");
     if (label !== null) label.textContent = "NO SCOPE";
     if (host !== null) host.textContent = "";
     pill.title = "No scope declared — start a web session or run an APK analysis to authorize active work";
+    renderStatusScope("No scope declared", false);
   }
 }
 
@@ -5783,10 +6303,13 @@ async function refreshSession(): Promise<void> {
 
 /**
  * Drops what the GUI still shows from the replaced session: its flows, the
- * selected flow, its surface, and a web target it had authorized. A new
- * session starts unscoped, so the web form asks for authorization again.
+ * selected flow, its surface, its Fuzz/Resend/Intercept workbench state, and a
+ * web target it had authorized. A new session starts unscoped, so the web
+ * form asks for authorization again. Everything is then re-read from the
+ * engine (see {@link reloadSessionState}), which is the source of truth.
  */
 function resetForFreshSession(): void {
+  resetWorkbenchState();
   flows.clear();
   selectedFlow = null;
   if (editor !== null) editor.hidden = true;
@@ -5798,6 +6321,7 @@ function resetForFreshSession(): void {
   announcedFuseFailure = "";
   renderSurfaceEmpty();
   harScope = null;
+  harProposal = null;
   renderHarScopeNotice();
   if (webTarget !== null) webTarget.value = "";
   if (webAuthorize !== null) webAuthorize.checked = false;
@@ -5805,6 +6329,68 @@ function resetForFreshSession(): void {
   if (webAuthorizedNote !== null) webAuthorizedNote.hidden = true;
   if (webSessionBadge !== null) webSessionBadge.textContent = "not started";
   if (webSessionStatus !== null) webSessionStatus.textContent = "Session active.";
+}
+
+/**
+ * Clears every piece of client-side workbench state belonging to the replaced
+ * session, so nothing from it (a Fuzz draft, a finished job's results, a Resend
+ * item, a held request) can be acted on in the next one.
+ */
+function resetWorkbenchState(): void {
+  // Fuzz: unstarted drafts live only here; jobs and results are the engine's.
+  if (fuzzerPoll !== undefined) { window.clearInterval(fuzzerPoll); fuzzerPoll = undefined; }
+  if (discoveryPoll !== undefined) { window.clearInterval(discoveryPoll); discoveryPoll = undefined; }
+  selectedFuzzer = null;
+  fuzzTemplate = "";
+  selectedFuzzResult = null;
+  fuzzDisplayFilter = { search: "", status: "", onlyMatched: false };
+  fuzzerJobsList.clear();
+  fuzzDrafts.clear();
+  fuzzDraftTemplates.clear();
+  fuzzJobTemplates.clear();
+  selectedDraftKey = null;
+  discoveryJob = null;
+  discoveryStartedAt = null;
+  // Resend: abandon in-flight sends; their responses belong to the old session.
+  resendAborts.forEach((controller) => controller.abort());
+  resendAborts.clear();
+  resendInFlight.clear();
+  resendStartedAt.clear();
+  resendContexts.clear();
+  resendDrafts.clear();
+  resendFailures.clear();
+  resendBinaryAsText.clear();
+  selectedResend = null;
+  selectedResendRevision = null;
+  renderedResendId = null;
+  // Intercept: held requests are the old session's.
+  pending.clear();
+  heldSince.clear();
+  sseView = null;
+  lastSurfaceEndpoints = [];
+  renderQueue();
+  renderResendList();
+  seedResendEmpty();
+  renderFuzzList();
+  seedFuzzerEmpty();
+}
+
+/** Re-reads the active session's state from the engine after a new session
+ *  or an opened one: traffic, held requests, the capture browser, the
+ *  workbench queues and the stored surface. */
+async function reloadSessionState(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/workbench/flows");
+    if (response.ok) ((await response.json()) as FlowSummary[]).forEach((flow) => ingestFlow(flow));
+  } catch { /* the telemetry stream also carries new flows */ }
+  renderFlows();
+  await refreshPending();
+  await refreshBrowserStatus();
+  await refreshResendList();
+  await refreshFuzzList();
+  await restoreWorkbench();
+  await refreshStoredSurface();
+  await loadWsConnections();
 }
 
 async function newSession(): Promise<void> {
@@ -5826,22 +6412,66 @@ async function newSession(): Promise<void> {
       toast("New session created", "success");
     });
     await refreshSession();
-    await loadWsConnections();
+    await reloadSessionState();
   } catch (error) {
     reportUnexpected(error, { id: "session.new-failed", what: "A new session could not be created.", why: "", fix: "Check the local API and the session store directory, then retry." });
   }
 }
 
-async function openSession(): Promise<void> {
-  const path = await promptDialog({
+interface RecentSession { readonly sessionId: string; readonly path: string; readonly modifiedAt: string; readonly bytes: number; readonly active: boolean; }
+
+/** "5 min ago", "3 h ago", "2 d ago". */
+function ageOf(iso: string): string {
+  const minutes = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60_000));
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} d ago`;
+}
+
+/** Chooses a session artifact: a recent one, the native picker, or a typed
+ *  path — the artifact lives in a 64-hex-named folder nobody types by hand. */
+async function chooseSessionArtifact(): Promise<string | null> {
+  let recent: RecentSession[] = [];
+  try {
+    const response = await fetch("/api/v1/session/recent");
+    if (response.ok) recent = ((await response.json()) as RecentSession[]).filter((entry) => !entry.active).slice(0, 6);
+  } catch { /* the picker and typed path still work */ }
+  const choice = await choiceDialog({
     eyebrow: "Session",
     title: "Open a saved session",
-    message: "Enter the path to a session artifact on this machine. Captured traffic, resend history, fuzzer jobs, and the audit trail are restored with it.",
+    message: recent.length === 0
+      ? "No other saved sessions were found on this machine. Browse to a session.json, or type its path. Captured traffic, Resend history, Fuzz attacks, and the audit trail are restored with it."
+      : "Pick a recent session, browse to a session.json, or type its path. Captured traffic, Resend history, Fuzz attacks, and the audit trail are restored with it.",
+    choices: [
+      ...recent.map((entry, index) => ({ key: `recent:${index}`, label: `${entry.sessionId.replace(/^session-/, "").slice(0, 12)}… · ${ageOf(entry.modifiedAt)} · ${formatBytes(entry.bytes)}` })),
+      { key: "browse", label: "Browse…", tone: "primary" as const },
+      { key: "type", label: "Type a path…" },
+    ],
+  });
+  if (choice === null) return null;
+  if (choice.startsWith("recent:")) return recent[Number(choice.slice(7))]?.path ?? null;
+  if (choice === "browse") {
+    try {
+      const response = await fetch("/api/v1/pick-file", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: "session" }) });
+      if (response.ok) {
+        const picked = (await response.json()) as { available: boolean; path?: string | null };
+        if (picked.available) return picked.path ?? null;
+      }
+    } catch { /* fall back to typing the path */ }
+  }
+  return promptDialog({
+    eyebrow: "Session",
+    title: "Open a saved session",
+    message: "Enter the full path to a session.json on this machine.",
     label: "Session artifact path",
     value: "",
-    placeholder: "artifacts/session.json",
+    placeholder: String.raw`…\apiaxess\workbench\session-…\session.json`,
     confirmLabel: "Open session",
   });
+}
+
+async function openSession(): Promise<void> {
+  const path = await chooseSessionArtifact();
   if (path === null) return;
   const sessionError = document.querySelector<HTMLElement>("#session-error");
   showInlineError(sessionError, null);
@@ -5850,10 +6480,12 @@ async function openSession(): Promise<void> {
     await withBusy(button, "Opening…", async () => {
       const response = await fetch("/api/v1/session/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
       await requireOk(response, "session could not be opened");
+      resetForFreshSession();
       renderSession((await response.json()) as SessionStatus);
       toast("Session opened", "success");
     });
     await refreshSession();
+    await reloadSessionState();
   } catch (error) {
     const diag = errorDiagnostic(error, { id: "session.open-failed", what: "The session could not be opened.", why: "", fix: "Check that the artifact path exists and was written by this version, then retry." });
     showInlineError(sessionError, diag);
@@ -5880,20 +6512,62 @@ async function saveSession(): Promise<void> {
  * 19. About
  * ==================================================================== */
 
+interface AboutInfo { readonly version: string; readonly commit?: string | null; readonly license: string; readonly notices: readonly { readonly component: string; readonly path: string }[]; }
+
 function renderAbout(status: SystemStatus | null): void {
   const host = document.querySelector<HTMLElement>("#about-build");
   if (host === null) return;
-  host.innerHTML = `<dt>Service</dt><dd class="t-mono">${escapeHtml(status?.service ?? "unavailable")}</dd>
-<dt>API</dt><dd class="t-mono">${escapeHtml(status?.apiVersion ?? "—")}</dd>
+  const row = (about: AboutInfo | null): string => `<dt>Version</dt><dd class="t-mono">${escapeHtml(about?.version ?? "—")}</dd>
+<dt>Build</dt><dd class="t-mono">${escapeHtml(about === null ? "—" : about.commit ?? "development build (no commit stamped)")}</dd>
+<dt>License</dt><dd class="t-mono">${escapeHtml(about?.license ?? "—")}</dd>
+<dt>Service</dt><dd class="t-mono">${escapeHtml(status?.service ?? "unavailable")} · API ${escapeHtml(status?.apiVersion ?? "—")}</dd>
 <dt>Endpoint</dt><dd class="t-mono">${escapeHtml(location.origin)}</dd>
-<dt>Identity</dt><dd>Kit v2.1 · Outfit bundled locally</dd>`;
+<dt>Fonts</dt><dd>Archivo (interface), IBM Plex Mono (data), Outfit (wordmark) — bundled locally, no network fonts</dd>`;
+  host.innerHTML = row(null);
+  const shortcuts = document.querySelector<HTMLElement>("#about-shortcuts");
+  if (shortcuts !== null) shortcuts.innerHTML = SHORTCUTS.map((shortcut) => `<li><span>${escapeHtml(shortcut.action)}</span><kbd>${escapeHtml(shortcutLabel(shortcut.keys))}</kbd></li>`).join("");
+  void (async () => {
+    let about: AboutInfo | null = null;
+    try {
+      const response = await fetch("/api/v1/about");
+      if (response.ok) about = (await response.json()) as AboutInfo;
+    } catch { /* the rows say unavailable */ }
+    host.innerHTML = row(about);
+    const notices = document.querySelector<HTMLElement>("#about-notices");
+    if (notices === null) return;
+    const list = about?.notices ?? [];
+    notices.innerHTML = `<p class="t-small">APIaxess is licensed under ${escapeHtml(about?.license ?? "Apache-2.0")}. The components it ships carry their own licenses and notices:</p>${list.length === 0
+      ? '<p class="t-small t-subtle">No component notices were found next to this installation (a development build runs from the source tree).</p>'
+      : list.map((notice) => `<details class="about-notice" data-component="${escapeHtml(notice.component)}"><summary class="t-mono">${escapeHtml(notice.component)}</summary><pre class="code">Loading…</pre></details>`).join("")}`;
+    notices.querySelectorAll<HTMLDetailsElement>("details.about-notice").forEach((details) => {
+      details.addEventListener("toggle", () => {
+        const pre = details.querySelector("pre");
+        if (!details.open || pre === null || pre.dataset.loaded === "true") return;
+        pre.dataset.loaded = "true";
+        void fetch(`/api/v1/about/notice?component=${encodeURIComponent(details.dataset.component ?? "")}`)
+          .then((response) => (response.ok ? response.text() : Promise.reject(new Error(String(response.status)))))
+          .then((text) => { pre.textContent = text; })
+          .catch(() => { pre.textContent = "This notice could not be read."; });
+      });
+    });
+  })();
 }
 
 /* ==================================================================== *
  * Wiring
  * ==================================================================== */
 
-interceptToggle?.addEventListener("change", () => sendControl({ type: "set_intercept", enabled: interceptToggle.checked, timeout_ms: INTERCEPT_TIMEOUT_MS }));
+interceptToggle?.addEventListener("change", () => sendControl({ type: "set_intercept", enabled: interceptToggle.checked, timeout_ms: interceptTimeoutMs() }));
+const interceptTimeoutSelect = document.querySelector<HTMLSelectElement>("#intercept-timeout");
+if (interceptTimeoutSelect !== null) {
+  interceptTimeoutSelect.value = String(interceptTimeoutMs() / 1000);
+  interceptTimeoutSelect.addEventListener("change", () => {
+    try { localStorage.setItem(INTERCEPT_TIMEOUT_KEY, interceptTimeoutSelect.value); } catch { /* a preference */ }
+    // Applies to requests held from now on, and to the live controller.
+    if (interceptToggle?.checked === true) sendControl({ type: "set_intercept", enabled: true, timeout_ms: interceptTimeoutMs() });
+    toast(`Held requests now auto-forward after ${interceptTimeoutSelect.selectedOptions[0]?.textContent ?? "the new timeout"}`, "info");
+  });
+}
 hostFilter?.addEventListener("change", () => sendControl({ type: "set_host_filter", hosts: hostFilter.value.split(",").map((host) => host.trim()).filter(Boolean) }));
 document.querySelector("#forward")?.addEventListener("click", () => editAction("forward"));
 document.querySelector("#forward-modified")?.addEventListener("click", () => editAction("forward_modified"));
@@ -6024,6 +6698,8 @@ interface ToolStatus {
   readonly present: boolean;
   readonly overridden: boolean;
   readonly optional: boolean;
+  /** Present but unusable as installed, with what to do about it. */
+  readonly problem?: string | null;
 }
 
 interface SettingsResponse {
@@ -6082,7 +6758,10 @@ function settingField(entry: SettingEntry): string {
 }
 
 function settingsToolRow(tool: ToolStatus): string {
-  const badge = tool.present
+  const problem = tool.problem ?? null;
+  const badge = tool.present && problem !== null
+    ? `<span class="badge badge--caution" title="${escapeHtml(problem)}">out of date</span>`
+    : tool.present
     ? `<span class="badge badge--success">present</span>`
     : tool.optional
       ? `<span class="badge badge--caution">not installed</span>`
@@ -6090,7 +6769,7 @@ function settingsToolRow(tool: ToolStatus): string {
   const override = tool.overridden ? `<span class="badge">override</span>` : "";
   return `<div class="tool-row">
     <span class="tool-row__name t-label">${escapeHtml(tool.label)}</span>
-    <span class="tool-row__path">${escapeHtml(tool.path)}</span>
+    <span class="tool-row__path">${escapeHtml(tool.path)}${problem === null ? "" : `<br><span class="t-small">${escapeHtml(problem)}</span>`}</span>
     <span class="tool-row__status">${override}${badge}</span>
   </div>`;
 }
@@ -6261,6 +6940,7 @@ function paintShell(): void {
   onViewChange((view) => {
     if (view === "session") void refreshSession();
     if (view === "surface") void refreshStoredSurface();
+    if (view === "export") void loadExportDefaults();
     if (view === "web") void populateWordlists();
     if (view === "workbench") {
       void refreshResendList();
@@ -6461,7 +7141,9 @@ function renderDevices(devices: readonly PairingDevice[]): void {
     // The app's own managed Android target is never offered for manual
     // pairing, in any state: APIaxess provisions it itself.
     const managed = device.managed === true;
-    const ready = device.state.toLowerCase() === "ready";
+    const managedPhase = managed ? managedTargetPhase(device.serial) : null;
+    const state = managedPhase ?? device.state;
+    const ready = state.toLowerCase() === "ready";
     const reason = managed
       ? "This is APIaxess's own Android target. The app provisions it itself, so it is never paired manually; drive it from the Android target view."
       : ready
@@ -6472,7 +7154,7 @@ function renderDevices(devices: readonly PairingDevice[]): void {
             ? "Authorize this host's adb key on the device, then refresh."
             : `Device is not ready (${device.state}).`;
     const managedBadge = managed ? ` <span class="badge">managed target</span>` : "";
-    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(device.serial)}</b> <span class="badge${ready ? "" : " badge--caution"}">${escapeHtml(device.state)}</span>${managedBadge}<br><span class="t-small t-subtle">${escapeHtml(managed ? reason : device.description)}</span></span>`;
+    row.innerHTML = `<span class="list-row__target"><b>${escapeHtml(device.serial)}</b> <span class="badge${ready ? "" : " badge--caution"}">${escapeHtml(state)}</span>${managedBadge}<br><span class="t-small t-subtle">${escapeHtml(managed ? reason : device.description)}</span></span>`;
     const arm = document.createElement("button");
     arm.type = "button";
     arm.className = "btn btn--sm btn--primary";
@@ -6486,9 +7168,24 @@ function renderDevices(devices: readonly PairingDevice[]): void {
   devicesList.append(list);
 }
 
+/** The Android target's own phase for the managed device `serial` while it is
+ *  still starting (adb reports the emulator ready before provisioning ends),
+ *  so Devices and the Android target view say the same thing. */
+function managedTargetPhase(serial: string): string | null {
+  const status = lastAndroidStatus;
+  if (status === null || (status.serial !== null && status.serial !== serial)) return null;
+  const label: Partial<Record<AndroidPhase, string>> = { booting: "booting", provisioning: "provisioning", streaming: "starting stream" };
+  return label[status.phase] ?? null;
+}
+
 async function refreshDevices(): Promise<void> {
   if (operatorToken === "") { renderDevicesUnavailable(); return; }
   try {
+    // The managed target's lifecycle comes from the Android target itself.
+    try {
+      const android = await fetch("/api/v1/android-target/status", { headers: pairingHeaders() });
+      if (android.ok) lastAndroidStatus = (await android.json()) as AndroidTargetStatus;
+    } catch { /* the device list still renders from adb alone */ }
     const response = await fetch("/api/v1/pairing/devices", { headers: pairingHeaders() });
     await requireOk(response, "attached devices unavailable");
     renderDevices((await response.json()) as PairingDevice[]);
@@ -6787,7 +7484,7 @@ function androidStepsMarkup(status: AndroidTargetStatus): string {
 /** Renders the actionable non-info diagnostics inline in the panel (right message,
  * right place) rather than only in the global drawer. */
 function androidDiagnosticNotices(status: AndroidTargetStatus): string {
-  const notable = status.diagnostics.filter((d) => /unavailable|failed|missing|not-active|not-running|degraded|software-mode/.test(d.id));
+  const notable = status.diagnostics.filter((d) => /unavailable|failed|missing|not-active|not-running|not-served|outdated|degraded|software-mode/.test(d.id));
   return notable
     .map((d) => `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(d.what)}</p><p>${escapeHtml(d.why)}</p><p class="t-small t-subtle">${escapeHtml(d.fix)}</p></div></div>`)
     .join("");
@@ -6796,6 +7493,10 @@ function androidDiagnosticNotices(status: AndroidTargetStatus): string {
 function androidStatusBody(status: AndroidTargetStatus): string {
   if (!status.addonPresent) {
     return stateBlock({ icon: "apk", title: "Android target add-on not installed", body: "The GUI Android target is a separate, optional download. Install it with install-android-target.ps1 (Windows) or .sh (Linux), then launch it here." });
+  }
+  const outdated = status.addonOutdated ?? null;
+  if (outdated !== null && (status.phase === "idle" || status.phase === "error")) {
+    return `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">The Android target add-on is out of date</p><p>Version ${escapeHtml(outdated.installed)} is installed; this APIaxess needs ${escapeHtml(outdated.required)} or newer. The older add-on's screen stream does not serve the device view this version uses, so its screen would stay blank. The APIaxess installer does not update the add-on.</p><p class="t-small t-subtle">Update it by re-running install-android-target.ps1 (Windows) or install-android-target.sh (Linux), then launch the target here.</p></div></div>`;
   }
   if (status.phase === "idle") {
     return stateBlock({ icon: "play", title: "No Android target running", body: "Launch to boot the AVD, provision it (client app, session CA, instrumentation), and start the screen stream — one click." });
@@ -6861,6 +7562,7 @@ async function preferredStreamPlayer(): Promise<"webcodecs" | "broadway"> {
 function updateAndroidScreen(status: AndroidTargetStatus): void {
   if (androidScreen === null) return;
   const canStream = status.phase === "ready" && status.streaming;
+  if (androidScreenHint !== null) androidScreenHint.hidden = !canStream;
   if (canStream) {
     if (androidScreenMounted) return;
     androidScreenMounted = true;
@@ -6879,7 +7581,8 @@ function updateAndroidScreen(status: AndroidTargetStatus): void {
   androidScreenMounted = false;
   let body: string;
   if (!status.addonPresent) body = "Install the Android target add-on to stream a device screen.";
-  else if (status.phase === "ready") body = "The target is running, but its streaming components are not installed. Reinstall the add-on to enable the screen.";
+  else if ((status.addonOutdated ?? null) !== null && status.phase !== "ready") body = "Update the Android target add-on to see and drive its screen here.";
+  else if (status.phase === "ready") body = "The target is running and capturing, but its screen is not being streamed. The notice beside this card says why and how to fix it.";
   else if (status.phase === "idle" || status.phase === "error") body = "Launch the Android target to see and drive its screen here.";
   else body = "The screen appears here once the target finishes provisioning and the stream starts.";
   androidScreen.innerHTML = stateBlock({ icon: "traffic", title: "Screen", body });
@@ -6916,7 +7619,8 @@ function renderAndroidStatus(status: AndroidTargetStatus): void {
   if (androidPhaseBadge !== null) androidPhaseBadge.textContent = status.phase;
   const inFlight = status.phase === "booting" || status.phase === "provisioning" || status.phase === "streaming";
   if (androidLaunch !== null) {
-    androidLaunch.disabled = inFlight || !status.addonPresent;
+    androidLaunch.disabled = inFlight || !status.addonPresent || (status.addonOutdated ?? null) !== null;
+    androidLaunch.title = (status.addonOutdated ?? null) !== null ? "Update the Android target add-on first." : "";
     androidLaunch.hidden = status.phase === "ready";
   }
   if (androidStop !== null) androidStop.hidden = !(inFlight || status.phase === "ready");

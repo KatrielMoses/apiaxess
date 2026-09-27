@@ -108,6 +108,31 @@ pub struct AllowedNetworkTarget {
 }
 
 impl AllowedNetworkTarget {
+    /// How the rule reads to an operator, always stating its port restriction
+    /// so a host never looks authorized on ports it isn't:
+    /// `127.0.0.1:9201`, `127.0.0.1 (ports 80, 443)`, `localhost (any port)`,
+    /// `*.example.com (any port)`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let host = match &self.host {
+            HostMatch::Exact { host } if host.contains(':') => format!("[{host}]"),
+            HostMatch::Exact { host } => host.clone(),
+            HostMatch::DomainSuffix { domain } => format!("*.{domain}"),
+        };
+        match self.ports.as_slice() {
+            [] => format!("{host} (any port)"),
+            [port] => format!("{host}:{port}"),
+            ports => format!(
+                "{host} (ports {})",
+                ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
     fn validate(&self, index: usize) -> Result<(), Diagnostic> {
         validate_stable_key(
             &format!("engagement_scope.allowed_targets[{index}].id"),

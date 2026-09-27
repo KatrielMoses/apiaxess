@@ -314,6 +314,7 @@ fn document() -> ApiDocument {
                 ),
                 body: schema(&ids),
                 media_type: Some("application/json".to_owned()),
+                headers: Vec::new(),
             }],
             pagination_signals: Vec::new(),
         }],

@@ -393,7 +393,30 @@ pub fn run_pipeline(
         Arc::new(apiaxess_external_tools::ProcessToolRunner),
         config.intake.clone(),
     );
-    let normalized = match target.intake(&config.artifact_path) {
+    // Intake is the first tenth of the run; its own measured progress (phases,
+    // then classes decoded) moves the bar through it instead of 0% for minutes.
+    let last_reported = std::sync::Mutex::new(0_u16);
+    let report_intake = |progress: apiaxess_target_apk::IntakeProgress| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let basis_points = (progress.fraction.clamp(0.0, 1.0) * 1_000.0) as u16;
+        let Ok(mut last) = last_reported.lock() else {
+            return;
+        };
+        if basis_points < last.saturating_add(20) && basis_points < 1_000 {
+            return;
+        }
+        *last = basis_points;
+        let _ = announce(
+            runtime,
+            config,
+            &diagnostics,
+            PipelineStage::Intake,
+            basis_points,
+            &progress.message,
+            dynamic_ran,
+        );
+    };
+    let normalized = match target.intake_with_progress(&config.artifact_path, &report_intake) {
         Ok(artifact) => artifact,
         Err(failure) => {
             return Err(fail(

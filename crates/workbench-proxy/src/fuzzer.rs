@@ -415,7 +415,7 @@ impl FuzzerWorkbench {
         stopped.state = FuzzerJobState::Stopped;
         stopped
             .diagnostics
-            .push(catalogue::PROXY_FUZZER_CANCELLED.instantiate(DiagnosticContext::new()));
+            .push(stopped_diagnostic(&stopped.config));
         self.persist(&stopped)?;
         self.replace(stopped.clone());
         Ok(stopped)
@@ -977,12 +977,13 @@ impl FuzzerWorkbench {
                     .stop()
                     .map_err(|error| ffuf_failed("stop", &error.to_string()))?;
                 completed.state = FuzzerJobState::Stopped;
-                if completed.diagnostics.iter().all(|diagnostic| {
-                    diagnostic.id.as_ref() != catalogue::PROXY_FUZZER_CANCELLED.id
-                }) {
-                    completed.diagnostics.push(
-                        catalogue::PROXY_FUZZER_CANCELLED.instantiate(DiagnosticContext::new()),
-                    );
+                let stopped = stopped_diagnostic(&completed.config);
+                if completed
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.id != stopped.id)
+                {
+                    completed.diagnostics.push(stopped);
                 }
                 self.persist_off_runtime(&completed).await?;
                 self.replace(completed);
@@ -2643,6 +2644,16 @@ fn fuzzer_config_diagnostic(operation: &str, detail: &str) -> Diagnostic {
     catalogue::PROXY_FUZZER_CONFIG_INVALID.instantiate(context)
 }
 
+/// What a stopped job reports: a discovery run (the auto-calibrating ffuf
+/// sweep) is named as one, never as a Fuzz attack, and vice versa.
+fn stopped_diagnostic(config: &FuzzerConfig) -> Diagnostic {
+    if config.auto_calibrate {
+        catalogue::WEB_DISCOVERY_STOPPED.instantiate(DiagnosticContext::new())
+    } else {
+        catalogue::PROXY_FUZZER_CANCELLED.instantiate(DiagnosticContext::new())
+    }
+}
+
 /// Builds the honest observed-rate diagnostic comparing estimate vs. reality.
 /// `is_discovery` (directory discovery auto-calibrates) selects the discovery
 /// label; an ffuf-tier Fuzz run gets the Fuzz-appropriate id so the Diagnostics
@@ -3620,6 +3631,22 @@ mod tests {
         assert_eq!(
             rate_observed_diagnostic(3, 1.0, 3.0, 0, true).id.as_ref(),
             "web.discovery-rate-observed"
+        );
+    }
+
+    #[test]
+    fn a_stopped_discovery_run_is_not_reported_as_a_fuzz_attack() {
+        let mut discovery = config(FuzzerAttackType::Sniper);
+        discovery.auto_calibrate = true;
+        assert_eq!(
+            super::stopped_diagnostic(&discovery).id.as_ref(),
+            "web.discovery-stopped"
+        );
+        assert_eq!(
+            super::stopped_diagnostic(&config(FuzzerAttackType::Sniper))
+                .id
+                .as_ref(),
+            "proxy.fuzzer-cancelled"
         );
     }
 

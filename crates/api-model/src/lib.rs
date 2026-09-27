@@ -30,8 +30,8 @@ pub use confidence::{
     HandoffResolution, MergeCounts,
 };
 pub use delivery::{
-    CapturedGraphQlOperation, EndpointEvidence, EvidenceTally, RequestEncoding,
-    captured_graphql_operations, endpoint_base_url, is_transport_header,
+    CapturedGraphQlOperation, EndpointEvidence, EvidenceTally, ExportableGrpcOperation,
+    RequestEncoding, captured_graphql_operations, endpoint_base_url, is_transport_header,
 };
 pub use document::{ApiDocument, CURRENT_FORMAT_VERSION};
 pub use error::{ModelError, ModelResult};

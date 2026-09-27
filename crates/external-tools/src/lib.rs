@@ -129,6 +129,24 @@ pub struct ToolProcess {
     stderr: Arc<Mutex<Vec<u8>>>,
 }
 
+/// Opens `path` in the platform file manager (Explorer, Finder, or the
+/// desktop's handler via `xdg-open`). Detached on purpose: the window belongs
+/// to the operator's desktop, not to any `APIaxess` process group.
+///
+/// # Errors
+///
+/// Returns the operating-system error when the file manager cannot start.
+pub fn open_in_file_manager(path: &std::path::Path) -> io::Result<()> {
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(opener).arg(path).spawn().map(|_| ())
+}
+
 /// A feature-owned process command that still crosses the central process
 /// boundary. Browser launch uses this port so feature crates do not construct
 /// `std::process::Command` directly.

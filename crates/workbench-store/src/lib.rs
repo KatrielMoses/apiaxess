@@ -1346,7 +1346,10 @@ impl TrafficStore {
         // (the old table is absent, or the new one already exists) is expected on
         // fresh or already-migrated stores and is ignored — the CREATE TABLE IF
         // NOT EXISTS below then owns the schema.
-        let _ = connection.execute("ALTER TABLE repeater_contexts RENAME TO resend_contexts", []);
+        let _ = connection.execute(
+            "ALTER TABLE repeater_contexts RENAME TO resend_contexts",
+            [],
+        );
         let _ = connection.execute("ALTER TABLE intruder_jobs RENAME TO fuzzer_jobs", []);
         connection
             .execute_batch(
@@ -2363,7 +2366,7 @@ impl TrafficStore {
     ) -> Result<Vec<u8>, Diagnostic> {
         self.commit_to_session(session, at)?;
         SessionDocument::new(session.clone(), at)
-            .to_json_pretty()
+            .to_json()
             .map_err(|e| {
                 let mut context = DiagnosticContext::new();
                 context.insert("error".to_owned(), DiagnosticValue::String(e.to_string()));
@@ -2512,7 +2515,19 @@ impl TrafficStore {
     /// Returns a diagnostic when stored flows cannot be loaded or the HAR
     /// document cannot be serialized.
     pub fn export_har(&self) -> Result<Vec<u8>, Diagnostic> {
+        self.export_har_filtered(false)
+    }
+
+    /// [`Self::export_har`], optionally limited to flows classified in the
+    /// engagement scope (the target's traffic, without third-party or
+    /// background calls).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::export_har`].
+    pub fn export_har_filtered(&self, in_scope_only: bool) -> Result<Vec<u8>, Diagnostic> {
         let mut entries = Vec::new();
+        let mut left_out = 0_usize;
         for summary in self.summaries()? {
             // Observed traffic only: Resend/Fuzz requests are tool-synthesized,
             // and re-imported as captures they would fuse into endpoints nobody
@@ -2524,6 +2539,10 @@ impl TrafficStore {
                     .as_deref()
                     .is_some_and(|method| method.eq_ignore_ascii_case("CONNECT"))
             {
+                continue;
+            }
+            if in_scope_only && summary.scope != ScopeDisposition::InScope {
+                left_out += 1;
                 continue;
             }
             if let Some(flow) = self.get(summary.id)? {
@@ -2540,7 +2559,14 @@ impl TrafficStore {
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                 },
                 entries,
-                comment: "Exported by APIaxess from captured traffic. Resend/Fuzz traffic and CONNECT tunnels are not included. Header and body sizes the capture did not measure are -1; each exchange's single recorded duration is reported as timings.wait.".to_owned(),
+                comment: format!(
+                    "Exported by APIaxess from captured traffic{}. Resend/Fuzz traffic and CONNECT tunnels are not included. Header and body sizes the capture did not measure are -1; each exchange's single recorded duration is reported as timings.wait.",
+                    if in_scope_only {
+                        format!(", in-scope flows only ({left_out} outside the scope left out)")
+                    } else {
+                        String::new()
+                    }
+                ),
             },
         })
         .map_err(|e| interchange_diag("export", &e.to_string()))
@@ -4299,6 +4325,116 @@ pub fn har_hosts(bytes: &[u8]) -> Result<std::collections::BTreeMap<String, usiz
     Ok(hosts)
 }
 
+/// One origin (host and effective port) seen in a HAR document.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarOrigin {
+    /// Lower-cased request host.
+    pub host: String,
+    /// The port the requests went to (the scheme's default when unstated).
+    pub port: u16,
+    /// Entries sent to this origin.
+    pub entries: usize,
+    /// Of those, top-level page loads: what the browsing session was actually
+    /// looking at, as opposed to what those pages (or the browser) called.
+    pub navigations: usize,
+}
+
+/// The request origins of a HAR document, each with its entry count and how
+/// many of its entries were top-level navigations.
+///
+/// A navigation is a request the browser marked `Sec-Fetch-Mode: navigate` /
+/// `Sec-Fetch-Dest: document` without a speculative `Sec-Purpose`, or — for a
+/// HAR recorded without Fetch Metadata — a GET that accepted and received
+/// HTML.
+///
+/// # Errors
+///
+/// Returns [`catalogue::PROXY_HAR_IMPORT_MALFORMED`] when the bytes are not a
+/// HAR document.
+pub fn har_origins(bytes: &[u8]) -> Result<Vec<HarOrigin>, Diagnostic> {
+    // Read before an import: a file that is not a HAR is malformed, exactly
+    // as the import itself would report it.
+    let document: HarDocument = serde_json::from_slice(bytes).map_err(|e| {
+        let mut context = DiagnosticContext::new();
+        context.insert("error".to_owned(), DiagnosticValue::String(e.to_string()));
+        catalogue::PROXY_HAR_IMPORT_MALFORMED.instantiate(context)
+    })?;
+    let mut origins = std::collections::BTreeMap::<(String, u16), (usize, usize)>::new();
+    for entry in &document.log.entries {
+        let url = entry.request.url.as_str();
+        let Some((host, port)) = url_host_and_port(url) else {
+            continue;
+        };
+        let tally = origins.entry((host, port)).or_default();
+        tally.0 += 1;
+        if is_har_navigation(entry) {
+            tally.1 += 1;
+        }
+    }
+    Ok(origins
+        .into_iter()
+        .map(|((host, port), (entries, navigations))| HarOrigin {
+            host,
+            port,
+            entries,
+            navigations,
+        })
+        .collect())
+}
+
+/// Host and effective port of an absolute `http(s)`/`ws(s)` URL.
+fn url_host_and_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, v)| v);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(literal) => {
+            let (host, after) = literal.split_once(']')?;
+            (host, after.strip_prefix(':'))
+        }
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(port) => port.parse().ok()?,
+        None => default,
+    };
+    Some((host, port))
+}
+
+fn is_har_navigation(entry: &HarEntry) -> bool {
+    let header = |headers: &[HarHeader], name: &str| {
+        headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.trim().to_ascii_lowercase())
+    };
+    let request = &entry.request.headers;
+    if header(request, "sec-purpose").is_some() {
+        return false;
+    }
+    if let Some(mode) = header(request, "sec-fetch-mode") {
+        return mode == "navigate"
+            && header(request, "sec-fetch-dest").is_none_or(|dest| dest == "document");
+    }
+    entry.request.method.eq_ignore_ascii_case("GET")
+        && header(request, "accept").is_some_and(|accept| accept.contains("text/html"))
+        && header(&entry.response.headers, "content-type")
+            .is_some_and(|kind| kind.starts_with("text/html"))
+}
+
 fn parse_time(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value).map_or_else(|_| Utc::now(), |v| v.with_timezone(&Utc))
 }
@@ -5060,6 +5196,39 @@ mod tests {
             vec![
                 ("app.example.test".to_owned(), 2),
                 ("cdn.other.test".to_owned(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn har_origins_count_what_was_browsed_not_what_was_frequent() {
+        // Shaped like the regression HAR: the browser's own update checks
+        // outnumber the target, but only the target was navigated to.
+        let service = r#"{"request":{"method":"POST","url":"https://update.googleapis.com/service/update2/json","headers":[{"name":"sec-fetch-site","value":"none"},{"name":"sec-fetch-mode","value":"no-cors"},{"name":"sec-fetch-dest","value":"empty"}]},"response":{"status":200,"headers":[]}}"#;
+        let har = format!(
+            r#"{{"log":{{"entries":[{service},{service},{service},
+            {{"request":{{"method":"GET","url":"http://127.0.0.1:9201/","headers":[{{"name":"Sec-Fetch-Mode","value":"navigate"}},{{"name":"Sec-Fetch-Dest","value":"document"}}]}},"response":{{"status":200,"headers":[]}}}},
+            {{"request":{{"method":"GET","url":"http://127.0.0.1:9201/api/items","headers":[{{"name":"sec-fetch-mode","value":"cors"}}]}},"response":{{"status":200,"headers":[]}}}},
+            {{"request":{{"method":"GET","url":"http://localhost:9202/v1/geo","headers":[{{"name":"sec-fetch-mode","value":"cors"}}]}},"response":{{"status":200,"headers":[]}}}},
+            {{"request":{{"method":"GET","url":"https://www.google.com/search/warmup.html","headers":[{{"name":"sec-fetch-mode","value":"navigate"}},{{"name":"sec-purpose","value":"prefetch"}}]}},"response":{{"status":200,"headers":[]}}}},
+            {{"request":{{"method":"GET","url":"https://legacy.example.test/home","headers":[{{"name":"Accept","value":"text/html,*/*"}}]}},"response":{{"status":200,"headers":[{{"name":"Content-Type","value":"text/html; charset=utf-8"}}]}}}},
+            {{"request":{{"method":"GET","url":"wss://legacy.example.test:8443/live","headers":[]}},"response":{{"status":101,"headers":[]}}}}
+            ]}}}}"#
+        );
+        let origins = har_origins(har.as_bytes()).expect("origins");
+        let view: Vec<_> = origins
+            .iter()
+            .map(|o| (o.host.as_str(), o.port, o.entries, o.navigations))
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                ("127.0.0.1", 9201, 2, 1),
+                ("legacy.example.test", 443, 1, 1),
+                ("legacy.example.test", 8443, 1, 0),
+                ("localhost", 9202, 1, 0),
+                ("update.googleapis.com", 443, 3, 0),
+                ("www.google.com", 443, 1, 0),
             ]
         );
     }

@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::{
-    Endpoint, EndpointIdentity, GraphQlOperationType, SamplePayload, SchemaShape, SourceType,
-    UnifiedApiSurface, UnifiedEndpoint, parse_graphql_operations,
+    Endpoint, EndpointIdentity, GraphQlOperationType, ProtocolOperation, ProtocolOperationIdentity,
+    ProvenanceRegistry, SamplePayload, SchemaShape, SourceType, UnifiedApiSurface, UnifiedEndpoint,
+    parse_graphql_operations,
 };
 
 /// The evidence behind one endpoint, in the product's vocabulary.
@@ -48,6 +49,26 @@ impl EndpointEvidence {
         }
     }
 
+    /// A protocol operation's evidence: the sources of its presence evidence
+    /// (the rule the GUI's `surface/operations.ts` applies).
+    #[must_use]
+    pub fn of_operation(operation: &ProtocolOperation, provenance: &ProvenanceRegistry) -> Self {
+        let sources: Vec<SourceType> = operation
+            .presence
+            .candidates
+            .iter()
+            .flat_map(|candidate| &candidate.evidence)
+            .filter_map(|id| provenance.entity(id))
+            .map(|entity| entity.source_type)
+            .collect();
+        Self {
+            observed: sources.contains(&SourceType::DynamicCapture),
+            in_code: sources
+                .iter()
+                .any(|source| *source != SourceType::DynamicCapture),
+        }
+    }
+
     /// `confirmed` or `inferred`.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -66,6 +87,28 @@ impl EndpointEvidence {
             (true, false) => "confirmed (observed in live traffic)",
             (false, _) => "inferred (recovered from code only; not observed being called)",
         }
+    }
+}
+
+/// A gRPC method as every emitter exports it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportableGrpcOperation {
+    /// Fully-qualified protobuf service (`shop.v1.CartService`).
+    pub service: String,
+    /// Method name (`Checkout`).
+    pub method: String,
+    /// Origin the calls went to; `None` when known only from code, in which
+    /// case an export can name the method but not address it.
+    pub base_url: Option<String>,
+    /// Observed and/or found in code.
+    pub evidence: EndpointEvidence,
+}
+
+impl ExportableGrpcOperation {
+    /// The gRPC-Web request path, `/{service}/{method}`.
+    #[must_use]
+    pub fn path(&self) -> String {
+        format!("/{}/{}", self.service, self.method)
     }
 }
 
@@ -122,6 +165,37 @@ impl UnifiedApiSurface {
         }
         tally.inferred = tally.endpoints - tally.confirmed;
         tally
+    }
+
+    /// The surface's gRPC methods, in a stable order, with the evidence and
+    /// origin each export needs. Emitters list every one: an operation the
+    /// surface knows is never silently dropped from an export.
+    #[must_use]
+    pub fn grpc_operations(&self) -> Vec<ExportableGrpcOperation> {
+        let mut operations: Vec<_> = self
+            .surface
+            .protocol_operations
+            .iter()
+            .filter_map(|operation| match &operation.identity {
+                ProtocolOperationIdentity::Grpc {
+                    service,
+                    method,
+                    base_url,
+                } => Some(ExportableGrpcOperation {
+                    service: service.clone(),
+                    method: method.clone(),
+                    base_url: base_url
+                        .as_ref()
+                        .map(|base| base.trim_end_matches('/').to_owned()),
+                    evidence: EndpointEvidence::of_operation(operation, &self.surface.provenance),
+                }),
+                ProtocolOperationIdentity::GraphQl { .. } => None,
+            })
+            .collect();
+        operations.sort_by(|a, b| {
+            (&a.service, &a.method, &a.base_url).cmp(&(&b.service, &b.method, &b.base_url))
+        });
+        operations
     }
 
     /// The origin most endpoints are served from: every emitter's default

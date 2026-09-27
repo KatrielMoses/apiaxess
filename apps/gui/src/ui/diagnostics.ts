@@ -67,6 +67,66 @@ ${whyBlock}
     .join("");
 }
 
+/** A diagnostic with its typed context (engine `DiagnosticValue`s). */
+export interface ContextualDiagnostic extends Diagnostic {
+  readonly context?: Readonly<Record<string, { readonly type?: string; readonly value?: unknown }>>;
+}
+
+/**
+ * Surface diagnostics grouped by cause, each card saying how many times it
+ * was raised and naming what it concerns — the endpoint and the kind of fact
+ * from its context — so hundreds of identical cards become one actionable one.
+ */
+export function groupedSurfaceDiagnosticsHtml(
+  entries: readonly (ContextualDiagnostic | null | undefined)[],
+  emptyBody: string,
+): string {
+  const diagnostics = entries.filter(
+    (entry): entry is ContextualDiagnostic => entry !== null && entry !== undefined,
+  );
+  if (diagnostics.length === 0) {
+    return stateBlock({ icon: "check", title: "Nothing reported", body: emptyBody, compact: true });
+  }
+  const text = (entry: ContextualDiagnostic, key: string): string => {
+    const value = entry.context?.[key]?.value;
+    return typeof value === "string" ? value : "";
+  };
+  const groups = new Map<string, ContextualDiagnostic[]>();
+  for (const entry of diagnostics) {
+    const group = groups.get(entry.id);
+    if (group === undefined) groups.set(entry.id, [entry]);
+    else group.push(entry);
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.length - a.length)
+    .map((group) => {
+      const head = group[0]!;
+      // What each occurrence is about: "GET host/path · query parameter".
+      const subjects = new Map<string, number>();
+      for (const entry of group) {
+        const endpoint = text(entry, "endpoint");
+        const fact = text(entry, "fact");
+        const subject = [endpoint, fact].filter((part) => part !== "").join(" · ") || text(entry, "path");
+        if (subject !== "") subjects.set(subject, (subjects.get(subject) ?? 0) + 1);
+      }
+      const named = [...subjects.entries()].sort((a, b) => b[1] - a[1]);
+      const subjectBlock = named.length === 0
+        ? ""
+        : `<div class="diagnostic__line"><span>About</span><ul class="diagnostic__causes">${named
+            .slice(0, 8)
+            .map(([subject, count]) => `<li><span class="t-mono">${escapeHtml(subject)}</span>${count > 1 ? ` <span class="t-subtle">×${count}</span>` : ""}</li>`)
+            .join("")}${named.length > 8 ? `<li class="t-subtle">+${named.length - 8} more</li>` : ""}</ul></div>`;
+      return `<article class="diagnostic diagnostic--${tone(head)}">
+<p class="diagnostic__id">${escapeHtml(head.id)}${group.length > 1 ? `<span class="diagnostic__count">×${group.length}</span>` : ""}</p>
+<p class="diagnostic__what">${escapeHtml(head.what)}</p>
+<div class="diagnostic__line"><span>Why</span><p>${escapeHtml(head.why)}</p></div>
+${subjectBlock}
+<div class="diagnostic__line"><span>Fix</span><p>${escapeHtml(head.fix)}</p></div>
+</article>`;
+    })
+    .join("");
+}
+
 /**
  * Renders a list of diagnostics, or a branded empty state when there are none.
  * Null entries — how the engine encodes "no diagnostic" inside a collection —
@@ -96,7 +156,9 @@ export function diagnosticListHtml(
  */
 export class DiagnosticsLog {
   readonly #entries: Diagnostic[] = [];
-  #seen = 0;
+  /** Causes (diagnostic ids) the operator has seen in the drawer. Every badge
+   *  counts causes, so unread is counted in causes too. */
+  readonly #seenCauses = new Set<string>();
 
   get entries(): readonly Diagnostic[] {
     return this.#entries;
@@ -115,13 +177,13 @@ export class DiagnosticsLog {
 
   clear(): void {
     this.#entries.length = 0;
-    this.#seen = 0;
+    this.#seenCauses.clear();
     this.render();
   }
 
   /** Marks everything currently logged as read, clearing the header count. */
   markRead(): void {
-    this.#seen = this.#entries.length;
+    this.#entries.forEach((entry) => this.#seenCauses.add(entry.id));
     this.render();
   }
 
@@ -161,7 +223,7 @@ export class DiagnosticsLog {
       statusCell.hidden = causes === 0;
     }
 
-    const unread = Math.max(0, this.#entries.length - this.#seen);
+    const unread = new Set(this.#entries.map((entry) => entry.id).filter((id) => !this.#seenCauses.has(id))).size;
     if (count !== null) {
       count.textContent = unread > 99 ? "99+" : String(unread);
       count.hidden = unread === 0;
@@ -170,8 +232,10 @@ export class DiagnosticsLog {
       summary.textContent = causes === 0 ? "No diagnostics" : `${causes} cause${causes === 1 ? "" : "s"} this session`;
     }
     if (toggle !== null) {
-      toggle.title = causes === 0 ? "Diagnostics" : `Diagnostics — ${causes} cause${causes === 1 ? "" : "s"}`;
+      toggle.title = causes === 0 ? "Diagnostics" : `Diagnostics — ${causes} cause${causes === 1 ? "" : "s"}${unread === 0 ? "" : `, ${unread} new`}`;
     }
+    const clear = document.querySelector<HTMLButtonElement>("#diagnostics-clear");
+    if (clear !== null) clear.disabled = total === 0;
   }
 }
 

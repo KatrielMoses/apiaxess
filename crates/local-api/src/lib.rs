@@ -94,6 +94,13 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
     Ok(Router::new()
         .route("/api/v1/system/status", get(system_status))
         .route("/api/v1/pick-file", axum::routing::post(pick_file))
+        .route("/api/v1/session/recent", get(recent_sessions))
+        .route("/api/v1/about", get(about))
+        .route("/api/v1/about/notice", get(about_notice))
+        .route(
+            "/api/v1/pipeline/check",
+            axum::routing::post(check_pipeline_artifact),
+        )
         .route(
             "/api/v1/settings",
             get(get_settings).put(update_settings_handler),
@@ -169,6 +176,11 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         )
         .route("/api/v1/surface", get(current_surface))
         .route("/api/v1/export", axum::routing::post(export_artifacts))
+        .route("/api/v1/export/defaults", get(export_defaults))
+        .route(
+            "/api/v1/export/open-folder",
+            axum::routing::post(open_export_folder),
+        )
         .route("/api/v1/workbench/session", get(workbench_session))
         .route("/api/v1/workbench/health", get(workbench_health))
         .route("/api/v1/workbench/diagnostics", get(workbench_diagnostics))
@@ -232,6 +244,7 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
             "/api/v1/workbench/fuzzer/preview",
             axum::routing::post(preview_fuzzer),
         )
+        .route("/api/v1/workbench/scope/assess", get(assess_scope))
         .route(
             "/api/v1/workbench/fuzzer/payload-lists",
             get(list_payload_lists),
@@ -673,14 +686,99 @@ struct PickFileResponse {
 /// directly. It is a local, single-operator, side-effectful action, so the modal
 /// runs on a blocking thread. Platforms without a bundled native picker report
 /// `available: false`, and the GUI falls back to the filename input.
-async fn pick_file(State(_state): State<ApiState>) -> Json<PickFileResponse> {
+#[derive(Deserialize, Default)]
+struct PickFileRequest {
+    /// `session` picks a session artifact; anything else an Android package.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactCheckRequest {
+    artifact_path: String,
+}
+
+/// Checks an APK path the way intake will, before the operator is asked to
+/// confirm a run for it.
+async fn check_pipeline_artifact(
+    Json(request): Json<ArtifactCheckRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    let path = std::path::PathBuf::from(request.artifact_path.trim());
+    tokio::task::spawn_blocking(move || apiaxess_engine_shell::check_apk_artifact(&path))
+        .await
+        .map_err(|error| {
+            let mut context = DiagnosticContext::new();
+            context.insert(
+                "error".to_owned(),
+                DiagnosticValue::String(error.to_string()),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(catalogue::PIPELINE_STAGE_FAILED.instantiate(context)),
+            )
+        })?
+        .map(|format| Json(serde_json::json!({ "format": format })))
+        .map_err(|diagnostic| (StatusCode::UNPROCESSABLE_ENTITY, Json(diagnostic)))
+}
+
+/// Version, build commit, license and shipped third-party notices.
+async fn about() -> Json<apiaxess_engine_shell::AboutInfo> {
+    Json(apiaxess_engine_shell::about_info())
+}
+
+#[derive(Deserialize)]
+struct NoticeQuery {
+    component: String,
+}
+
+/// One component's notices text. Only files the About listing found can be
+/// read, so this never serves an arbitrary path.
+async fn about_notice(
+    Query(query): Query<NoticeQuery>,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], String), StatusCode> {
+    let info = apiaxess_engine_shell::about_info();
+    let notice = info
+        .notices
+        .iter()
+        .find(|notice| notice.component == query.component)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let text = std::fs::read_to_string(&notice.path).map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        text,
+    ))
+}
+
+/// Recent session artifacts on this machine, newest first.
+async fn recent_sessions(
+    State(state): State<ApiState>,
+) -> Json<Vec<apiaxess_engine_shell::RecentSession>> {
+    Json(state.engine.recent_sessions(8))
+}
+
+async fn pick_file(
+    State(_state): State<ApiState>,
+    request: Option<Json<PickFileRequest>>,
+) -> Json<PickFileResponse> {
+    let session = request.and_then(|Json(request)| request.kind).as_deref() == Some("session");
     #[cfg(windows)]
     {
-        let path = tokio::task::spawn_blocking(|| {
-            let mut dialog = rfd::FileDialog::new()
-                .set_title("Select an Android package")
-                .add_filter("Android package", &["apk", "apks", "xapk", "aab"])
-                .add_filter("All files", &["*"]);
+        let path = tokio::task::spawn_blocking(move || {
+            let mut dialog = if session {
+                rfd::FileDialog::new()
+                    .set_title("Open a saved session")
+                    .add_filter("APIaxess session", &["json"])
+                    .set_directory(apiaxess_engine_shell::Engine::session_store_dir())
+            } else {
+                rfd::FileDialog::new()
+                    .set_title("Select an Android package")
+                    .add_filter("Android package", &["apk", "apks", "xapk", "aab"])
+                    .add_filter("All files", &["*"])
+            };
             // Own the dialog to the current foreground window (the app the user
             // just clicked "Browse" in) so it opens on top and focused, not behind
             // the window where they'd have to hunt for it in the taskbar. Without
@@ -702,6 +800,7 @@ async fn pick_file(State(_state): State<ApiState>) -> Json<PickFileResponse> {
     }
     #[cfg(not(windows))]
     {
+        let _ = session;
         Json(PickFileResponse {
             available: false,
             path: None,
@@ -1310,6 +1409,27 @@ async fn export_artifacts(
         .map_err(export_response)
 }
 
+/// Where an export goes when the operator does not choose a directory: an
+/// absolute, per-user folder (relative paths also resolve below it).
+async fn export_defaults() -> Json<serde_json::Value> {
+    let root = apiaxess_engine_shell::default_export_root();
+    Json(serde_json::json!({
+        "root": root.display().to_string(),
+        "outputDir": root.join("web").display().to_string(),
+    }))
+}
+
+/// Opens the last export's directory in the file manager (only that one).
+async fn open_export_folder(
+    State(state): State<ApiState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
+    state
+        .engine
+        .open_last_export_dir()
+        .map(|dir| Json(serde_json::json!({ "opened": dir })))
+        .map_err(|diagnostic| export_response(vec![diagnostic]))
+}
+
 fn export_response(
     mut diagnostics: Vec<apiaxess_diagnostics::Diagnostic>,
 ) -> (StatusCode, Json<apiaxess_diagnostics::Diagnostic>) {
@@ -1618,8 +1738,16 @@ async fn pending_flows(State(state): State<ApiState>) -> Json<Vec<u64>> {
     )
 }
 
+#[derive(Deserialize)]
+struct HarExportQuery {
+    /// `in` limits the export to flows classified in the engagement scope.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
 async fn export_har(
     State(state): State<ApiState>,
+    Query(query): Query<HarExportQuery>,
 ) -> Result<
     ([(axum::http::HeaderName, &'static str); 1], Vec<u8>),
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
@@ -1627,7 +1755,7 @@ async fn export_har(
     state
         .engine
         .live_workbench()
-        .export_har()
+        .export_har_filtered(query.scope.as_deref() == Some("in"))
         .map(|bytes| {
             (
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1956,6 +2084,27 @@ async fn create_fuzzer(
         .map_err(storage_response)
 }
 
+#[derive(Deserialize)]
+struct AssessScopeQuery {
+    url: String,
+}
+
+/// How a URL relates to the declared scope, as the senders will classify it,
+/// so a tool can warn before sending (warned, never blocked).
+async fn assess_scope(
+    State(state): State<ApiState>,
+    Query(query): Query<AssessScopeQuery>,
+) -> Result<
+    Json<apiaxess_engine_shell::ScopeUrlAssessment>,
+    (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
+> {
+    state
+        .engine
+        .assess_url_scope(&query.url)
+        .map(Json)
+        .map_err(session_response)
+}
+
 /// Returns the honest pre-run request-count estimate for a draft configuration,
 /// so the GUI count preview shares the payload engine's cardinality math rather
 /// than reimplementing it. Requires no persisted job.
@@ -1986,17 +2135,12 @@ async fn get_fuzzer(
     Json<apiaxess_workbench_store::FuzzerJob>,
     (StatusCode, Json<apiaxess_diagnostics::Diagnostic>),
 > {
-    state
-        .engine
-        .fuzzer()
-        .get(&job_id)
-        .map(Json)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(catalogue::PROXY_LIVE_DESYNC.instantiate(DiagnosticContext::new())),
-            )
-        })
+    state.engine.fuzzer().get(&job_id).map(Json).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(catalogue::PROXY_LIVE_DESYNC.instantiate(DiagnosticContext::new())),
+        )
+    })
 }
 
 async fn delete_fuzzer(

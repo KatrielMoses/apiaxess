@@ -66,6 +66,7 @@ async fn transparent_frontend_captures_redirected_origin_form_http() {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 ca,
                 intercept: None,
+                capture_browser_listener: false,
             },
             observer,
         )

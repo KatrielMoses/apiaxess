@@ -16,6 +16,8 @@ export interface WsConnection {
   readonly host?: string | null;
   readonly path?: string | null;
   readonly scope: string;
+  /** Whether the session declares any scope (false: nothing is authorized). */
+  readonly scopeDeclared?: boolean;
   readonly origin: string;
   readonly openedAt: string;
   readonly closedAt?: string | null;

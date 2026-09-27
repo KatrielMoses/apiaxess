@@ -22,7 +22,7 @@
 use std::{
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -31,6 +31,15 @@ use apiaxess_external_tools::{ManagedProcess, ManagedProcessCommand};
 
 /// Owns the engine child so it can be torn down when the app exits.
 type EngineSlot = Arc<Mutex<Option<ManagedProcess>>>;
+
+/// Set once the app itself is stopping the engine, so the supervisor never
+/// mistakes a deliberate shutdown for a crash.
+static ENGINE_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Most restarts of a crashed engine within [`RESTART_WINDOW`] before giving
+/// up (the GUI then shows its "engine stopped" state instead of a spinner).
+const MAX_RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(300);
 
 /// How the shell presents the workbench.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -83,6 +92,10 @@ fn main() {
         }
     };
     let engine_slot: EngineSlot = Arc::new(Mutex::new(Some(engine)));
+    {
+        let supervised = Arc::clone(&engine_slot);
+        std::thread::spawn(move || supervise_engine(&supervised, gui_port, proxy_port));
+    }
 
     // Wait for the engine's readiness endpoint before showing the window, so the
     // first paint is the ready GUI, not a connection error.
@@ -260,8 +273,52 @@ fn data_root() -> Option<PathBuf> {
     }
 }
 
+/// Watches the engine child and restarts it, on the same loopback ports, when
+/// it exits on its own, so the window (which keeps reconnecting) recovers by
+/// itself. Bounded, so an engine that cannot stay up is not respawned forever.
+fn supervise_engine(slot: &EngineSlot, gui_port: u16, proxy_port: u16) {
+    let mut restarts: Vec<Instant> = Vec::new();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if ENGINE_STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let exited = match slot.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(child) => child.try_wait().ok().flatten().is_some(),
+                None => return,
+            },
+            Err(_) => return,
+        };
+        if !exited || ENGINE_STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        restarts.retain(|at| at.elapsed() < RESTART_WINDOW);
+        if restarts.len() >= MAX_RESTARTS {
+            eprintln!("APIaxess: the local engine keeps stopping; not restarting it again.");
+            return;
+        }
+        restarts.push(Instant::now());
+        eprintln!("APIaxess: the local engine stopped unexpectedly; restarting it.");
+        // Reopen the session it was running (up to its last save).
+        let resume = session_to_resume();
+        match spawn_engine_with(gui_port, proxy_port, resume.as_deref()) {
+            Ok(child) => {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(child);
+                }
+            }
+            Err(error) => {
+                eprintln!("APIaxess: could not restart the local engine: {error}");
+                return;
+            }
+        }
+    }
+}
+
 /// Terminates the engine child (and its process tree) if it is still running.
 fn stop_engine(slot: &EngineSlot) {
+    ENGINE_STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut guard) = slot.lock()
         && let Some(mut child) = guard.take()
     {
@@ -272,7 +329,31 @@ fn stop_engine(slot: &EngineSlot) {
 /// Spawns the local engine in its default HTTP-server mode, bound to the chosen
 /// loopback ports, inside the shared process boundary (Job Object on Windows,
 /// process group on Unix) so it is torn down with this shell.
+/// Per-launch file the engine writes the active session's artifact path to,
+/// so a restarted engine can reopen that session.
+fn active_session_pointer() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "apiaxess-active-session-{}.txt",
+        std::process::id()
+    ))
+}
+
+/// The session a crashed engine was running, if it saved one.
+fn session_to_resume() -> Option<PathBuf> {
+    let recorded = std::fs::read_to_string(active_session_pointer()).ok()?;
+    let path = PathBuf::from(recorded.trim());
+    path.is_file().then_some(path)
+}
+
 fn spawn_engine(gui_port: u16, proxy_port: u16) -> std::io::Result<ManagedProcess> {
+    spawn_engine_with(gui_port, proxy_port, None)
+}
+
+fn spawn_engine_with(
+    gui_port: u16,
+    proxy_port: u16,
+    resume: Option<&Path>,
+) -> std::io::Result<ManagedProcess> {
     let binary = engine_binary();
     if !binary.is_file() {
         return Err(std::io::Error::new(
@@ -283,6 +364,10 @@ fn spawn_engine(gui_port: u16, proxy_port: u16) -> std::io::Result<ManagedProces
     let mut command = ManagedProcessCommand::new(&binary);
     command.env("APIAXESS_GUI_ADDRESS", format!("127.0.0.1:{gui_port}"));
     command.env("APIAXESS_PROXY_ADDRESS", format!("127.0.0.1:{proxy_port}"));
+    command.env("APIAXESS_ACTIVE_SESSION_POINTER", active_session_pointer());
+    if let Some(session) = resume {
+        command.env("APIAXESS_SESSION_FILE", session);
+    }
     command.spawn()
 }
 

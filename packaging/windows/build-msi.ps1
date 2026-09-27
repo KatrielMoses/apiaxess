@@ -289,6 +289,13 @@ if (-not $SkipApplicationBuild) {
     }
     Push-Location $repositoryRoot
     try {
+        # Stamp the source commit into the engine for its About page (read with
+        # option_env!, so a new commit rebuilds it). A dirty tree says so.
+        $commit = (& git -C $repositoryRoot rev-parse --short=12 HEAD 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $commit) {
+            $dirty = (& git -C $repositoryRoot status --porcelain 2>$null)
+            $env:APIAXESS_BUILD_COMMIT = if ($dirty) { "$commit+local-changes" } else { $commit }
+        }
         if ($BundleFrida) {
             Invoke-Checked "cargo" "build" "--release" "-p" "apiaxess" "--features" "frida-embedded"
         }

@@ -150,7 +150,10 @@ function partyChip(connection: WsConnection): string {
   return "";
 }
 
-function scopeLabel(scope: string): string {
+function scopeLabel(scope: string, scopeDeclared: boolean): string {
+  // Captured before any scope exists, a connection is admitted for capture,
+  // not authorized: it is relabelled once a scope is declared.
+  if (!scopeDeclared) return "no scope declared";
   if (scope === "in_scope") return "in scope";
   if (scope === "outside_declared_scope") return "out of scope";
   return "scope undetermined";
@@ -188,7 +191,7 @@ function renderList(): void {
     const selected = connection.id === selectedConnection ? " is-selected" : "";
     return `<button class="list-row ws-row${selected}" type="button" data-ws-connection="${connection.id}">
   <span class="ws-row__main"><span class="t-mono ws-row__host">${escapeHtml(connection.host ?? connection.url)}</span><span class="t-mono t-small t-subtle ws-row__path">${escapeHtml(connection.path ?? "")}</span></span>
-  <span class="ws-row__meta">${status}<span class="t-small t-numeric" title="Messages">${connection.messageCount}</span>${partyChip(connection)}<span class="t-small t-subtle">${scopeLabel(connection.scope)}</span></span>
+  <span class="ws-row__meta">${status}<span class="t-small t-numeric" title="Messages">${connection.messageCount}</span>${partyChip(connection)}<span class="t-small t-subtle">${scopeLabel(connection.scope, connection.scopeDeclared ?? true)}</span></span>
 </button>`;
   }).join("");
 }

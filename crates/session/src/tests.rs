@@ -434,3 +434,21 @@ fn checkpoint_versions_and_unknown_fields_fail_explicitly() {
     let error = SessionCheckpoint::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
     assert_eq!(error.id.as_ref(), "persistence.session-json-invalid");
 }
+
+#[test]
+fn a_file_that_is_not_a_session_is_named_for_what_it_is() {
+    let openapi = br#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{}}"#;
+    let error = SessionDocument::from_json(openapi).expect_err("not a session");
+    assert_eq!(error.what.as_ref(), "This file is not an APIaxess session.");
+    assert!(error.why.contains("an OpenAPI document"), "{}", error.why);
+    let har = br#"{"log":{"version":"1.2","entries":[]}}"#;
+    let error = SessionDocument::from_json(har).expect_err("not a session");
+    assert!(error.why.contains("a HAR traffic file"), "{}", error.why);
+}
+
+#[test]
+fn broken_session_json_reports_where_it_broke() {
+    let error = SessionDocument::from_json(b"{\n  \"format_version\": 1,\n  oops\n}")
+        .expect_err("malformed");
+    assert!(error.why.contains("line 3"), "{}", error.why);
+}

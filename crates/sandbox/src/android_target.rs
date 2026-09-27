@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use apiaxess_diagnostics::{Diagnostic, catalogue};
+use apiaxess_diagnostics::{Diagnostic, DiagnosticValue, catalogue};
 use apiaxess_external_tools::{ExternalToolRunner, ToolProbe, ToolProcess, ToolProcessRequest};
 use serde::Deserialize;
 
@@ -150,6 +150,33 @@ pub struct AndroidTargetAddon {
     manifest: AndroidTargetManifest,
 }
 
+/// The oldest add-on payload (`major.minor`) this engine works with. Bump it
+/// whenever the engine starts relying on something only a newer payload has,
+/// together with `payload_version` in `packaging/assets/android-target.toml`.
+///
+/// 1.1 — ws-scrcpy serves the device view under the reverse-proxied base path
+/// (`WS_SCRCPY_PATHNAME`) and binds loopback only.
+pub const REQUIRED_PAYLOAD_VERSION: (u32, u32) = (1, 1);
+
+/// `"1.0.0-android13"` → `(1, 0, 0)`.
+fn parse_payload_version(version: &str) -> Option<(u32, u32, u32)> {
+    let numeric = version.split(['-', '+']).next()?;
+    let mut parts = numeric.split('.').map(str::parse::<u32>);
+    let major = parts.next()?.ok()?;
+    let minor = parts.next().unwrap_or(Ok(0)).ok()?;
+    let patch = parts.next().unwrap_or(Ok(0)).ok()?;
+    Some((major, minor, patch))
+}
+
+/// The required payload version as operators see it (`1.1.0`).
+#[must_use]
+pub fn required_payload_version_label() -> String {
+    format!(
+        "{}.{}.0",
+        REQUIRED_PAYLOAD_VERSION.0, REQUIRED_PAYLOAD_VERSION.1
+    )
+}
+
 impl AndroidTargetAddon {
     /// Resolves the add-on from the install layout (or the
     /// `APIAXESS_ANDROID_TARGET` override).
@@ -196,6 +223,44 @@ impl AndroidTargetAddon {
             root: root.to_path_buf(),
             manifest,
         })
+    }
+
+    /// When the installed payload is older than [`REQUIRED_PAYLOAD_VERSION`] (or
+    /// its version cannot be read), its version string — the add-on works with
+    /// this engine only once it is updated.
+    #[must_use]
+    pub fn outdated_version(&self) -> Option<&str> {
+        let installed = self.manifest.payload_version.as_str();
+        let compatible = parse_payload_version(installed).is_some_and(|(major, minor, _)| {
+            major == REQUIRED_PAYLOAD_VERSION.0 && minor >= REQUIRED_PAYLOAD_VERSION.1
+        });
+        (!compatible).then_some(installed)
+    }
+
+    /// Refuses an add-on this engine cannot drive correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`catalogue::ANDROID_TARGET_OUTDATED`] naming the installed and
+    /// required versions when [`Self::outdated_version`] reports one.
+    pub fn ensure_compatible(&self) -> Result<(), Diagnostic> {
+        let Some(installed) = self.outdated_version() else {
+            return Ok(());
+        };
+        let mut diagnostic = catalogue::ANDROID_TARGET_OUTDATED.instantiate(context(
+            BACKEND_ID,
+            "installed_version",
+            installed.to_owned(),
+        ));
+        diagnostic.context.insert(
+            "required_version".to_owned(),
+            DiagnosticValue::String(format!("{} or newer", required_payload_version_label())),
+        );
+        diagnostic.context.insert(
+            "addon_path".to_owned(),
+            DiagnosticValue::String(self.root.display().to_string()),
+        );
+        Err(diagnostic)
     }
 
     /// Whether an add-on payload is installed at the resolved location. Cheap
@@ -707,6 +772,42 @@ impl AndroidTargetStream {
         self.process.as_ref().is_some_and(ToolProcess::is_running)
     }
 
+    /// Waits until ws-scrcpy actually serves the device view at its base path —
+    /// the page the engine reverse-proxies — not merely until its port accepts
+    /// connections. A server that answers anything but success (an old build
+    /// that serves only `/` answers 404 here) is a definitive failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`catalogue::ANDROID_STREAM_NOT_SERVED`] with what the stream
+    /// answered (or that it never answered within `timeout`).
+    pub fn ensure_served(&self, timeout: Duration) -> Result<(), Diagnostic> {
+        let deadline = Instant::now() + timeout;
+        let mut last = "ws-scrcpy did not answer".to_owned();
+        while Instant::now() < deadline {
+            if !self.is_running() {
+                "the ws-scrcpy process exited".clone_into(&mut last);
+                break;
+            }
+            match http_status(self.port, &self.base_path) {
+                Ok(status) if (200..400).contains(&status) => return Ok(()),
+                Ok(status) => {
+                    last = format!("ws-scrcpy answered HTTP {status} for {}", self.base_path);
+                    break;
+                }
+                Err(error) => last = error,
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let mut diagnostic =
+            catalogue::ANDROID_STREAM_NOT_SERVED.instantiate(context(BACKEND_ID, "answer", last));
+        diagnostic.context.insert(
+            "base_path".to_owned(),
+            DiagnosticValue::String(self.base_path.clone()),
+        );
+        Err(diagnostic)
+    }
+
     /// Best-effort wait until ws-scrcpy accepts a loopback TCP connection, so the
     /// reverse-proxy's first forwarded request does not race the Node startup.
     /// Returns whether the port became reachable within `timeout`.
@@ -741,6 +842,30 @@ impl AndroidTargetStream {
         }
         Ok(())
     }
+}
+
+/// The HTTP status loopback `port` answers for `GET path`.
+fn http_status(port: u16, path: &str) -> Result<u16, String> {
+    use std::io::{Read, Write};
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500))
+        .map_err(|error| format!("ws-scrcpy is not accepting connections: {error}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("could not ask ws-scrcpy for {path}: {error}"))?;
+    let mut head = [0_u8; 64];
+    let read = stream
+        .read(&mut head)
+        .map_err(|error| format!("ws-scrcpy did not answer for {path}: {error}"))?;
+    let line = String::from_utf8_lossy(&head[..read]);
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| format!("ws-scrcpy sent no HTTP status for {path}"))
 }
 
 /// Polls `sys.boot_completed` until the AVD is up or the deadline elapses.
@@ -1008,6 +1133,95 @@ mod tests {
         assert!(addon.streaming().is_none());
         assert!(addon.node_executable().is_none());
         assert!(addon.ws_scrcpy_entry().is_none());
+    }
+
+    #[test]
+    fn an_add_on_older_than_the_engine_requires_is_refused_by_version() {
+        let dir = Scratch::new();
+        // The shape of the 2026-09-09 add-on found installed under a newer
+        // APIaxess: it even declares the base path its ws-scrcpy can't serve.
+        dir.write_manifest(&sample_manifest_json("artifacts/apiaxess-client.apk"));
+        let stale = AndroidTargetAddon::resolve_at(dir.path()).expect("resolves");
+        assert_eq!(stale.outdated_version(), Some("1.0.0-android13"));
+        let refusal = stale.ensure_compatible().expect_err("refused");
+        assert_eq!(refusal.id.as_ref(), catalogue::ANDROID_TARGET_OUTDATED.id);
+        assert_eq!(
+            refusal.context.get("installed_version"),
+            Some(&DiagnosticValue::String("1.0.0-android13".to_owned()))
+        );
+        assert_eq!(
+            refusal.context.get("required_version"),
+            Some(&DiagnosticValue::String("1.1.0 or newer".to_owned()))
+        );
+
+        for (version, compatible) in [
+            ("1.1.0-android13", true),
+            ("1.4.2", true),
+            ("1.0.9-android13", false),
+            ("2.0.0-android14", false),
+            ("unversioned", false),
+        ] {
+            dir.write_manifest(
+                &sample_manifest_json("artifacts/apiaxess-client.apk")
+                    .replace("1.0.0-android13", version),
+            );
+            let addon = AndroidTargetAddon::resolve_at(dir.path()).expect("resolves");
+            assert_eq!(addon.ensure_compatible().is_ok(), compatible, "{version}");
+        }
+    }
+
+    #[test]
+    fn the_shipped_add_on_manifest_meets_the_engine_requirement() {
+        let toml = include_str!("../../../packaging/assets/android-target.toml");
+        let version = toml
+            .lines()
+            .find_map(|line| line.strip_prefix("payload_version = "))
+            .expect("payload_version")
+            .trim_matches('"');
+        let (major, minor, _) = parse_payload_version(version).expect("parses");
+        assert!(
+            major == REQUIRED_PAYLOAD_VERSION.0 && minor >= REQUIRED_PAYLOAD_VERSION.1,
+            "android-target.toml ships {version}, below the required {}",
+            required_payload_version_label()
+        );
+    }
+
+    #[test]
+    fn the_stream_probe_reads_what_ws_scrcpy_answers_at_the_base_path() {
+        use std::io::{Read, Write};
+        // One server that serves only "/" — like the stale ws-scrcpy build —
+        // and 404s the reverse-proxied base path.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 256];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let line = String::from_utf8_lossy(&request).to_string();
+                let answer = if line.starts_with("GET / ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                };
+                socket.write_all(answer.as_bytes()).expect("write");
+            }
+        });
+        assert_eq!(http_status(port, "/android-stream/"), Ok(404));
+        assert_eq!(http_status(port, "/"), Ok(200));
+        server.join().expect("server");
+        // Nothing listening is an error, not a status.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let closed_port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        assert!(http_status(closed_port, "/android-stream/").is_err());
     }
 
     #[test]

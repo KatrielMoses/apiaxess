@@ -179,6 +179,26 @@ impl PythonSdkEmitter {
                     ));
                 }
             }
+            // gRPC-Web methods the surface can address (observed on an
+            // origin): one call each, sending the operator's protobuf frame.
+            for grpc in surface.grpc_operations() {
+                let Some(base) = grpc.base_url.as_deref() else {
+                    continue;
+                };
+                let stem = format!(
+                    "grpc_{}_{}",
+                    snake_case(&grpc.service),
+                    snake_case(&grpc.method)
+                );
+                let mut name = stem.clone();
+                let mut suffix = 2;
+                while !method_names.insert(name.clone()) {
+                    name = format!("{stem}_{suffix}");
+                    suffix += 1;
+                }
+                let origin = (primary_base.as_deref() != Some(base)).then_some(base);
+                methods.push(render_grpc_method(&grpc, &name, origin));
+            }
             (methods, models.finish(), model_diagnostics)
         };
         diagnostics.extend(model_diagnostics);
@@ -402,7 +422,9 @@ impl<'a> ModelBuilder<'a> {
         if let Some(name) = self.names.get(path) {
             return name.clone();
         }
-        let base = format!("{}{}", pascal_case(hint), suffix(path));
+        // The readable name alone; a clash is numbered below, in emission
+        // order, so names are stable and never carry a hash.
+        let base = pascal_case(hint);
         let mut name = base.clone();
         let mut index = 2_u32;
         while !self.used_names.insert(name.clone()) {
@@ -662,6 +684,8 @@ fn render_method(
     Method { source }
 }
 
+// The client module is one ordered template assembly.
+#[allow(clippy::too_many_lines)]
 fn render_client(
     emitter: &PythonSdkEmitter,
     surface: &UnifiedApiSurface,
@@ -712,6 +736,12 @@ def _decode_response(response: httpx.Response, model_type: Any) -> Any:
         .endpoints
         .iter()
         .filter_map(endpoint_base_url)
+        .chain(
+            surface
+                .grpc_operations()
+                .into_iter()
+                .filter_map(|grpc| grpc.base_url),
+        )
         .filter(|base| primary.as_deref() != Some(base.as_str()))
         .collect::<Vec<_>>();
     origins.sort();
@@ -1388,6 +1418,35 @@ fn render_graphql_method(
     Method { source }
 }
 
+/// A gRPC-Web method: POSTs the caller's length-prefixed protobuf frame and
+/// returns the raw response. Without the service's .proto the message schema
+/// is unknown, so the SDK does not pretend to encode or decode it.
+fn render_grpc_method(
+    grpc: &apiaxess_api_model::ExportableGrpcOperation,
+    method_name: &str,
+    origin: Option<&str>,
+) -> Method {
+    let mut source = String::new();
+    let _ = writeln!(
+        source,
+        "    def {method_name}(self, message: bytes) -> httpx.Response:"
+    );
+    let _ = writeln!(
+        source,
+        "        \"\"\"gRPC-Web call {service}/{method} — {evidence}.\n\n        `message` is one gRPC-Web frame as sent on the wire (a 5-byte length prefix and the protobuf message; a captured request body works). The protobuf schema is not recoverable without the service's .proto, so the message is not built or decoded here: read the raw response, and grpc-status from its trailers.\n        \"\"\"",
+        service = py_doc(&grpc.service),
+        method = py_doc(&grpc.method),
+        evidence = py_doc(grpc.evidence.describe())
+    );
+    let _ = writeln!(
+        source,
+        "        return self._request(\"POST\", {path}, params=None, content=message, content_type=\"application/grpc-web+proto\", signer_ids=[], origin={origin})",
+        path = py_str(&grpc.path()),
+        origin = py_opt_str(origin)
+    );
+    Method { source }
+}
+
 fn endpoint_confidence(surface: &UnifiedApiSurface, identity: &EndpointIdentity) -> String {
     surface
         .confidence
@@ -1506,15 +1565,6 @@ fn safe_name(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn suffix(value: &str) -> String {
-    let mut hash = 2_166_136_261_u32;
-    for byte in value.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    format!("{hash:08x}")
 }
 
 fn valid_identifier(value: &str) -> bool {

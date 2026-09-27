@@ -33,6 +33,9 @@
     <Icon Id="AppIcon.exe" SourceFile="!(bindpath.Stage)\bin\apiaxess-desktop.exe" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.exe" />
     <Property Id="ARPNOREPAIR" Value="1" />
+    <!-- Add/Remove Programs "InstallLocation": Windows Installer leaves it blank
+         unless ARPINSTALLLOCATION is set, so set it once the folder is resolved. -->
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
 
     <!-- Finish page: offer to launch APIaxess immediately (checked by default),
          the way a normal desktop app installer does. -->

@@ -219,6 +219,70 @@ impl OpenApiEmitter {
             );
         }
 
+        // gRPC-Web methods: each observed one is a real HTTP call,
+        // `POST {origin}/{service}/{method}` with a length-prefixed protobuf
+        // body. Its message schema is not recoverable without the .proto, so
+        // the body is described as binary, honestly.
+        let grpc_operations = surface.grpc_operations();
+        for grpc in &grpc_operations {
+            let Some(base) = grpc.base_url.as_deref() else {
+                continue;
+            };
+            let path = grpc.path();
+            let taken = paths
+                .get(&path)
+                .and_then(Value::as_object)
+                .is_some_and(|item| item.contains_key("post"));
+            if taken {
+                builder.diagnostics.push(diagnostic(
+                    catalogue::OPENAPI_UNREPRESENTABLE,
+                    [
+                        ("field", format!("grpc {}/{}", grpc.service, grpc.method)),
+                        ("detail", format!("POST {path} is already an operation; the gRPC method is listed in {X_PREFIX}grpc-operations only")),
+                    ],
+                ));
+                continue;
+            }
+            let binary = json!({"schema": {"type": "string", "format": "binary"}});
+            let mut operation = json!({
+                "summary": format!("gRPC-Web {}/{}", grpc.service, grpc.method),
+                "description": format!(
+                    "A gRPC-Web call: the body is a length-prefixed protobuf message, and the outcome is in the grpc-status trailer. The message schema is not recoverable without the service's .proto, so it is described as binary. Evidence: {}.",
+                    grpc.evidence.describe()
+                ),
+                "requestBody": {"required": true, "content": {"application/grpc-web+proto": binary.clone()}},
+                "responses": {"200": {"description": "gRPC-Web response (see the grpc-status trailer)", "content": {"application/grpc-web+proto": binary}}},
+                format!("{X_PREFIX}grpc"): {
+                    "service": grpc.service,
+                    "method": grpc.method,
+                    "transport": "grpc-web",
+                    "evidence": grpc.evidence.label(),
+                },
+            });
+            if primary_base.as_deref() != Some(base) {
+                if let Value::Object(fields) = &mut operation {
+                    fields.insert("servers".to_owned(), json!([{"url": base}]));
+                }
+            }
+            let base_id = format!(
+                "grpc_{}_{}",
+                safe_name(&grpc.service),
+                safe_name(&grpc.method)
+            );
+            let mut unique_id = base_id.clone();
+            let mut suffix = 2_u32;
+            while !seen_operation_ids.insert(unique_id.clone()) {
+                unique_id = format!("{base_id}_{suffix}");
+                suffix = suffix.saturating_add(1);
+            }
+            if let Value::Object(item) = paths
+                .entry(path)
+                .or_insert_with(|| Value::Object(Map::new()))
+            {
+                item.insert("post".to_owned(), set_operation_id(operation, unique_id));
+            }
+        }
+
         let mut document = Map::new();
         document.insert(
             "openapi".to_owned(),
@@ -275,6 +339,26 @@ impl OpenApiEmitter {
             );
         }
         document.insert("components".to_owned(), Value::Object(components));
+        if !grpc_operations.is_empty() {
+            document.insert(
+                format!("{X_PREFIX}grpc-operations"),
+                Value::Array(
+                    grpc_operations
+                        .iter()
+                        .map(|grpc| {
+                            json!({
+                                "service": grpc.service,
+                                "method": grpc.method,
+                                "path": grpc.path(),
+                                "base_url": grpc.base_url,
+                                "evidence": grpc.evidence.label(),
+                                "addressable": grpc.base_url.is_some(),
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
         add_root_extensions(&mut document, surface, &emission_diagnostics);
         Ok(OpenApiEmission {
             document: Value::Object(document),

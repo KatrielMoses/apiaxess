@@ -204,6 +204,15 @@ impl Default for ApkIntakeConfig {
     }
 }
 
+/// How far an intake has got, for a caller that shows progress.
+#[derive(Clone, Debug)]
+pub struct IntakeProgress {
+    /// Share of intake done, 0.0–1.0.
+    pub fraction: f32,
+    /// What intake is doing.
+    pub message: String,
+}
+
 /// An intake failure represented by the canonical diagnostic framework.
 #[derive(Clone, Debug)]
 pub struct IntakeFailure {
@@ -258,8 +267,36 @@ impl ApkTarget {
     ///
     /// Panics only if a worker thread unexpectedly panics while an external
     /// invocation is being joined; the production runner does not do so.
-    #[allow(clippy::too_many_lines)]
     pub fn intake(&self, input: &Path) -> Result<NormalizedUnpackedArtifact, IntakeFailure> {
+        self.intake_with_progress(input, &|_| {})
+    }
+
+    /// [`Self::intake`], reporting how far it has got: fixed points as each
+    /// phase completes, and — through the long apktool/jadx step — the share
+    /// of the artifact's classes both tools have written out, measured against
+    /// the class count in the DEX headers.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::intake`].
+    ///
+    /// # Panics
+    ///
+    /// See [`Self::intake`].
+    // Intake is one ordered sequence of phases; splitting it would scatter the
+    // workspace guard and provenance bookkeeping across helpers.
+    #[allow(clippy::too_many_lines)]
+    pub fn intake_with_progress(
+        &self,
+        input: &Path,
+        progress: &(dyn Fn(IntakeProgress) + Sync),
+    ) -> Result<NormalizedUnpackedArtifact, IntakeFailure> {
+        let report = |fraction: f32, message: &str| {
+            progress(IntakeProgress {
+                fraction,
+                message: message.to_owned(),
+            });
+        };
         let intake_started = Instant::now();
         let format = detect_format(input)?;
         verify_bundled_integrity(&self.config.tools)?;
@@ -269,6 +306,7 @@ impl ApkTarget {
         let input_bytes = fs::metadata(input).map(|meta| meta.len()).unwrap_or(0);
         let tool_timeout = resolve_tool_timeout(self.config.tool_timeout, input_bytes);
         profile_intake("format_detected", intake_started, None);
+        report(0.03, "Artifact format recognized");
         let workspace = create_workspace(&self.config.output_root)?;
         let mut workspace_guard = IntakeWorkspaceGuard::new(workspace.clone());
         let raw_root = workspace.join("raw");
@@ -327,6 +365,7 @@ impl ApkTarget {
             intake_started,
             Some(format!("count={}", installable_apks.len())),
         );
+        report(0.08, "Installable APKs resolved");
         if installable_apks.is_empty() {
             return Err(failure(
                 ARTIFACT_BUNDLE_RESOLUTION_FAILED,
@@ -354,10 +393,12 @@ impl ApkTarget {
                     .sum::<usize>()
             )),
         );
+        report(0.15, "Archive indexed");
 
         let mut diagnostics = Vec::new();
         let (apktool, jadx) = self.probe_unpackers()?;
         profile_intake("toolchain_probed", intake_started, None);
+        report(0.2, "Decoding and decompiling with apktool and jadx");
         let mut structural_outputs = Vec::with_capacity(installable_apks.len());
         let mut decompiled_source_roots = Vec::with_capacity(installable_apks.len());
         let mut provenance = vec![
@@ -378,7 +419,9 @@ impl ApkTarget {
         ];
         let mut dex_files = Vec::new();
 
-        for apk in &installable_apks {
+        let apk_count = installable_apks.len().max(1);
+        for (apk_index, apk) in installable_apks.iter().enumerate() {
+            let class_total = dex_class_count(Path::new(&apk.path));
             let apk_workspace = workspace.join("unpacked").join(&apk.id);
             let apktool_root = apk_workspace.join("apktool");
             let jadx_root = apk_workspace.join("jadx");
@@ -396,8 +439,28 @@ impl ApkTarget {
             let heartbeat_started = Instant::now();
             let (apktool_result, jadx_result) = std::thread::scope(|scope| {
                 let apk_id = apk.id.as_str();
-                let heartbeat =
-                    scope.spawn(|| report_unpack_progress(&running, heartbeat_started, apk_id));
+                // Class and file counts stay far below f32's exact range; the
+                // fraction only drives a progress bar.
+                #[allow(clippy::cast_precision_loss)]
+                let heartbeat = scope.spawn(|| {
+                    report_unpack_progress(&running, heartbeat_started, apk_id, &|written| {
+                        // Both tools write one file per class; together they
+                        // have written 2 × classes files when done.
+                        let done = if class_total == 0 {
+                            0.0
+                        } else {
+                            (written as f32 / (2.0 * class_total as f32)).min(1.0)
+                        };
+                        report(
+                            0.2 + 0.6 * ((apk_index as f32 + done) / apk_count as f32),
+                            &format!(
+                                "Decoding and decompiling with apktool and jadx: {}% of {} classes",
+                                (done * 100.0).round(),
+                                class_total
+                            ),
+                        );
+                    }, &apktool_root, &jadx_root);
+                });
                 let apktool =
                     scope.spawn(|| self.run_apktool(&apktool, apk, &apktool_root, tool_timeout));
                 let jadx = scope.spawn(|| self.run_jadx(&jadx, apk, &jadx_root, tool_timeout));
@@ -493,6 +556,7 @@ impl ApkTarget {
                         .map_or(0, |output| output.smali_roots.len())
                 )),
             );
+            report(0.88, "Normalizing decoded output");
         }
         if dex_files.is_empty() {
             return Err(failure(
@@ -559,6 +623,7 @@ impl ApkTarget {
                     .map(|profile| profile.tier)
             )),
         );
+        report(0.95, "Protection detection done");
         artifact.provenance.push(ComponentProvenance {
             component: ArtifactComponent::ProtectionMetadata,
             source_tool: artifact.protection.detector.clone(),
@@ -570,6 +635,7 @@ impl ApkTarget {
             .validate()
             .map_err(|why| failure(ARTIFACT_UNPACK_FAILED, why))?;
         profile_intake("intake_complete", intake_started, None);
+        report(1.0, "Artifact normalized");
         workspace_guard.disarm();
         Ok(artifact)
     }
@@ -882,6 +948,18 @@ fn probe_request(
     }
 }
 
+/// Checks, before a run is confirmed, that `input` is an artifact the pipeline
+/// can take: an existing file of a supported Android format. The same check
+/// intake runs first, so the answer is the one the run would give.
+///
+/// # Errors
+///
+/// Returns the intake diagnostic (`artifact.not-found`, unsupported format,
+/// malformed archive).
+pub fn check_artifact(input: &Path) -> Result<ArtifactFormat, Diagnostic> {
+    detect_format(input).map_err(|failure| failure.diagnostic)
+}
+
 fn detect_format(input: &Path) -> Result<ArtifactFormat, IntakeFailure> {
     if !input.is_file() {
         // A missing (or non-file) path is a not-found problem, not an
@@ -1169,12 +1247,30 @@ const UNPACK_HEARTBEAT_SECS: u64 = 30;
 /// large-APK unpack reads as progressing rather than hung. Stops promptly once
 /// `running` is cleared. Nothing is emitted before the first interval, so a fast
 /// small-APK intake stays quiet.
-fn report_unpack_progress(running: &AtomicBool, started: Instant, apk_id: &str) {
+fn report_unpack_progress(
+    running: &AtomicBool,
+    started: Instant,
+    apk_id: &str,
+    written: &dyn Fn(u64),
+    apktool_root: &Path,
+    jadx_root: &Path,
+) {
     let mut since_report = Duration::ZERO;
+    let mut since_count = Duration::ZERO;
     let tick = Duration::from_millis(250);
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(tick);
         since_report = since_report.saturating_add(tick);
+        since_count = since_count.saturating_add(tick);
+        if since_count >= Duration::from_secs(2) {
+            since_count = Duration::ZERO;
+            // One smali file per class from apktool, one Java file per
+            // top-level class from jadx.
+            written(
+                count_files_with(apktool_root, "smali")
+                    + count_files_with(&jadx_root.join("sources"), "java"),
+            );
+        }
         if since_report.as_secs() >= UNPACK_HEARTBEAT_SECS {
             since_report = Duration::ZERO;
             eprintln!(
@@ -1183,6 +1279,71 @@ fn report_unpack_progress(running: &AtomicBool, started: Instant, apk_id: &str) 
             );
         }
     }
+}
+
+/// Files with `extension` below `root` (recursively); 0 when it is absent.
+fn count_files_with(root: &Path, extension: &str) -> u64 {
+    let mut count = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Classes defined across an APK's `classes*.dex` files, read from each DEX
+/// header's `class_defs_size` (offset 0x60); 0 when unreadable.
+fn dex_class_count(apk: &Path) -> u64 {
+    let Ok(file) = File::open(apk) else {
+        return 0;
+    };
+    let Ok(mut archive) = ZipArchive::new(file) else {
+        return 0;
+    };
+    let mut total = 0_u64;
+    for index in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(index) else {
+            continue;
+        };
+        let name = entry.name().to_owned();
+        // A top-level `classes.dex`, `classes2.dex`, ...
+        let member = Path::new(&name);
+        let is_dex = !name.contains('/')
+            && member
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dex"))
+            && member
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.strip_prefix("classes"))
+                .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit()));
+        if !is_dex {
+            continue;
+        }
+        let mut header = [0_u8; 0x70];
+        if io::Read::read_exact(&mut entry, &mut header).is_ok() {
+            total += u64::from(u32::from_le_bytes([
+                header[0x60],
+                header[0x61],
+                header[0x62],
+                header[0x63],
+            ]));
+        }
+    }
+    total
 }
 
 fn profile_intake(stage: &str, started: Instant, detail: Option<String>) {
@@ -1425,7 +1586,10 @@ fn ensure_success(tool: &str, invocation: &ToolInvocation) -> Result<(), Diagnos
             .collect();
         Err(failure(
             EXTERNAL_TOOL_INVOCATION_FAILED,
-            format!("{tool} exited with {}: {summary}", format_exit_code(invocation.exit_code)),
+            format!(
+                "{tool} exited with {}: {summary}",
+                format_exit_code(invocation.exit_code)
+            ),
         )
         .diagnostic)
     }
@@ -1482,6 +1646,38 @@ mod tests {
     use apiaxess_artifact_intake::ArtifactFormat;
     use std::{fs, fs::File, io::Write, path::Path};
     use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn dex_class_count_reads_every_classes_dex_header() {
+        let path = std::env::temp_dir().join(format!(
+            "apiaxess-dex-count-{}-{}.apk",
+            std::process::id(),
+            super::now_seconds()
+        ));
+        let dex = |classes: u32| {
+            let mut header = vec![0_u8; 0x70];
+            header[..4].copy_from_slice(b"dex\n");
+            header[0x60..0x64].copy_from_slice(&classes.to_le_bytes());
+            header
+        };
+        let file = File::create(&path).expect("create fixture");
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for (name, body) in [
+            ("classes.dex", dex(42)),
+            ("classes2.dex", dex(8)),
+            ("assets/classes.dex", dex(1000)),
+            ("AndroidManifest.xml", b"manifest".to_vec()),
+        ] {
+            archive.start_file(name, options).expect("start member");
+            archive.write_all(&body).expect("write member");
+        }
+        archive.finish().expect("finish fixture");
+        // The two top-level DEX files count; a DEX nested in assets does not.
+        assert_eq!(super::dex_class_count(&path), 50);
+        assert_eq!(super::dex_class_count(Path::new("missing.apk")), 0);
+        fs::remove_file(path).expect("remove fixture");
+    }
 
     #[test]
     fn missing_input_is_not_misclassified_as_an_apk() {

@@ -33,7 +33,7 @@
 schema_version = 1
 product = "APIaxess GUI Android target"
 addon_id = "android-target"
-payload_version = "1.0.0-android13"
+payload_version = "1.1.0-android13"
 android_api_level = 33
 android_release = "13"
 image_variant = "default"                 # pure AOSP; NOT google_apis / playstore

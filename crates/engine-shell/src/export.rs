@@ -149,8 +149,11 @@ pub struct ExportedArtifact {
 pub struct ExportReport {
     /// Session that supplied the unified surface.
     pub session_id: String,
-    /// Destination directory.
+    /// Destination directory, absolute.
     pub output_dir: String,
+    /// Every file written, as an absolute path (primary artifacts first, the
+    /// evidence sidecar last).
+    pub files: Vec<String>,
     /// Files emitted by format.
     pub artifacts: Vec<ExportedArtifact>,
     /// Retained-evidence sidecar referenced by primary artifacts.
@@ -341,7 +344,7 @@ pub fn export_session_artifacts(
         let mut paths = Vec::new();
         let mut bytes = 0_u64;
         for entry in entries {
-            paths.push(entry.relative_path.display().to_string());
+            paths.push(display_path(&entry.relative_path));
             bytes = bytes.saturating_add(entry.bytes.len() as u64);
         }
         artifacts.push(ExportedArtifact {
@@ -358,9 +361,22 @@ pub fn export_session_artifacts(
         &diagnostics,
     )
     .map_err(|error| vec![error])?;
+    // Report where the files really are, not the path as typed.
+    let output_dir = fs::canonicalize(&config.output_dir).map_or_else(
+        |_| config.output_dir.display().to_string(),
+        |path| display_path(&path),
+    );
+    let mut files: Vec<String> = pending
+        .iter()
+        .filter(|artifact| !artifact.sidecar)
+        .chain(pending.iter().filter(|artifact| artifact.sidecar))
+        .map(|artifact| display_path(&Path::new(&output_dir).join(&artifact.relative_path)))
+        .collect();
+    files.dedup();
     Ok(ExportReport {
         session_id,
-        output_dir: config.output_dir.display().to_string(),
+        output_dir,
+        files,
         artifacts,
         evidence_sidecar: "apiaxess-evidence.json".to_owned(),
         diagnostics,
@@ -384,6 +400,20 @@ fn evidence_sidecar(
         "diagnostics": surface.diagnostics,
         "export_diagnostics": export_diagnostics
     }))
+}
+
+/// A path as the operator reads it: Windows' canonical `\\?\` prefix removed.
+fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    let text = text
+        .strip_prefix(r"\\?\")
+        .map_or(text.clone(), str::to_owned);
+    // Artifact names use `/`; on Windows, report one separator throughout.
+    if cfg!(windows) {
+        text.replace('/', "\\")
+    } else {
+        text
+    }
 }
 
 fn write_artifact(output_dir: &Path, relative_path: &Path, bytes: &[u8]) -> Result<(), Diagnostic> {

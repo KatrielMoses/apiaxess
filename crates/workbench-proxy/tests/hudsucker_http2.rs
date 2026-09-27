@@ -233,6 +233,7 @@ async fn start_proxy(
                 bind_addr: "127.0.0.1:0".parse()?,
                 ca,
                 intercept: None,
+                capture_browser_listener: false,
             },
             observer,
         )

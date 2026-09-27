@@ -2036,7 +2036,11 @@ impl ProtocolDecoderExtractor for GrpcExtractor {
                         builder.add_operation(
                             "grpc-java",
                             detection,
-                            ProtocolOperationIdentity::Grpc { service, method },
+                            ProtocolOperationIdentity::Grpc {
+                                service,
+                                method,
+                                base_url: None,
+                            },
                             &document.path,
                         );
                     }
@@ -2044,7 +2048,11 @@ impl ProtocolDecoderExtractor for GrpcExtractor {
                     builder.add_operation(
                         "grpc-java",
                         detection,
-                        ProtocolOperationIdentity::Grpc { service, method },
+                        ProtocolOperationIdentity::Grpc {
+                            service,
+                            method,
+                            base_url: None,
+                        },
                         &document.path,
                     );
                 }

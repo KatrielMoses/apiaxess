@@ -169,7 +169,70 @@ pub struct ProxyConfig {
     pub ca: SessionCa,
     /// Optional test/intercept gate held before a request is forwarded.
     pub intercept: Option<Arc<InterceptController>>,
+    /// Also bind an ephemeral loopback listener used only by the `APIaxess`
+    /// capture browser. Traffic arriving there is known to come from that
+    /// browser, so its own service traffic can be kept out of the capture (see
+    /// [`is_browser_internal`]) without guessing about any other client.
+    pub capture_browser_listener: bool,
 }
+
+/// Which listener a request arrived on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListenerRole {
+    /// The shared proxy port: devices, external browsers, workbench senders.
+    Shared,
+    /// The capture browser's dedicated port.
+    CaptureBrowser,
+}
+
+/// Whether a request that reached the capture browser's dedicated listener is
+/// the browser's own traffic rather than something a page or the operator
+/// asked for.
+///
+/// Chromium stamps Fetch Metadata on requests to potentially trustworthy
+/// destinations. `Sec-Fetch-Site` names the relation between the request's
+/// initiator and its destination; every request a page issues has an initiator,
+/// so it reads `same-origin`, `same-site` or `cross-site`. Only a request with
+/// no initiator at all reads `none`, and there are exactly two kinds: a
+/// navigation the user (or `APIaxess`, over CDP) started, and the browser's own
+/// service traffic — component updater, GCM check-in, account probes — which
+/// the network service sends as `none` / `no-cors`. So a `none` request is the
+/// browser's own when it is not a navigation, or when it is a speculative
+/// navigation (`Sec-Purpose`, e.g. the search warm-up page) no one asked for.
+///
+/// Fetch Metadata is absent from WebSocket handshakes and from every request to
+/// a plain-HTTP remote host, so its absence alone says nothing. What does is
+/// `Accept-Language`: Chromium adds it to every request made in a profile's
+/// network context — all page traffic, WebSocket handshakes included — while
+/// the browser's service traffic (component downloads over plain HTTP, update
+/// checks) runs in the profile-less system network context and carries none.
+/// A request with neither is the browser's own.
+///
+/// An HTTP/1.1 `CONNECT` is tunnel bookkeeping — the requests inside the tunnel
+/// are recorded on their own — and is never a flow.
+fn is_browser_internal(req: &Request<Body>) -> bool {
+    if req.method() == Method::CONNECT {
+        return req.version() != Version::HTTP_2;
+    }
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    let Some(site) = header("sec-fetch-site") else {
+        return header("accept-language").is_none();
+    };
+    if !site.eq_ignore_ascii_case("none") {
+        return false;
+    }
+    let navigation =
+        header("sec-fetch-mode").is_some_and(|mode| mode.eq_ignore_ascii_case("navigate"));
+    !navigation || header("sec-purpose").is_some()
+}
+
+/// Longest a paused request may be held for a decision.
+pub const MAX_INTERCEPT_HOLD: Duration = Duration::from_secs(600);
 
 /// Flow pause gate used by acceptance fixtures and the future intercept layer.
 ///
@@ -255,10 +318,12 @@ impl InterceptController {
         self.enabled.load(Ordering::Acquire)
     }
 
-    /// Sets the maximum time a paused request may wait for a UI decision.
+    /// Sets the maximum time a paused request may wait for a UI decision,
+    /// bounded to [`MAX_INTERCEPT_HOLD`]: a request held longer is, to the
+    /// client that sent it, simply hung.
     pub fn set_timeout(&self, timeout: Duration) {
         if let Ok(mut current) = self.timeout.lock() {
-            *current = timeout.max(Duration::from_millis(100));
+            *current = timeout.clamp(Duration::from_millis(100), MAX_INTERCEPT_HOLD);
         }
     }
 
@@ -283,6 +348,23 @@ impl InterceptController {
             .ok()
             .and_then(|mut pending| pending.remove(&flow_id))
             .is_some_and(|sender| sender.send(decision).is_ok())
+    }
+
+    /// Drops every request still held for a decision, answering each client
+    /// as an operator Drop would (403). Used when the session they belong to
+    /// ends, so a new session never inherits — or forwards — a request no one
+    /// approved. Returns how many were dropped.
+    pub fn drop_all_pending(&self) -> usize {
+        let held: Vec<_> = self
+            .pending
+            .lock()
+            .map(|mut pending| pending.drain().map(|(_, sender)| sender).collect())
+            .unwrap_or_default();
+        let count = held.len();
+        for sender in held {
+            let _ = sender.send(InterceptDecision::Drop);
+        }
+        count
     }
 
     /// Returns the currently paused flow IDs for the live intercept queue.
@@ -440,6 +522,13 @@ pub enum FlowEvent {
         /// The direction whose stream ended.
         direction: WebSocketDirection,
     },
+    /// The capture browser made a request of its own (not one a page issued);
+    /// it was forwarded but deliberately not recorded. Carries only the host,
+    /// so the withheld traffic can be counted honestly.
+    BrowserInternalWithheld {
+        /// Destination host of the withheld request.
+        host: String,
+    },
     /// A backend failure was converted to a canonical diagnostic.
     Diagnostic(Diagnostic),
 }
@@ -542,7 +631,6 @@ impl ProxyBackend for HudsuckerBackend {
             let local_addr = listener
                 .local_addr()
                 .map_err(|error| bind_diagnostic(config.bind_addr, &error))?;
-            let (stop_sender, stop_receiver) = oneshot::channel();
             let handler = ObserveHandler::new(config.session_id, observer, config.intercept);
             let mut roots = hudsucker::rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -568,31 +656,81 @@ impl ProxyBackend for HudsuckerBackend {
             let mut raw_tls = upstream_tls.clone();
             raw_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
             let handler = handler.with_raw_upstream_tls(Arc::new(raw_tls));
-            let proxy = hudsucker::Proxy::builder()
-                .with_listener(listener)
-                .with_ca(config.ca)
-                .with_http_connector(upstream_connector)
-                .with_http_handler(handler.clone())
-                .with_websocket_handler(handler)
-                .with_graceful_shutdown(async move {
-                    let _ = stop_receiver.await;
-                })
-                .build()
-                .map_err(|error| backend_start_diagnostic(&error))?;
-            let task = tokio::spawn(async move {
-                proxy
-                    .start()
+            // The capture browser's dedicated listener shares the CA, upstream
+            // connector, observer and intercept gate; only its role differs.
+            let capture_browser = if config.capture_browser_listener {
+                let browser_bind = SocketAddr::from(([127, 0, 0, 1], 0));
+                let browser_listener = TcpListener::bind(browser_bind)
                     .await
-                    .map_err(|error| backend_start_diagnostic(&error))
-            });
+                    .map_err(|error| bind_diagnostic(browser_bind, &error))?;
+                let browser_addr = browser_listener
+                    .local_addr()
+                    .map_err(|error| bind_diagnostic(browser_bind, &error))?;
+                let (sender, task) = serve_listener(
+                    browser_listener,
+                    config.ca.clone(),
+                    upstream_connector.clone(),
+                    handler.clone().with_role(ListenerRole::CaptureBrowser),
+                )?;
+                Some(ListenerTask {
+                    local_addr: browser_addr,
+                    stop_sender: Some(sender),
+                    task: Some(task),
+                })
+            } else {
+                None
+            };
+            let (stop_sender, task) =
+                serve_listener(listener, config.ca, upstream_connector, handler)?;
             Ok(ProxyHandle {
                 local_addr,
                 backend: BackendKind::Hudsucker,
                 stop_sender: Some(stop_sender),
                 task: Some(task),
+                capture_browser,
             })
         })
     }
+}
+
+type ProxyTask = JoinHandle<Result<(), Diagnostic>>;
+
+/// Serves one bound listener with the shared MITM machinery until its stop
+/// signal fires.
+fn serve_listener(
+    listener: TcpListener,
+    ca: SessionCa,
+    connector: hyper_rustls::HttpsConnector<
+        hudsucker::hyper_util::client::legacy::connect::HttpConnector,
+    >,
+    handler: ObserveHandler,
+) -> Result<(oneshot::Sender<()>, ProxyTask), Diagnostic> {
+    let (stop_sender, stop_receiver) = oneshot::channel();
+    let proxy = hudsucker::Proxy::builder()
+        .with_listener(listener)
+        .with_ca(ca)
+        .with_http_connector(connector)
+        .with_http_handler(handler.clone())
+        .with_websocket_handler(handler)
+        .with_graceful_shutdown(async move {
+            let _ = stop_receiver.await;
+        })
+        .build()
+        .map_err(|error| backend_start_diagnostic(&error))?;
+    let task = tokio::spawn(async move {
+        proxy
+            .start()
+            .await
+            .map_err(|error| backend_start_diagnostic(&error))
+    });
+    Ok((stop_sender, task))
+}
+
+/// A secondary listener owned by a [`ProxyHandle`].
+struct ListenerTask {
+    local_addr: SocketAddr,
+    stop_sender: Option<oneshot::Sender<()>>,
+    task: Option<ProxyTask>,
 }
 
 /// A running proxy listener. Dropping it is not considered a clean lifecycle
@@ -602,6 +740,8 @@ pub struct ProxyHandle {
     pub(crate) backend: BackendKind,
     pub(crate) stop_sender: Option<oneshot::Sender<()>>,
     pub(crate) task: Option<JoinHandle<Result<(), Diagnostic>>>,
+    /// The capture browser's dedicated listener, when one was requested.
+    capture_browser: Option<ListenerTask>,
 }
 
 impl std::fmt::Debug for ProxyHandle {
@@ -610,6 +750,13 @@ impl std::fmt::Debug for ProxyHandle {
             .debug_struct("ProxyHandle")
             .field("local_addr", &self.local_addr)
             .field("backend", &self.backend)
+            .field(
+                "capture_browser_addr",
+                &self
+                    .capture_browser
+                    .as_ref()
+                    .map(|listener| listener.local_addr),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -627,7 +774,15 @@ impl ProxyHandle {
         self.backend
     }
 
-    /// Gracefully stops the listener and waits for the backend task.
+    /// The capture browser's dedicated listener address, when one is bound.
+    #[must_use]
+    pub fn capture_browser_addr(&self) -> Option<SocketAddr> {
+        self.capture_browser
+            .as_ref()
+            .map(|listener| listener.local_addr)
+    }
+
+    /// Gracefully stops the listener(s) and waits for the backend task(s).
     ///
     /// # Errors
     ///
@@ -635,6 +790,18 @@ impl ProxyHandle {
     pub async fn shutdown(mut self) -> Result<(), Diagnostic> {
         if let Some(stop_sender) = self.stop_sender.take() {
             let _ = stop_sender.send(());
+        }
+        if let Some(mut browser) = self.capture_browser.take() {
+            if let Some(stop_sender) = browser.stop_sender.take() {
+                let _ = stop_sender.send(());
+            }
+            if let Some(task) = browser.task.take() {
+                match task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => return Err(join_diagnostic(&error)),
+                }
+            }
         }
         if let Some(task) = self.task.take() {
             match task.await {
@@ -652,6 +819,13 @@ impl Drop for ProxyHandle {
         if let Some(stop_sender) = self.stop_sender.take() {
             let _ = stop_sender.send(());
         }
+        if let Some(stop_sender) = self
+            .capture_browser
+            .as_mut()
+            .and_then(|browser| browser.stop_sender.take())
+        {
+            let _ = stop_sender.send(());
+        }
     }
 }
 
@@ -660,6 +834,7 @@ impl Drop for ProxyHandle {
 pub struct ProxyCore {
     backend: Box<dyn ProxyBackend>,
     handle: Option<ProxyHandle>,
+    capture_browser_listener: bool,
 }
 
 impl std::fmt::Debug for ProxyCore {
@@ -668,6 +843,7 @@ impl std::fmt::Debug for ProxyCore {
             .debug_struct("ProxyCore")
             .field("backend", &self.backend.kind())
             .field("running", &self.handle.is_some())
+            .field("capture_browser_listener", &self.capture_browser_listener)
             .finish()
     }
 }
@@ -691,7 +867,22 @@ impl ProxyCore {
         Self {
             backend,
             handle: None,
+            capture_browser_listener: false,
         }
+    }
+
+    /// Also binds the capture browser's dedicated loopback listener when the
+    /// proxy starts (see [`ProxyConfig::capture_browser_listener`]).
+    pub fn enable_capture_browser_listener(&mut self) {
+        self.capture_browser_listener = true;
+    }
+
+    /// The capture browser's dedicated listener, while the proxy is running.
+    #[must_use]
+    pub fn capture_browser_addr(&self) -> Option<SocketAddr> {
+        self.handle
+            .as_ref()
+            .and_then(ProxyHandle::capture_browser_addr)
     }
 
     /// Returns capability health for the configured proxy route.
@@ -757,6 +948,7 @@ impl ProxyCore {
         if self.handle.is_some() {
             return Err(catalogue::PROXY_BACKEND_START_FAILED.instantiate(DiagnosticContext::new()));
         }
+        let capture_browser_listener = self.capture_browser_listener;
         let handle = self
             .backend
             .start(
@@ -765,6 +957,7 @@ impl ProxyCore {
                     bind_addr,
                     ca,
                     intercept,
+                    capture_browser_listener,
                 },
                 observer,
             )
@@ -818,6 +1011,20 @@ struct ObserveHandler {
     current_flow_id: Option<u64>,
     /// TLS config for byte-faithful workbench sends (see [`crate::raw_http`]).
     raw_upstream_tls: Option<Arc<hudsucker::rustls::ClientConfig>>,
+    /// The listener this handler serves.
+    role: ListenerRole,
+    /// Set when this per-request clone is forwarding the capture browser's own
+    /// traffic, which is relayed but never observed.
+    withheld: bool,
+    /// Origins of documents the capture browser loaded speculatively on its
+    /// own (e.g. the search warm-up page it prerenders), which were withheld.
+    /// Their subresources are withheld too: see
+    /// [`Self::loads_for_withheld_speculation`].
+    speculative_origins: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// WebSocket upgrade requests awaiting their tunnel, by connection. hudsucker
+    /// answers a successful upgrade itself (no `handle_response`), so the 101
+    /// is recorded against the handshake flow once the tunnel opens.
+    ws_handshakes: Arc<std::sync::Mutex<HashMap<WebSocketConnectionKey, u64>>>,
 }
 
 impl ObserveHandler {
@@ -832,7 +1039,61 @@ impl ObserveHandler {
             intercept,
             current_flow_id: None,
             raw_upstream_tls: None,
+            role: ListenerRole::Shared,
+            withheld: false,
+            ws_handshakes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            speculative_origins: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// A withheld speculative navigation (`Sec-Purpose`) marks its origin, so
+    /// the prerendered page's own loads can be recognised.
+    fn remember_withheld_speculation(&self, req: &Request<Body>) {
+        let speculative = req.headers().contains_key("sec-purpose");
+        let navigation = req
+            .headers()
+            .get("sec-fetch-mode")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("navigate"));
+        if !(speculative && navigation) {
+            return;
+        }
+        if let (Some(origin), Ok(mut origins)) =
+            (uri_origin(req.uri()), self.speculative_origins.lock())
+        {
+            origins.insert(origin);
+        }
+    }
+
+    /// A speculative load (`Sec-Purpose: prefetch;prerender`) made by a page
+    /// the browser prerendered for itself. Its initiator is that page, so its
+    /// Fetch Metadata reads same-origin or cross-site like any page request;
+    /// what gives it away is that its `Referer`/`Origin` is a document already
+    /// withheld as the browser's own. A target page's own speculation rules
+    /// never match: its documents were never withheld.
+    fn loads_for_withheld_speculation(&self, req: &Request<Body>) -> bool {
+        if !req.headers().contains_key("sec-purpose") {
+            return false;
+        }
+        let Ok(origins) = self.speculative_origins.lock() else {
+            return false;
+        };
+        if origins.is_empty() {
+            return false;
+        }
+        ["referer", "origin"].iter().any(|name| {
+            req.headers()
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<hudsucker::hyper::Uri>().ok())
+                .and_then(|uri| uri_origin(&uri))
+                .is_some_and(|origin| origins.contains(&origin))
+        })
+    }
+
+    fn with_role(mut self, role: ListenerRole) -> Self {
+        self.role = role;
+        self
     }
 
     fn with_raw_upstream_tls(mut self, tls: Arc<hudsucker::rustls::ClientConfig>) -> Self {
@@ -840,18 +1101,92 @@ impl ObserveHandler {
         self
     }
 
-    fn observe_request(&self, req: &Request<Body>, origin: FlowOrigin) -> u64 {
+    fn observe_request(
+        &self,
+        req: &Request<Body>,
+        origin: FlowOrigin,
+        sent_headers: Option<Vec<(String, String)>>,
+    ) -> u64 {
         let flow_id = self.observer.allocate_flow_id();
         self.observer.observe(FlowEvent::Request {
             flow_id,
             method: req.method().to_string(),
             uri: req.uri().to_string(),
             version: format!("{:?}", req.version()),
-            headers: headers(req.headers()),
+            headers: sent_headers.unwrap_or_else(|| headers(req.headers())),
             origin,
         });
         flow_id
     }
+}
+
+/// A request's headers with their names in the case the client sent them.
+///
+/// hyper keeps the received case only in a crate-private extension (hudsucker
+/// enables `preserve_header_case`), and its `HeaderMap` lowercases names. The
+/// case is recovered the way hyper itself would forward it: the head, with
+/// those extensions, is encoded by an HTTP/1 client into an in-memory pipe and
+/// the header lines are read back. `None` if anything about that fails.
+async fn original_case_headers(req: &Request<Body>) -> Option<Vec<(String, String)>> {
+    use hudsucker::hyper::client::conn::http1;
+    use tokio::io::AsyncReadExt;
+
+    let mut probe = Request::builder()
+        .method(req.method().clone())
+        .uri("/")
+        .body(Body::empty())
+        .ok()?;
+    *probe.headers_mut() = req.headers().clone();
+    *probe.extensions_mut() = req.extensions().clone();
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let (mut sender, connection) = http1::Builder::new()
+        .preserve_header_case(true)
+        .handshake(hudsucker::hyper_util::rt::TokioIo::new(client))
+        .await
+        .ok()?;
+    let driver = tokio::spawn(connection);
+    // Nothing answers; only the encoded head is read back.
+    let request = tokio::spawn(async move { sender.send_request(probe).await });
+    let mut head = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let read = tokio::time::timeout(Duration::from_millis(500), async {
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = server.read(&mut buffer).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            head.extend_from_slice(&buffer[..read]);
+        }
+        Some(())
+    })
+    .await;
+    request.abort();
+    driver.abort();
+    read.ok()??;
+    let text = String::from_utf8_lossy(&head);
+    let lines = text
+        .split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty());
+    let recovered: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.to_owned(), value.trim().to_owned()))
+        })
+        .collect();
+    // hyper may add framing of its own (a zero Content-Length for the empty
+    // probe body); keep only what the client really sent, in its order.
+    let sent = headers(req.headers());
+    let mut recased = Vec::with_capacity(sent.len());
+    let mut pool = recovered;
+    for (name, value) in sent {
+        let position = pool
+            .iter()
+            .position(|(candidate, _)| candidate.eq_ignore_ascii_case(&name))?;
+        let (cased, _) = pool.remove(position);
+        recased.push((cased, value));
+    }
+    Some(recased)
 }
 
 /// Transparent DNAT delivers clear HTTP in origin-form because the Android
@@ -881,6 +1216,9 @@ fn normalize_origin_form(req: &mut Request<Body>) {
 }
 
 impl HttpHandler for ObserveHandler {
+    // One request's path through the proxy, in order: marker handling,
+    // withholding, observation, the intercept gate, then forwarding.
+    #[allow(clippy::too_many_lines)]
     async fn handle_request(
         &mut self,
         ctx: &HttpContext,
@@ -892,6 +1230,22 @@ impl HttpHandler for ObserveHandler {
         // never leaks upstream and never appears in stored traffic. Ordinary
         // observed traffic carries no marker and tags as `Capture`.
         let origin = take_origin_marker(&mut req);
+        // The capture browser's own service traffic (and its CONNECT tunnel
+        // bookkeeping) is relayed untouched but kept out of the capture: not
+        // recorded, stored, scoped, intercepted, fused or exported. Only its
+        // host is reported, so the withheld volume stays visible.
+        if self.role == ListenerRole::CaptureBrowser
+            && (is_browser_internal(&req) || self.loads_for_withheld_speculation(&req))
+        {
+            self.withheld = true;
+            self.remember_withheld_speculation(&req);
+            if req.method() != Method::CONNECT {
+                self.observer.observe(FlowEvent::BrowserInternalWithheld {
+                    host: req.uri().host().unwrap_or_default().to_owned(),
+                });
+            }
+            return RequestOrResponse::Request(req);
+        }
         // Applied before observation so the recorded request shows the headers
         // that actually go on the wire.
         let wire_headers = take_wire_headers(&mut req);
@@ -902,7 +1256,19 @@ impl HttpHandler for ObserveHandler {
             self.observer
                 .observe(FlowEvent::Diagnostic(rfc8441_diagnostic()));
         }
-        let flow_id = self.observe_request(&req, origin);
+        // A request intercept is about to hold is recorded with its header names
+        // in the case the client sent them, so the editor shows — and a
+        // modified forward sends — exactly those names (as Resend does).
+        let sent_headers = match &self.intercept {
+            Some(intercept)
+                if matches!(req.version(), Version::HTTP_10 | Version::HTTP_11)
+                    && intercept.holds(req.uri().host()) =>
+            {
+                original_case_headers(&req).await
+            }
+            _ => None,
+        };
+        let flow_id = self.observe_request(&req, origin, sent_headers);
         // WebSocket upgrades: the proxy relays frames with tungstenite, which does
         // not implement permessage-deflate. Forwarding the client's offer would let
         // the server compress its frames, which then fail to decode, so the
@@ -916,6 +1282,17 @@ impl HttpHandler for ObserveHandler {
             .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
         {
             req.headers_mut().remove("sec-websocket-extensions");
+            if let Some(url) = websocket_url(req.uri()) {
+                if let Ok(mut pending) = self.ws_handshakes.lock() {
+                    pending.insert(
+                        WebSocketConnectionKey {
+                            client: ctx.client_addr,
+                            url,
+                        },
+                        flow_id,
+                    );
+                }
+            }
         }
         // Record on this per-request handler clone so `handle_response` correlates
         // to exactly this request — never to another concurrent stream on the same
@@ -1008,6 +1385,9 @@ impl HttpHandler for ObserveHandler {
     }
 
     async fn handle_response(&mut self, ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+        if self.withheld {
+            return res;
+        }
         // Correlate to the request this same per-request clone handled.
         let flow_id = self.current_flow_id.unwrap_or_default();
         self.observer.observe(FlowEvent::Response {
@@ -1192,6 +1572,14 @@ impl ObserveHandler {
 
     /// Records an upstream failure diagnostic and answers `502`.
     fn upstream_failure(&self, ctx: &HttpContext, chain: String) -> Response<Body> {
+        if self.withheld {
+            // The browser's own service call failing is not the operator's
+            // concern; answer it without a diagnostic.
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::empty())
+                .expect("static proxy error response is valid");
+        }
         let mut context = DiagnosticContext::new();
         context.insert(
             "session_id".to_owned(),
@@ -1394,6 +1782,27 @@ fn malformed_edit_diagnostic(flow_id: u64, error: &str) -> Diagnostic {
 }
 
 /// The connection and direction a WebSocket context describes.
+/// `scheme://authority` of an absolute URI, lower-cased.
+fn uri_origin(uri: &hudsucker::hyper::Uri) -> Option<String> {
+    Some(format!(
+        "{}://{}",
+        uri.scheme_str()?.to_ascii_lowercase(),
+        uri.authority()?.as_str().to_ascii_lowercase()
+    ))
+}
+
+/// The `ws://`/`wss://` URL hudsucker dials for an upgrade request.
+fn websocket_url(uri: &hudsucker::hyper::Uri) -> Option<String> {
+    let scheme = match uri.scheme_str()? {
+        "http" | "ws" => "ws",
+        "https" | "wss" => "wss",
+        _ => return None,
+    };
+    let authority = uri.authority()?;
+    let path = uri.path_and_query().map_or("/", |path| path.as_str());
+    Some(format!("{scheme}://{authority}{path}"))
+}
+
 fn websocket_endpoint(ctx: &WebSocketContext) -> (WebSocketConnectionKey, WebSocketDirection) {
     match ctx {
         WebSocketContext::ClientToServer { src, dst, .. } => (
@@ -1433,6 +1842,23 @@ impl WebSocketHandler for ObserveHandler {
     ) -> impl std::future::Future<Output = ()> + Send {
         use hudsucker::futures::{SinkExt, StreamExt};
         use hudsucker::tokio_tungstenite::tungstenite::Error as WsError;
+        // The tunnel only opens on a 101: settle the handshake flow now, so its
+        // Live row and exports show the switch rather than a pending request.
+        let (connection, _) = websocket_endpoint(&ctx);
+        let handshake = self
+            .ws_handshakes
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&connection));
+        if let Some(flow_id) = handshake {
+            self.observer.observe(FlowEvent::Response {
+                flow_id,
+                client_addr: connection.client,
+                status: StatusCode::SWITCHING_PROTOCOLS.as_u16(),
+                version: format!("{:?}", Version::HTTP_11),
+                headers: Vec::new(),
+            });
+        }
         async move {
             while let Some(message) = stream.next().await {
                 let Ok(message) = message else {
@@ -1649,6 +2075,7 @@ mod tests {
                     bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                     ca: SessionCa::generate().expect("CA"),
                     intercept: None,
+                    capture_browser_listener: false,
                 },
                 observer.clone(),
             )
@@ -1687,6 +2114,436 @@ mod tests {
         drop(observer);
         drop(store);
         fs::remove_dir_all(store_path).expect("remove test traffic store");
+    }
+
+    #[test]
+    fn browser_internal_traffic_is_the_initiator_less_requests_no_one_navigated_to() {
+        use super::is_browser_internal;
+        use hudsucker::{
+            Body,
+            hyper::{Method, Request, Version},
+        };
+        // Header sets as Chromium sends them (from a real capture).
+        let request = |method: Method, uri: &str, headers: &[(&str, &str)]| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            builder.body(Body::empty()).expect("request")
+        };
+        let service = [
+            ("sec-fetch-site", "none"),
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-dest", "empty"),
+        ];
+        // The browser's own service calls.
+        for uri in [
+            "https://update.googleapis.com/service/update2/json",
+            "https://android.clients.google.com/checkin",
+            "https://accounts.google.com/ListAccounts",
+        ] {
+            assert!(
+                is_browser_internal(&request(Method::POST, uri, &service)),
+                "{uri}"
+            );
+        }
+        // The search warm-up: an initiator-less speculative navigation.
+        assert!(is_browser_internal(&request(
+            Method::GET,
+            "https://www.google.com/search/warmup.html",
+            &[
+                ("sec-fetch-site", "none"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+                ("sec-purpose", "prefetch"),
+            ],
+        )));
+        // A navigation the operator (or APIaxess over CDP) started is kept.
+        assert!(!is_browser_internal(&request(
+            Method::GET,
+            "http://127.0.0.1:9201/",
+            &[
+                ("sec-fetch-site", "none"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+                ("sec-fetch-user", "?1"),
+            ],
+        )));
+        // Page traffic always has an initiator, same-site or not.
+        assert!(!is_browser_internal(&request(
+            Method::POST,
+            "http://127.0.0.1:9201/graphql",
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("sec-fetch-mode", "cors")
+            ],
+        )));
+        assert!(!is_browser_internal(&request(
+            Method::GET,
+            "https://fonts.gstatic.com/s/font.woff2",
+            &[("sec-fetch-site", "cross-site"), ("sec-fetch-dest", "font")],
+        )));
+        // Without Fetch Metadata, page traffic still carries the profile's
+        // Accept-Language: a WebSocket handshake, a plain-HTTP remote host.
+        assert!(!is_browser_internal(&request(
+            Method::GET,
+            "http://127.0.0.1:9201/ws?room=ref",
+            &[
+                ("upgrade", "websocket"),
+                ("origin", "http://127.0.0.1:9201"),
+                ("accept-language", "en-US,en;q=0.9"),
+            ],
+        )));
+        assert!(!is_browser_internal(&request(
+            Method::GET,
+            "http://example.test/page",
+            &[("accept-language", "en-US,en;q=0.9")],
+        )));
+        // A component download from the profile-less system context has
+        // neither.
+        assert!(is_browser_internal(&request(
+            Method::GET,
+            "http://edgedl.me.gvt1.com/edgedl/release2/chrome_component/x.crx3",
+            &[
+                ("accept-encoding", "gzip, deflate"),
+                ("user-agent", "Mozilla/5.0")
+            ],
+        )));
+        // Tunnel bookkeeping is never a flow; an HTTP/2 extended CONNECT is a
+        // WebSocket and is kept.
+        assert!(is_browser_internal(&request(
+            Method::CONNECT,
+            "example.test:443",
+            &[]
+        )));
+        let mut extended = request(Method::CONNECT, "https://example.test/ws", &[]);
+        *extended.version_mut() = Version::HTTP_2;
+        assert!(!is_browser_internal(&extended));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn capture_browser_listener_relays_but_withholds_the_browsers_own_traffic() {
+        let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("upstream listener");
+        let upstream_address = upstream.local_addr().expect("upstream address");
+        let upstream_task = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = upstream.accept().await.expect("upstream accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = socket.read(&mut buffer).await.expect("upstream read");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                paths.push(line);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .expect("upstream response");
+            }
+            paths
+        });
+        let store_path = env::temp_dir().join(format!(
+            "apiaxess-proxy-browser-internal-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = Arc::new(
+            TrafficStore::open(&store_path, "session:browser-internal-test")
+                .expect("traffic store"),
+        );
+        let observer = Arc::new(LiveWorkbench::new());
+        observer.attach_store(Arc::clone(&store));
+        let handle = HudsuckerBackend
+            .start(
+                ProxyConfig {
+                    session_id: "session:browser-internal-test".to_owned(),
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    ca: SessionCa::generate().expect("CA"),
+                    intercept: None,
+                    capture_browser_listener: true,
+                },
+                observer.clone(),
+            )
+            .await
+            .expect("proxy starts");
+        let shared = handle.local_addr();
+        let browser = handle
+            .capture_browser_addr()
+            .expect("capture browser listener is bound");
+        assert_ne!(shared, browser);
+        let authority = upstream_address.to_string();
+        let get = |path: &str, metadata: &str| {
+            format!(
+                "GET http://{authority}{path} HTTP/1.1\r\nHost: {authority}\r\n{metadata}Connection: close\r\n\r\n"
+            )
+        };
+        let service = "Sec-Fetch-Site: none\r\nSec-Fetch-Mode: no-cors\r\n";
+        let own = send_http_request(browser, get("/browser-own", service).as_bytes())
+            .await
+            .expect("browser-internal request");
+        let navigation = "Sec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\n";
+        let page = send_http_request(browser, get("/page", navigation).as_bytes())
+            .await
+            .expect("page request");
+        // The same service-shaped request from another client is not the
+        // capture browser's, so it is captured.
+        let device = send_http_request(shared, get("/shared", service).as_bytes())
+            .await
+            .expect("shared-listener request");
+        for response in [&own, &page, &device] {
+            assert!(String::from_utf8_lossy(response).starts_with("HTTP/1.1 200"));
+        }
+        handle.shutdown().await.expect("proxy shutdown");
+        // All three really reached the upstream: nothing is blocked.
+        assert_eq!(upstream_task.await.expect("upstream task").len(), 3);
+        let mut recorded: Vec<_> = store
+            .summaries()
+            .expect("traffic summaries")
+            .into_iter()
+            .filter_map(|summary| summary.path)
+            .collect();
+        recorded.sort();
+        // The navigation and the other client's request are captured; the
+        // browser's own request is not.
+        assert_eq!(recorded, vec!["/page".to_owned(), "/shared".to_owned()]);
+        assert_eq!(
+            observer.browser_internal_withheld(),
+            vec![("127.0.0.1".to_owned(), 1)]
+        );
+        drop(observer);
+        drop(store);
+        fs::remove_dir_all(store_path).expect("remove test traffic store");
+    }
+
+    #[tokio::test]
+    async fn a_websocket_handshake_settles_at_101_once_the_tunnel_opens() {
+        use hudsucker::futures::{SinkExt, StreamExt};
+        use hudsucker::tokio_tungstenite::{accept_async, client_async, tungstenite::Message};
+
+        // An upstream WebSocket echo server.
+        let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("upstream listener");
+        let upstream_address = upstream.local_addr().expect("upstream address");
+        let upstream_task = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.expect("upstream accept");
+            let mut ws = accept_async(socket).await.expect("upstream handshake");
+            while let Some(Ok(message)) = ws.next().await {
+                if message.is_close() {
+                    break;
+                }
+                if message.is_text() && ws.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let store_path = env::temp_dir().join(format!(
+            "apiaxess-proxy-ws-handshake-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = Arc::new(
+            TrafficStore::open(&store_path, "session:ws-handshake-test").expect("traffic store"),
+        );
+        let observer = Arc::new(LiveWorkbench::new());
+        observer.attach_store(Arc::clone(&store));
+        let handle = HudsuckerBackend
+            .start(
+                ProxyConfig {
+                    session_id: "session:ws-handshake-test".to_owned(),
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    ca: SessionCa::generate().expect("CA"),
+                    intercept: None,
+                    capture_browser_listener: false,
+                },
+                observer.clone(),
+            )
+            .await
+            .expect("proxy starts");
+        // A proxy-aware client speaks to the proxy; tungstenite sends the
+        // upgrade in origin form with a Host header, which the proxy resolves.
+        let tcp = tokio::net::TcpStream::connect(handle.local_addr())
+            .await
+            .expect("connect proxy");
+        let (mut ws, _) = client_async(format!("ws://{upstream_address}/ws?room=ref"), tcp)
+            .await
+            .expect("handshake through the proxy");
+        ws.send(Message::text("hello")).await.expect("send");
+        let echoed = ws.next().await.expect("echo").expect("echo frame");
+        assert_eq!(echoed.into_text().expect("text").as_str(), "hello");
+        ws.close(None).await.expect("close");
+        drop(ws);
+        upstream_task.await.expect("upstream task");
+        // The tunnel's events are persisted off-path; give them a moment.
+        let mut handshake = None;
+        for _ in 0..50 {
+            handshake = store
+                .summaries()
+                .expect("summaries")
+                .into_iter()
+                .find(|flow| flow.path.as_deref() == Some("/ws?room=ref"));
+            if handshake.as_ref().is_some_and(|flow| flow.status.is_some()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let handshake = handshake.expect("the handshake is a flow");
+        assert_eq!(handshake.status, Some(101), "not left pending at status 0");
+        let mut connections = Vec::new();
+        for _ in 0..50 {
+            connections = store.ws_connections().expect("connections");
+            if connections
+                .first()
+                .is_some_and(|connection| connection.message_count >= 2)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            connections
+                .first()
+                .is_some_and(|connection| connection.message_count >= 2)
+        );
+        handle.shutdown().await.expect("proxy shutdown");
+        drop(observer);
+        drop(store);
+        let _ = fs::remove_dir_all(store_path);
+    }
+
+    #[tokio::test]
+    async fn requests_held_by_a_replaced_session_are_dropped_not_inherited() {
+        let controller = Arc::new(super::InterceptController::default());
+        controller.set_enabled(true);
+        let waiting = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(
+                async move { controller.await_decision(7, Some("api.example.test")).await },
+            )
+        };
+        let held = next_held(&controller, &[]).await;
+        assert_eq!(held, 7);
+        assert_eq!(controller.drop_all_pending(), 1);
+        assert_eq!(
+            waiting.await.expect("decision"),
+            super::InterceptDecision::Drop
+        );
+        assert!(controller.pending_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_page_the_browser_prerendered_for_itself_is_withheld_with_its_loads() {
+        let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("upstream listener");
+        let upstream_address = upstream.local_addr().expect("upstream address");
+        let upstream_task = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = upstream.accept().await.expect("upstream accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.expect("upstream read");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .expect("upstream response");
+            }
+        });
+        let store_path = env::temp_dir().join(format!(
+            "apiaxess-proxy-speculation-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = Arc::new(
+            TrafficStore::open(&store_path, "session:speculation-test").expect("traffic store"),
+        );
+        let observer = Arc::new(LiveWorkbench::new());
+        observer.attach_store(Arc::clone(&store));
+        let handle = HudsuckerBackend
+            .start(
+                ProxyConfig {
+                    session_id: "session:speculation-test".to_owned(),
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    ca: SessionCa::generate().expect("CA"),
+                    intercept: None,
+                    capture_browser_listener: true,
+                },
+                observer.clone(),
+            )
+            .await
+            .expect("proxy starts");
+        let browser = handle.capture_browser_addr().expect("capture listener");
+        let authority = upstream_address.to_string();
+        let get = |path: &str, headers: &str| {
+            format!(
+                "GET http://{authority}{path} HTTP/1.1\r\nHost: {authority}\r\nAccept-Language: en-US\r\n{headers}Connection: close\r\n\r\n"
+            )
+        };
+        // 1. The browser prerenders its own search warm-up page.
+        let warmup = "Sec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\nSec-Purpose: prefetch;prerender\r\n";
+        send_http_request(browser, get("/search/warmup.html", warmup).as_bytes())
+            .await
+            .expect("warm-up");
+        // 2. That prerendered page loads an image: same-origin to itself.
+        let prerendered_load = format!(
+            "Sec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: image\r\nSec-Purpose: prefetch;prerender\r\nReferer: http://{authority}/search/warmup.html\r\n"
+        );
+        send_http_request(browser, get("/logo.png", &prerendered_load).as_bytes())
+            .await
+            .expect("prerendered load");
+        // 3. The target's own page prefetches something (its own speculation
+        //    rules): its document was never withheld, so it is captured.
+        let target_prefetch = "Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: no-cors\r\nSec-Purpose: prefetch\r\nReferer: http://target.test/\r\n";
+        send_http_request(browser, get("/next", target_prefetch).as_bytes())
+            .await
+            .expect("target prefetch");
+        handle.shutdown().await.expect("proxy shutdown");
+        upstream_task.await.expect("upstream task");
+        let recorded: Vec<_> = store
+            .summaries()
+            .expect("summaries")
+            .into_iter()
+            .filter_map(|summary| summary.path)
+            .collect();
+        assert_eq!(recorded, vec!["/next".to_owned()]);
+        assert_eq!(
+            observer.browser_internal_withheld(),
+            vec![("127.0.0.1".to_owned(), 2)]
+        );
+        drop(observer);
+        drop(store);
+        let _ = fs::remove_dir_all(store_path);
     }
 
     /// Holds one request on `controller` and returns its flow id.
@@ -1762,6 +2619,7 @@ mod tests {
                     bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                     ca: SessionCa::generate().expect("CA"),
                     intercept: Some(Arc::clone(&controller)),
+                    capture_browser_listener: false,
                 },
                 observer.clone(),
             )
@@ -1791,6 +2649,15 @@ mod tests {
         seen.push(held);
         let detail = observer.flow(held).expect("held flow");
         assert_eq!(detail.request_body.as_deref(), Some(&original[..]));
+        // The held request shows its header names as the client sent them,
+        // not hyper's lowercase map.
+        let names: Vec<&str> = detail
+            .request_headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(names.contains(&"Content-Type"), "{names:?}");
+        assert!(names.contains(&"Content-Length"), "{names:?}");
         let edited = br#"{"name":"edited-item","extra":true}"#;
         let mut headers = detail.request_headers.clone();
         headers.push(("X-Edited".to_owned(), "Yes".to_owned()));
@@ -1809,8 +2676,13 @@ mod tests {
         assert!(response.ends_with(std::str::from_utf8(edited).expect("utf8")));
         let on_wire = wire.recv().await.expect("modified request on the wire");
         assert!(on_wire.contains("\r\nX-Edited: Yes\r\n"), "{on_wire}");
+        // Edited, the names keep that case on the wire (as Resend sends them).
         assert!(
-            on_wire.contains(&format!("\r\ncontent-length: {}\r\n", edited.len())),
+            on_wire.contains("\r\nContent-Type: application/json\r\n"),
+            "{on_wire}"
+        );
+        assert!(
+            on_wire.contains(&format!("\r\nContent-Length: {}\r\n", edited.len())),
             "{on_wire}"
         );
         assert!(on_wire.ends_with(std::str::from_utf8(edited).expect("utf8")));
@@ -1976,6 +2848,7 @@ mod tests {
                     bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                     ca: ca.clone(),
                     intercept: None,
+                    capture_browser_listener: false,
                 },
                 observer.clone(),
             )
@@ -2035,6 +2908,7 @@ mod tests {
                     bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                     ca: SessionCa::generate().expect("CA"),
                     intercept: None,
+                    capture_browser_listener: false,
                 },
                 Arc::new(NoopObserver),
             )

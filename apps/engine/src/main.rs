@@ -1097,6 +1097,7 @@ impl WorkbenchRuntime {
         let ca = SessionCa::generate()?;
         engine.configure_browser_ca(ca.clone());
         let live = engine.live_workbench();
+        proxy.enable_capture_browser_listener();
         let bound_address = proxy
             .start_with_intercept(
                 &session,
@@ -1110,6 +1111,9 @@ impl WorkbenchRuntime {
         // health is always available; no external backend to probe or report.
         engine.set_proxy_health(proxy.health().await);
         engine.set_proxy_address(bound_address);
+        if let Some(capture_browser) = proxy.capture_browser_addr() {
+            engine.set_capture_browser_proxy_address(capture_browser);
+        }
         let sender = Arc::new(ProxyResendSender::new(bound_address, ca.clone()));
         engine.attach_resend_sender(sender);
         engine.set_fuzzer_ffuf_proxy(bound_address);
@@ -1635,9 +1639,7 @@ mod tests {
             Some(200)
         );
         assert_eq!(
-            store
-                .resend_contexts()
-                .expect("persisted resend contexts")[0]
+            store.resend_contexts().expect("persisted resend contexts")[0]
                 .history
                 .len(),
             1

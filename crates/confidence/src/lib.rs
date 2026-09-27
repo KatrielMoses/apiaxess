@@ -757,7 +757,36 @@ fn fact_diagnostic(
             i64::try_from(fact.merge_counts.true_conflict).unwrap_or(i64::MAX),
         ),
     );
+    // Name the endpoint and the kind of fact, so a reader can act on it
+    // without decoding the model path.
+    if let Some(endpoint) = &fact.endpoint {
+        context.insert(
+            "endpoint".to_owned(),
+            DiagnosticValue::String(format!(
+                "{} {}{}",
+                endpoint.method.as_str(),
+                endpoint.host.as_deref().unwrap_or(""),
+                endpoint.path_template.as_str()
+            )),
+        );
+    }
+    context.insert(
+        "fact".to_owned(),
+        DiagnosticValue::String(words(&format!("{:?}", fact.field_class))),
+    );
     definition.instantiate(context)
+}
+
+/// `RequestSchema` → `request schema`.
+fn words(camel: &str) -> String {
+    let mut out = String::with_capacity(camel.len() + 4);
+    for (index, ch) in camel.chars().enumerate() {
+        if ch.is_ascii_uppercase() && index > 0 {
+            out.push(' ');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
 }
 
 fn diagnostic(

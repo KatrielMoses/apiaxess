@@ -62,7 +62,7 @@
           >
             <span class="omnibox__icon" data-icon="search" data-icon-size="12"></span>
             <span class="omnibox__text">Go to surface, flow, endpoint or command</span>
-            <span class="omnibox__key">⌘K</span>
+            <span class="omnibox__key" data-shortcut="⌘K">⌘K</span>
           </button>
         </div>
         <div class="titlebar__scope">
@@ -162,15 +162,6 @@
              ========================================================== -->
         <section class="view" id="view-start" data-view="start" hidden>
           <div class="landing">
-            <div class="landing__hero">
-              <p class="t-label">API surface reconstruction</p>
-              <h1>Recover an application's real API surface from what it ships and what it does.</h1>
-              <p>
-                Pick an input. APIaxess reverse-engineers the reachable API from evidence — never
-                from guesswork — and reports honest coverage for everything it could not confirm.
-              </p>
-            </div>
-
             <div class="landing__paths">
               <button class="path-card" type="button" data-nav="apk" id="path-apk">
                 <span class="path-card__top">
@@ -632,7 +623,7 @@
               <article class="panel">
                 <div class="panel__header">
                   <div class="panel__heading"><span data-icon="traffic"></span><h2>Screen</h2></div>
-                  <span class="panel__hint">interactive</span>
+                  <span class="panel__hint" id="android-screen-hint" hidden>interactive</span>
                 </div>
                 <div class="panel__body panel__body--flush" id="android-screen"></div>
               </article>
@@ -661,13 +652,24 @@
                   <input id="intercept-toggle" type="checkbox" />
                   <span>Intercept matching requests</span>
                 </label>
+                <label class="field field--inline" title="A held request with no decision is forwarded unmodified after this long.">
+                  <span class="field__label">Auto-forward after</span>
+                  <select class="input input--sm" id="intercept-timeout" aria-label="Auto-forward held requests after">
+                    <option value="15">15 s</option>
+                    <option value="30">30 s</option>
+                    <option value="60">1 min</option>
+                    <option value="120">2 min</option>
+                    <option value="300">5 min</option>
+                    <option value="600">10 min</option>
+                  </select>
+                </label>
                 <div class="field field--inline workbench__filter">
                   <label class="field__label" for="host-filter" title="Limits which hosts are paused when intercept is on. This is not the session engagement scope.">Intercept hosts</label>
                   <input class="input input--mono" id="host-filter" type="text" placeholder="blank = all hosts · api.example.com, *.internal" spellcheck="false" />
                 </div>
                 <div class="field field--inline workbench__search">
                   <span class="workbench__search-icon" data-icon="discovery" aria-hidden="true"></span>
-                  <input class="input input--mono" id="flow-search" type="search" placeholder="Filter traffic — host, path, method, status" spellcheck="false" aria-label="Filter live traffic" />
+                  <input class="input input--mono" id="flow-search" type="search" placeholder="Filter traffic — host:port, path, method, status" spellcheck="false" aria-label="Filter live traffic" />
                 </div>
                 <select class="input input--sm" id="flow-filter-method" aria-label="Filter by request method" title="Filter by request method">
                   <option value="">Any method</option>
@@ -695,6 +697,7 @@
               <div class="har-scope" id="har-scope-notice" role="status" hidden></div>
               <div class="wb-split" data-wbsplit="live">
                 <div class="wb-split__pane wb-split__pane--list">
+                  <p class="t-small t-subtle flow-paused" id="flow-paused" role="status" hidden></p>
                   <div class="workbench__scroll"><div class="list" id="flow-list" aria-live="polite"></div></div>
                 </div>
                 <div class="wb-split__gutter" data-wbgutter="live" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize traffic list"></div>
@@ -938,7 +941,7 @@
 
                   <div class="field">
                     <label class="field__label" for="export-dir">Output directory</label>
-                    <input class="input input--mono" id="export-dir" type="text" value="artifacts/web" spellcheck="false" />
+                    <input class="input input--mono" id="export-dir" type="text" value="" placeholder="Documents\APIaxess\exports\web" spellcheck="false" />
                     <p class="field__hint">Relative paths resolve against the engine's working directory.</p>
                   </div>
                 </div>
@@ -971,7 +974,7 @@
               <p class="t-label">Durable state</p>
               <h1 class="t-display">Session</h1>
               <p>
-                Sessions are durable: captured traffic, Resend history, Fuzzer jobs, pipeline
+                Sessions are durable: captured traffic, Resend history, Fuzz attacks, pipeline
                 state, and the audit trail all survive a restart.
               </p>
             </div>
@@ -1092,12 +1095,15 @@
                 <div class="panel__heading"><span data-icon="help"></span><h2>Keyboard</h2></div>
               </div>
               <div class="panel__body">
-                <ul class="shortcut-list">
-                  <li><span>Diagnostics drawer</span><kbd>Esc</kbd></li>
-                  <li><span>Close dialog</span><kbd>Esc</kbd></li>
-                  <li><span>Confirm dialog</span><kbd>Enter</kbd></li>
-                </ul>
+                <ul class="shortcut-list" id="about-shortcuts"></ul>
               </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel__header">
+                <div class="panel__heading"><span data-icon="shield"></span><h2>Licenses &amp; notices</h2></div>
+              </div>
+              <div class="panel__body stack" id="about-notices"></div>
             </article>
 
             <article class="panel">
@@ -1138,6 +1144,7 @@
       <footer class="statusbar" id="statusbar">
         <span class="statusbar__cell statusbar__cell--surface" id="statusbar-surface">START</span>
         <span class="statusbar__cell" id="statusbar-session">no session</span>
+        <span class="statusbar__cell statusbar__cell--scope is-unscoped" id="statusbar-scope" role="status"><span class="statusbar__dot statusbar__dot--scope" aria-hidden="true"></span><span id="statusbar-scope-text">No scope declared</span></span>
         <span class="statusbar__cell statusbar__cell--transport" title="Control channel — reliable">
           <span class="statusbar__dot statusbar__dot--control" aria-hidden="true"></span>CONTROL
         </span>
@@ -1146,8 +1153,9 @@
         </span>
         <span class="statusbar__spacer"></span>
         <button class="statusbar__cell statusbar__cell--action" id="statusbar-menu" type="button" aria-haspopup="menu" aria-expanded="false" hidden>☰ MENU</button>
-        <button class="statusbar__cell statusbar__cell--action" id="statusbar-sidebar" data-toggle="sidebar" type="button" hidden>SIDEBAR ⌘B</button>
-        <button class="statusbar__cell statusbar__cell--action" id="statusbar-dock" data-toggle="dock" type="button" hidden>DOCK ⌘J</button>
+        <button class="statusbar__cell statusbar__cell--action" id="statusbar-sidebar" data-toggle="sidebar" type="button" hidden>SIDEBAR <span data-shortcut="⌘B">⌘B</span></button>
+        <button class="statusbar__cell statusbar__cell--action" id="statusbar-dock" data-toggle="dock" type="button" hidden>DOCK <span data-shortcut="⌘J">⌘J</span></button>
+        <button class="statusbar__cell statusbar__cell--action" id="statusbar-inspector" data-toggle="inspector" type="button" hidden>INSPECTOR <span data-shortcut="⌘⌥I">⌘⌥I</span></button>
         <button class="statusbar__cell statusbar__cell--action statusbar__cell--diag" id="statusbar-diag" data-open="diagnostics" type="button" hidden>0 DIAGNOSTICS</button>
         <span class="statusbar__cell" id="statusbar-locality">127.0.0.1</span>
       </footer>

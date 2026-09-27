@@ -745,6 +745,23 @@
 .statusbar__cell--diag {
   color: var(--s-red);
 }
+/* The scope/authorization state, shown here only when the titlebar's scope
+   pill has dropped (≤1119px), so it is never silently removed. */
+.statusbar__cell--scope {
+  display: none;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.statusbar__dot--scope {
+  background: var(--s-blue);
+}
+.statusbar__cell--scope.is-unscoped {
+  color: var(--s-ink2);
+}
+.statusbar__cell--scope.is-unscoped .statusbar__dot--scope {
+  background: var(--s-ink3);
+}
 .statusbar__dot {
   width: 5px;
   height: 5px;
@@ -1110,17 +1127,42 @@
  * inspector (region 7), resizable by the injected inspector splitter.
  * ================================================================== */
 .app-main .workbench__bar {
-  gap: 10px;
-  flex-wrap: nowrap;
-  padding: 0 12px;
+  gap: 6px 10px;
+  /* Wraps rather than clips: every control (Export HAR, the counter) stays
+     reachable at narrow widths instead of being cut off. */
+  flex-wrap: wrap;
+  padding: 4px 12px;
   min-height: 32px;
   border-bottom: 2px solid var(--s-rule);
-  overflow: hidden;
 }
 /* Workbench = three tools (Live traffic / Resend / Fuzz); the shell inspector
    splitter is unused here (each tool owns its own list|detail splitter). */
 .shell[data-inspector="collapsed"] .splitter--inspector {
   display: none;
+}
+/* Toggle inspector (View menu, Ctrl+Alt+I): each tool's detail pane is its
+   inspector. Collapsed, the list takes the full width; the status bar offers
+   the way back. */
+.shell[data-inspector="collapsed"] .wb-split > .wb-split__pane--detail,
+.shell[data-inspector="collapsed"] .wb-split > .wb-split__gutter {
+  display: none;
+}
+.shell[data-inspector="collapsed"] .wb-split > .wb-split__pane--list {
+  flex: 1 1 auto;
+  max-width: none;
+}
+
+/* The terminal "engine stopped" notice: pinned above everything, so a lost
+   engine is never just an endless status-bar spinner. */
+.engine-down {
+  position: fixed;
+  left: 50%;
+  bottom: var(--space-6);
+  transform: translateX(-50%);
+  z-index: 1000;
+  width: min(40rem, calc(100vw - 2 * var(--space-4)));
+  align-items: center;
+  box-shadow: var(--shadow-overlay);
 }
 
 /* ================================================================== *
@@ -1137,6 +1179,9 @@
   .titlebar__scope,
   .menubar {
     display: none;
+  }
+  .statusbar__cell--scope {
+    display: flex;
   }
 }
 

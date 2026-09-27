@@ -1069,9 +1069,9 @@ pub mod catalogue {
         id: "proxy.intercept-timeout",
         category: DiagnosticCategory::Session,
         severity: DiagnosticSeverity::Warning,
-        what: "A paused request reached the live intercept timeout.",
-        why: "The control channel did not return a decision before the session timeout elapsed.",
-        fix: "Reconnect the GUI, forward or drop promptly, or increase the session intercept timeout for long investigations.",
+        what: "A held request timed out and was forwarded unmodified.",
+        why: "No forward, modify, or drop decision arrived before the intercept timeout elapsed, so the original request went upstream; any edits in progress were not applied.",
+        fix: "Decide on held requests within the timeout, or raise it with Auto-forward after (next to Intercept, up to 10 minutes) for long investigations.",
     };
 
     /// The live editor supplied an invalid method, header, or body edit.
@@ -1498,6 +1498,16 @@ pub mod catalogue {
         fix: "Inspect the structured process diagnostic, verify the wordlist and target request, then retry or use a native stateful job.",
     };
 
+    /// A directory-discovery run was stopped before every candidate was probed.
+    pub const WEB_DISCOVERY_STOPPED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "web.discovery-stopped",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Info,
+        what: "The discovery run was stopped.",
+        why: "It was stopped (or the session closed) before every candidate was probed; the hits found so far are kept.",
+        fix: "Run discovery again to probe the remaining candidates.",
+    };
+
     /// Observed request rate reported after a stateless discovery/fuzzer run,
     /// so the pre-run estimate can be judged honestly against reality.
     pub const WEB_DISCOVERY_RATE_OBSERVED: DiagnosticDefinition = DiagnosticDefinition {
@@ -1544,8 +1554,8 @@ pub mod catalogue {
         id: "proxy.fuzzer-cancelled",
         category: DiagnosticCategory::Session,
         severity: DiagnosticSeverity::Info,
-        what: "The fuzzer job was stopped.",
-        why: "The user cancelled the job or the session closed while work was in progress.",
+        what: "The Fuzz attack was stopped.",
+        why: "The attack was cancelled, or the session closed, while work was in progress.",
         fix: "Resume the job or start a new attack if more payloads are authorized.",
     };
 
@@ -2394,6 +2404,21 @@ pub mod catalogue {
         fix: "Install the GUI Android target add-on (install-android-target.ps1 / .sh) to enable a GUI-drivable target; static, web, and autonomous-dynamic workflows do not require it.",
     };
 
+    /// The installed GUI Android target add-on predates what this engine needs.
+    ///
+    /// The add-on is versioned separately from the application and the installer
+    /// never updates it, so an older payload can sit under a newer `APIaxess`. Its
+    /// `payloadVersion` is compared with the version the engine requires; the
+    /// context carries both.
+    pub const ANDROID_TARGET_OUTDATED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-target-outdated",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Error,
+        what: "The installed GUI Android target add-on is out of date.",
+        why: "It is older than this version of APIaxess supports: its screen stream is not built for the path the engine serves the device view under, so the device screen would stay blank. The APIaxess installer does not update the separately installed add-on.",
+        fix: "Update the add-on by re-running install-android-target.ps1 (Windows) or install-android-target.sh (Linux), then launch the Android target again.",
+    };
+
     /// The GUI Android target add-on manifest is missing or malformed.
     pub const ANDROID_TARGET_MANIFEST_INVALID: DiagnosticDefinition = DiagnosticDefinition {
         id: "sandbox.android-target-manifest-invalid",
@@ -2447,6 +2472,7 @@ pub mod catalogue {
     /// Every Phase D1 (GUI Android target add-on) definition.
     pub const PHASE_D1: &[DiagnosticDefinition] = &[
         ANDROID_TARGET_MISSING,
+        ANDROID_TARGET_OUTDATED,
         ANDROID_TARGET_MANIFEST_INVALID,
         ANDROID_TARGET_CLIENT_APK_MISSING,
         ANDROID_TARGET_BOOTED,
@@ -2467,6 +2493,17 @@ pub mod catalogue {
         what: "The GUI Android target add-on does not include the screen-streaming components.",
         why: "ws-scrcpy and its bundled Node runtime were not staged in the add-on, so the target's screen cannot be streamed.",
         fix: "Reinstall the GUI Android target add-on so ws-scrcpy and the Node runtime are staged; the target still boots and captures traffic without streaming.",
+    };
+
+    /// ws-scrcpy started, but does not serve the device view where the engine
+    /// reverse-proxies it, so the Android screen would be blank.
+    pub const ANDROID_STREAM_NOT_SERVED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.android-stream-not-served",
+        category: DiagnosticCategory::Sandbox,
+        severity: DiagnosticSeverity::Error,
+        what: "The Android target's screen stream is not being served.",
+        why: "ws-scrcpy started but did not answer with the device view at its base path (the context has what it answered), so the screen would be blank. This happens when the add-on's ws-scrcpy build predates base-path support, or when it failed to start.",
+        fix: "Update the GUI Android target add-on (re-run install-android-target.ps1 or .sh), then relaunch the target. It still boots and captures traffic without the screen.",
     };
 
     /// The GUI Android target's screen stream (ws-scrcpy) started on loopback.
@@ -2517,6 +2554,7 @@ pub mod catalogue {
     /// Every Phase D2 (ws-scrcpy streaming + authenticated reverse-proxy) definition.
     pub const PHASE_D2: &[DiagnosticDefinition] = &[
         ANDROID_STREAM_UNAVAILABLE,
+        ANDROID_STREAM_NOT_SERVED,
         ANDROID_STREAM_STARTED,
         ANDROID_STREAM_NOT_ACTIVE,
         ANDROID_STREAM_AUTH_REJECTED,
@@ -3715,6 +3753,7 @@ pub mod catalogue {
         PROXY_FUZZER_FFUF_UNAVAILABLE,
         PROXY_FUZZER_FFUF_FAILED,
         WEB_DISCOVERY_RATE_OBSERVED,
+        WEB_DISCOVERY_STOPPED,
         PROXY_FUZZER_RATE_OBSERVED,
         PROXY_FUZZER_CONFIG_INVALID,
         PROXY_FUZZER_SEQUENCE_FAILED,

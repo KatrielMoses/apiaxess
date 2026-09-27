@@ -211,6 +211,11 @@ pub enum ProtocolOperationIdentity {
         service: String,
         /// Method name within the service.
         method: String,
+        /// Origin (`scheme://host[:port]`) the calls were observed going to;
+        /// `None` for an operation known only statically. It is what lets an
+        /// export address the call (`POST {base_url}/{service}/{method}`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
     },
     /// GraphQL operation over one endpoint.
     GraphQl {
@@ -756,6 +761,11 @@ pub struct ResponseBody {
     /// content type was observed (older documents also omit it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
+    /// Names of the response headers observed with this status (lower-case,
+    /// sorted), so a reader can see what the response actually carries.
+    /// Empty when none were observed (and in older documents).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
 }
 
 /// Response status selector independent of `OpenAPI` keys.

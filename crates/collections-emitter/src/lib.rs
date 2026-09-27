@@ -131,6 +131,11 @@ impl CollectionsEmitter {
             items.push(Value::Object(folder));
         }
 
+        // gRPC-Web methods, each as the HTTP call it is.
+        for grpc in surface.grpc_operations() {
+            items.push(grpc_folder(&grpc, primary_base.as_deref(), &mut variables));
+        }
+
         let document = json!({
             "info": {
                 "name": self.name,
@@ -285,6 +290,68 @@ fn diagnostic<const N: usize>(
     definition.instantiate(context)
 }
 
+/// A gRPC-Web method as a collection folder. The protobuf message is not
+/// reconstructable without the .proto, so the body is a binary file the
+/// operator supplies, and the description says so. A method known only from
+/// code has no origin to address, so its folder carries no request.
+fn grpc_folder(
+    grpc: &apiaxess_api_model::ExportableGrpcOperation,
+    primary_base: Option<&str>,
+    variables: &mut BTreeMap<String, Value>,
+) -> Value {
+    let mut folder = Map::new();
+    folder.insert(
+        "name".to_owned(),
+        Value::String(format!("gRPC {}/{}", grpc.service, grpc.method)),
+    );
+    let Some(base) = grpc.base_url.clone() else {
+        folder.insert(
+            "description".to_owned(),
+            Value::String(format!(
+                "gRPC method {}/{} — {}. Its origin is unknown (it was never observed being called), so no request is generated.",
+                grpc.service,
+                grpc.method,
+                grpc.evidence.describe()
+            )),
+        );
+        folder.insert("item".to_owned(), Value::Array(Vec::new()));
+        return Value::Object(folder);
+    };
+    let variable = origin_variable_for(Some(base), primary_base, variables);
+    let description = format!(
+        "gRPC-Web call to {}/{} — {}. The body is one length-prefixed protobuf message; its schema is not recoverable without the service's .proto, so attach the binary message (a captured one works) as the body. The outcome is in the grpc-status trailer.",
+        grpc.service,
+        grpc.method,
+        grpc.evidence.describe()
+    );
+    folder.insert("description".to_owned(), Value::String(description.clone()));
+    let segments: Vec<Value> = [grpc.service.clone(), grpc.method.clone()]
+        .into_iter()
+        .map(Value::String)
+        .collect();
+    folder.insert(
+        "item".to_owned(),
+        json!([{
+            "name": format!("{}/{}", grpc.service, grpc.method),
+            "request": {
+                "method": "POST",
+                "description": description,
+                "header": [
+                    {"key": "content-type", "value": "application/grpc-web+proto"},
+                    {"key": "x-grpc-web", "value": "1"}
+                ],
+                "body": {"mode": "file", "file": {"src": ""}},
+                "url": {
+                    "raw": format!("{{{{{variable}}}}}{}", grpc.path()),
+                    "host": [format!("{{{{{variable}}}}}")],
+                    "path": segments
+                }
+            }
+        }]),
+    );
+    Value::Object(folder)
+}
+
 /// The collection variable an endpoint's requests are sent to: `baseUrl` for
 /// the primary origin, otherwise a variable of its own origin (added once).
 fn origin_variable(
@@ -292,7 +359,17 @@ fn origin_variable(
     primary_base: Option<&str>,
     variables: &mut BTreeMap<String, Value>,
 ) -> String {
-    match endpoint_base_url(endpoint) {
+    origin_variable_for(endpoint_base_url(endpoint), primary_base, variables)
+}
+
+/// The collection variable for requests served from `base` (see
+/// [`origin_variable`]).
+fn origin_variable_for(
+    base: Option<String>,
+    primary_base: Option<&str>,
+    variables: &mut BTreeMap<String, Value>,
+) -> String {
+    match base {
         Some(base) if primary_base != Some(base.as_str()) => {
             let key = format!(
                 "baseUrl_{}",
@@ -575,8 +652,15 @@ fn postman_body(slot: &SchemaSlot, encoding: &RequestEncoding) -> (Value, &'stat
     };
     let raw_json = || serde_json::to_string_pretty(&example).expect("example JSON is serializable");
     match encoding {
-        RequestEncoding::Json(_) | RequestEncoding::TextJson(_) => (
+        RequestEncoding::Json(_) => (
             json!({"mode": "raw", "raw": raw_json(), "options": {"raw": {"language": "json"}}}),
+            PLACEHOLDERS,
+        ),
+        // JSON-shaped text sent as a text media type (beacons): the JSON is
+        // kept, but labelled as the text it is sent as, so Postman does not
+        // present (or send) it as application/json.
+        RequestEncoding::TextJson(_) => (
+            json!({"mode": "raw", "raw": raw_json(), "options": {"raw": {"language": "text"}}}),
             PLACEHOLDERS,
         ),
         RequestEncoding::Form(_) => (

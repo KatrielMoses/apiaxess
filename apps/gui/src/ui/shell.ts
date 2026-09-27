@@ -8,6 +8,7 @@
  * layout persistence, all without ever remounting a streaming container.
  */
 
+import { localizeShortcuts, shortcutLabel } from "./keys";
 import { icon, type IconName } from "../brand/icons";
 import { escapeHtml } from "./dom";
 import { onViewChange, showView, type ViewName } from "./nav";
@@ -121,9 +122,11 @@ function toggle(attr: "sidebar" | "dock" | "inspector", force?: boolean): void {
 function syncStatusAffordances(): void {
   const sidebarCell = document.querySelector<HTMLElement>("#statusbar-sidebar");
   const dockCell = document.querySelector<HTMLElement>("#statusbar-dock");
+  const inspectorCell = document.querySelector<HTMLElement>("#statusbar-inspector");
   const menuCell = document.querySelector<HTMLElement>("#statusbar-menu");
   if (sidebarCell !== null) sidebarCell.hidden = shell.getAttribute("data-sidebar") !== "collapsed";
   if (dockCell !== null) dockCell.hidden = shell.getAttribute("data-dock") !== "collapsed";
+  if (inspectorCell !== null) inspectorCell.hidden = shell.getAttribute("data-inspector") !== "collapsed";
   // The menubar is `display:none` at ≤1119px (see shell.css); mirror that here.
   if (menuCell !== null) menuCell.hidden = !window.matchMedia("(max-width: 1119px)").matches;
 }
@@ -178,18 +181,16 @@ function adoptDock(): void {
   };
   tabs.forEach((tab) => tab.addEventListener("click", () => select(tab.dataset.docktab ?? "queue")));
 
-  // Keep the dock queue badge and the status-bar count live off the real list.
-  const queue = document.getElementById("queue-list");
+}
+
+/** Shows how many requests the intercept queue holds on the dock tab. Driven
+ *  by the held set itself (not by counting rendered rows). */
+export function setDockQueueCount(count: number): void {
   const badge = document.getElementById("dock-queue-badge");
-  if (queue !== null && badge !== null) {
-    const sync = (): void => {
-      const n = queue.querySelectorAll(".queue-item, [data-queue-item], li, .list__row").length;
-      badge.textContent = String(n);
-      badge.hidden = n === 0;
-    };
-    new MutationObserver(sync).observe(queue, { childList: true, subtree: true });
-    sync();
-  }
+  if (badge === null) return;
+  badge.textContent = String(count);
+  badge.hidden = count === 0;
+  badge.title = count === 0 ? "" : `${count} request${count === 1 ? "" : "s"} held`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -385,7 +386,10 @@ function openPalette(): void {
     }
   });
   scrim.addEventListener("pointerdown", (event) => {
-    if (event.target === scrim) closePalette();
+    if (event.target !== scrim) return;
+    // Keep the click from moving focus to <body> once the scrim is gone.
+    event.preventDefault();
+    closePalette();
   });
   render();
   input.focus();
@@ -394,7 +398,13 @@ function openPalette(): void {
 function closePalette(): void {
   paletteEl?.remove();
   paletteEl = null;
-  lastFocus?.focus();
+  const target = lastFocus;
+  target?.focus();
+  // A pointer dismissal finishes its default actions after this handler;
+  // restore focus once more after them so it lands where it came from.
+  window.setTimeout(() => {
+    if (document.activeElement === document.body) target?.focus();
+  }, 0);
 }
 
 /* ------------------------------------------------------------------ *
@@ -492,7 +502,7 @@ function openCompactMenu(trigger: HTMLElement): void {
         .map((entry) => {
           if (entry === "separator") return `<div class="menu-dropdown__sep" role="separator"></div>`;
           actions.push(entry);
-          return `<button class="menu-dropdown__item" type="button" role="menuitem">${entry.label}${entry.hint === undefined ? "" : `<span class="menu-dropdown__hint">${entry.hint}</span>`}</button>`;
+          return `<button class="menu-dropdown__item" type="button" role="menuitem">${entry.label}${entry.hint === undefined ? "" : `<span class="menu-dropdown__hint">${shortcutLabel(entry.hint)}</span>`}</button>`;
         })
         .join("");
       return `${menuIndex === 0 ? "" : `<div class="menu-dropdown__sep" role="separator"></div>`}${header}${items}`;
@@ -534,6 +544,15 @@ export function refreshLayoutForSession(): void {
   setPane("sidebar", layout.sidebar ?? PANE_DEFAULTS.sidebar, false);
   setPane("inspector", layout.inspector ?? PANE_DEFAULTS.inspector, false);
   setPane("dock", layout.dock ?? PANE_DEFAULTS.dock, false);
+  // The layout is keyed by session, and the first restore runs before the
+  // session is known: apply the saved open/collapsed states now too, so a
+  // collapsed inspector (or sidebar, or dock) stays collapsed across reloads.
+  const cramped = window.matchMedia("(max-width: 1119px)").matches;
+  const narrow = window.matchMedia("(max-width: 899px)").matches;
+  shell.setAttribute("data-sidebar", cramped || layout.sidebarOpen === false ? "collapsed" : "open");
+  shell.setAttribute("data-dock", narrow || layout.dockOpen === false ? "collapsed" : "open");
+  shell.setAttribute("data-inspector", layout.inspectorOpen === false ? "collapsed" : "open");
+  syncStatusAffordances();
 }
 
 function initMenubar(): void {
@@ -565,7 +584,7 @@ function initMenubar(): void {
       .map((entry) =>
         entry === "separator"
           ? `<div class="menu-dropdown__sep" role="separator"></div>`
-          : `<button class="menu-dropdown__item" type="button" role="menuitem">${entry.label}${entry.hint === undefined ? "" : `<span class="menu-dropdown__hint">${entry.hint}</span>`}</button>`,
+          : `<button class="menu-dropdown__item" type="button" role="menuitem">${entry.label}${entry.hint === undefined ? "" : `<span class="menu-dropdown__hint">${shortcutLabel(entry.hint)}</span>`}</button>`,
       )
       .join("");
     const rect = trigger.getBoundingClientRect();
@@ -610,6 +629,7 @@ function initMenubar(): void {
  * ------------------------------------------------------------------ */
 
 export function initShell(): void {
+  localizeShortcuts();
   const el = document.getElementById("shell");
   if (el === null) return;
   shell = el;
@@ -626,7 +646,7 @@ export function initShell(): void {
 
   // Status-bar affordances and the omnibox.
   document.querySelectorAll<HTMLElement>("[data-toggle]").forEach((cell) =>
-    cell.addEventListener("click", () => toggle(cell.dataset.toggle as "sidebar" | "dock")),
+    cell.addEventListener("click", () => toggle(cell.dataset.toggle as "sidebar" | "dock" | "inspector")),
   );
   document.getElementById("omnibox")?.addEventListener("click", openPalette);
   const menuAffordance = document.getElementById("statusbar-menu");

@@ -64,6 +64,17 @@ impl SessionDocument {
         Ok(())
     }
 
+    /// Serializes an invariant-valid complete session as compact UTF-8 JSON,
+    /// the form written to disk (pretty-printing roughly doubled the file).
+    ///
+    /// # Errors
+    ///
+    /// Returns a canonical diagnostic rather than persisting invalid or lossy state.
+    pub fn to_json(&self) -> Result<Vec<u8>, Diagnostic> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| json_diagnostic(&error))
+    }
+
     /// Serializes an invariant-valid complete session as pretty UTF-8 JSON.
     ///
     /// # Errors
@@ -82,6 +93,11 @@ impl SessionDocument {
     pub fn from_json(bytes: &[u8]) -> Result<Self, Diagnostic> {
         let raw_value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|error| json_diagnostic(&error))?;
+        // Valid JSON that is not a session at all (an export, a HAR) is named
+        // for what it is, rather than reported as broken session JSON.
+        if !(raw_value.get("format_version").is_some() && raw_value.get("session").is_some()) {
+            return Err(not_a_session(&raw_value));
+        }
         if let Some(found) = raw_value
             .get("format_version")
             .and_then(serde_json::Value::as_u64)
@@ -142,6 +158,31 @@ fn unsupported_format(found: u32) -> Diagnostic {
     diagnostic
 }
 
+/// A JSON document that is not a session artifact, named by what it looks like.
+fn not_a_session(value: &serde_json::Value) -> Diagnostic {
+    let looks_like = if value.get("openapi").is_some() || value.get("swagger").is_some() {
+        "an OpenAPI document (an APIaxess export)"
+    } else if value
+        .get("log")
+        .and_then(|log| log.get("entries"))
+        .is_some()
+    {
+        "a HAR traffic file (import it from Live traffic → Import HAR instead)"
+    } else if value.get("info").is_some() && value.get("item").is_some() {
+        "a Postman collection (an APIaxess export)"
+    } else {
+        "some other JSON document"
+    };
+    let mut diagnostic = SESSION_JSON_INVALID.instantiate(DiagnosticContext::new());
+    diagnostic.what = "This file is not an APIaxess session.".into();
+    diagnostic.why = format!(
+        "It is valid JSON, but it has no session record: it looks like {looks_like}. A session artifact is a session.json written by Save (session format version {CURRENT_SESSION_FORMAT_VERSION})."
+    )
+    .into();
+    diagnostic.fix = "Choose a session.json from a session folder (pick one from Recent sessions, or Browse to it), then open it.".into();
+    diagnostic
+}
+
 fn json_diagnostic(error: &serde_json::Error) -> Diagnostic {
     let mut context = DiagnosticContext::new();
     context.insert(
@@ -156,7 +197,15 @@ fn json_diagnostic(error: &serde_json::Error) -> Diagnostic {
         "column".to_owned(),
         DiagnosticValue::Integer(i64::try_from(error.column()).unwrap_or(i64::MAX)),
     );
-    SESSION_JSON_INVALID.instantiate(context)
+    let mut diagnostic = SESSION_JSON_INVALID.instantiate(context);
+    // Put the location where the operator reads it, not only in the context.
+    diagnostic.why = format!(
+        "The file is not valid JSON at line {}, column {}: {error}.",
+        error.line(),
+        error.column()
+    )
+    .into();
+    diagnostic
 }
 
 fn unknown_fields(fields: Vec<String>) -> Diagnostic {

@@ -76,6 +76,11 @@ pub struct Engine {
     session_ca: Arc<RwLock<Option<SessionCa>>>,
     browser_launch: Arc<std::sync::Mutex<Option<ActiveBrowserLaunch>>>,
     proxy_address: Arc<RwLock<Option<std::net::SocketAddr>>>,
+    /// The proxy's listener dedicated to the capture browser, which lets the
+    /// browser's own service traffic be kept out of the capture.
+    capture_browser_proxy_address: Arc<RwLock<Option<std::net::SocketAddr>>>,
+    /// Where the last export wrote, so "Open folder" opens exactly that.
+    last_export_dir: Arc<RwLock<Option<PathBuf>>>,
     session_runtime: Arc<RwLock<Option<Arc<SessionRuntime>>>>,
     proxy_health: Arc<RwLock<Option<BackendHealth>>>,
     /// Devices provisioned this session (Phase C5). Retained so the installed
@@ -133,6 +138,28 @@ pub struct AndroidTargetLaunchReport {
     pub diagnostics: Vec<apiaxess_diagnostics::Diagnostic>,
 }
 
+/// An installed Android target add-on that is older than the engine requires.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidAddonVersionGap {
+    /// The installed payload version.
+    pub installed: String,
+    /// The oldest payload version this engine works with.
+    pub required: String,
+}
+
+/// The installed add-on's version gap, if it is out of date.
+fn android_addon_version_gap() -> Option<AndroidAddonVersionGap> {
+    use apiaxess_sandbox::android_target::{AndroidTargetAddon, required_payload_version_label};
+    let addon = AndroidTargetAddon::resolve().ok()?;
+    addon
+        .outdated_version()
+        .map(|installed| AndroidAddonVersionGap {
+            installed: installed.to_owned(),
+            required: required_payload_version_label(),
+        })
+}
+
 /// The live phase of the GUI Android target (Phase D3), for the workbench panel to
 /// render legible per-step progress and honest failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -162,6 +189,9 @@ pub struct WsConnectionView {
     /// First- or third-party, when classifiable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub party: Option<apiaxess_api_model::HostParty>,
+    /// Whether the session declares any scope. Without one, a connection
+    /// admitted for capture is not "in scope" in any authorizing sense.
+    pub scope_declared: bool,
 }
 
 /// The outcome of importing a HAR into the active session.
@@ -174,19 +204,194 @@ pub struct HarImportReport {
     pub in_scope: usize,
     /// Flows outside the declared scope, by host: imported but not fused.
     pub outside_scope: std::collections::BTreeMap<String, usize>,
-    /// The scope derived from the HAR, when the session had none.
+    /// When the session had no scope: the origins the HAR offers as a target,
+    /// for the operator to confirm. Nothing is authorized by the import.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub derived_scope: Option<HarDerivedScope>,
+    pub scope_proposal: Option<HarScopeProposal>,
 }
 
-/// A scope derived from an imported HAR's own hosts.
+/// Checks an APK path the way intake will, before a run is confirmed. Returns
+/// the recognized artifact format.
+///
+/// # Errors
+///
+/// Returns intake's own diagnostic (`artifact.not-found`, unsupported format,
+/// malformed archive).
+pub fn check_apk_artifact(
+    path: &Path,
+) -> Result<apiaxess_artifact_intake::ArtifactFormat, apiaxess_diagnostics::Diagnostic> {
+    apiaxess_target_apk::check_artifact(path)
+}
+
+/// What the About page states about this build.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HarDerivedScope {
-    /// Hosts put in scope, each as an exact-host rule.
-    pub hosts: Vec<String>,
-    /// The HAR's other hosts, left out of scope as third-party.
-    pub excluded_hosts: Vec<String>,
+pub struct AboutInfo {
+    /// Product version (the workspace version).
+    pub version: String,
+    /// Source commit the build was made from, when the build stamped one.
+    pub commit: Option<String>,
+    /// The product's own license.
+    pub license: String,
+    /// Third-party notices shipped with this install, one per component.
+    pub notices: Vec<NoticeFile>,
+}
+
+/// One component's third-party notices file.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoticeFile {
+    /// Component, as its install-relative folder (`runtime/chromium`).
+    pub component: String,
+    /// Absolute path of the notices file.
+    pub path: String,
+}
+
+/// The installation root: the parent of the `bin/` holding this executable.
+fn install_root() -> Option<PathBuf> {
+    env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+/// Version, build commit, license and shipped notices for the About page.
+#[must_use]
+pub fn about_info() -> AboutInfo {
+    let mut notices = Vec::new();
+    if let Some(root) = install_root() {
+        // Components install their notices as `<component>/APIaxess-NOTICES.md`.
+        let mut pending = vec![(root.clone(), 0_u8)];
+        while let Some((dir, depth)) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if depth < 3 {
+                        pending.push((path, depth + 1));
+                    }
+                } else if entry.file_name() == "APIaxess-NOTICES.md" {
+                    let component = path
+                        .parent()
+                        .and_then(|parent| parent.strip_prefix(&root).ok())
+                        .map(|relative| relative.display().to_string().replace('\\', "/"))
+                        .unwrap_or_default();
+                    notices.push(NoticeFile {
+                        component: if component.is_empty() {
+                            "APIaxess".to_owned()
+                        } else {
+                            component
+                        },
+                        path: path.display().to_string(),
+                    });
+                }
+            }
+        }
+    }
+    notices.sort_by(|a, b| a.component.cmp(&b.component));
+    AboutInfo {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        commit: option_env!("APIAXESS_BUILD_COMMIT")
+            .map(str::trim)
+            .filter(|commit| !commit.is_empty())
+            .map(str::to_owned),
+        license: "Apache-2.0".to_owned(),
+        notices,
+    }
+}
+
+/// A session artifact on this machine, for the Open picker.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentSession {
+    /// The session's folder name (`session-<id>`).
+    pub session_id: String,
+    /// Absolute path of its `session.json`.
+    pub path: String,
+    /// When it was last written.
+    pub modified_at: chrono::DateTime<chrono::Utc>,
+    /// Its size on disk.
+    pub bytes: u64,
+    /// Whether it is the session open right now.
+    pub active: bool,
+}
+
+/// How a URL a tool is about to send to relates to the declared scope.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeUrlAssessment {
+    /// The engine's verdict for the URL's host and port.
+    pub disposition: apiaxess_session::ScopeDisposition,
+    /// Whether the session declares any scope at all.
+    pub scope_declared: bool,
+    /// The `host:port` the URL addresses, when it parses.
+    pub target: Option<String>,
+    /// The declared scope, each rule with its port restriction.
+    pub scope: Vec<String>,
+}
+
+/// `(host, port)` of an absolute `http(s)`/`ws(s)` URL, defaulting the port by
+/// scheme, as the senders resolve it.
+fn url_network_target(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, v)| v);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(literal) => {
+            let (host, after) = literal.split_once(']')?;
+            (host, after.strip_prefix(':'))
+        }
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(port) => port.parse().ok()?,
+        None => default,
+    };
+    Some((host, port))
+}
+
+/// A scope an imported HAR suggests, pending the operator's confirmation.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarScopeProposal {
+    /// Origins the HAR's own top-level page loads went to — what was being
+    /// browsed. Empty when the HAR records no page load; the operator then
+    /// chooses from `origins`. Never chosen by traffic volume.
+    pub suggested: Vec<HarProposedOrigin>,
+    /// Every origin in the HAR that can be a scope rule.
+    pub origins: Vec<HarProposedOrigin>,
+}
+
+/// One origin an imported HAR contains.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarProposedOrigin {
+    /// Request host.
+    pub host: String,
+    /// Port the requests went to.
+    pub port: u16,
+    /// HAR entries for this origin.
+    pub entries: usize,
+    /// Of those, top-level page loads.
+    pub navigations: usize,
+    /// First/third-party label for the host (a hint, not a decision).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party: Option<apiaxess_api_model::HostParty>,
 }
 
 /// Static analysis of the APK installed onto the Android target.
@@ -221,6 +426,9 @@ pub struct AndroidTargetStatus {
     /// Whether the add-on payload is installed at all (drives the "download it"
     /// empty state).
     pub addon_present: bool,
+    /// When the installed add-on is older than this engine needs: the versions,
+    /// so the panel can ask for an update instead of offering a broken launch.
+    pub addon_outdated: Option<AndroidAddonVersionGap>,
     /// adb serial of the booted target, once booting has started.
     pub serial: Option<String>,
     /// The ws-scrcpy port the authenticated view is reverse-proxied from, when
@@ -260,6 +468,7 @@ impl Default for AndroidTargetStatus {
             phase: AndroidTargetPhase::Idle,
             message: "No Android target is running.".to_owned(),
             addon_present: false,
+            addon_outdated: None,
             serial: None,
             ws_scrcpy_port: None,
             streaming: false,
@@ -349,12 +558,37 @@ fn bundled_wordlist_sources() -> &'static [(&'static str, &'static str, &'static
     // (id, label, kind, raw)
     &[
         ("quick", "Quick sample (8)", "directory", ""),
-        ("common", "SecLists common.txt", "directory", COMMON_WORDLIST),
-        ("raft-small-directories", "SecLists raft-small-directories", "directory", RAFT_SMALL_DIRECTORIES),
-        ("api-endpoints", "SecLists api-endpoints", "directory", API_ENDPOINTS_WORDLIST),
+        (
+            "common",
+            "SecLists common.txt",
+            "directory",
+            COMMON_WORDLIST,
+        ),
+        (
+            "raft-small-directories",
+            "SecLists raft-small-directories",
+            "directory",
+            RAFT_SMALL_DIRECTORIES,
+        ),
+        (
+            "api-endpoints",
+            "SecLists api-endpoints",
+            "directory",
+            API_ENDPOINTS_WORDLIST,
+        ),
         ("large", "APIaxess curated", "directory", LARGE_WORDLIST),
-        ("subdomains-top-5000", "SecLists subdomains top 5000", "subdomain", SUBDOMAINS_TOP_5000),
-        ("subdomains-top-20000", "SecLists subdomains top 20000", "subdomain", SUBDOMAINS_TOP_20000),
+        (
+            "subdomains-top-5000",
+            "SecLists subdomains top 5000",
+            "subdomain",
+            SUBDOMAINS_TOP_5000,
+        ),
+        (
+            "subdomains-top-20000",
+            "SecLists subdomains top 20000",
+            "subdomain",
+            SUBDOMAINS_TOP_20000,
+        ),
     ]
 }
 
@@ -364,13 +598,23 @@ pub fn bundled_wordlist_catalogue() -> Vec<WordlistInfo> {
     bundled_wordlist_sources()
         .iter()
         .map(|(id, label, kind, raw)| {
-            let count = if *id == "quick" { 8 } else { parse_wordlist(raw).len() };
+            let count = if *id == "quick" {
+                8
+            } else {
+                parse_wordlist(raw).len()
+            };
             WordlistInfo {
                 id: (*id).to_owned(),
                 label: (*label).to_owned(),
                 kind: (*kind).to_owned(),
                 count,
-                source: if *id == "large" { "APIaxess".to_owned() } else if *id == "quick" { "built-in".to_owned() } else { "SecLists".to_owned() },
+                source: if *id == "large" {
+                    "APIaxess".to_owned()
+                } else if *id == "quick" {
+                    "built-in".to_owned()
+                } else {
+                    "SecLists".to_owned()
+                },
             }
         })
         .collect()
@@ -381,10 +625,12 @@ pub fn bundled_wordlist_catalogue() -> Vec<WordlistInfo> {
 pub fn bundled_wordlist(name: &str) -> Option<Vec<String>> {
     match name {
         "small" | "quick" => Some(
-            ["www", "api", "app", "dev", "staging", "admin", "v1", "health"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            [
+                "www", "api", "app", "dev", "staging", "admin", "v1", "health",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         ),
         "medium" => Some(
             [
@@ -416,6 +662,8 @@ impl Engine {
             session_ca: Arc::new(RwLock::new(None)),
             browser_launch: Arc::new(std::sync::Mutex::new(None)),
             proxy_address: Arc::new(RwLock::new(None)),
+            capture_browser_proxy_address: Arc::new(RwLock::new(None)),
+            last_export_dir: Arc::new(RwLock::new(None)),
             session_runtime: Arc::new(RwLock::new(None)),
             proxy_health: Arc::new(RwLock::new(None)),
             provisioned_devices: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -465,6 +713,14 @@ impl Engine {
         self.live_workbench.reset_admit_all();
         self.set_engagement_scope(session.engagement_scope().clone());
         self.attach_traffic_store(&runtime.store());
+        // The desktop app restarts a crashed engine; it reopens the session
+        // named here, so the operator's work comes back with the engine.
+        if let (Some(pointer), Ok(status)) = (
+            env::var_os("APIAXESS_ACTIVE_SESSION_POINTER"),
+            runtime.status(),
+        ) {
+            let _ = fs::write(pointer, status.artifact_path.as_bytes());
+        }
         self.session_runtime
             .write()
             .map_err(|_| {
@@ -572,7 +828,50 @@ impl Engine {
                         .instantiate(apiaxess_diagnostics::DiagnosticContext::new()),
                 ]
             })?;
-        export_session_artifacts(&runtime, config)
+        // A relative directory lands below the per-user export root, never
+        // wherever the engine process happened to be started from.
+        let mut config = config.clone();
+        if config.output_dir.is_relative() {
+            config.output_dir = default_export_root().join(&config.output_dir);
+        }
+        let report = export_session_artifacts(&runtime, &config)?;
+        if let Ok(mut last) = self.last_export_dir.write() {
+            *last = Some(PathBuf::from(&report.output_dir));
+        }
+        Ok(report)
+    }
+
+    /// Opens the directory the last export wrote in the platform file
+    /// manager. Only that directory: the local API never opens arbitrary paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when nothing has been exported yet or the file
+    /// manager cannot be started.
+    pub fn open_last_export_dir(&self) -> Result<String, apiaxess_diagnostics::Diagnostic> {
+        let dir = self
+            .last_export_dir
+            .read()
+            .ok()
+            .and_then(|last| last.clone())
+            .filter(|dir| dir.is_dir())
+            .ok_or_else(|| {
+                let mut diagnostic = apiaxess_diagnostics::catalogue::EXPORT_INVALID_REQUEST
+                    .instantiate(apiaxess_diagnostics::DiagnosticContext::new());
+                diagnostic.what = "There is no export folder to open yet.".into();
+                diagnostic.why = "Nothing has been exported in this session run.".into();
+                diagnostic.fix = "Export the surface first, then open its folder.".into();
+                diagnostic
+            })?;
+        apiaxess_external_tools::open_in_file_manager(&dir).map_err(|error| {
+            let mut diagnostic = apiaxess_diagnostics::catalogue::EXPORT_WRITE_FAILED
+                .instantiate(apiaxess_diagnostics::DiagnosticContext::new());
+            diagnostic.what = "The export folder could not be opened.".into();
+            diagnostic.why = format!("The file manager could not be started: {error}").into();
+            diagnostic.fix = format!("Open {} in your file manager.", dir.display()).into();
+            diagnostic
+        })?;
+        Ok(dir.display().to_string())
     }
 
     /// Returns the canonical engagement scope for workbench classification.
@@ -600,15 +899,13 @@ impl Engine {
         &self,
         scope: EngagementScope,
     ) -> Result<SessionStatus, apiaxess_diagnostics::Diagnostic> {
-        // The record names what the operator authorized, so an AUTHORIZED
-        // session always has a matching entry in its audit trail.
+        // The record names what the operator authorized — each host with its
+        // port restriction — so an AUTHORIZED session always has a matching,
+        // unambiguous entry in its audit trail.
         let hosts = scope
             .allowed_targets
             .iter()
-            .map(|target| match &target.host {
-                HostMatch::Exact { host } => host.clone(),
-                HostMatch::DomainSuffix { domain } => format!("*.{domain}"),
-            })
+            .map(AllowedNetworkTarget::label)
             .collect::<Vec<_>>();
         let summary = if hosts.is_empty() {
             "Cleared the declared engagement scope: active work is not authorized".to_owned()
@@ -619,6 +916,48 @@ impl Engine {
             )
         };
         self.apply_session_scope(scope, AuditActor::User, "session.scope.update", summary)
+    }
+
+    /// Assesses `url` against the active session's declared scope, the same
+    /// way the Resend and Fuzz senders classify each request, so a tool can
+    /// warn before it sends anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when no session is active.
+    pub fn assess_url_scope(
+        &self,
+        url: &str,
+    ) -> Result<ScopeUrlAssessment, apiaxess_diagnostics::Diagnostic> {
+        let scope = self.session_scope()?;
+        let target = url_network_target(url);
+        let disposition = target.as_ref().map_or(
+            apiaxess_session::ScopeDisposition::Undetermined,
+            |(host, port)| {
+                scope
+                    .assess(&ActionTarget::Network {
+                        host: host.clone(),
+                        port: Some(*port),
+                    })
+                    .disposition
+            },
+        );
+        Ok(ScopeUrlAssessment {
+            disposition,
+            scope_declared: !scope.allowed_targets.is_empty(),
+            target: target.map(|(host, port)| {
+                if host.contains(':') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                }
+            }),
+            scope: scope
+                .allowed_targets
+                .iter()
+                .map(AllowedNetworkTarget::label)
+                .collect(),
+        })
     }
 
     /// Appends a completed session action to the audit trail and saves the
@@ -668,6 +1007,13 @@ impl Engine {
         })?;
         let now = chrono::Utc::now();
         let mut session = runtime.session_snapshot()?;
+        let removed: Vec<AllowedNetworkTarget> = session
+            .engagement_scope()
+            .allowed_targets
+            .iter()
+            .filter(|rule| !scope.allowed_targets.contains(rule))
+            .cloned()
+            .collect();
         session.update_engagement_scope(scope, now)?;
         let action_id = format!(
             "{kind}:{}",
@@ -689,8 +1035,11 @@ impl Engine {
         self.set_engagement_scope(runtime.session_snapshot()?.engagement_scope().clone());
         // Traffic captured before this scope existed (or before a host was added)
         // was classified against the old scope; re-classify it now so it reaches
-        // fusion instead of being silently excluded.
+        // fusion instead of being silently excluded. A removed rule takes back
+        // exactly what it had admitted.
         self.live_workbench.promote_stored_flows_into_scope()?;
+        self.live_workbench
+            .demote_flows_for_removed_rules(&removed)?;
         runtime.save()
     }
 
@@ -705,8 +1054,58 @@ impl Engine {
         artifact_path: &Path,
     ) -> Result<SessionStatus, apiaxess_diagnostics::Diagnostic> {
         let runtime = Arc::new(SessionRuntime::open(artifact_path, &session_store_root())?);
+        // Held requests belong to the session being replaced.
+        self.live_workbench
+            .intercept_controller()
+            .drop_all_pending();
         self.attach_session_runtime(runtime)?;
+        // Opening is part of the engagement record, like New and Save.
+        self.record_session_action(
+            AuditActor::User,
+            "session.open",
+            format!("Opened this session from {}", artifact_path.display()),
+        )?;
         self.session_status()
+    }
+
+    /// Session artifacts on this machine, newest first, for the Open picker.
+    /// Metadata only: artifacts can be hundreds of megabytes, so none is read.
+    #[must_use]
+    pub fn recent_sessions(&self, limit: usize) -> Vec<RecentSession> {
+        let active = self
+            .session_runtime()
+            .ok()
+            .flatten()
+            .and_then(|runtime| runtime.session_snapshot().ok())
+            .map(|session| session.id().as_str().to_owned());
+        let mut found: Vec<RecentSession> = fs::read_dir(session_store_root())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path().join("session.json");
+                let metadata = fs::metadata(&path).ok()?;
+                let modified = metadata.modified().ok()?;
+                let folder = entry.file_name().to_string_lossy().into_owned();
+                Some(RecentSession {
+                    active: active.as_deref()
+                        == Some(folder.replacen("session-", "session:", 1).as_str()),
+                    session_id: folder,
+                    path: path.display().to_string(),
+                    modified_at: chrono::DateTime::<chrono::Utc>::from(modified),
+                    bytes: metadata.len(),
+                })
+            })
+            .collect();
+        found.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+        found.truncate(limit);
+        found
+    }
+
+    /// Where session artifacts live, for the Open picker's starting folder.
+    #[must_use]
+    pub fn session_store_dir() -> PathBuf {
+        session_store_root()
     }
 
     /// Starts a fresh active session: no declared scope, no API surface, and
@@ -739,6 +1138,22 @@ impl Engine {
         })?;
         current.save()?;
         let previous = current.session_snapshot()?;
+        // The capture browser belongs to the session it was launched for; left
+        // running, its traffic would pour into the fresh one. Stop it first.
+        let stopped_browser = self
+            .browser_launch
+            .lock()
+            .map_err(|_| browser_launch_diagnostic("browser launch state is unavailable"))?
+            .is_some();
+        if stopped_browser {
+            self.stop_browser()?;
+        }
+        self.live_workbench.reset_browser_internal_withheld();
+        // Requests the previous session held for a decision belong to it.
+        let dropped_held = self
+            .live_workbench
+            .intercept_controller()
+            .drop_all_pending();
         let now = chrono::Utc::now();
         let session_id = fresh_session_id()?;
         let declared = requested_scope.is_some();
@@ -780,17 +1195,25 @@ impl Engine {
             actor: AuditActor::User,
             action: ActionDescriptor {
                 kind: "session.new".to_owned(),
-                summary: if declared {
-                    format!(
-                        "Started a new session (replacing {}) with a declared scope",
-                        previous.id().as_str()
-                    )
-                } else {
-                    format!(
-                        "Started a new session (replacing {}) with no declared scope",
-                        previous.id().as_str()
-                    )
-                },
+                summary: format!(
+                    "Started a new session (replacing {}) with {}{}{}",
+                    previous.id().as_str(),
+                    if declared {
+                        "a declared scope"
+                    } else {
+                        "no declared scope"
+                    },
+                    if stopped_browser {
+                        "; stopped the previous session's capture browser"
+                    } else {
+                        ""
+                    },
+                    match dropped_held {
+                        0 => String::new(),
+                        1 => "; dropped 1 request the previous session still held".to_owned(),
+                        n => format!("; dropped {n} requests the previous session still held"),
+                    }
+                ),
             },
             target: ActionTarget::SessionTarget,
             outcome: ActionOutcome::Completed,
@@ -819,7 +1242,12 @@ impl Engine {
     ) -> Result<DiscoveryEstimate, apiaxess_diagnostics::Diagnostic> {
         let values = custom
             .or_else(|| bundled_wordlist(wordlist))
-            .ok_or_else(|| browser_diagnostic(apiaxess_diagnostics::catalogue::DISCOVERY_WORDLIST_UNKNOWN, "discovery wordlist was not found"))?;
+            .ok_or_else(|| {
+                browser_diagnostic(
+                    apiaxess_diagnostics::catalogue::DISCOVERY_WORDLIST_UNKNOWN,
+                    "discovery wordlist was not found",
+                )
+            })?;
         let target = self.web_target_origin()?;
         // Realistic default: end-to-end throughput through the routed proxy (and,
         // on the APK path, the emulator) to a real target is latency-bound at a
@@ -860,7 +1288,12 @@ impl Engine {
     ) -> Result<apiaxess_workbench_store::FuzzerJob, apiaxess_diagnostics::Diagnostic> {
         let values = custom
             .or_else(|| bundled_wordlist(wordlist))
-            .ok_or_else(|| browser_diagnostic(apiaxess_diagnostics::catalogue::DISCOVERY_WORDLIST_UNKNOWN, "discovery wordlist was not found"))?;
+            .ok_or_else(|| {
+                browser_diagnostic(
+                    apiaxess_diagnostics::catalogue::DISCOVERY_WORDLIST_UNKNOWN,
+                    "discovery wordlist was not found",
+                )
+            })?;
         let estimate = self.estimate_discovery(kind, wordlist, Some(values.clone()))?;
         if !confirmed {
             return Err(browser_launch_diagnostic(&format!(
@@ -1038,11 +1471,14 @@ impl Engine {
                 *weights.entry(host.clone()).or_default() += 1;
             }
         }
-        let hints = first_party_hints(runtime.session_snapshot()?.engagement_scope());
+        let session = runtime.session_snapshot()?;
+        let scope_declared = !session.engagement_scope().allowed_targets.is_empty();
+        let hints = first_party_hints(session.engagement_scope());
         let parties = apiaxess_unified_surface::party::classify_hosts(&weights, &hints);
         Ok(connections
             .into_iter()
             .map(|connection| WsConnectionView {
+                scope_declared,
                 party: connection
                     .host
                     .as_ref()
@@ -1052,24 +1488,23 @@ impl Engine {
             .collect())
     }
 
-    /// Imports a HAR into the session's traffic. When the session has no scope
-    /// declared, one is derived from the HAR first (see
-    /// [`Self::derive_scope_from_har`]) so the imported traffic is in scope and
-    /// fuses, instead of every flow being silently excluded as undetermined.
+    /// Imports a HAR into the session's traffic. A HAR never authorizes
+    /// anything by itself: when the session has no scope declared, the report
+    /// carries a proposal (see [`Self::propose_scope_from_har`]) and the
+    /// session stays unauthorized until the operator confirms a scope.
     ///
     /// # Errors
     ///
-    /// Returns a diagnostic when the HAR is invalid, the derived scope cannot
-    /// be declared, or the import fails.
+    /// Returns a diagnostic when the HAR is invalid or the import fails.
     pub fn import_har(
         &self,
         bytes: &[u8],
     ) -> Result<HarImportReport, apiaxess_diagnostics::Diagnostic> {
-        let derived_scope = match self.session_runtime()? {
+        let scope_proposal = match self.session_runtime()? {
             Some(runtime) => {
                 let scope = runtime.session_snapshot()?.engagement_scope().clone();
                 if scope.allowed_targets.is_empty() {
-                    self.derive_scope_from_har(scope, bytes)?
+                    Some(propose_scope_from_har(&scope, bytes)?)
                 } else {
                     None
                 }
@@ -1078,7 +1513,7 @@ impl Engine {
         };
         let outcome = self.live_workbench.import_har(bytes, "har.import")?;
         let outside = outcome.outside_scope.values().sum::<usize>();
-        let summary = format!(
+        let mut summary = format!(
             "Imported {} flow(s) from {} host(s) in a HAR file: {} in scope, {} outside the scope{}",
             outcome.imported,
             outcome.hosts,
@@ -1098,75 +1533,32 @@ impl Engine {
                 )
             }
         );
+        if let Some(proposal) = &scope_proposal {
+            if proposal.suggested.is_empty() {
+                summary.push_str(
+                    ". No scope is declared and the HAR records no page load to suggest one; nothing is authorized",
+                );
+            } else {
+                use std::fmt::Write as _;
+                let suggested = proposal
+                    .suggested
+                    .iter()
+                    .map(|origin| format!("{}:{}", origin.host, origin.port))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(
+                    summary,
+                    ". No scope is declared: proposed {suggested} (the pages the HAR browsed) for the operator to confirm; nothing is authorized until they do"
+                );
+            }
+        }
         self.record_session_action(AuditActor::User, "har.import", summary)?;
         Ok(HarImportReport {
             imported: outcome.imported,
             in_scope: outcome.in_scope,
             outside_scope: outcome.outside_scope,
-            derived_scope,
+            scope_proposal,
         })
-    }
-
-    /// Declares a scope from a HAR's own hosts, as exact-host rules: the hosts
-    /// the structural classifier finds first-party (the dominant domain), or
-    /// every HAR host when none dominates. Never wider than the HAR's hosts;
-    /// the audit trail records it as derived, and the operator can narrow it.
-    fn derive_scope_from_har(
-        &self,
-        mut scope: EngagementScope,
-        bytes: &[u8],
-    ) -> Result<Option<HarDerivedScope>, apiaxess_diagnostics::Diagnostic> {
-        // Only hosts that form a valid scope rule are candidates.
-        let rule = |host: &str| AllowedNetworkTarget {
-            id: format!(
-                "har:{}",
-                host.chars()
-                    .map(|ch| match ch {
-                        'a'..='z' | '0'..='9' | '.' | '-' | '_' => ch,
-                        _ => '-',
-                    })
-                    .collect::<String>()
-            ),
-            host: HostMatch::Exact {
-                host: host.to_owned(),
-            },
-            ports: Vec::new(),
-        };
-        let weights = apiaxess_workbench_store::har_hosts(bytes)?
-            .into_iter()
-            .filter(|(host, _)| {
-                EngagementScope {
-                    allowed_targets: vec![rule(host)],
-                    ..scope.clone()
-                }
-                .validate()
-                .is_ok()
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if weights.is_empty() {
-            return Ok(None);
-        }
-        let parties =
-            apiaxess_unified_surface::party::classify_hosts(&weights, &first_party_hints(&scope));
-        let (hosts, excluded_hosts): (Vec<_>, Vec<_>) = weights.keys().cloned().partition(|host| {
-            parties.is_empty()
-                || parties.get(host) == Some(&apiaxess_api_model::HostParty::FirstParty)
-        });
-        scope.allowed_targets = hosts.iter().map(|host| rule(host)).collect();
-        self.apply_session_scope(
-            scope,
-            AuditActor::Engine,
-            "session.scope.derive-from-har",
-            format!(
-                "No scope was declared: scoped to {} host(s) from the imported HAR ({})",
-                hosts.len(),
-                hosts.join(", ")
-            ),
-        )?;
-        Ok(Some(HarDerivedScope {
-            hosts,
-            excluded_hosts,
-        }))
     }
 
     /// One page of a WebSocket connection's messages, after `after` (sequence).
@@ -1268,8 +1660,14 @@ impl Engine {
             apiaxess_unified_surface::UnifiedSurfaceConfig::new(format!("{run_id}:surface"))
                 .map_err(|error| vec![error])?;
         surface_config.first_party = first_party_hints(session.engagement_scope());
+        // Each fuse re-derives every fact from the stored flows, so earlier
+        // runs' evidence graphs are no longer referenced; drop them (and the
+        // superseded assembly) rather than let the session grow on every fuse.
+        let mut base = confidence.document;
+        base.unified_surface = None;
+        base.prune_unreferenced_provenance();
         let surface = apiaxess_unified_surface::assemble_document(
-            &confidence.document,
+            &base,
             &surface_config,
             chrono::Utc::now(),
         )?;
@@ -1727,8 +2125,13 @@ impl Engine {
             DeviceProvisioner, PortMapping, ProvisionOptions,
         };
 
-        // 1. Resolve the optional, separately-downloaded add-on payload.
+        // 1. Resolve the optional, separately-downloaded add-on payload, and
+        //    refuse one older than this engine drives correctly (it would boot
+        //    into a blank screen that claims to be streaming).
         let addon = AndroidTargetAddon::resolve().map_err(|diagnostic| vec![diagnostic])?;
+        addon
+            .ensure_compatible()
+            .map_err(|diagnostic| vec![diagnostic])?;
 
         // 2. First-boot provisioning needs the live session CA + running proxy,
         //    exactly like the C2 device path.
@@ -1818,22 +2221,29 @@ impl Engine {
         //     stream binds 127.0.0.1 only; the engine reverse-proxies it.
         self.set_android_phase(AndroidTargetPhase::Streaming, "Starting the screen stream…");
         let streaming = match booted.start_streaming() {
-            Ok(stream) => {
-                // A brief readiness wait so the first proxied request does not race
-                // Node startup; best-effort, never fatal.
-                let _ = stream.wait_ready(std::time::Duration::from_secs(15));
-                if let Ok(mut slot) = self.android_stream.lock() {
-                    if let Some(previous) = slot.take() {
-                        let _ = previous.stop();
+            // "Streaming" is reported only once ws-scrcpy really serves the
+            // device view at the reverse-proxied base path — a process that
+            // started but answers 404 there is an honest error, not a screen.
+            Ok(stream) => match stream.ensure_served(std::time::Duration::from_secs(20)) {
+                Ok(()) => {
+                    if let Ok(mut slot) = self.android_stream.lock() {
+                        if let Some(previous) = slot.take() {
+                            let _ = previous.stop();
+                        }
+                        *slot = Some(stream);
                     }
-                    *slot = Some(stream);
+                    diagnostics.push(
+                        apiaxess_diagnostics::catalogue::ANDROID_STREAM_STARTED
+                            .instantiate(device_serial_context(&serial)),
+                    );
+                    true
                 }
-                diagnostics.push(
-                    apiaxess_diagnostics::catalogue::ANDROID_STREAM_STARTED
-                        .instantiate(device_serial_context(&serial)),
-                );
-                true
-            }
+                Err(not_served) => {
+                    diagnostics.push(not_served);
+                    let _ = stream.stop();
+                    false
+                }
+            },
             Err(mut errors) => {
                 diagnostics.append(&mut errors);
                 false
@@ -1967,6 +2377,11 @@ impl Engine {
             .map(|status| status.clone())
             .unwrap_or_default();
         status.addon_present = apiaxess_sandbox::android_target::AndroidTargetAddon::is_present();
+        status.addon_outdated = if status.addon_present {
+            android_addon_version_gap()
+        } else {
+            None
+        };
         let session_id = self
             .session_runtime()
             .ok()
@@ -2239,7 +2654,7 @@ impl Engine {
             status.message = if report.streaming {
                 "The Android target is ready — install your target APK and drive it.".to_owned()
             } else {
-                "The Android target is ready, but screen streaming is unavailable (reinstall the add-on's streaming components).".to_owned()
+                "The Android target is ready and capturing, but its screen is not being streamed; see the diagnostic for why and how to fix it.".to_owned()
             };
             status.serial = Some(report.serial.clone());
             status.ws_scrcpy_port = report.streaming.then_some(report.ws_scrcpy_port);
@@ -2365,6 +2780,13 @@ impl Engine {
         }
     }
 
+    /// Records the proxy listener dedicated to the capture browser.
+    pub fn set_capture_browser_proxy_address(&self, address: std::net::SocketAddr) {
+        if let Ok(mut configured) = self.capture_browser_proxy_address.write() {
+            *configured = Some(address);
+        }
+    }
+
     /// The bound workbench MITM proxy port, if the proxy is running. Used to build
     /// the pairing QR and to arm a device's reverse tunnel (Phase C5).
     #[must_use]
@@ -2425,6 +2847,15 @@ impl Engine {
                     "the session proxy is not running; start APIaxess with the web session open",
                 )
             })?;
+        // Chromium goes through its own listener so the traffic it makes for
+        // itself (updates, GCM, sign-in probes) is recognised and withheld.
+        let chromium_proxy = self
+            .capture_browser_proxy_address
+            .read()
+            .ok()
+            .and_then(|value| *value)
+            .unwrap_or(proxy);
+        self.live_workbench.reset_browser_internal_withheld();
         let (profile, trust, firefox_trust) = match browser {
             BrowserKind::Firefox => {
                 let trust = self.browser_trust.provision_firefox()?;
@@ -2444,7 +2875,8 @@ impl Engine {
         // Now that the profile directory exists, materialize the landing page and
         // point the (otherwise empty) target at it.
         if open_landing {
-            target = write_capture_landing_page(&profile).unwrap_or_else(|_| "about:blank".to_owned());
+            target =
+                write_capture_landing_page(&profile).unwrap_or_else(|_| "about:blank".to_owned());
         }
         let binary = match browser {
             BrowserKind::Firefox => {
@@ -2461,7 +2893,7 @@ impl Engine {
                 command.arg(&target);
             }
             BrowserKind::Chromium => {
-                command.args(chromium_launch_arguments(&profile, proxy));
+                command.args(chromium_launch_arguments(&profile, chromium_proxy));
                 command.arg("about:blank");
             }
         }
@@ -2510,6 +2942,7 @@ impl Engine {
             trust,
             cdp_connected: browser == BrowserKind::Firefox || debug_port.is_some(),
             debug_port,
+            withheld_browser_traffic: Vec::new(),
         })
     }
 
@@ -2592,6 +3025,7 @@ impl Engine {
                 trust: self.browser_trust.status(),
                 cdp_connected: active.debug_port.is_some(),
                 debug_port: active.debug_port,
+                withheld_browser_traffic: withheld_browser_traffic(&self.live_workbench),
             },
         ))
     }
@@ -2705,6 +3139,29 @@ pub struct BrowserLaunchStatus {
     /// Ephemeral loopback CDP port, when Chromium is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_port: Option<u16>,
+    /// Requests the capture browser made for itself (not for any page) since
+    /// it was launched: relayed, but not recorded, stored, scoped or exported.
+    pub withheld_browser_traffic: Vec<WithheldBrowserHost>,
+}
+
+/// One host the capture browser contacted on its own behalf.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithheldBrowserHost {
+    /// Destination host.
+    pub host: String,
+    /// Requests withheld for it.
+    pub count: u64,
+}
+
+fn withheld_browser_traffic(live: &LiveWorkbench) -> Vec<WithheldBrowserHost> {
+    let mut hosts: Vec<_> = live
+        .browser_internal_withheld()
+        .into_iter()
+        .map(|(host, count)| WithheldBrowserHost { host, count })
+        .collect();
+    hosts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.host.cmp(&b.host)));
+    hosts
 }
 
 impl BrowserLaunchStatus {
@@ -2717,6 +3174,7 @@ impl BrowserLaunchStatus {
             trust,
             cdp_connected: false,
             debug_port: None,
+            withheld_browser_traffic: Vec::new(),
         }
     }
 }
@@ -2773,6 +3231,16 @@ fn chromium_launch_arguments(profile: &Path, proxy: std::net::SocketAddr) -> Vec
         "--no-first-run".to_owned(),
         "--no-default-browser-check".to_owned(),
         "--disable-background-networking".to_owned(),
+        // Chromium still makes some service calls with these set; whatever gets
+        // through is withheld by the capture browser's dedicated proxy listener.
+        "--disable-component-update".to_owned(),
+        "--disable-sync".to_owned(),
+        "--disable-domain-reliability".to_owned(),
+        "--disable-client-side-phishing-detection".to_owned(),
+        "--disable-component-extensions-with-background-pages".to_owned(),
+        "--no-service-autorun".to_owned(),
+        "--password-store=basic".to_owned(),
+        "--disable-search-engine-choice-screen".to_owned(),
         "--disable-default-apps".to_owned(),
         "--no-pings".to_owned(),
         "--disable-extensions".to_owned(),
@@ -2788,7 +3256,7 @@ fn chromium_launch_arguments(profile: &Path, proxy: std::net::SocketAddr) -> Vec
         "--disable-media-session-api".to_owned(),
         "--no-experiments".to_owned(),
         "--no-events".to_owned(),
-        "--disable-features=ChromeWhatsNewUI,HttpsUpgrades,ImageServiceObserveSyncDownloadStatus,LensOverlay,RenderDocument,SessionRestoreInfobar,TrackingProtection3pcd".to_owned(),
+        "--disable-features=ChromeWhatsNewUI,HttpsUpgrades,ImageServiceObserveSyncDownloadStatus,LensOverlay,RenderDocument,SessionRestoreInfobar,TrackingProtection3pcd,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,AutofillServerCommunication,CertificateTransparencyComponentUpdater,NetworkTimeServiceQuerying".to_owned(),
         "--remote-debugging-port=0".to_owned(),
         "--new-window".to_owned(),
     ]);
@@ -2848,6 +3316,10 @@ pub struct BundledToolStatus {
     /// Whether absence is expected by default (the analysis-runtime is a separate
     /// optional download, not part of the base install).
     pub optional: bool,
+    /// Present but unusable as installed (e.g. an add-on older than this
+    /// engine needs), with what to do about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// The expected bundled Chromium path (non-failing, for status display).
@@ -2890,6 +3362,7 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
             present: component.path.is_file(),
             overridden: false,
             optional: false,
+            problem: None,
         });
     }
     // An overridden static tool has no integrity component; surface it from env.
@@ -2909,6 +3382,7 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
                 path: path.display().to_string(),
                 overridden: true,
                 optional: false,
+                problem: None,
             });
         }
     }
@@ -2922,6 +3396,7 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
         path: ffuf_path,
         overridden: ffuf_overridden,
         optional: false,
+        problem: None,
     });
 
     // Chromium (browser).
@@ -2933,6 +3408,7 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
         path: chromium.display().to_string(),
         overridden: env::var_os("APIAXESS_CHROMIUM").is_some(),
         optional: false,
+        problem: None,
     });
 
     // Analysis runtime (dynamic) — the separate, optional ~2 GB payload.
@@ -2946,6 +3422,7 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
         path: runtime.runtime_root.display().to_string(),
         overridden: env::var_os("APIAXESS_ANALYSIS_RUNTIME").is_some(),
         optional: true,
+        problem: None,
     });
 
     // GUI Android target (Phase D1) — the separate, optional GUI-target add-on.
@@ -2957,6 +3434,12 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
         path: android_target_root.display().to_string(),
         overridden: env::var_os("APIAXESS_ANDROID_TARGET").is_some(),
         optional: true,
+        problem: android_addon_version_gap().map(|gap| {
+            format!(
+                "Out of date: version {} is installed, this APIaxess needs {} or newer. Re-run install-android-target to update it.",
+                gap.installed, gap.required
+            )
+        }),
     });
 
     push_device_tool_status(&mut statuses, &runtime);
@@ -2978,6 +3461,7 @@ fn push_device_tool_status(
         path: runtime.adb_executable.display().to_string(),
         overridden: env::var_os("APIAXESS_ANALYSIS_RUNTIME").is_some(),
         optional: true,
+        problem: None,
     });
     // Frida: frida-core is linked in only by the frida-embedded build, and
     // frida-server (pushed to the device) ships with the analysis runtime and,
@@ -2993,6 +3477,7 @@ fn push_device_tool_status(
         },
         overridden: false,
         optional: true,
+        problem: None,
     });
     let frida_server = apiaxess_sandbox::bundled_frida_server_path();
     statuses.push(BundledToolStatus {
@@ -3002,6 +3487,7 @@ fn push_device_tool_status(
         path: frida_server.display().to_string(),
         overridden: env::var_os("APIAXESS_ANALYSIS_RUNTIME").is_some(),
         optional: true,
+        problem: None,
     });
     if let Ok(addon) = apiaxess_sandbox::android_target::AndroidTargetAddon::resolve() {
         let addon_frida = addon.frida_server_path();
@@ -3012,6 +3498,7 @@ fn push_device_tool_status(
             path: addon_frida.display().to_string(),
             overridden: env::var_os("APIAXESS_ANDROID_TARGET").is_some(),
             optional: true,
+            problem: None,
         });
     }
 }
@@ -3306,6 +3793,25 @@ fn web_session_diagnostic(reason: &str) -> apiaxess_diagnostics::Diagnostic {
     diagnostic
 }
 
+/// Where exports go by default: a per-user folder the operator can find —
+/// `Documents\APIaxess\exports` on Windows, `~/Documents/APIaxess/exports`
+/// (or `~/APIaxess/exports` without a Documents folder) elsewhere.
+/// `APIAXESS_EXPORT_DIR` overrides it.
+#[must_use]
+pub fn default_export_root() -> PathBuf {
+    if let Some(configured) = env::var_os("APIAXESS_EXPORT_DIR") {
+        return PathBuf::from(configured);
+    }
+    let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    match home {
+        Some(home) if home.join("Documents").is_dir() || cfg!(windows) => {
+            home.join("Documents").join("APIaxess").join("exports")
+        }
+        Some(home) => home.join("APIaxess").join("exports"),
+        None => durable_data_root().join("apiaxess").join("exports"),
+    }
+}
+
 fn session_store_root() -> PathBuf {
     if let Some(configured) = env::var_os("APIAXESS_WORKBENCH_STORE_DIR") {
         return PathBuf::from(configured);
@@ -3369,6 +3875,73 @@ impl Default for Engine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The scope an imported HAR suggests, without applying any of it.
+///
+/// The suggestion is the origins the HAR's own top-level page loads went to:
+/// what the recorded session was browsing. Background and third-party calls —
+/// however many there are — only ever appear as options. Each origin is kept
+/// only if it can form a valid scope rule; party labels are hints.
+fn propose_scope_from_har(
+    scope: &EngagementScope,
+    bytes: &[u8],
+) -> Result<HarScopeProposal, apiaxess_diagnostics::Diagnostic> {
+    let valid_host = |host: &str| {
+        EngagementScope {
+            allowed_targets: vec![AllowedNetworkTarget {
+                id: "har:candidate".to_owned(),
+                host: HostMatch::Exact {
+                    host: host.to_owned(),
+                },
+                ports: Vec::new(),
+            }],
+            ..scope.clone()
+        }
+        .validate()
+        .is_ok()
+    };
+    let origins: Vec<_> = apiaxess_workbench_store::har_origins(bytes)?
+        .into_iter()
+        .filter(|origin| valid_host(&origin.host))
+        .collect();
+    let mut weights = std::collections::BTreeMap::<String, usize>::new();
+    for origin in &origins {
+        *weights.entry(origin.host.clone()).or_default() += origin.entries;
+    }
+    // What the HAR browsed is the first party; volume alone (a browser's own
+    // update checks) must not make a host first-party.
+    let mut hints = first_party_hints(scope);
+    hints.first_party_hosts.extend(
+        origins
+            .iter()
+            .filter(|origin| origin.navigations > 0)
+            .map(|origin| origin.host.clone()),
+    );
+    let parties = apiaxess_unified_surface::party::classify_hosts(&weights, &hints);
+    let mut origins: Vec<_> = origins
+        .into_iter()
+        .map(|origin| HarProposedOrigin {
+            party: parties.get(&origin.host).copied(),
+            host: origin.host,
+            port: origin.port,
+            entries: origin.entries,
+            navigations: origin.navigations,
+        })
+        .collect();
+    origins.sort_by(|a, b| {
+        b.navigations
+            .cmp(&a.navigations)
+            .then_with(|| b.entries.cmp(&a.entries))
+            .then_with(|| a.host.cmp(&b.host))
+            .then_with(|| a.port.cmp(&b.port))
+    });
+    let suggested = origins
+        .iter()
+        .filter(|origin| origin.navigations > 0)
+        .cloned()
+        .collect();
+    Ok(HarScopeProposal { suggested, origins })
 }
 
 /// What identifies the session target's own backend: a web target's own
@@ -3542,6 +4115,45 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({"log": {"entries": entries}})).expect("har")
     }
 
+    /// One HAR entry: method, URL, and request headers.
+    type HarTestEntry<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+    /// A HAR whose entries carry request headers, as a browser records them.
+    fn har_with_headers(entries: &[HarTestEntry<'_>]) -> Vec<u8> {
+        let entries = entries
+            .iter()
+            .map(|(method, url, headers)| {
+                let headers = headers
+                    .iter()
+                    .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "request": {"method": method, "url": url, "headers": headers},
+                    "response": {"status": 200, "headers": [
+                        {"name": "content-type", "value": "application/json"}
+                    ], "content": {"text": "{\"ok\":true}", "mimeType": "application/json"}}
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&serde_json::json!({"log": {"entries": entries}})).expect("har")
+    }
+
+    /// The operator confirms a scope: exact host rules, bound to the port.
+    fn confirm_scope(engine: &super::Engine, origins: &[(&str, u16)]) {
+        let mut scope = engine.session_scope().expect("scope");
+        scope.allowed_targets = origins
+            .iter()
+            .map(|(host, port)| apiaxess_session::AllowedNetworkTarget {
+                id: format!("har:{host}-{port}"),
+                host: apiaxess_session::HostMatch::Exact {
+                    host: (*host).to_owned(),
+                },
+                ports: vec![*port],
+            })
+            .collect();
+        engine.update_session_scope(scope).expect("operator scope");
+    }
+
     fn stored_scopes(engine: &super::Engine) -> Vec<(String, apiaxess_session::ScopeDisposition)> {
         let runtime = engine.session_runtime().expect("runtime").expect("session");
         runtime
@@ -3554,66 +4166,180 @@ mod tests {
     }
 
     #[test]
-    fn a_har_imported_without_a_scope_is_scoped_to_its_own_first_party_hosts_and_fuses() {
+    fn a_har_imported_without_a_scope_proposes_what_was_browsed_and_authorizes_nothing() {
         let engine = engine_with_session(&[]);
+        let navigate: &[(&str, &str)] = &[
+            ("sec-fetch-site", "none"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+        ];
+        let page_call: &[(&str, &str)] = &[
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "cors"),
+        ];
+        let service: &[(&str, &str)] = &[("sec-fetch-site", "none"), ("sec-fetch-mode", "no-cors")];
+        // The browser's own update checks outnumber the target, as in the
+        // regression HAR that used to authorize update.googleapis.com.
+        let mut entries = vec![
+            ("GET", "https://app.example.test/", navigate),
+            ("GET", "https://app.example.test/v1/items", page_call),
+            ("POST", "https://app.example.test/v1/orders", page_call),
+            ("GET", "https://cdn.tracker.test/pixel.gif", page_call),
+        ];
+        for _ in 0..6 {
+            entries.push((
+                "POST",
+                "https://update.googleapis.com/service/update2/json",
+                service,
+            ));
+        }
         let report = engine
-            .import_har(&har(&[
-                ("GET", "https://app.example.test/v1/items"),
-                ("GET", "https://app.example.test:8443/v1/items/7"),
-                ("POST", "https://api.example.test/v1/orders"),
-                ("GET", "https://cdn.tracker.test/pixel.gif"),
-            ]))
+            .import_har(&har_with_headers(&entries))
             .expect("import");
-        assert_eq!(report.imported, 4);
-        let derived = report.derived_scope.expect("a scope was derived");
-        assert_eq!(derived.hosts, vec!["api.example.test", "app.example.test"]);
-        assert_eq!(derived.excluded_hosts, vec!["cdn.tracker.test"]);
-        // Exactly the HAR's own first-party hosts: exact rules, never wider.
-        let scope = engine.session_scope().expect("scope");
-        assert!(scope.allowed_targets.iter().all(|rule| matches!(
-            &rule.host,
-            apiaxess_session::HostMatch::Exact { host } if derived.hosts.contains(host)
-        )));
-        assert_eq!(scope.allowed_targets.len(), 2);
+        assert_eq!(report.imported, 10);
+        // Nothing is authorized, and nothing is in scope until the operator
+        // says so.
+        assert!(
+            engine
+                .session_scope()
+                .expect("scope")
+                .allowed_targets
+                .is_empty()
+        );
+        assert_eq!(report.in_scope, 0);
+        let proposal = report.scope_proposal.expect("a proposal");
+        let suggested: Vec<_> = proposal
+            .suggested
+            .iter()
+            .map(|origin| (origin.host.as_str(), origin.port))
+            .collect();
+        assert_eq!(suggested, vec![("app.example.test", 443)]);
+        // The browsed host is the first party, however many calls the
+        // browser's own update checks made.
+        let party = |host: &str| {
+            proposal
+                .origins
+                .iter()
+                .find(|origin| origin.host == host)
+                .and_then(|origin| origin.party)
+        };
+        assert_eq!(
+            party("app.example.test"),
+            Some(apiaxess_api_model::HostParty::FirstParty)
+        );
+        assert_eq!(
+            party("update.googleapis.com"),
+            Some(apiaxess_api_model::HostParty::ThirdParty)
+        );
+        // Every origin is offered; the frequent one is never suggested.
+        assert!(
+            proposal
+                .origins
+                .iter()
+                .any(|origin| origin.host == "update.googleapis.com"
+                    && origin.entries == 6
+                    && origin.navigations == 0)
+        );
+        let audit = engine.session_audit().expect("audit");
+        let serialized = serde_json::to_string(&audit).expect("audit json");
+        assert!(!serialized.contains("session.scope.derive-from-har"));
+        assert!(serialized.contains("nothing is authorized until they do"));
+
+        // The operator confirms the suggestion: the imported flows re-classify
+        // and fuse; the others stay outside the scope.
+        confirm_scope(&engine, &[("app.example.test", 443)]);
         for (host, disposition) in stored_scopes(&engine) {
-            let expected = if host == "cdn.tracker.test" {
-                apiaxess_session::ScopeDisposition::OutsideDeclaredScope
-            } else {
+            let expected = if host == "app.example.test" {
                 apiaxess_session::ScopeDisposition::InScope
+            } else {
+                apiaxess_session::ScopeDisposition::OutsideDeclaredScope
             };
             assert_eq!(disposition, expected, "{host}");
         }
-        // Recorded in the audit trail as derived, not as an operator action.
-        let audit = engine.session_audit().expect("audit");
-        assert!(audit.iter().any(|record| {
-            serde_json::to_string(record)
-                .expect("record")
-                .contains("session.scope.derive-from-har")
-        }));
-        // Import a HAR, fuse, get a surface.
+        let declared = engine.session_audit().expect("audit");
+        let declared = declared.last().expect("declaration");
+        assert_eq!(declared.action.kind, "session.scope.update");
+        assert_eq!(declared.actor, apiaxess_session::AuditActor::User);
         let surface = engine.fuse_web_capture().expect("fuse");
         let mut endpoints = surface
             .endpoints
             .iter()
-            .map(|endpoint| {
-                (
-                    endpoint.endpoint.identity.host.clone().unwrap_or_default(),
-                    endpoint.endpoint.identity.path_template.as_str().to_owned(),
-                )
-            })
+            .map(|endpoint| endpoint.endpoint.identity.path_template.as_str().to_owned())
             .collect::<Vec<_>>();
         endpoints.sort();
+        assert!(endpoints.contains(&"/v1/items".to_owned()));
+        assert!(endpoints.contains(&"/v1/orders".to_owned()));
+        assert!(
+            surface
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.endpoint.identity.host.as_deref()
+                    == Some("app.example.test"))
+        );
+    }
+
+    #[test]
+    fn narrowing_the_scope_takes_back_what_the_removed_rule_admitted() {
+        let engine = engine_with_session(&["app.example.test", "other.example.test"]);
+        engine
+            .import_har(&har(&[
+                ("GET", "https://app.example.test/v1/items"),
+                ("GET", "https://other.example.test/v1/items"),
+            ]))
+            .expect("import");
+        let disposition = |host: &str| {
+            stored_scopes(&engine)
+                .into_iter()
+                .find(|(flow_host, _)| flow_host == host)
+                .map(|(_, disposition)| disposition)
+        };
         assert_eq!(
-            endpoints,
-            vec![
-                ("api.example.test".to_owned(), "/v1/orders".to_owned()),
-                ("app.example.test".to_owned(), "/v1/items".to_owned()),
-                // A non-default port is part of an endpoint's host identity.
-                (
-                    "app.example.test:8443".to_owned(),
-                    "/v1/items/{id}".to_owned()
-                ),
-            ]
+            disposition("other.example.test"),
+            Some(apiaxess_session::ScopeDisposition::InScope)
+        );
+        let full = engine.session_scope().expect("scope");
+        let mut narrowed = full.clone();
+        narrowed.allowed_targets.retain(|rule| {
+            !matches!(&rule.host, apiaxess_session::HostMatch::Exact { host } if host == "other.example.test")
+                && !matches!(&rule.host, apiaxess_session::HostMatch::DomainSuffix { domain } if domain == "other.example.test")
+        });
+        assert_eq!(narrowed.allowed_targets.len(), 1);
+        engine.update_session_scope(narrowed).expect("narrow");
+        assert_eq!(
+            disposition("other.example.test"),
+            Some(apiaxess_session::ScopeDisposition::OutsideDeclaredScope)
+        );
+        assert_eq!(
+            disposition("app.example.test"),
+            Some(apiaxess_session::ScopeDisposition::InScope)
+        );
+        // Widening again promotes it back.
+        engine.update_session_scope(full).expect("widen");
+        assert_eq!(
+            disposition("other.example.test"),
+            Some(apiaxess_session::ScopeDisposition::InScope)
+        );
+    }
+
+    #[test]
+    fn a_har_with_no_page_load_suggests_nothing() {
+        let engine = engine_with_session(&[]);
+        let report = engine
+            .import_har(&har(&[
+                ("GET", "https://api.example.test/v1/items"),
+                ("GET", "https://api.example.test/v1/items/7"),
+                ("GET", "https://cdn.tracker.test/pixel.gif"),
+            ]))
+            .expect("import");
+        let proposal = report.scope_proposal.expect("a proposal");
+        assert!(proposal.suggested.is_empty());
+        assert_eq!(proposal.origins.len(), 2);
+        assert!(
+            engine
+                .session_scope()
+                .expect("scope")
+                .allowed_targets
+                .is_empty()
         );
     }
 
@@ -3628,7 +4354,7 @@ mod tests {
             ]))
             .expect("import");
         assert_eq!(report.imported, 2);
-        assert!(report.derived_scope.is_none());
+        assert!(report.scope_proposal.is_none());
         assert_eq!(engine.session_scope().expect("scope"), before);
         let mut scopes = stored_scopes(&engine);
         scopes.sort_by(|left, right| left.0.cmp(&right.0));
@@ -3706,6 +4432,7 @@ mod tests {
             operations.contains(&apiaxess_api_model::ProtocolOperationIdentity::Grpc {
                 service: "shop.v1.CartService".to_owned(),
                 method: "Checkout".to_owned(),
+                base_url: Some("https://api.example.test".to_owned()),
             })
         );
         // The gRPC call is not also an opaque REST POST.
@@ -3717,6 +4444,192 @@ mod tests {
                 .as_str()
                 != "/shop.v1.CartService/Checkout")
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_captured_grpc_web_call_is_exported_by_every_emitter() {
+        let engine = engine_with_session(&["api.example.test"]);
+        let runtime = engine.session_runtime().expect("runtime").expect("session");
+        let store = runtime.store();
+        let captured = |method: &str, path: &str, content_type: &str, body: &[u8]| {
+            apiaxess_workbench_store::FlowCapture {
+                id: store.allocate_flow_id(),
+                captured_at: chrono::Utc::now(),
+                protocol: "h2".to_owned(),
+                method: Some(method.to_owned()),
+                host: Some("api.example.test".to_owned()),
+                url: Some(format!("https://api.example.test{path}")),
+                path: Some(path.to_owned()),
+                status: Some(200),
+                duration_ms: Some(3),
+                request_headers: vec![("content-type".to_owned(), content_type.to_owned())],
+                response_headers: vec![("content-type".to_owned(), content_type.to_owned())],
+                request_body: Some(body.to_vec()),
+                response_body: None,
+                scope: apiaxess_session::ScopeDisposition::InScope,
+                provenance: "proxy.observer".to_owned(),
+                origin: apiaxess_workbench_store::FlowOrigin::Capture,
+            }
+        };
+        store
+            .upsert(&captured(
+                "POST",
+                "/v1/items",
+                "application/json",
+                br#"{"sku":"a"}"#,
+            ))
+            .expect("rest flow");
+        store
+            .upsert(&captured(
+                "POST",
+                "/shop.v1.CartService/Checkout",
+                "application/grpc-web+proto",
+                &[0, 0, 0, 0, 2, 8, 1],
+            ))
+            .expect("grpc flow");
+        let surface = engine.fuse_web_capture().expect("fuse");
+
+        // OpenAPI: the call as an addressable operation, honestly binary.
+        let openapi = apiaxess_openapi_emitter::OpenApiEmitter::default()
+            .emit(&surface)
+            .expect("openapi")
+            .document;
+        let operation = &openapi["paths"]["/shop.v1.CartService/Checkout"]["post"];
+        assert_eq!(
+            operation["x-apiaxess-grpc"]["service"],
+            "shop.v1.CartService"
+        );
+        assert_eq!(operation["x-apiaxess-grpc"]["evidence"], "confirmed");
+        assert_eq!(
+            operation["requestBody"]["content"]["application/grpc-web+proto"]["schema"]["format"],
+            "binary"
+        );
+        assert!(
+            operation.get("servers").is_none(),
+            "served from the primary origin"
+        );
+        assert_eq!(
+            openapi["x-apiaxess-grpc-operations"][0]["method"],
+            "Checkout"
+        );
+
+        // Postman: a runnable request to the right origin variable.
+        let postman = apiaxess_collections_emitter::CollectionsEmitter::default()
+            .emit_collection(&surface)
+            .expect("postman")
+            .document;
+        let folder = postman["item"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["name"] == "gRPC shop.v1.CartService/Checkout")
+            .expect("gRPC folder");
+        let request = &folder["item"][0]["request"];
+        assert_eq!(request["method"], "POST");
+        assert_eq!(
+            request["url"]["raw"],
+            "{{baseUrl}}/shop.v1.CartService/Checkout"
+        );
+        assert_eq!(request["body"]["mode"], "file");
+        assert!(
+            folder["description"]
+                .as_str()
+                .expect("description")
+                .contains("confirmed")
+        );
+
+        // Python SDK: a method that sends the caller's frame as-is.
+        let sdk = apiaxess_python_sdk_emitter::PythonSdkEmitter::default()
+            .generate(&surface)
+            .expect("sdk");
+        let script = r#"
+import inspect, json, httpx
+from apiaxess_client.client import ApiClient, DEFAULT_BASE_URL
+sent = []
+def handler(request):
+    sent.append({"url": str(request.url), "type": request.headers.get("content-type"), "body": list(request.content)})
+    return httpx.Response(200, content=b"\x00\x00\x00\x00\x00", headers={"content-type": "application/grpc-web+proto"})
+client = ApiClient(http_client=httpx.Client(base_url=DEFAULT_BASE_URL, transport=httpx.MockTransport(handler)))
+names = [name for name, _ in inspect.getmembers(ApiClient, inspect.isfunction) if name.startswith("grpc_")]
+response = getattr(client, names[0])(bytes([0, 0, 0, 0, 2, 8, 1]))
+print("RESULT " + json.dumps({"names": names, "sent": sent, "type": type(response).__name__}))
+"#;
+        let client = sdk.file("apiaxess_client/client.py").expect("client.py");
+        let output =
+            match apiaxess_python_sdk_emitter::testing::run_generated_python(&sdk.files, script) {
+                Ok(Some(output)) => output,
+                Ok(None) => return,
+                Err(output) => {
+                    panic!("the generated SDK does not run:\n{output}\n--- client.py ---\n{client}")
+                }
+            };
+        let result: serde_json::Value = serde_json::from_str(
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("RESULT "))
+                .expect("result line"),
+        )
+        .expect("result json");
+        assert_eq!(result["names"].as_array().expect("names").len(), 1);
+        assert_eq!(
+            result["sent"][0]["url"],
+            "https://api.example.test/shop.v1.CartService/Checkout"
+        );
+        assert_eq!(result["sent"][0]["type"], "application/grpc-web+proto");
+        assert_eq!(
+            result["sent"][0]["body"],
+            serde_json::json!([0, 0, 0, 0, 2, 8, 1])
+        );
+        assert_eq!(result["type"], "Response");
+    }
+
+    #[test]
+    fn repeated_fuses_do_not_grow_the_session_and_the_artifact_stores_one_surface() {
+        let engine = reference_engine(&["127.0.0.1:9201", "localhost:9202"]);
+        let runtime = engine.session_runtime().expect("runtime").expect("session");
+        let provenance_size = || {
+            let session = runtime.session_snapshot().expect("session");
+            let registry = &session.api_document().surface.provenance;
+            (
+                registry.entities.len(),
+                registry.activities.len(),
+                registry.agents.len(),
+            )
+        };
+        engine.fuse_web_capture().expect("first fuse");
+        let after_first = provenance_size();
+        engine.fuse_web_capture().expect("second fuse");
+        engine.fuse_web_capture().expect("third fuse");
+        // The same flows re-fused: earlier runs' evidence graphs are dropped,
+        // not accumulated (the live capture fused every ~6 s).
+        assert_eq!(provenance_size(), after_first);
+
+        let status = engine.session_status().expect("status");
+        let bytes = std::fs::read(&status.artifact_path).expect("artifact");
+        // Compact on disk, and the unified surface does not repeat the
+        // document's own surface and confidence.
+        assert!(
+            !bytes.windows(2).any(|pair| pair == b"\n "),
+            "pretty-printed"
+        );
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let document = &raw["session"]["api_document"];
+        assert!(document["surface"].is_object());
+        assert!(document["unified_surface"].is_object());
+        assert!(document["unified_surface"].get("surface").is_none());
+        assert!(document["unified_surface"].get("confidence").is_none());
+        // And it loads back to the same document, unified surface included.
+        let loaded = apiaxess_session::SessionDocument::from_json(&bytes).expect("artifact loads");
+        let session = runtime.session_snapshot().expect("session");
+        assert_eq!(loaded.session.api_document(), session.api_document());
+        let unified = loaded
+            .session
+            .api_document()
+            .unified_surface
+            .as_ref()
+            .expect("unified surface");
+        assert_eq!(&unified.surface, &session.api_document().surface);
     }
 
     const PROFILE_QUERY: &str = "query GetProfile($id: ID!) { profile(id: $id) { id name } }";
@@ -4090,20 +5003,31 @@ mod tests {
             original.surface.protocol_operations.len()
         );
 
-        // Into a fresh session with no scope: scoped from the HAR's own
-        // first-party host; the third-party host is reported, not dropped
-        // silently, and everything in scope fuses as before.
+        // Into a fresh session with no scope: the import authorizes nothing
+        // and offers the HAR's origins; once the operator confirms the
+        // first-party origin, it fuses as before and the third-party host
+        // stays reported outside the scope.
         let fresh = engine_with_session(&[]);
         let report = fresh.import_har(&har).expect("import");
-        assert_eq!(
-            report.derived_scope.as_ref().expect("derived").hosts,
-            vec!["127.0.0.1"]
+        assert!(
+            fresh
+                .session_scope()
+                .expect("scope")
+                .allowed_targets
+                .is_empty()
         );
-        assert_eq!(report.in_scope, 5);
-        assert_eq!(
-            report.outside_scope.clone().into_iter().collect::<Vec<_>>(),
-            vec![("localhost".to_owned(), 1)]
-        );
+        assert_eq!(report.in_scope, 0);
+        let offered: Vec<_> = report
+            .scope_proposal
+            .as_ref()
+            .expect("proposal")
+            .origins
+            .iter()
+            .map(|origin| (origin.host.as_str(), origin.port))
+            .collect();
+        assert!(offered.contains(&("127.0.0.1", 9201)));
+        assert!(offered.contains(&("localhost", 9202)));
+        confirm_scope(&fresh, &[("127.0.0.1", 9201)]);
         let fused = endpoint_set(&fresh.fuse_web_capture().expect("fuse"));
         let first_party = original_endpoints
             .iter()
@@ -4597,7 +5521,10 @@ print("RESULT " + json.dumps(sent))
         let status = engine.android_target_status();
         assert_eq!(status.phase, super::AndroidTargetPhase::Error);
         assert_eq!(status.message, failure.what.to_string());
-        assert_ne!(status.message, "The GUI Android target booted headless and is ready for provisioning.");
+        assert_ne!(
+            status.message,
+            "The GUI Android target booted headless and is ready for provisioning."
+        );
     }
 
     #[test]

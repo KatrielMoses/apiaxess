@@ -405,6 +405,10 @@ pub struct LiveWorkbench {
     websockets: Mutex<HashMap<crate::WebSocketConnectionKey, LiveWsConnection>>,
     /// Ordered, off-path WebSocket and event-stream persistence.
     stream_writer: Mutex<mpsc::Sender<StreamWrite>>,
+    /// Requests the capture browser made of its own accord (not for a page),
+    /// relayed but never recorded, counted by host so the capture can say
+    /// honestly what it left out.
+    browser_internal_withheld: Mutex<BTreeMap<String, u64>>,
 }
 
 impl LiveWorkbench {
@@ -442,6 +446,29 @@ impl LiveWorkbench {
             fallback_flow_id: AtomicU64::new(1),
             websockets: Mutex::new(HashMap::new()),
             stream_writer: Mutex::new(stream_writer),
+            browser_internal_withheld: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Hosts of the capture browser's own requests withheld from the capture
+    /// since the browser was last launched, with a count for each.
+    #[must_use]
+    pub fn browser_internal_withheld(&self) -> Vec<(String, u64)> {
+        self.browser_internal_withheld
+            .lock()
+            .map(|withheld| {
+                withheld
+                    .iter()
+                    .map(|(host, count)| (host.clone(), *count))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Starts a fresh withheld tally (a new capture browser or session).
+    pub fn reset_browser_internal_withheld(&self) {
+        if let Ok(mut withheld) = self.browser_internal_withheld.lock() {
+            withheld.clear();
         }
     }
 
@@ -802,6 +829,12 @@ impl FlowObserver for LiveWorkbench {
             self.publish_diagnostic(diagnostic);
             return;
         }
+        if let FlowEvent::BrowserInternalWithheld { host } = event {
+            if let Ok(mut withheld) = self.browser_internal_withheld.lock() {
+                *withheld.entry(host).or_insert(0) += 1;
+            }
+            return;
+        }
         if let FlowEvent::BodyEnd { flow_id, direction } = event {
             if direction == BodyDirection::Response {
                 self.observe_sse_end(flow_id);
@@ -969,7 +1002,10 @@ impl FlowObserver for LiveWorkbench {
                 self.observe_ws_closed(&connection, direction);
                 return;
             }
-            FlowEvent::BodyChunk { .. } | FlowEvent::BodyEnd { .. } | FlowEvent::Diagnostic(_) => {
+            FlowEvent::BodyChunk { .. }
+            | FlowEvent::BodyEnd { .. }
+            | FlowEvent::Diagnostic(_)
+            | FlowEvent::BrowserInternalWithheld { .. } => {
                 unreachable!()
             }
         };
@@ -1283,6 +1319,67 @@ impl LiveWorkbench {
             .disposition
     }
 
+    /// Re-classifies the stored flows that rules just removed from the scope
+    /// had admitted, against the scope now in force — so narrowing a scope
+    /// never leaves flows labelled "in scope" for a host that no longer is
+    /// (and so never exports or fuses them as such). Flows admitted any other
+    /// way are untouched. Returns how many flows changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the store cannot be read or updated.
+    pub fn demote_flows_for_removed_rules(
+        &self,
+        removed: &[apiaxess_session::AllowedNetworkTarget],
+    ) -> Result<usize, Diagnostic> {
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
+            return Ok(0);
+        };
+        let Some(current) = self
+            .engagement_scope
+            .read()
+            .ok()
+            .and_then(|scope| scope.clone())
+        else {
+            return Ok(0);
+        };
+        let dropped = EngagementScope {
+            allowed_targets: removed.to_vec(),
+            ..current
+        };
+        let admitted_by_dropped_rule = |host: &str, url: Option<&str>| {
+            let port = url
+                .and_then(|value| value.parse::<reqwest::Url>().ok())
+                .and_then(|value| value.port_or_known_default());
+            dropped
+                .assess(&ActionTarget::Network {
+                    host: host.to_owned(),
+                    port,
+                })
+                .disposition
+                == ScopeDisposition::InScope
+        };
+        let ids: Vec<u64> = store
+            .summaries()?
+            .into_iter()
+            .filter(|flow| flow.scope == ScopeDisposition::InScope)
+            .filter(|flow| {
+                flow.host
+                    .as_deref()
+                    .is_some_and(|host| admitted_by_dropped_rule(host, flow.url.as_deref()))
+            })
+            .map(|flow| flow.id)
+            .collect();
+        store.reclassify_flows(&ids, |host, url| {
+            host.map_or(ScopeDisposition::Undetermined, |host| {
+                self.classify_scope(host, url)
+            })
+        })
+    }
+
     /// Promotes stored flows that the current engagement scope now covers to
     /// in-scope (upgrade-only), so traffic captured before the scope was
     /// declared or widened is not silently left out of fusion. Returns how many
@@ -1332,10 +1429,19 @@ impl LiveWorkbench {
     ///
     /// Returns a diagnostic when no store is attached or export fails.
     pub fn export_har(&self) -> Result<Vec<u8>, Diagnostic> {
+        self.export_har_filtered(false)
+    }
+
+    /// [`Self::export_har`], optionally limited to in-scope flows.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::export_har`].
+    pub fn export_har_filtered(&self, in_scope_only: bool) -> Result<Vec<u8>, Diagnostic> {
         let Some(store) = self.store.read().ok().and_then(|store| store.clone()) else {
             return Err(catalogue::PROXY_STORE_OPEN_FAILED.instantiate(DiagnosticContext::new()));
         };
-        store.export_har()
+        store.export_har_filtered(in_scope_only)
     }
 }
 

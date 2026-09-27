@@ -408,6 +408,13 @@ pub fn capture_into_document(
             if seen.is_none() {
                 *seen = media;
             }
+            let names = entry.response_headers.entry(status).or_default();
+            names.extend(
+                flow.response_headers
+                    .iter()
+                    .map(|(name, _)| name.trim().to_ascii_lowercase())
+                    .filter(|name| !name.is_empty()),
+            );
         }
         if let (Some(status), Some(body)) = (flow.status, flow.response_body.as_ref()) {
             if let Some(sample) = parse_payload(
@@ -596,6 +603,8 @@ struct Accumulator {
     /// first one observed). A status whose body is not structured data has no
     /// JSON sample but is still a real response.
     response_media: BTreeMap<u16, Option<String>>,
+    /// Response header names observed per status.
+    response_headers: BTreeMap<u16, std::collections::BTreeSet<String>>,
     auth: Option<AuthenticationScheme>,
     pagination: BTreeSet<PaginationSignal>,
 }
@@ -615,6 +624,7 @@ impl Accumulator {
             request_opaque: false,
             response_samples: BTreeMap::new(),
             response_media: BTreeMap::new(),
+            response_headers: BTreeMap::new(),
             auth: None,
             pagination: BTreeSet::new(),
         }
@@ -898,6 +908,8 @@ fn apply_accumulator(
     Ok(())
 }
 
+// One endpoint's facts are built field by field, in model order.
+#[allow(clippy::too_many_lines)]
 fn new_endpoint(
     entry: &Accumulator,
     config: &DynamicCaptureConfig,
@@ -987,6 +999,7 @@ fn new_endpoint(
             ),
             body,
             media_type: media.clone(),
+            headers: observed_response_headers(entry, *status),
         });
     }
     endpoint.pagination_signals = entry
@@ -1141,6 +1154,12 @@ fn apply_existing_parameters(
             if response.media_type.is_none() {
                 response.media_type.clone_from(media);
             }
+            for name in observed_response_headers(entry, *status) {
+                if !response.headers.contains(&name) {
+                    response.headers.push(name);
+                }
+            }
+            response.headers.sort();
         } else {
             endpoint.responses.push(ResponseBody {
                 selector: ResponseSelector::Exact(*status),
@@ -1157,6 +1176,7 @@ fn apply_existing_parameters(
                     None => opaque_slot(media.as_deref(), &entry.flow_entities, ids, activity),
                 },
                 media_type: media.clone(),
+                headers: observed_response_headers(entry, *status),
             });
         }
     }
@@ -1794,6 +1814,15 @@ fn observed_graphql_operations(
     operations
 }
 
+/// The response header names observed with `status`, sorted.
+fn observed_response_headers(entry: &Accumulator, status: u16) -> Vec<String> {
+    entry
+        .response_headers
+        .get(&status)
+        .map(|names| names.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// The gRPC operation a flow is, when it carries a gRPC content type
 /// (`application/grpc`, `+proto`, `-web`, `-web-text`, ...) on a
 /// `/package.Service/Method` path.
@@ -1811,11 +1840,16 @@ fn observed_grpc_operation(flow: &FlowCapture, path: &str) -> Option<ProtocolOpe
         return None;
     }
     let (service, method) = parse_grpc_method_path(path)?;
-    Some(ProtocolOperationIdentity::Grpc { service, method })
+    Some(ProtocolOperationIdentity::Grpc {
+        service,
+        method,
+        base_url: flow_origin(flow),
+    })
 }
 
-/// Records an observed gRPC call: it confirms the same service/method (from
-/// the static pass or an earlier flow) or adds it as a dynamic operation.
+/// Records an observed gRPC call: it confirms the same service/method on the
+/// same origin (from an earlier flow), or one known only statically (which
+/// takes the observed origin); on another origin it is a separate operation.
 fn apply_grpc_operation(
     document: &mut ApiDocument,
     identity: &ProtocolOperationIdentity,
@@ -1823,19 +1857,48 @@ fn apply_grpc_operation(
     activity: &apiaxess_api_model::ActivityId,
     ids: &mut IdFactory,
 ) {
+    let ProtocolOperationIdentity::Grpc {
+        service,
+        method,
+        base_url,
+    } = identity
+    else {
+        return;
+    };
+    let same_origin = |existing: &Option<String>| match (existing, base_url) {
+        (Some(existing), Some(observed)) => existing
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(observed.trim_end_matches('/')),
+        (None, None) => true,
+        _ => false,
+    };
     let operations = &mut document.surface.protocol_operations;
-    match operations
-        .iter_mut()
-        .find(|operation| &operation.identity == identity)
-    {
-        Some(operation) => append_candidate(
-            &mut operation.presence,
-            PresenceAssertion::Present,
-            flows,
-            ids.candidate(),
-            false,
-            activity,
-        ),
+    let position = operations
+        .iter()
+        .position(|operation| matches!(&operation.identity, ProtocolOperationIdentity::Grpc { service: existing_service, method: existing_method, base_url: existing } if existing_service == service && existing_method == method && same_origin(existing)))
+        .or_else(|| {
+            operations.iter().position(|operation| {
+                matches!(&operation.identity, ProtocolOperationIdentity::Grpc { service: existing_service, method: existing_method, base_url: None } if existing_service == service && existing_method == method)
+            })
+        });
+    match position.map(|index| &mut operations[index]) {
+        Some(operation) => {
+            if let ProtocolOperationIdentity::Grpc {
+                base_url: existing @ None,
+                ..
+            } = &mut operation.identity
+            {
+                existing.clone_from(base_url);
+            }
+            append_candidate(
+                &mut operation.presence,
+                PresenceAssertion::Present,
+                flows,
+                ids.candidate(),
+                false,
+                activity,
+            );
+        }
         None => operations.push(ProtocolOperation {
             identity: identity.clone(),
             presence: dynamic_fact(
@@ -2155,6 +2218,26 @@ mod tests {
     }
 
     #[test]
+    fn observed_response_header_names_are_kept_per_status() {
+        let mut first = flow(1, "/v1/items", br#"{"id":1}"#);
+        first.response_headers = vec![
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("X-Request-Id".to_owned(), "abc".to_owned()),
+        ];
+        let mut second = flow(2, "/v1/items", br#"{"id":2}"#);
+        second.response_headers = vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("set-cookie".to_owned(), "s=1".to_owned()),
+        ];
+        let report = capture(&empty_document(), &[first, second]);
+        let endpoint = &report.document.surface.endpoints[0];
+        assert_eq!(
+            endpoint.responses[0].headers,
+            vec!["content-type", "set-cookie", "x-request-id"]
+        );
+    }
+
+    #[test]
     fn unmatched_id_route_becomes_dynamic_fact_with_provenance() {
         let document = ApiDocument::new(ApiSurface {
             provenance: ProvenanceRegistry::default(),
@@ -2342,7 +2425,9 @@ mod tests {
             .protocol_operations
             .iter()
             .filter_map(|operation| match &operation.identity {
-                ProtocolOperationIdentity::Grpc { service, method } => Some((
+                ProtocolOperationIdentity::Grpc {
+                    service, method, ..
+                } => Some((
                     service.clone(),
                     method.clone(),
                     operation.presence.candidates.len(),
