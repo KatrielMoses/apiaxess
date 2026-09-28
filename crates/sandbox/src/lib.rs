@@ -107,13 +107,18 @@ impl AccelerationMode {
     /// returns the honest diagnostic that must be surfaced to the operator.
     #[must_use]
     pub fn detect(report: &HostCapabilityReport) -> (Self, Diagnostic) {
+        Self::detect_for_host(report, cfg!(target_os = "windows"))
+    }
+
+    /// Like [`Self::detect`], but for an explicit host family so a planner
+    /// modelling another environment applies that environment's rules rather
+    /// than the compile host's.
+    fn detect_for_host(report: &HostCapabilityReport, windows_host: bool) -> (Self, Diagnostic) {
         // Windows' transitional AEHD accelerator is reported as degraded but is
         // still hardware acceleration for this decision.
-        let allow_degraded = cfg!(target_os = "windows");
-        let accelerated = report.supports(CAPABILITY_AVD_ACCELERATION, allow_degraded)
+        let accelerated = report.supports(CAPABILITY_AVD_ACCELERATION, windows_host)
             || report.supports(CAPABILITY_WSL2_NESTED_KVM, false)
-            || (cfg!(target_os = "windows")
-                && report.supports(CAPABILITY_WINDOWS_HYPERVISOR, true));
+            || (windows_host && report.supports(CAPABILITY_WINDOWS_HYPERVISOR, true));
         if accelerated {
             (
                 Self::Accelerated,
@@ -222,7 +227,14 @@ impl SandboxRuntimePlanner {
             && report.supports(CAPABILITY_REDOID_KERNEL, false);
         let mut diagnostics = Vec::new();
         // The honest, capability-driven speed decision for the bundled emulator.
-        let (acceleration, acceleration_diagnostic) = AccelerationMode::detect(report);
+        let windows_host = matches!(
+            environment,
+            RuntimeEnvironment::NativeWindows
+                | RuntimeEnvironment::WindowsHome
+                | RuntimeEnvironment::WindowsArm
+        );
+        let (acceleration, acceleration_diagnostic) =
+            AccelerationMode::detect_for_host(report, windows_host);
         diagnostics.push(acceleration_diagnostic);
         // The host-dependent accelerated tiers still computed for the "advanced"
         // offering; the zero-config default is the bundled emulator below.
@@ -3463,9 +3475,15 @@ fn available_space(path: &Path) -> Option<u64> {
 
 #[cfg(unix)]
 fn available_space_impl(path: &Path) -> Option<u64> {
+    // statvfs field widths are target-dependent (u64 on Linux x86_64, narrower
+    // on macOS and 32-bit targets), so widen generically rather than through a
+    // conversion that is an identity on some targets.
+    fn widen(value: impl TryInto<u64>) -> Option<u64> {
+        value.try_into().ok()
+    }
     let stats = nix::sys::statvfs::statvfs(path).ok()?;
-    let fragment_size = u64::try_from(stats.fragment_size()).ok()?;
-    let blocks_available = u64::try_from(stats.blocks_available()).ok()?;
+    let fragment_size = widen(stats.fragment_size())?;
+    let blocks_available = widen(stats.blocks_available())?;
     Some(blocks_available.saturating_mul(fragment_size))
 }
 

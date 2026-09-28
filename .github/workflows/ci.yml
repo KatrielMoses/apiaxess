@@ -41,8 +41,13 @@ jobs:
       - run: pnpm ui:check
       - run: pnpm ui:build
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # Clippy and tests must report on every OS leg even when an earlier
+      # step (e.g. fmt drift) fails: cfg(unix)/cfg(windows) lints and
+      # platform-divergent tests are only visible on their own runner.
+      - if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test --workspace
       - name: APKM capstone prerequisite result
         run: cargo test -p apiaxess-target-apk --test capstone_apkm real_apkm_capstone_evidence -- --nocapture
       - run: cargo xtask boundaries

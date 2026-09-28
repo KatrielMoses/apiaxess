@@ -939,8 +939,13 @@ mod tests {
     };
 
     fn artifact(source: &str, marker_name: &str) -> NormalizedUnpackedArtifact {
+        // Parallel tests can read the same coarse clock tick (notably on
+        // Windows), so a per-call counter keeps each fixture root private.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "apiaxess-protection-test-{}",
+            "apiaxess-protection-test-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

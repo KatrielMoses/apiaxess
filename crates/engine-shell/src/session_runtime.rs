@@ -569,7 +569,10 @@ mod tests {
             })
             .unwrap();
         let mut changed = runtime.session_snapshot().unwrap();
-        let checkpoint_time = started + Duration::seconds(1);
+        // The baseline save stamps the session with the real clock, and store
+        // setup can take seconds on fsync-heavy filesystems; order the next
+        // mutation after that watermark rather than after `started`.
+        let checkpoint_time = changed.updated_at() + Duration::seconds(1);
         changed
             .set_analysis_pipeline_state(
                 AnalysisPipelineState {

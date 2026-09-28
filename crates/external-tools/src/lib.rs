@@ -305,41 +305,30 @@ impl ToolProcess {
         let Some(child) = slot.as_mut() else {
             return Ok(());
         };
-        if child
-            .try_wait()
-            .map_err(|source| ExternalToolError::Wait {
-                tool_id: self.tool_id.clone(),
-                source,
-            })?
-            .is_none()
-        {
-            #[cfg(windows)]
-            {
-                if let Err(error) = kill_process_tree(child.id(), &self.tool_id)
-                    && child
-                        .try_wait()
-                        .map_err(|source| ExternalToolError::Wait {
-                            tool_id: self.tool_id.clone(),
-                            source,
-                        })?
-                        .is_none()
-                {
-                    return Err(error);
-                }
-            }
-            if child
+        let still_running = |child: &mut std::process::Child| {
+            child
                 .try_wait()
+                .map(|status| status.is_none())
                 .map_err(|source| ExternalToolError::Wait {
                     tool_id: self.tool_id.clone(),
                     source,
-                })?
-                .is_none()
-            {
-                child.kill().map_err(|source| ExternalToolError::Kill {
-                    tool_id: self.tool_id.clone(),
-                    source,
-                })?;
-            }
+                })
+        };
+        // Windows first terminates the whole tree so helper grandchildren do
+        // not outlive the tool; a tree-kill failure only matters if the child
+        // survived it.
+        #[cfg(windows)]
+        if still_running(child)?
+            && let Err(error) = kill_process_tree(child.id(), &self.tool_id)
+            && still_running(child)?
+        {
+            return Err(error);
+        }
+        if still_running(child)? {
+            child.kill().map_err(|source| ExternalToolError::Kill {
+                tool_id: self.tool_id.clone(),
+                source,
+            })?;
         }
         child.wait().map_err(|source| ExternalToolError::Wait {
             tool_id: self.tool_id.clone(),
