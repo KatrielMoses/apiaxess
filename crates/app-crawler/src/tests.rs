@@ -752,9 +752,9 @@ impl SandboxControl for OtpFlowDevice {
             ["input", "text", value] => {
                 let screen = state.screen;
                 let focused = state.focused;
-                state
-                    .log
-                    .push(format!("type {value:?} focus={focused:?} screen={screen:?}"));
+                state.log.push(format!(
+                    "type {value:?} focus={focused:?} screen={screen:?}"
+                ));
                 match focused {
                     Some(OtpField::Phone) => state.typed_phone = (*value).to_owned(),
                     Some(OtpField::Otp) => state.typed_otp = (*value).to_owned(),
@@ -847,7 +847,11 @@ fn phone_otp_flow_crosses_the_gate_with_staged_credentials() {
     );
     // The profile screen behind the gate was actually reached.
     let state = device.state.lock().unwrap();
-    assert_eq!(state.screen, OtpScreen::Profile, "landed on the post-auth screen");
+    assert_eq!(
+        state.screen,
+        OtpScreen::Profile,
+        "landed on the post-auth screen"
+    );
     assert_eq!(state.typed_phone, "8888888888", "log: {:#?}", state.log);
     assert_eq!(state.typed_otp, "0000", "log: {:#?}", state.log);
 }
