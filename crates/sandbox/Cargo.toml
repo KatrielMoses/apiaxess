@@ -53,6 +53,9 @@ windows-sys = { version = "0.59", features = [
 # host Frida CLI. Requires the frida-core devkit at build/link time.
 frida-embedded = ["dep:frida"]
 
+[dev-dependencies]
+apiaxess-test-fixtures = { path = "../test-fixtures" }
+
 # This crate links `frida-core` (behind the optional `frida-embedded` feature)
 # through the first-party FFI bindings, whose runtime init (`Frida::obtain`) is an
 # `unsafe fn`. The workspace otherwise forbids unsafe entirely; this crate relaxes

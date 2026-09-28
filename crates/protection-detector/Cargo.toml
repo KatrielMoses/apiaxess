@@ -17,5 +17,8 @@ aho-corasick = "1.1"
 serde.workspace = true
 zip = "2.2.2"
 
+[dev-dependencies]
+apiaxess-test-fixtures = { path = "../test-fixtures" }
+
 [lints]
 workspace = true

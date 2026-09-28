@@ -3620,16 +3620,18 @@ mod tests {
         if std::env::var_os("APIAXESS_PHASE_8_7_REAL").is_none() {
             return;
         }
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root");
-        let fixture = workspace.join("fixtures/capstone/feeder-2.22.0-4050.apk");
+        let Some(fixture) = apiaxess_test_fixtures::capstone_apk(
+            "network-extraction::real_feeder_probe_preserves_endpoints_and_reduces_packaged_noise",
+            &[],
+        ) else {
+            return;
+        };
+        let workspace = apiaxess_test_fixtures::workspace_root();
         let intake = workspace.join("tmp/phase-8.4.1-feeder-intake/intake-1787837677");
         let apktool = intake.join("unpacked/base/apktool");
         let jadx = intake.join("unpacked/base/jadx");
         assert!(
-            fixture.is_file() && apktool.is_dir() && jadx.is_dir(),
+            apktool.is_dir() && jadx.is_dir(),
             "Phase 8.7 real probe requires the existing Feeder intake workspace"
         );
 

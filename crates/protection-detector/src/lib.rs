@@ -1034,16 +1034,12 @@ mod tests {
 
     #[test]
     fn checked_in_feeder_fixture_is_a_reproducible_unpacked_negative_control() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("workspace root")
-            .join("fixtures/capstone/feeder-2.22.0-4050.apk");
-        assert!(
-            fixture.is_file(),
-            "missing checked-in fixture: {}",
-            fixture.display()
-        );
+        let Some(fixture) = apiaxess_test_fixtures::capstone_apk(
+            "protection-detector::checked_in_feeder_fixture_is_a_reproducible_unpacked_negative_control",
+            &[],
+        ) else {
+            return;
+        };
         let static_archive =
             apiaxess_artifact_intake::index_static_archive(&fixture).expect("index Feeder fixture");
         let artifact = NormalizedUnpackedArtifact {

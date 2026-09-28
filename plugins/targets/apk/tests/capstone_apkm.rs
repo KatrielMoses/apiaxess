@@ -53,7 +53,6 @@ fn capstone_stage_report_path(output_root: &Path) -> PathBuf {
 }
 
 const CAPSTONE_LIVE_ENV: &str = "APIAXESS_CAPSTONE_LIVE";
-const DEFAULT_CAPSTONE_FIXTURE: &str = "fixtures/capstone/feeder-2.22.0-4050.apk";
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -78,7 +77,7 @@ fn configured_path(root: &Path, variable: &str) -> Option<PathBuf> {
 fn capstone_input(root: &Path) -> PathBuf {
     configured_path(root, "APIAXESS_CAPSTONE_APK")
         .or_else(|| configured_path(root, "APIAXESS_CAPSTONE_APKM"))
-        .unwrap_or_else(|| root.join(DEFAULT_CAPSTONE_FIXTURE))
+        .unwrap_or_else(|| apiaxess_test_fixtures::capstone_apk_path(&[]))
 }
 
 fn enabled(value: &Result<String, std::env::VarError>) -> bool {
@@ -232,7 +231,7 @@ fn capstone_skip_reason(root: &Path, input: &Path, tools: &ApkToolchainConfig) -
 }
 
 fn skip_capstone(reason: impl std::fmt::Display) {
-    eprintln!("skipped: APKM capstone — {reason}");
+    apiaxess_test_fixtures::skip("capstone_apkm::real_apkm_capstone_evidence", reason);
 }
 
 fn capstone_avd_config() -> AvdConfig {

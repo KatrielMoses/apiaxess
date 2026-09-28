@@ -19,6 +19,7 @@ apiaxess-network-extraction = { path = "../../../crates/network-extraction" }
 apiaxess-network-routing = { path = "../../../crates/network-routing" }
 apiaxess-static-pass = { path = "../../../crates/static-pass" }
 apiaxess-sandbox = { path = "../../../crates/sandbox" }
+apiaxess-test-fixtures = { path = "../../../crates/test-fixtures" }
 apiaxess-host-capabilities = { path = "../../../crates/host-capabilities" }
 apiaxess-dynamic-capture = { path = "../../../crates/dynamic-capture" }
 apiaxess-session = { path = "../../../crates/session" }

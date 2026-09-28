@@ -364,21 +364,28 @@ mod tests {
     /// Real `aapt2` output, when the gitignored local APKs are present.
     #[test]
     fn reads_real_apks_when_present() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
-        for (apk, expected) in [
-            (
-                "reference-target/artifacts/mailaccess-reference-debug.apk",
-                "pro.mailaccess.reference",
-            ),
-            (
-                "capstone/feeder-2.22.0-4050.apk",
-                "com.nononsenseapps.feeder",
-            ),
-        ] {
-            let path = root.join(apk);
-            if path.is_file() {
-                assert_eq!(package_name(&path).as_deref(), Ok(expected), "{apk}");
-            }
+        const TEST: &str = "sandbox::apk_manifest::reads_real_apks_when_present";
+        let reference = apiaxess_test_fixtures::workspace_root()
+            .join("fixtures/reference-target/artifacts/mailaccess-reference-debug.apk");
+        if reference.is_file() {
+            assert_eq!(
+                package_name(&reference).as_deref(),
+                Ok("pro.mailaccess.reference")
+            );
+        } else {
+            apiaxess_test_fixtures::skip(
+                TEST,
+                format_args!(
+                    "reference APK not built at {} (gitignored)",
+                    reference.display()
+                ),
+            );
+        }
+        if let Some(capstone) = apiaxess_test_fixtures::capstone_apk(TEST, &[]) {
+            assert_eq!(
+                package_name(&capstone).as_deref(),
+                Ok("com.nononsenseapps.feeder")
+            );
         }
     }
 

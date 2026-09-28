@@ -23,7 +23,6 @@ use apiaxess_external_tools::ProcessToolRunner;
 use apiaxess_target_apk::{ApkIntakeConfig, ApkTarget, resolve_from_resource_base};
 
 const VERIFY_ENV: &str = "APIAXESS_BUNDLED_VERIFY";
-const DEFAULT_FIXTURE: &str = "fixtures/capstone/feeder-2.22.0-4050.apk";
 const DEFAULT_BASE: &str = "target/verify-install";
 
 fn workspace_root() -> PathBuf {
@@ -42,14 +41,21 @@ fn enabled(name: &str) -> bool {
 #[test]
 fn real_apk_unpacks_and_decompiles_on_bundled_runtime() {
     if !enabled(VERIFY_ENV) {
-        eprintln!("skipping: set {VERIFY_ENV}=1 to run the bundled clean-host verification");
+        apiaxess_test_fixtures::skip(
+            "bundled_clean_host::real_apk_unpacks_and_decompiles_on_bundled_runtime",
+            format_args!("set {VERIFY_ENV}=1 to run the bundled clean-host verification"),
+        );
         return;
     }
     let root = workspace_root();
     let base = std::env::var_os("APIAXESS_BUNDLED_BASE")
         .map_or_else(|| root.join(DEFAULT_BASE), PathBuf::from);
-    let fixture = std::env::var_os("APIAXESS_BUNDLED_APK")
-        .map_or_else(|| root.join(DEFAULT_FIXTURE), PathBuf::from);
+    let Some(fixture) = apiaxess_test_fixtures::capstone_apk(
+        "bundled_clean_host::real_apk_unpacks_and_decompiles_on_bundled_runtime",
+        &["APIAXESS_BUNDLED_APK"],
+    ) else {
+        return;
+    };
 
     assert!(
         base.join("tools")
@@ -58,11 +64,6 @@ fn real_apk_unpacks_and_decompiles_on_bundled_runtime() {
             .is_file(),
         "staged apktool jar missing under {}; run the packaging fetch step first",
         base.display()
-    );
-    assert!(
-        fixture.is_file(),
-        "verification fixture missing: {}",
-        fixture.display()
     );
 
     let tools = resolve_from_resource_base(&base);

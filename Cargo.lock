@@ -80,6 +80,7 @@ dependencies = [
  "apiaxess-local-api",
  "apiaxess-session",
  "apiaxess-target-apk",
+ "apiaxess-test-fixtures",
  "apiaxess-workbench-proxy",
  "apiaxess-workbench-store",
  "axum",
@@ -328,6 +329,7 @@ dependencies = [
  "apiaxess-artifact-intake",
  "apiaxess-diagnostics",
  "apiaxess-network-routing",
+ "apiaxess-test-fixtures",
  "chrono",
  "serde",
 ]
@@ -367,6 +369,7 @@ dependencies = [
  "aho-corasick",
  "apiaxess-artifact-intake",
  "apiaxess-diagnostics",
+ "apiaxess-test-fixtures",
  "serde",
  "zip",
 ]
@@ -391,6 +394,7 @@ dependencies = [
  "apiaxess-external-tools",
  "apiaxess-host-capabilities",
  "apiaxess-session",
+ "apiaxess-test-fixtures",
  "apiaxess-workbench-proxy",
  "base64 0.22.1",
  "chrono",
@@ -446,6 +450,7 @@ dependencies = [
  "apiaxess-sandbox",
  "apiaxess-session",
  "apiaxess-static-pass",
+ "apiaxess-test-fixtures",
  "apiaxess-workbench-proxy",
  "apiaxess-workbench-store",
  "chrono",
@@ -453,6 +458,10 @@ dependencies = [
  "tokio",
  "zip",
 ]
+
+[[package]]
+name = "apiaxess-test-fixtures"
+version = "0.1.0"
 
 [[package]]
 name = "apiaxess-unified-surface"

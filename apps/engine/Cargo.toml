@@ -28,6 +28,9 @@ tracing-subscriber.workspace = true
 # enables this with the pinned devkit (see packaging/assets/frida.toml).
 frida-embedded = ["apiaxess-engine-shell/frida-embedded"]
 
+[dev-dependencies]
+apiaxess-test-fixtures = { path = "../../crates/test-fixtures" }
+
 # The composition root applies persisted operator settings to the environment at
 # startup, before any thread exists — the one audited `std::env::set_var`. The
 # workspace otherwise forbids unsafe; this crate relaxes that single lint to

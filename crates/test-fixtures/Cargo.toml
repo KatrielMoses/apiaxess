@@ -1,0 +1,11 @@
+[package]
+name = "apiaxess-test-fixtures"
+description = "Shared resolution and visible skipping for gitignored local test fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

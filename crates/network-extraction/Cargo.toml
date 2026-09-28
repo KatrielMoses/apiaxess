@@ -14,5 +14,8 @@ apiaxess-network-routing = { path = "../network-routing" }
 chrono.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+apiaxess-test-fixtures = { path = "../test-fixtures" }
+
 [lints]
 workspace = true

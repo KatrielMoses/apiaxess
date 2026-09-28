@@ -1428,7 +1428,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use std::{
-        env, fs,
+        fs,
         net::SocketAddr,
         path::{Path, PathBuf},
         sync::Arc,
@@ -1830,16 +1830,13 @@ mod tests {
     #[test]
     #[ignore = "real Feeder static analysis is long-running and requires apktool/jadx"]
     fn assembled_product_runs_real_apk_through_the_durable_pipeline() {
-        let fixture = env::var_os("APIAXESS_PIPELINE_FIXTURE")
-            .map_or_else(
-                || {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../fixtures/capstone/feeder-2.22.0-4050.apk")
-                },
-                PathBuf::from,
-            )
-            .canonicalize()
-            .expect("pipeline APK fixture");
+        let Some(fixture) = apiaxess_test_fixtures::capstone_apk(
+            "apiaxess::assembled_product_runs_real_apk_through_the_durable_pipeline",
+            &["APIAXESS_PIPELINE_FIXTURE"],
+        ) else {
+            return;
+        };
+        let fixture = fixture.canonicalize().expect("pipeline APK fixture");
         let root = temporary_path("assembled-pipeline");
         let store = Arc::new(
             TrafficStore::open(&root, "session:assembled-pipeline").expect("traffic store"),

@@ -29,6 +29,7 @@ members = [
     "crates/plugin-host",
     "crates/sandbox",
     "crates/session",
+    "crates/test-fixtures",
     "crates/workbench-proxy",
     "crates/workbench-store",
     "plugins/targets/apk",
