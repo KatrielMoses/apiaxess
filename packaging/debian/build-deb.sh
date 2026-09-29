@@ -135,6 +135,10 @@ install -m 0755 "$engine" "$pkg_root/usr/bin/apiaxess"
 install -m 0755 "$desktop" "$pkg_root/usr/bin/apiaxess-desktop"
 cp -r "$gui_dist/." "$share/gui/"
 cp "$repository_root/README.md" "$doc/README.md"
+# Apache-2.0 section 4: every distributed copy carries the License and NOTICE.
+# Debian looks for the license text at /usr/share/doc/<package>/copyright.
+cp "$repository_root/LICENSE" "$doc/copyright"
+cp "$repository_root/NOTICE" "$doc/NOTICE"
 
 # Desktop launcher + icon so the app appears in the applications menu.
 install -m 0644 "$repository_root/apps/desktop/icons/icon.png" "$pkg_root/usr/share/icons/hicolor/512x512/apps/apiaxess.png"
@@ -206,8 +210,9 @@ Version: $product_version
 Section: utils
 Priority: optional
 Architecture: $architecture
-Maintainer: APIaxess <packaging@apiaxess.invalid>
+Maintainer: APIaxess <packaging@apiaxess.dev>
 Installed-Size: $installed_size_kb
+Homepage: https://apiaxess.dev
 Depends: libwebkit2gtk-4.1-0, libnss3, libnspr4, libatk1.0-0, libatk-bridge2.0-0, libcups2, libdrm2, libgbm1, libgtk-3-0, libasound2, libxkbcommon0, libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libxext6, libxi6, libxtst6, libx11-6, libxcb1, libpango-1.0-0, libcairo2, libatspi2.0-0, ca-certificates, fonts-liberation
 Description: APIaxess local API-recovery workbench
  A native desktop app: the branded GUI runs in its own window (a Tauri/WebKitGTK

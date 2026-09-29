@@ -54,3 +54,26 @@ Note: the emulator's *accelerated* performance depends on host virtualization
 (KVM/WHPX), a CPU/firmware capability that cannot be bundled; the bundled
 software (QEMU + image) runs everywhere, in software mode when no virtualization
 is present (see `sandbox.software-mode-active`).
+
+## Releasing
+
+Release assets are unsigned; integrity comes from the published `SHA256SUMS`.
+
+1. Build from the commit being tagged, so the engine's About page carries a clean
+   commit stamp:
+   - Windows: `pwsh packaging/windows/build-msi.ps1` → `artifacts/windows/`
+     `APIaxess-<v>-windows-x64.msi` and `APIaxess-<v>-windows-x64-portable.zip`
+     (the same staged tree, zipped, for Scoop).
+   - Linux: `bash packaging/debian/build-deb.sh` → `artifacts/linux/apiaxess_<v>_amd64.deb`.
+2. Collect the three assets in one directory and write `SHA256SUMS` with
+   `pwsh packaging/gen-checksums.ps1 -Directory <dir>` or
+   `bash packaging/gen-checksums.sh <dir>` (identical output).
+3. `pwsh packaging/update-manifests.ps1 -Sums <dir>/SHA256SUMS` points the Scoop
+   manifest and Chocolatey package at the release's URLs and hashes.
+4. Create the GitHub Release `v<v>` with the MSI, zip, `.deb`, and `SHA256SUMS`.
+5. Copy `scoop/apiaxess.json` to `bucket/apiaxess.json` in the
+   `KatrielMoses/scoop-apiaxess` bucket repo. Later versions can be bumped there by
+   Scoop's `checkver`/`autoupdate`, which reads the hash from `SHA256SUMS`.
+6. `choco pack chocolatey/apiaxess.nuspec` and `choco push` to the community
+   repository (moderation takes days; the package downloads the release MSI and
+   verifies its SHA-256).

@@ -366,6 +366,9 @@ if (-not (Test-Path -LiteralPath $webview2Bootstrapper -PathType Leaf)) {
 Copy-Item -LiteralPath $webview2Bootstrapper -Destination (Join-Path $stageBin "MicrosoftEdgeWebview2Setup.exe")
 Copy-Item -Path (Join-Path $gui "*") -Destination $stageGui -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") -Destination (Join-Path $stageRoot "README.md")
+# Apache-2.0 section 4: every distributed copy carries the License and NOTICE.
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination (Join-Path $stageRoot "LICENSE.txt")
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "NOTICE") -Destination (Join-Path $stageRoot "NOTICE.txt")
 
 if (-not $ChromiumRuntimeDirectory) {
     $ChromiumRuntimeDirectory = Join-Path $targetRoot "chromium-runtime"
@@ -581,6 +584,20 @@ Invoke-Checked $wix "build" (Join-Path $PSScriptRoot "Product.wxs") $payloadFrag
 
 $msiHash = (Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash.ToLowerInvariant()
 "$msiHash  $msiName" | Set-Content -LiteralPath "$msiPath.sha256" -Encoding ascii
+
+# Portable zip of the same staged tree, for package managers that prefer an
+# archive over an MSI (Scoop). The archive root is the install root (bin\,
+# share\, runtime\, ...), so it runs from wherever it is extracted; user data
+# still lives under %LOCALAPPDATA%\apiaxess, never beside the binaries.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zipName = "APIaxess-$productVersion-windows-$Architecture-portable.zip"
+$zipPath = Join-Path $OutputDirectory $zipName
+if (Test-Path -LiteralPath $zipPath) {
+    Remove-Item -LiteralPath $zipPath -Force
+}
+[System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+$zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+"$zipHash  $zipName" | Set-Content -LiteralPath "$zipPath.sha256" -Encoding ascii
 $buildManifest = [ordered]@{
     schemaVersion = 1
     product = "APIaxess"
@@ -612,6 +629,8 @@ $buildManifest = [ordered]@{
     }
     msi = $msiName
     msiSha256 = $msiHash
+    portableZip = $zipName
+    portableZipSha256 = $zipHash
     productSourceCutoffUtc = $newestProductSource.LastWriteTimeUtc.ToString("o")
     engineSha256 = (Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()
     desktopSha256 = (Get-FileHash -LiteralPath $desktop -Algorithm SHA256).Hash.ToLowerInvariant()

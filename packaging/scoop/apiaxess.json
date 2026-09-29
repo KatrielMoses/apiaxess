@@ -1,0 +1,34 @@
+{
+    "version": "0.1.0",
+    "description": "Open-source security workbench that recovers an app's API from APKs, live traffic, and HAR files.",
+    "homepage": "https://apiaxess.dev",
+    "license": "Apache-2.0",
+    "notes": "User data lives in %LOCALAPPDATA%\\apiaxess and is kept on uninstall.",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/KatrielMoses/apiaxess/releases/download/v0.1.0/APIaxess-0.1.0-windows-x64-portable.zip",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+    },
+    "bin": "bin\\apiaxess.exe",
+    "shortcuts": [
+        [
+            "bin\\apiaxess-desktop.exe",
+            "APIaxess"
+        ]
+    ],
+    "checkver": {
+        "github": "https://github.com/KatrielMoses/apiaxess"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/KatrielMoses/apiaxess/releases/download/v$version/APIaxess-$version-windows-x64-portable.zip",
+                "hash": {
+                    "url": "https://github.com/KatrielMoses/apiaxess/releases/download/v$version/SHA256SUMS",
+                    "regex": "$sha256\\s+$basename"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>apiaxess</id>
+    <version>0.1.0</version>
+    <title>APIaxess</title>
+    <authors>APIaxess</authors>
+    <owners>KatrielMoses</owners>
+    <projectUrl>https://apiaxess.dev</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/KatrielMoses/apiaxess/staging/apps/desktop/icons/128x128.png</iconUrl>
+    <licenseUrl>https://github.com/KatrielMoses/apiaxess/blob/staging/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/KatrielMoses/apiaxess</projectSourceUrl>
+    <packageSourceUrl>https://github.com/KatrielMoses/apiaxess/tree/staging/packaging/chocolatey</packageSourceUrl>
+    <docsUrl>https://github.com/KatrielMoses/apiaxess#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/KatrielMoses/apiaxess/issues</bugTrackerUrl>
+    <releaseNotes>https://github.com/KatrielMoses/apiaxess/releases/tag/v0.1.0</releaseNotes>
+    <tags>api security pentest reverse-engineering android apk proxy har openapi foss</tags>
+    <summary>Open-source security workbench that recovers an app's API.</summary>
+    <description><![CDATA[APIaxess is an open-source security workbench that reverse-engineers an app's API from its APK, its live traffic, and HAR files, and fuses the evidence into an OpenAPI document, a Postman collection, and a Python SDK.
+
+It ships as a native desktop app with everything it needs bundled — a private Chromium, a trimmed Java runtime, apktool, jadx, and ffuf — and runs entirely on your machine.
+
+This package installs the official per-user MSI from the GitHub release after verifying its SHA-256. The release is unsigned; its checksums are published with every release.
+]]></description>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

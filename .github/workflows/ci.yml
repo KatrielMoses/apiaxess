@@ -86,6 +86,7 @@ jobs:
           name: APIaxess-${{ github.sha }}-windows-x64
           path: |
             artifacts/windows/*.msi
+            artifacts/windows/*.zip
             artifacts/windows/*.sha256
             artifacts/windows/*.build.json
           if-no-files-found: error

@@ -36,12 +36,35 @@ currently **unsigned** — published **SHA-256 checksums** let you verify integr
 on Windows the first run shows a SmartScreen "unknown publisher" prompt (More info →
 Run anyway). We sign once the project earns the traction to justify it.
 
-- **Windows:** `scoop install apiaxess` · `choco install apiaxess` · or the per-user MSI.
-- **Linux (Debian/Ubuntu):** install the `.deb` with `sudo apt install ./apiaxess_*.deb`.
+**Windows — Scoop:**
 
-Exact bucket/repository URLs and checksums are listed on the release page and
-[apiaxess.dev](https://apiaxess.dev). To build from source instead, see *Run the product*
-below.
+```powershell
+scoop bucket add apiaxess https://github.com/KatrielMoses/scoop-apiaxess
+scoop install apiaxess/apiaxess
+```
+
+**Windows — installer:** download `APIaxess-<version>-windows-x64.msi` from the
+[latest release](https://github.com/KatrielMoses/apiaxess/releases/latest) and run it
+(per-user, no admin needed). A Chocolatey package is in community review.
+
+**Linux (Debian/Ubuntu 24.04+):** download `apiaxess_<version>_amd64.deb` from the
+[latest release](https://github.com/KatrielMoses/apiaxess/releases/latest), then:
+
+```bash
+sudo apt install ./apiaxess_*.deb
+```
+
+**Verify a download** against the release's `SHA256SUMS`:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing          # Linux
+```
+
+```powershell
+Get-FileHash .\APIaxess-*.msi -Algorithm SHA256   # Windows: compare with SHA256SUMS
+```
+
+To build from source instead, see *Run the product* below.
 
 ## Architecture at a glance
 
