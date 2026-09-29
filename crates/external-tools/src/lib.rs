@@ -248,6 +248,43 @@ impl ManagedProcess {
     pub fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
+
+    /// Asks the process to exit, waits up to `grace` for it, then terminates
+    /// its group/job as [`Self::kill`] does. On Unix the leader gets `SIGTERM`
+    /// first, so a process that leads other process groups of its own (the
+    /// engine's capture Chromium) can reap them before the group kill; Windows
+    /// kills the job straight away, which takes nested jobs with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system termination or wait error, if any.
+    pub fn terminate(&mut self, grace: Duration) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.id())
+            && nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+            .is_ok()
+        {
+            let deadline = Instant::now() + grace;
+            while self.try_wait()?.is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = grace;
+        let result = self.kill();
+        // A process that exited on SIGTERM leaves an empty group to sweep:
+        // `ESRCH` is the expected outcome, not a failure.
+        #[cfg(unix)]
+        if let Err(error) = &result
+            && error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32)
+        {
+            return Ok(());
+        }
+        result
+    }
 }
 
 impl std::fmt::Debug for ToolProcess {
@@ -898,6 +935,41 @@ mod tests {
                 "timed-out invocation took {returned_in:?}"
             );
             assert!(reaped, "timeout orphaned grandchild {grandchild}");
+        }
+
+        #[test]
+        fn terminate_lets_a_managed_process_reap_a_child_outside_its_group() {
+            // The engine's capture Chromium leads its own process group, so the
+            // group kill cannot reach it; only the engine's SIGTERM teardown can.
+            let pid_file = pid_file("terminate");
+            let mut command = crate::ManagedProcessCommand::new("/bin/sh");
+            command.args([
+                "-c".to_owned(),
+                format!(
+                    "setsid sleep 60 & child=$!; echo $child > '{}'; \
+                     trap 'kill $child; exit 0' TERM; wait",
+                    pid_file.display()
+                ),
+            ]);
+            let mut process = command.spawn().expect("parent spawns");
+            let outside_child = recorded_pid(&pid_file);
+            assert!(kill(outside_child, None).is_ok(), "child is running");
+
+            let started = Instant::now();
+            process
+                .terminate(Duration::from_secs(10))
+                .expect("parent terminates");
+
+            let reaped = exits_within(outside_child, Duration::from_secs(10));
+            if !reaped {
+                let _ = kill(outside_child, nix::sys::signal::Signal::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&pid_file);
+            assert!(reaped, "terminate() orphaned child {outside_child}");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "a parent that exits on SIGTERM is not held for the full grace"
+            );
         }
     }
 }

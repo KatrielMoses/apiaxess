@@ -108,6 +108,15 @@ if [ "$skip_application_build" != "true" ]; then
         exit 1
     fi
     ( cd "$repository_root/apps/gui" && node "$vite" build )
+    # Stamp the source commit into the engine for its About page and --version
+    # (read with option_env!, so a new commit rebuilds it). A dirty tree says so.
+    # A pre-set APIAXESS_BUILD_COMMIT wins (a build from an exported source tree).
+    if [ -z "${APIAXESS_BUILD_COMMIT:-}" ] && commit="$(git -C "$repository_root" rev-parse --short=12 HEAD 2>/dev/null)" && [ -n "$commit" ]; then
+        if [ -n "$(git -C "$repository_root" status --porcelain 2>/dev/null)" ]; then
+            commit="$commit+local-changes"
+        fi
+        export APIAXESS_BUILD_COMMIT="$commit"
+    fi
     if [ "$bundle_frida" = "true" ]; then
         ( cd "$repository_root" && cargo build --release -p apiaxess --features frida-embedded )
     else

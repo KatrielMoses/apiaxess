@@ -71,6 +71,15 @@ impl Drop for CheckpointTask {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `--version` answers before anything else runs: no settings, no runtime,
+    // no engine.
+    if env::args()
+        .nth(1)
+        .is_some_and(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("{}", version_line());
+        return Ok(());
+    }
     // Apply persisted operator settings to the environment before the async
     // runtime (and any worker threads) exists, so every existing `APIAXESS_*`
     // consumer honors them with no change.
@@ -283,12 +292,21 @@ struct BrowseOptions {
     session_path: PathBuf,
 }
 
+/// `apiaxess <version> (<commit>)`, or just the version for an unstamped build.
+fn version_line() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    apiaxess_engine_shell::build_commit().map_or_else(
+        || format!("apiaxess {version}"),
+        |commit| format!("apiaxess {version} ({commit})"),
+    )
+}
+
 fn print_cli_help() {
     println!(
         "Export: apiaxess export <session> --format <openapi|sdk|postman|har|all> --out <dir> [--json]"
     );
     println!(
-        "APIaxess\n\nCommands:\n  apiaxess                                    Launch the local workbench (loopback UI)\n  apiaxess serve [--port <n>] [--host <addr>] Run headless: serve the UI on a port until Ctrl-C\n  apiaxess analyze <apk> [options]\n  apiaxess web <domain-or-url> --authorize [options]\n  apiaxess inspect <session> [--json]\n\nWeb options:\n  --authorize               Affirm that you are authorized to test this target (required)\n  --output <path>           Persist the web session artifact at this path\n  --json                    Print the started session status as JSON\n\nAnalyze options:\n  --static-only             Run the static pipeline only (default)\n  --dynamic                 Request dynamic enrichment when session evidence exists\n  --session <path>          Resume an existing session artifact\n  --output <path>           Persist a new session artifact at this path\n  --scope <json|@file>      Declare the complete session EngagementScope\n  --allow-target <host>     Add an allowed host rule (repeatable)\n  --staged-credential <kind=value>  Pre-stage a login credential for the crawler,\n                            keyed by field kind (phone, otp, password, pin, email,\n                            username). Repeatable. e.g. --staged-credential phone=8888888888\n  --session-id <id>         Set the ID for a new session\n  --intake-output <dir>     Store normalized intake output below this directory\n  --json                    Print the unified surface as JSON\n  -h, --help                Show this help\n\nAPK analysis uses APIaxess's bundled Java runtime, apktool, and jadx by\ndefault, so nothing is required on the host. Advanced overrides:\nAPIAXESS_JAVA, APIAXESS_APKTOOL, APIAXESS_JADX (a .jar value runs through the\nbundled runtime; anything else is treated as a self-contained launcher)."
+        "APIaxess\n\nCommands:\n  apiaxess                                    Launch the local workbench (loopback UI)\n  apiaxess serve [--port <n>] [--host <addr>] Run headless: serve the UI on a port until Ctrl-C\n  apiaxess --version, -V                       Print the version (and build commit) and exit\n  apiaxess analyze <apk> [options]\n  apiaxess web <domain-or-url> --authorize [options]\n  apiaxess inspect <session> [--json]\n\nWeb options:\n  --authorize               Affirm that you are authorized to test this target (required)\n  --output <path>           Persist the web session artifact at this path\n  --json                    Print the started session status as JSON\n\nAnalyze options:\n  --static-only             Run the static pipeline only (default)\n  --dynamic                 Request dynamic enrichment when session evidence exists\n  --session <path>          Resume an existing session artifact\n  --output <path>           Persist a new session artifact at this path\n  --scope <json|@file>      Declare the complete session EngagementScope\n  --allow-target <host>     Add an allowed host rule (repeatable)\n  --staged-credential <kind=value>  Pre-stage a login credential for the crawler,\n                            keyed by field kind (phone, otp, password, pin, email,\n                            username). Repeatable. e.g. --staged-credential phone=8888888888\n  --session-id <id>         Set the ID for a new session\n  --intake-output <dir>     Store normalized intake output below this directory\n  --json                    Print the unified surface as JSON\n  -h, --help                Show this help\n\nAPK analysis uses APIaxess's bundled Java runtime, apktool, and jadx by\ndefault, so nothing is required on the host. Advanced overrides:\nAPIAXESS_JAVA, APIAXESS_APKTOOL, APIAXESS_JADX (a .jar value runs through the\nbundled runtime; anything else is treated as a self-contained launcher)."
     );
 }
 
@@ -1421,7 +1439,21 @@ fn resolve_gui_directory(
     installed.unwrap_or_else(|| development.to_path_buf())
 }
 
+/// Resolves on Ctrl-C, or on Unix also on `SIGTERM` (systemd, `kill`, the
+/// desktop shell's stop), so every stop runs the same graceful teardown that
+/// reaps the capture Chromium's process group.
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
     let _ = tokio::signal::ctrl_c().await;
 }
 

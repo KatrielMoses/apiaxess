@@ -247,20 +247,58 @@ pub struct NoticeFile {
     pub path: String,
 }
 
-/// The installation root: the parent of the `bin/` holding this executable.
-fn install_root() -> Option<PathBuf> {
-    env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()
-        .map(Path::to_path_buf)
+/// The install layout's resource base (the MSI root, the `.deb`'s
+/// `share/apiaxess`), with its `bin/..` step resolved lexically so notice paths
+/// read cleanly.
+fn resource_root() -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in apiaxess_install_layout::resource_base()?.components() {
+        if component == std::path::Component::ParentDir {
+            root.pop();
+        } else {
+            root.push(component);
+        }
+    }
+    Some(root)
+}
+
+/// The About-page label for a notices file in the `relative` folder under the
+/// resource base, identical across layouts: the Java runtime's per-OS subfolder
+/// is dropped, and the `.deb`'s top-level `chromium/` reads as the MSI's
+/// `runtime/chromium` (see `chromium_in`).
+fn notice_component(relative: &str) -> String {
+    let mut segments: Vec<&str> = relative
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() > 1
+        && segments
+            .last()
+            .is_some_and(|last| matches!(*last, "windows" | "linux" | "macos"))
+    {
+        segments.pop();
+    }
+    match segments.as_slice() {
+        [] => "APIaxess".to_owned(),
+        ["chromium"] => "runtime/chromium".to_owned(),
+        _ => segments.join("/"),
+    }
+}
+
+/// The source commit stamped into this build by the MSI and `.deb` build
+/// scripts (`APIAXESS_BUILD_COMMIT`), or `None` for an unstamped dev build.
+#[must_use]
+pub fn build_commit() -> Option<&'static str> {
+    option_env!("APIAXESS_BUILD_COMMIT")
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty())
 }
 
 /// Version, build commit, license and shipped notices for the About page.
 #[must_use]
 pub fn about_info() -> AboutInfo {
     let mut notices = Vec::new();
-    if let Some(root) = install_root() {
+    if let Some(root) = resource_root() {
         // Components install their notices as `<component>/APIaxess-NOTICES.md`.
         let mut pending = vec![(root.clone(), 0_u8)];
         while let Some((dir, depth)) = pending.pop() {
@@ -274,17 +312,13 @@ pub fn about_info() -> AboutInfo {
                         pending.push((path, depth + 1));
                     }
                 } else if entry.file_name() == "APIaxess-NOTICES.md" {
-                    let component = path
+                    let relative = path
                         .parent()
                         .and_then(|parent| parent.strip_prefix(&root).ok())
                         .map(|relative| relative.display().to_string().replace('\\', "/"))
                         .unwrap_or_default();
                     notices.push(NoticeFile {
-                        component: if component.is_empty() {
-                            "APIaxess".to_owned()
-                        } else {
-                            component
-                        },
+                        component: notice_component(&relative),
                         path: path.display().to_string(),
                     });
                 }
@@ -294,10 +328,7 @@ pub fn about_info() -> AboutInfo {
     notices.sort_by(|a, b| a.component.cmp(&b.component));
     AboutInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        commit: option_env!("APIAXESS_BUILD_COMMIT")
-            .map(str::trim)
-            .filter(|commit| !commit.is_empty())
-            .map(str::to_owned),
+        commit: build_commit().map(str::to_owned),
         license: "Apache-2.0".to_owned(),
         notices,
     }
@@ -3951,7 +3982,9 @@ fn first_party_hints(
 
 #[cfg(test)]
 mod tests {
-    use super::{bundled_wordlist, chromium_launch_arguments, lacks_x11_and_wayland};
+    use super::{
+        bundled_wordlist, chromium_launch_arguments, lacks_x11_and_wayland, notice_component,
+    };
     use std::{net::SocketAddr, path::Path};
 
     #[test]
@@ -3976,6 +4009,23 @@ mod tests {
         );
         assert!(!arguments.iter().any(|arg| arg.starts_with("--headless")));
         assert!(!arguments.iter().any(|arg| arg == "--no-sandbox"));
+    }
+
+    #[test]
+    fn notice_components_read_the_same_on_the_msi_and_deb_layouts() {
+        // MSI (resource base = install root) and .deb (share/apiaxess) folders.
+        for (msi, deb) in [
+            ("runtime/java/windows", "runtime/java/linux"),
+            ("runtime/chromium", "chromium"),
+            ("tools", "tools"),
+            ("tools/ffuf", "tools/ffuf"),
+        ] {
+            assert_eq!(notice_component(msi), notice_component(deb));
+        }
+        assert_eq!(notice_component("runtime/java/linux"), "runtime/java");
+        assert_eq!(notice_component("chromium"), "runtime/chromium");
+        assert_eq!(notice_component(""), "APIaxess");
+        assert_eq!(notice_component("analysis-runtime"), "analysis-runtime");
     }
 
     #[test]

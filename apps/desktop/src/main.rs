@@ -303,9 +303,14 @@ fn stop_engine(slot: &EngineSlot) {
     if let Ok(mut guard) = slot.lock()
         && let Some(mut child) = guard.take()
     {
-        let _ = child.kill();
+        // A graceful stop first: the engine's own teardown reaps the capture
+        // Chromium, which leads a process group the group kill cannot reach.
+        let _ = child.terminate(ENGINE_STOP_GRACE);
     }
 }
+
+/// How long a stopping engine gets to tear down before it is killed.
+const ENGINE_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// Spawns the local engine in its default HTTP-server mode, bound to the chosen
 /// loopback ports, inside the shared process boundary (Job Object on Windows,
