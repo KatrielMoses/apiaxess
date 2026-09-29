@@ -1,10 +1,47 @@
 # APIaxess
 
-APIaxess is a security-analysis workbench for recovering and working with an
-application's hidden API surface. The assembled product combines a durable,
-scope-aware session model; live proxy capture with resend and fuzzer
-workbenches; the APK analysis pipeline; structured diagnostics and progress;
-and artifact export for OpenAPI 3.1, Python httpx, Postman, and HAR.
+**Reconstruct an application's real, reachable API surface — from the code it ships
+and the traffic it makes — with zero setup.**
+
+APIaxess is an open-source security workbench that reverse-engineers an app's API
+from *evidence*, never guesswork, and reports honest coverage for whatever it can't
+confirm. Point it at a web app or an Android APK: it captures live traffic through a
+bundled browser, analyzes the APK statically and dynamically, and fuses everything
+into one auditable API surface you can resend, fuzz, and export.
+
+Everything is bundled — Chromium, a Java runtime, apktool, jadx, ffuf, Frida, and an
+Android emulator — so there is nothing to install and wire up. It all runs locally on
+`127.0.0.1`; nothing is uploaded.
+
+[Website](https://apiaxess.dev) · [License](LICENSE) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
+
+## What you get
+
+- **Zero-setup capture** — a bundled browser + MITM proxy covering HTTPS, WebSocket,
+  SSE, gRPC-Web, and GraphQL.
+- **APK analysis** — static extraction plus a dynamic sandbox pass, fused into one surface.
+- **Workbenches** — Resend (a cleaner Repeater) and Fuzz (Burp-Intruder-class attack
+  types, payload engine, and grep).
+- **Honest output** — a fused API surface with per-endpoint evidence (confirmed vs
+  inferred) and coverage it never overstates.
+- **Export** — OpenAPI 3.1, Postman, HAR 1.2, and a runnable Python (httpx) SDK.
+- **Local & auditable** — loopback-only, a durable session with an append-only audit
+  trail; scope is advisory and honest — it warns, it never silently blocks.
+
+## Install
+
+APIaxess ships for **Windows and Linux** today (macOS is on the roadmap). Downloads and
+one-line install commands are on **[apiaxess.dev](https://apiaxess.dev)**. Builds are
+currently **unsigned** — published **SHA-256 checksums** let you verify integrity, and
+on Windows the first run shows a SmartScreen "unknown publisher" prompt (More info →
+Run anyway). We sign once the project earns the traction to justify it.
+
+- **Windows:** `scoop install apiaxess` · `choco install apiaxess` · or the per-user MSI.
+- **Linux (Debian/Ubuntu):** install the `.deb` with `sudo apt install ./apiaxess_*.deb`.
+
+Exact bucket/repository URLs and checksums are listed on the release page and
+[apiaxess.dev](https://apiaxess.dev). To build from source instead, see *Run the product*
+below.
 
 ## Architecture at a glance
 
@@ -138,18 +175,15 @@ what is reachable:
   This prints a warning and is your responsibility to secure (firewall/VPN);
   APIaxess is a local-bind-by-default tool and never exposes itself implicitly.
 
-## Install on Windows
+## Packaging & reproducible builds
 
-The versioned x64 MSI installs APIaxess per-user without requiring elevation:
-
-```text
-artifacts/windows/APIaxess-0.1.0-windows-x64.msi
-```
-
-Packaging inputs, reproducible build instructions, the private Node/pnpm runtime
-policy, and the installed-product verification command are documented in
-[Windows MSI packaging](packaging/windows/README.md). External analysis tools and
-Android images remain runtime-acquired and are not part of the installer.
+The per-user x64 MSI (no elevation required) and the Debian `.deb` are built from the
+inputs under `packaging/`. Reproducible build instructions, the private Node/pnpm
+runtime policy, and the installed-product verification command are documented in
+[Windows MSI packaging](packaging/windows/README.md) and
+[Debian packaging](packaging/debian/README.md). Bundled tools are fetched and
+SHA-256-verified at build time; the optional dynamic-analysis Android runtime is a
+separate download, not part of the base installer.
 
 ## Verify boundaries
 

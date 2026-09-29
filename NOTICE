@@ -1,0 +1,20 @@
+APIaxess
+Copyright 2026 APIaxess
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party tools, each under its own license. The APIaxess
+code does not relicense them; they are redistributed under their original terms,
+and their full notices ship with the installed product. See:
+
+  packaging/assets/chromium-NOTICES.md         (bundled Chromium)
+  packaging/assets/java-runtime-NOTICES.md      (bundled OpenJDK runtime)
+  packaging/assets/apk-tools-NOTICES.md         (bundled apktool, jadx)
+  packaging/assets/ffuf-NOTICES.md              (bundled ffuf)
+  packaging/assets/frida-NOTICES.md             (bundled Frida)
+  packaging/assets/android-target-NOTICES.md    (Android target add-on)
+  packaging/assets/analysis-runtime-NOTICES.md  (QEMU + Android image analysis runtime)
+
+These components are invoked as separate bundled programs; where a component is
+linked (Frida), it is used under license terms that permit this and its notices
+are included above.

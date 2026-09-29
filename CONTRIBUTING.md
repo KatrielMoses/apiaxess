@@ -1,5 +1,29 @@
 # Contributing
 
+Thanks for your interest in APIaxess. Contributions are welcome.
+
+- **Report bugs / request features:** open a GitHub issue with steps to reproduce and
+  your platform. For **security vulnerabilities**, do not open a public issue — follow
+  [SECURITY.md](SECURITY.md).
+- **Submit changes:** fork, create a branch, and open a pull request. Keep the change
+  focused, run the gates below, and describe what you changed and why.
+- **Licensing:** by contributing, you agree your contributions are licensed under the
+  project's [Apache License 2.0](LICENSE).
+- **Testing / QA:** the local GUI+UX regression flow lives under `.claude/skills/` for
+  maintainers; a good PR includes tests where practical and notes what you verified.
+
+Before submitting, run the gates:
+
+```text
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+pnpm ui:check && pnpm ui:build
+cargo xtask boundaries && cargo xtask contracts && cargo xtask foundations
+```
+
+## Architecture rules (normative)
+
 The architecture records in `docs/architecture/` are normative. In particular:
 
 1. Feature crates do not launch child processes. Add an adapter to
