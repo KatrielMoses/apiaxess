@@ -14,6 +14,7 @@ apiaxess-local-api = { path = "../../crates/local-api" }
 apiaxess-diagnostics = { path = "../../crates/diagnostics" }
 apiaxess-session = { path = "../../crates/session" }
 apiaxess-target-apk = { path = "../../plugins/targets/apk" }
+apiaxess-updater = { path = "../../crates/updater" }
 apiaxess-workbench-proxy = { path = "../../crates/workbench-proxy" }
 apiaxess-workbench-store = { path = "../../crates/workbench-store" }
 axum.workspace = true

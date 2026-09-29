@@ -15,6 +15,7 @@
     "lint:ws-model": "node scripts/check-ws-model.mjs",
     "lint:flow-kind": "node scripts/check-flow-kind.mjs",
     "lint:surface-operations": "node scripts/check-surface-operations.mjs",
+    "lint:update-model": "node scripts/check-update-model.mjs",
     "dev": "vite --host 127.0.0.1"
   },
   "devDependencies": {

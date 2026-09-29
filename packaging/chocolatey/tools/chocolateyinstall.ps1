@@ -14,3 +14,10 @@ $packageArgs = @{
 }
 
 Install-ChocolateyPackage @packageArgs
+
+# Tell the in-app updater this copy is Chocolatey's, so it shows
+# `choco upgrade apiaxess` rather than running an MSI update itself.
+$installChannel = Join-Path $env:LOCALAPPDATA 'Programs\APIaxess\install-channel'
+if (Test-Path -LiteralPath (Split-Path -Parent $installChannel)) {
+  Set-Content -LiteralPath $installChannel -Value 'chocolatey' -NoNewline -Encoding ascii
+}

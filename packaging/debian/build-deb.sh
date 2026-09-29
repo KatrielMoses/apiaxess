@@ -143,6 +143,9 @@ install -m 0755 "$engine" "$pkg_root/usr/bin/apiaxess"
 # The native desktop shell is the double-click entry point; it spawns the engine.
 install -m 0755 "$desktop" "$pkg_root/usr/bin/apiaxess-desktop"
 cp -r "$gui_dist/." "$share/gui/"
+# Tells the in-app updater this copy is updated with apt (it verifies the new
+# .deb and shows the command; it never escalates privileges itself).
+printf 'deb' > "$share/install-channel"
 cp "$repository_root/README.md" "$doc/README.md"
 # Apache-2.0 section 4: every distributed copy carries the License and NOTICE.
 # Debian looks for the license text at /usr/share/doc/<package>/copyright.

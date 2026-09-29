@@ -147,6 +147,60 @@ pub fn open_in_file_manager(path: &std::path::Path) -> io::Result<()> {
     Command::new(opener).arg(path).spawn().map(|_| ())
 }
 
+/// Starts `executable` fully detached from every `APIaxess` process boundary,
+/// so it outlives the caller: the in-app updater's installer helper has to keep
+/// running after the app exits to replace the app's own files. No window, no
+/// inherited stdio. On Windows it also leaves the caller's Job Object when the
+/// job allows that, and otherwise starts without breaking away (a job that
+/// kills on close would still end it, so callers outside such a job use this).
+/// Returns the process ID.
+///
+/// # Errors
+///
+/// Returns the operating-system error when the process cannot start.
+pub fn spawn_detached<I, S>(executable: &std::path::Path, arguments: I) -> io::Result<u32>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let arguments: Vec<std::ffi::OsString> = arguments
+        .into_iter()
+        .map(|argument| argument.as_ref().to_os_string())
+        .collect();
+    let build = || {
+        let mut command = Command::new(executable);
+        command
+            .args(&arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows::Win32::System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+        };
+        let base = CREATE_NO_WINDOW.0 | CREATE_NEW_PROCESS_GROUP.0;
+        let mut breakaway = build();
+        breakaway.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB.0);
+        breakaway.spawn().map(|child| child.id()).or_else(|_| {
+            let mut plain = build();
+            plain.creation_flags(base);
+            plain.spawn().map(|child| child.id())
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = build();
+        // Its own process group, so a group kill of the caller does not reach it.
+        command.process_group(0);
+        command.spawn().map(|child| child.id())
+    }
+}
+
 /// A feature-owned process command that still crosses the central process
 /// boundary. Browser launch uses this port so feature crates do not construct
 /// `std::process::Command` directly.

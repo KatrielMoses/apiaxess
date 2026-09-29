@@ -17,12 +17,13 @@ use apiaxess_session::{
     AllowedNetworkTarget, EngagementScope, HostMatch, Session, SessionId, SessionLifecycle,
     TargetIdentifier, TargetIdentity,
 };
+use apiaxess_updater::service::{UpdateConfig, UpdateService};
 use apiaxess_workbench_proxy::{
     CaStateLog, ProxyCore, ProxyResendSender, SessionCa, SystemCaInstall, SystemStorePurger,
 };
 use apiaxess_workbench_store::TrafficStore;
 use chrono::Utc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_GUI_ADDRESS: &str = "127.0.0.1:7777";
@@ -195,6 +196,7 @@ async fn serve_workbench(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gui_directory = gui_directory();
     let engine = Engine::new();
+    let updates = update_service();
     // A saved setting that would have failed startup was skipped (its default
     // is in use): say so in the GUI, which stays reachable to fix it.
     for diagnostic in apiaxess_local_api::invalid_saved_settings() {
@@ -203,10 +205,11 @@ async fn serve_workbench(
     }
     let listener = tokio::net::TcpListener::bind(gui_address).await?;
     let bound_gui_address = listener.local_addr()?;
-    let application = apiaxess_local_api::router_with_port(
+    let application = apiaxess_local_api::router_with_updates(
         engine.clone(),
         &gui_directory,
         bound_gui_address.port(),
+        updates.clone(),
     )?;
     let startup_engine = engine.clone();
     let runtime = match WorkbenchRuntime::start_with_artifact(
@@ -223,7 +226,7 @@ async fn serve_workbench(
                 .live_workbench()
                 .publish_diagnostic(diagnostic.clone());
             let serve_result = axum::serve(listener, application)
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(shutdown_or_update(updates.clone()))
                 .await;
             serve_result?;
             return Err(Box::new(diagnostic) as Box<dyn std::error::Error>);
@@ -241,8 +244,9 @@ async fn serve_workbench(
     if announce_access {
         print_access_banner(bound_gui_address);
     }
+    updates.spawn_scheduler();
     let serve_result = axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_or_update(updates.clone()))
         .await;
     let shutdown_result = runtime.shutdown().await;
     serve_result?;
@@ -250,8 +254,57 @@ async fn serve_workbench(
         report_startup_diagnostic(&diagnostic);
         return Err(Box::new(diagnostic) as Box<dyn std::error::Error>);
     }
+    finish_update(&updates);
 
     Ok(())
+}
+
+/// The engine's update service: live for the workbench (desktop and `serve`),
+/// reading the "Check for updates" setting on every tick. A bad test override
+/// leaves the workbench running with updates off rather than failing startup.
+fn update_service() -> UpdateService {
+    match UpdateConfig::from_env(env!("CARGO_PKG_VERSION")) {
+        Ok(config) => UpdateService::new(config, apiaxess_local_api::update_checks_enabled),
+        Err(why) => {
+            warn!(%why, "update checks are unavailable");
+            UpdateService::inert()
+        }
+    }
+}
+
+/// After a clean shutdown: exit with the code an update install asked for
+/// (the desktop shell reads it), and for headless `serve`, which has no shell
+/// to do it, start the installer for an install scheduled for when the
+/// session ends.
+fn finish_update(updates: &UpdateService) {
+    let under_shell = env::var_os("APIAXESS_DESKTOP_SHELL").is_some();
+    if !under_shell
+        && updates.requested_exit().is_none()
+        && let Some(dir) = updates.updates_dir()
+        && apiaxess_updater::handoff::read_handoff(dir)
+            .is_some_and(|pending| pending.when == apiaxess_updater::InstallWhen::Deferred)
+        && let Some(pending) = apiaxess_updater::handoff::take_handoff(dir)
+    {
+        match apiaxess_updater::handoff::launch_msi_installer(
+            &pending,
+            std::process::id(),
+            dir,
+            None,
+        ) {
+            Ok(()) => println!(
+                "Installing APIaxess {} now that the session has ended.",
+                pending.version
+            ),
+            Err(error) => eprintln!("APIaxess {} was not installed: {error}", pending.version),
+        }
+    }
+    match updates.requested_exit() {
+        Some(0) => println!(
+            "Installing the APIaxess update. Start APIaxess again once the installer finishes."
+        ),
+        Some(code) => std::process::exit(code),
+        None => {}
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1437,6 +1490,14 @@ fn resolve_gui_directory(
         })
         .filter(|candidate| candidate.join("index.html").is_file());
     installed.unwrap_or_else(|| development.to_path_buf())
+}
+
+/// Resolves on a stop signal, or when an update install asks the engine to exit.
+async fn shutdown_or_update(updates: UpdateService) {
+    tokio::select! {
+        () = shutdown_signal() => {}
+        () = updates.exit_requested() => {}
+    }
 }
 
 /// Resolves on Ctrl-C, or on Unix also on `SIGTERM` (systemd, `kill`, the

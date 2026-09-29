@@ -19,6 +19,7 @@ members = [
     "crates/fusion",
     "crates/confidence",
     "crates/unified-surface",
+    "crates/updater",
     "crates/openapi-emitter",
     "crates/python-sdk-emitter",
     "crates/collections-emitter",

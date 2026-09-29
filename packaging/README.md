@@ -58,6 +58,9 @@ is present (see `sandbox.software-mode-active`).
 ## Releasing
 
 Release assets are unsigned; integrity comes from the published `SHA256SUMS`.
+Each package also carries an `install-channel` marker (`msi`, `portable`,
+`scoop`, `chocolatey`, `deb`) that tells the in-app updater how that copy is
+updated (see `crates/updater/src/channel.rs`).
 
 1. Build from the commit being tagged, so the engine's About page carries a clean
    commit stamp:
@@ -68,9 +71,23 @@ Release assets are unsigned; integrity comes from the published `SHA256SUMS`.
 2. Collect the three assets in one directory and write `SHA256SUMS` with
    `pwsh packaging/gen-checksums.ps1 -Directory <dir>` or
    `bash packaging/gen-checksums.sh <dir>` (identical output).
-3. `pwsh packaging/update-manifests.ps1 -Sums <dir>/SHA256SUMS` points the Scoop
-   manifest and Chocolatey package at the release's URLs and hashes.
+3. `pwsh packaging/update-manifests.ps1 -Sums <dir>/SHA256SUMS -LatestJson <dir>/latest.json -Artifacts <dir> -Summary "<one line>"`
+   points the Scoop manifest and Chocolatey package at the release's URLs and
+   hashes, and writes the in-app updater's `latest.json` from the same
+   SHA256SUMS (version, `https://apiaxess.dev/dl/<v>/<file>` URLs, SHA-256,
+   sizes, `min_supported`), so the Download page, the package managers and the
+   app can never disagree. Once the release key exists, sign the exact file:
+   `cargo xtask sign-manifest <key.pk8> <dir>/latest.json` writes
+   `latest.json.sig` (ed25519 over the raw bytes; never re-save the JSON after
+   signing). The key is created once, offline, with
+   `cargo xtask update-keygen <key.pk8>`; its public half goes into
+   `crates/updater/src/verify.rs` (`EMBEDDED_PUBLIC_KEY`), after which the app
+   refuses any unsigned or badly signed manifest.
 4. Create the GitHub Release `v<v>` with the MSI, zip, `.deb`, and `SHA256SUMS`.
+   Publish the same files to the website as `/dl/<v>/<file>`, then
+   `latest.json` (and `latest.json.sig`, once signing is on) to
+   `/releases/` — assets first, manifest last, so no app is ever pointed at a
+   file that is not there yet.
 5. Copy `scoop/apiaxess.json` to `bucket/apiaxess.json` in the
    `KatrielMoses/scoop-apiaxess` bucket repo. Later versions can be bumped there by
    Scoop's `checkver`/`autoupdate`, which reads the hash from `SHA256SUMS`.

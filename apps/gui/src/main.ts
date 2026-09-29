@@ -24,6 +24,7 @@ import { SHORTCUTS, shortcutLabel } from "./ui/keys";
 import { initTheme } from "./ui/theme";
 import { type CredentialDialogField, choiceDialog, confirmDialog, credentialDialog, promptDialog } from "./ui/overlay";
 import { toast } from "./ui/toast";
+import { type UpdateAction, type UpdateNotice, type UpdateStatus, updateView } from "./update/model";
 import {
   FUZZ_MARK,
   type ParsedTemplate,
@@ -6554,6 +6555,146 @@ function renderAbout(status: SystemStatus | null): void {
 }
 
 /* ==================================================================== *
+ * 19b. Updates — the in-app update notice and the Settings "Updates" panel
+ *
+ * The engine owns the check (daily, identifier-free, off-switchable) and the
+ * verified download; this only shows its status and sends the operator's
+ * choice. What each state says lives in update/model.ts.
+ * ==================================================================== */
+
+const UPDATE_DISMISSED_KEY = "apiaxess.update.dismissed";
+let updateStatus: UpdateStatus | null = null;
+let updatePoll: number | undefined;
+let updateInstallReported = false;
+
+function updateDismissed(): string | null {
+  try { return localStorage.getItem(UPDATE_DISMISSED_KEY); } catch { return null; }
+}
+
+function updateActionButton(action: UpdateAction): string {
+  const tone = action.primary === true ? "btn--primary" : "";
+  const title = action.reason === undefined ? "" : ` title="${escapeHtml(action.reason)}"`;
+  const value = action.value === undefined ? "" : ` data-update-value="${escapeHtml(action.value)}"`;
+  return `<button class="btn btn--sm ${tone}" type="button" data-update-action="${action.kind}"${value}${title}${action.disabled === true ? " disabled" : ""}>${escapeHtml(action.label)}</button>`;
+}
+
+function updateNoticeHtml(notice: UpdateNotice, banner: boolean): string {
+  const iconName = notice.tone === "success" ? "check" : notice.tone === "accent" ? "refresh" : "alert";
+  const command = notice.command === null ? "" : `<pre class="code t-mono update-command">${escapeHtml(notice.command)}</pre>`;
+  const later = banner && notice.dismissible ? `<button class="btn btn--sm btn--ghost" type="button" data-update-action="dismiss">Later</button>` : "";
+  const actions = notice.actions.length === 0 && later === "" ? "" : `<div class="row update-actions">${notice.actions.map(updateActionButton).join("")}${later}</div>`;
+  return `<div class="notice notice--${notice.tone}"><span class="notice__icon">${icon(iconName, { size: 18 })}</span><div class="notice__body"><p class="notice__title">${escapeHtml(notice.title)}</p><p>${escapeHtml(notice.body)}</p>${command}${actions}</div></div>`;
+}
+
+function renderUpdate(): void {
+  const status = updateStatus;
+  const banner = document.querySelector<HTMLElement>("#update-banner");
+  const panel = document.querySelector<HTMLElement>("#update-panel");
+  const lastChecked = document.querySelector<HTMLElement>("#update-last-checked");
+  const version = document.querySelector<HTMLElement>("#update-version");
+  const check = document.querySelector<HTMLButtonElement>("#update-check");
+  if (status === null) {
+    if (banner !== null) banner.hidden = true;
+    if (panel !== null) panel.innerHTML = '<p class="t-small t-subtle">Update status is unavailable.</p>';
+    if (check !== null) check.disabled = true;
+    return;
+  }
+  const view = updateView(status, new Date(), updateDismissed());
+  if (banner !== null) {
+    // Settings shows the same notice in its Updates panel.
+    const onSettings = document.querySelector<HTMLElement>('[data-view="settings"]')?.hidden === false;
+    banner.hidden = view.banner === null || onSettings;
+    banner.innerHTML = view.banner === null ? "" : updateNoticeHtml(view.banner, true);
+  }
+  if (panel !== null) {
+    const installed = status.lastInstall === null ? "" : updateNoticeHtml({ tone: status.lastInstall.succeeded ? "success" : "danger", title: status.lastInstall.succeeded ? "Updated" : "The last update did not install", body: status.lastInstall.message, command: null, actions: [], dismissible: false }, false);
+    panel.innerHTML = `${installed}${updateNoticeHtml(view.panel, false)}`;
+  }
+  if (lastChecked !== null) {
+    const signed = status.signature === "required" && status.lastChecked !== null && status.lastError === null ? " Release manifest signature verified." : "";
+    lastChecked.textContent = `${view.lastChecked}${signed}`;
+  }
+  if (version !== null) version.textContent = `v${status.currentVersion} · ${status.channel}`;
+  if (check !== null) check.disabled = !view.canCheck;
+}
+
+async function refreshUpdateStatus(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/update/status");
+    if (!response.ok) return;
+    updateStatus = (await response.json()) as UpdateStatus;
+  } catch {
+    return;
+  }
+  if (!updateInstallReported && updateStatus.lastInstall !== null) {
+    updateInstallReported = true;
+    toast(updateStatus.lastInstall.message, updateStatus.lastInstall.succeeded ? "success" : "danger");
+  }
+  renderUpdate();
+  // Follow a download or check closely; otherwise a slow refresh keeps the
+  // busy state and "Last checked" current.
+  const active = updateStatus.checking || updateStatus.download.state === "downloading";
+  window.clearInterval(updatePoll);
+  updatePoll = window.setInterval(() => void refreshUpdateStatus(), active ? 1000 : 60_000);
+}
+
+async function postUpdate(path: string, init: RequestInit = {}): Promise<void> {
+  const response = await fetch(path, { method: "POST", ...init, headers: { ...pairingHeaders(init.body !== undefined), ...(init.headers ?? {}) } });
+  await requireOk(response, "the update request failed");
+  updateStatus = (await response.json()) as UpdateStatus;
+  renderUpdate();
+}
+
+async function runUpdateAction(button: HTMLButtonElement): Promise<void> {
+  const kind = button.dataset.updateAction ?? "";
+  const value = button.dataset.updateValue ?? "";
+  try {
+    if (kind === "dismiss") {
+      try { if (updateStatus?.available != null) localStorage.setItem(UPDATE_DISMISSED_KEY, updateStatus.available.version); } catch { /* a preference */ }
+      renderUpdate();
+      return;
+    }
+    if (kind === "open-url") { window.open(value, "_blank", "noopener"); return; }
+    if (kind === "copy-command") {
+      toast((await copyText(value)) ? "Command copied." : "The clipboard is not available here.", "info");
+      return;
+    }
+    if (kind === "download") {
+      await withBusy(button, "Starting…", () => postUpdate("/api/v1/update/download"));
+      void refreshUpdateStatus();
+      return;
+    }
+    if (kind === "install-deferred") {
+      await withBusy(button, "Scheduling…", () => postUpdate("/api/v1/update/install", { body: JSON.stringify({ when: "deferred" }) }));
+      toast("The update installs when this session ends.", "success");
+      return;
+    }
+    if (kind === "cancel-deferred") {
+      await withBusy(button, "Cancelling…", () => postUpdate("/api/v1/update/install", { method: "DELETE" }));
+      return;
+    }
+    if (kind === "install-now") {
+      await withBusy(button, "Restarting…", () => postUpdate("/api/v1/update/install", { body: JSON.stringify({ when: "now" }) }));
+      toast("Session saved. APIaxess is closing to install the update and will reopen it.", "success");
+    }
+  } catch (error) {
+    if (!(error instanceof ApiRequestError)) reportUnexpected(error, { id: "update.action-failed", what: "The update action did not complete.", why: "", fix: "Check the update status in Settings and try again." });
+    void refreshUpdateStatus();
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("[data-update-action]");
+  if (button !== null && button !== undefined && !button.disabled) void runUpdateAction(button);
+});
+document.querySelector<HTMLButtonElement>("#update-check")?.addEventListener("click", (event) => {
+  const button = event.currentTarget as HTMLButtonElement;
+  void withBusy(button, "Checking…", () => postUpdate("/api/v1/update/check"))
+    .catch((error: unknown) => { if (!(error instanceof ApiRequestError)) reportUnexpected(error, { id: "update.check-failed", what: "The update check did not run.", why: "", fix: "Try again in a moment." }); })
+    .finally(() => renderUpdate());
+});
+
+/* ==================================================================== *
  * Wiring
  * ==================================================================== */
 
@@ -6901,8 +7042,12 @@ async function saveSettings(): Promise<void> {
         body: JSON.stringify({ values }),
       });
       await requireOk(response, "settings save failed");
-      renderSettings((await response.json()) as SettingsResponse);
-      toast("Settings saved — restart APIaxess to apply", "success");
+      const saved = (await response.json()) as SettingsResponse;
+      renderSettings(saved);
+      const needsRestart = saved.settings.some((entry) => entry.key in values && entry.restartRequired);
+      toast(needsRestart ? "Settings saved — restart APIaxess to apply" : "Settings saved", "success");
+      // The update-check toggle applies at once.
+      void refreshUpdateStatus();
     });
   } catch (error) {
     // The engine names the setting it refused: show its reason on that field.
@@ -6946,7 +7091,12 @@ function paintShell(): void {
       void refreshResendList();
       void refreshFuzzList();
     }
-    if (view === "settings") void refreshSettings();
+    if (view === "settings") {
+      void refreshSettings();
+      void refreshUpdateStatus();
+    } else {
+      renderUpdate();
+    }
     if (view === "devices") enterDevicesView();
     else leaveDevicesView();
     if (view === "android") enterAndroidView();
@@ -7075,6 +7225,7 @@ async function boot(): Promise<void> {
     await refreshPipeline();
     await refreshBrowserStatus();
     await restoreWorkbench();
+    void refreshUpdateStatus();
     window.setInterval(() => void refreshPending(), 500);
     window.setInterval(() => void refreshHealth(), 5000);
     pipelinePoll = window.setInterval(() => void refreshPipeline(), 1000);

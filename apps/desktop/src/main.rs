@@ -75,6 +75,11 @@ fn main() {
     #[cfg(windows)]
     ensure_webview2();
 
+    // An update scheduled for when the last session ended, if the app did not
+    // get to install it on the way out: install it now, before anything runs,
+    // and come back as the new version.
+    install_pending_update_and_exit();
+
     let force_choose = std::env::args()
         .skip(1)
         .any(|argument| argument == "--choose");
@@ -173,8 +178,77 @@ fn main() {
         .run(move |_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 stop_engine(&exit_slot);
+                // "Install when this session ends": the session just did.
+                install_deferred_update();
             }
         });
+}
+
+/// Starts the detached installer helper for a staged update (re-verifying the
+/// MSI's SHA-256 first). It waits for this shell to exit, installs, and, when
+/// `relaunch` is set, starts the new version reopening the handoff's session.
+/// The handoff is consumed either way, so a failing install is tried once.
+fn start_update_install(
+    pending: &apiaxess_updater::InstallHandoff,
+    relaunch: bool,
+) -> std::io::Result<()> {
+    let dir = apiaxess_updater::handoff::updates_dir();
+    let executable = relaunch.then(std::env::current_exe).transpose()?;
+    apiaxess_updater::handoff::launch_msi_installer(
+        pending,
+        std::process::id(),
+        &dir,
+        executable.as_deref(),
+    )
+}
+
+/// On launch: installs a staged update left over from the last session and
+/// exits (the helper relaunches the new version).
+fn install_pending_update_and_exit() {
+    if !cfg!(windows) {
+        return;
+    }
+    let Some(pending) =
+        apiaxess_updater::handoff::take_handoff(&apiaxess_updater::handoff::updates_dir())
+    else {
+        return;
+    };
+    match start_update_install(&pending, true) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => report_update_failure(&pending.version, &error),
+    }
+}
+
+/// On exit: installs an update scheduled for when the session ends. No
+/// relaunch; the operator closed the app.
+fn install_deferred_update() {
+    if !cfg!(windows) {
+        return;
+    }
+    let dir = apiaxess_updater::handoff::updates_dir();
+    if !apiaxess_updater::handoff::read_handoff(&dir)
+        .is_some_and(|pending| pending.when == apiaxess_updater::InstallWhen::Deferred)
+    {
+        return;
+    }
+    if let Some(pending) = apiaxess_updater::handoff::take_handoff(&dir)
+        && let Err(error) = start_update_install(&pending, false)
+    {
+        report_update_failure(&pending.version, &error);
+    }
+}
+
+/// Says why a staged update did not install; the app carries on as it is.
+fn report_update_failure(version: &str, error: &std::io::Error) {
+    eprintln!("APIaxess: the update to {version} was not installed: {error}");
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("APIaxess update")
+        .set_description(format!(
+            "The update to {version} was not installed:\n\n{error}\n\nAPIaxess will keep running the current version. You can download the update again from Settings."
+        ))
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 /// The app's window icon — the identity-kit mark, embedded from the same PNG the
@@ -266,13 +340,30 @@ fn supervise_engine(slot: &EngineSlot, gui_port: u16, proxy_port: u16) {
         }
         let exited = match slot.lock() {
             Ok(mut guard) => match guard.as_mut() {
-                Some(child) => child.try_wait().ok().flatten().is_some(),
+                Some(child) => child.try_wait().ok().flatten(),
                 None => return,
             },
             Err(_) => return,
         };
-        if !exited || ENGINE_STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+        let Some(status) = exited else {
             continue;
+        };
+        if ENGINE_STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        // The operator chose "Restart and update": the engine saved the
+        // session, staged the verified MSI, and exited on purpose.
+        if status.code() == Some(apiaxess_updater::INSTALL_EXIT_CODE)
+            && let Some(pending) =
+                apiaxess_updater::handoff::take_handoff(&apiaxess_updater::handoff::updates_dir())
+        {
+            match start_update_install(&pending, true) {
+                Ok(()) => {
+                    ENGINE_STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::process::exit(0);
+                }
+                Err(error) => report_update_failure(&pending.version, &error),
+            }
         }
         restarts.retain(|at| at.elapsed() < RESTART_WINDOW);
         if restarts.len() >= MAX_RESTARTS {
@@ -351,6 +442,9 @@ fn spawn_engine_with(
     command.env("APIAXESS_GUI_ADDRESS", format!("127.0.0.1:{gui_port}"));
     command.env("APIAXESS_PROXY_ADDRESS", format!("127.0.0.1:{proxy_port}"));
     command.env("APIAXESS_ACTIVE_SESSION_POINTER", active_session_pointer());
+    // Tells the engine an update install is this shell's to run (the engine
+    // sits in this shell's Job Object and cannot outlive it).
+    command.env("APIAXESS_DESKTOP_SHELL", "1");
     if let Some(session) = resume {
         command.env("APIAXESS_SESSION_FILE", session);
     }

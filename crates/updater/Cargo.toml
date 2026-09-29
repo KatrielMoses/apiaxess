@@ -1,0 +1,38 @@
+[package]
+name = "apiaxess-updater"
+description = "In-app update check, verified download, and installer handoff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["client"]
+# The network side: the daily manifest check, signature verification, and the
+# verified download. The desktop shell only consumes an install handoff, so it
+# builds without this.
+client = ["dep:reqwest", "dep:ring", "dep:tokio"]
+
+[dependencies]
+apiaxess-external-tools = { path = "../external-tools" }
+apiaxess-install-layout = { path = "../install-layout" }
+base64.workspace = true
+chrono.workspace = true
+semver = "1.0.28"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url = "2.5.8"
+# Already in the workspace lock through rustls; used directly for the ed25519
+# manifest signature check.
+ring = { version = "0.17.14", optional = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum.workspace = true
+
+[lints]
+workspace = true

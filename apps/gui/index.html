@@ -157,6 +157,8 @@
         <!-- Regions 4–8 · Content column -->
         <div class="shell__content">
           <main class="app-main">
+        <!-- In-app update notice (src/update/model.ts decides what it says). -->
+        <div class="update-banner" id="update-banner" role="status" aria-live="polite" hidden></div>
         <!-- ==========================================================
              3. Landing / entry
              ========================================================== -->
@@ -1065,6 +1067,27 @@
                     only — no engine setting changes and no restart is needed.
                   </p>
                 </div>
+              </div>
+            </article>
+            <article class="panel" id="settings-updates">
+              <div class="panel__header">
+                <div class="panel__heading"><span data-icon="refresh"></span><h2>Updates</h2></div>
+                <span class="panel__hint t-mono" id="update-version"></span>
+              </div>
+              <div class="panel__body stack">
+                <div id="update-panel"></div>
+                <div class="row row--between">
+                  <p class="t-small t-subtle" id="update-last-checked"></p>
+                  <button class="btn btn--sm" id="update-check" type="button">
+                    <span data-icon="refresh" data-icon-size="14"></span> Check now
+                  </button>
+                </div>
+                <p class="field__hint">
+                  The check is a plain GET of a static file on apiaxess.dev, once at startup and once a day. It sends
+                  only the app's version and platform (to pick the right download) — no identifiers, nothing about you
+                  or your sessions. Turn it off with "Check for updates" below or <span class="t-mono">APIAXESS_UPDATE_CHECK=0</span>.
+                  Downloads are checked against their published SHA-256 before anything is installed.
+                </p>
               </div>
             </article>
             <div id="settings-body" class="settings__engine"></div>

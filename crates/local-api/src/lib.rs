@@ -5,8 +5,11 @@ mod settings;
 mod stream_proxy;
 
 pub use settings::{
-    invalid_saved_settings, persisted_env_overrides, setting_label, value_is_from_saved_settings,
+    invalid_saved_settings, persisted_env_overrides, setting_label, update_checks_enabled,
+    value_is_from_saved_settings,
 };
+
+use apiaxess_updater::service::{UpdateService, UpdateStatus};
 
 use pairing::{DevicePairingRegistry, PairingOutcome, PendingPairingRegistry};
 
@@ -61,8 +64,24 @@ pub fn router(engine: Engine, gui_directory: &Path) -> io::Result<Router> {
 /// # Errors
 ///
 /// Returns an I/O error when the built GUI entry point is unavailable.
-#[allow(clippy::too_many_lines)] // A flat, auditable route table reads better than split builders.
 pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::Result<Router> {
+    router_with_updates(engine, gui_directory, port, UpdateService::inert())
+}
+
+/// [`router_with_port`] with the engine's update service, which the Settings
+/// line, the update banner, and the install flow read and drive. Only the
+/// composition root builds a live service, so no other router ever checks.
+///
+/// # Errors
+///
+/// Returns an I/O error when the built GUI entry point is unavailable.
+#[allow(clippy::too_many_lines)] // A flat, auditable route table reads better than split builders.
+pub fn router_with_updates(
+    engine: Engine,
+    gui_directory: &Path,
+    port: u16,
+    updates: UpdateService,
+) -> io::Result<Router> {
     let index = gui_directory.join("index.html");
     index.metadata()?;
     // Cache policy for the packaged GUI, so a rebuilt bundle is picked up without a
@@ -89,6 +108,7 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         pairing: DevicePairingRegistry::default(),
         pending_pairing: PendingPairingRegistry::default(),
         gui_port: port,
+        updates,
     };
 
     Ok(Router::new()
@@ -97,6 +117,16 @@ pub fn router_with_port(engine: Engine, gui_directory: &Path, port: u16) -> io::
         .route("/api/v1/session/recent", get(recent_sessions))
         .route("/api/v1/about", get(about))
         .route("/api/v1/about/notice", get(about_notice))
+        .route("/api/v1/update/status", get(update_status))
+        .route("/api/v1/update/check", axum::routing::post(update_check))
+        .route(
+            "/api/v1/update/download",
+            axum::routing::post(update_download),
+        )
+        .route(
+            "/api/v1/update/install",
+            axum::routing::post(update_install).delete(update_cancel),
+        )
         .route(
             "/api/v1/pipeline/check",
             axum::routing::post(check_pipeline_artifact),
@@ -338,6 +368,8 @@ struct ApiState {
     /// The GUI/control loopback port this router is bound to; carried into the
     /// pairing QR and used to arm a device's control-channel reverse tunnel.
     gui_port: u16,
+    /// The in-app updater (inert unless the composition root supplied one).
+    updates: UpdateService,
 }
 
 #[derive(Clone, Default)]
@@ -813,7 +845,7 @@ async fn get_settings(State(_state): State<ApiState>) -> Json<settings::Settings
 }
 
 async fn update_settings_handler(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(update): Json<settings::SettingsUpdate>,
 ) -> Result<Json<settings::SettingsView>, (StatusCode, Json<apiaxess_diagnostics::Diagnostic>)> {
     settings::update_settings(update).map_err(|error| {
@@ -830,7 +862,182 @@ async fn update_settings_handler(
         }
         (StatusCode::BAD_REQUEST, Json(diagnostic))
     })?;
+    // The update-check toggle applies without a restart.
+    state.updates.wake();
     Ok(Json(settings::settings_view()))
+}
+
+/// An API error: the status and the diagnostic the GUI shows.
+type ApiError = (StatusCode, Json<apiaxess_diagnostics::Diagnostic>);
+
+/// The update status plus what is running that an install would interrupt.
+fn update_status_with_busy(state: &ApiState) -> UpdateStatus {
+    let mut status = state.updates.status();
+    status.busy = busy_reasons(state);
+    status
+}
+
+/// What is running right now that installing an update (which restarts the
+/// app) would interrupt.
+fn busy_reasons(state: &ApiState) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if state
+        .engine
+        .browser_launch_status()
+        .is_ok_and(|status| status.running)
+    {
+        reasons.push("the capture browser is open".to_owned());
+    }
+    if state.engine.fuzzer().list().iter().any(|job| {
+        matches!(
+            job.state,
+            apiaxess_workbench_store::FuzzerJobState::Running
+                | apiaxess_workbench_store::FuzzerJobState::Paused
+        )
+    }) {
+        reasons.push("a Fuzz or discovery job is running".to_owned());
+    }
+    if !matches!(
+        state.engine.android_target_status().phase,
+        apiaxess_engine_shell::AndroidTargetPhase::Idle
+            | apiaxess_engine_shell::AndroidTargetPhase::Error
+    ) {
+        reasons.push("the Android target is running".to_owned());
+    }
+    if state.pipeline_runs.any_running() {
+        reasons.push("an APK analysis is running".to_owned());
+    }
+    reasons
+}
+
+fn update_refused(why: impl Into<String>, fix: &str) -> ApiError {
+    let mut diagnostic = catalogue::UPDATE_REFUSED.instantiate(DiagnosticContext::new());
+    diagnostic.why = why.into().into_boxed_str();
+    diagnostic.fix = fix.into();
+    (StatusCode::CONFLICT, Json(diagnostic))
+}
+
+async fn update_status(State(state): State<ApiState>) -> Json<UpdateStatus> {
+    Json(update_status_with_busy(&state))
+}
+
+async fn update_check(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<UpdateStatus>, ApiError> {
+    require_operator(&state, &headers, &state.engine.live_workbench())?;
+    state.updates.check_now().await.map_err(|why| {
+        update_refused(
+            why,
+            "Turn on \"Check for updates\" in Settings, then check again.",
+        )
+    })?;
+    Ok(Json(update_status_with_busy(&state)))
+}
+
+async fn update_download(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<UpdateStatus>, ApiError> {
+    require_operator(&state, &headers, &state.engine.live_workbench())?;
+    state
+        .updates
+        .start_download()
+        .map_err(|why| update_refused(why, "Check for updates again from Settings."))?;
+    Ok(Json(update_status_with_busy(&state)))
+}
+
+#[derive(Deserialize)]
+struct UpdateInstallRequest {
+    /// `now` (restart and install) or `deferred` (when this session ends).
+    #[serde(default)]
+    when: Option<String>,
+}
+
+/// Installs the verified MSI. `now` saves the session, hands the installer
+/// over, and shuts the engine down (the desktop shell, or for headless `serve`
+/// a detached helper, installs and relaunches); it is refused while work is
+/// running. `deferred` schedules the install for when this session ends.
+async fn update_install(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    request: Option<Json<UpdateInstallRequest>>,
+) -> Result<Json<UpdateStatus>, ApiError> {
+    use apiaxess_updater::InstallWhen;
+    require_operator(&state, &headers, &state.engine.live_workbench())?;
+    let when = match request.and_then(|Json(request)| request.when).as_deref() {
+        None | Some("now") => InstallWhen::Now,
+        Some("deferred") => InstallWhen::Deferred,
+        Some(other) => {
+            return Err(update_refused(
+                format!("unknown install time {other:?}"),
+                "Use \"now\" or \"deferred\".",
+            ));
+        }
+    };
+    if !state.updates.status().channel.installs_in_app() {
+        return Err(update_refused(
+            "This install is updated by its package manager, not by the app.",
+            "Run the update command shown in Settings → Updates.",
+        ));
+    }
+    if when == InstallWhen::Deferred {
+        state
+            .updates
+            .stage_install(InstallWhen::Deferred, None)
+            .map_err(|why| update_refused(why, "Download the update first."))?;
+        return Ok(Json(update_status_with_busy(&state)));
+    }
+    let busy = busy_reasons(&state);
+    if !busy.is_empty() {
+        let mut diagnostic = catalogue::UPDATE_SESSION_BUSY.instantiate(DiagnosticContext::new());
+        diagnostic.why = format!(
+            "Installing restarts APIaxess, and right now {}.",
+            busy.join(", ")
+        )
+        .into_boxed_str();
+        return Err((StatusCode::CONFLICT, Json(diagnostic)));
+    }
+    // Save the session so the relaunched app reopens it where it was.
+    let resume = state
+        .engine
+        .save_session()
+        .ok()
+        .map(|status| PathBuf::from(status.artifact_path));
+    let handoff = state
+        .updates
+        .stage_install(InstallWhen::Now, resume)
+        .map_err(|why| update_refused(why, "Download the update first."))?;
+    if std::env::var_os("APIAXESS_DESKTOP_SHELL").is_some() {
+        // The shell sees this exit code and starts the installer helper.
+        state
+            .updates
+            .request_exit(apiaxess_updater::INSTALL_EXIT_CODE);
+    } else {
+        let dir = state
+            .updates
+            .updates_dir()
+            .map_or_else(apiaxess_updater::handoff::updates_dir, Path::to_path_buf);
+        apiaxess_updater::handoff::clear_handoff(&dir);
+        apiaxess_updater::handoff::launch_msi_installer(&handoff, std::process::id(), &dir, None)
+            .map_err(|error| {
+            update_refused(
+                format!("the installer could not start: {error}"),
+                "Run the downloaded MSI yourself, or download it again from apiaxess.dev.",
+            )
+        })?;
+        state.updates.request_exit(0);
+    }
+    Ok(Json(update_status_with_busy(&state)))
+}
+
+async fn update_cancel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<UpdateStatus>, ApiError> {
+    require_operator(&state, &headers, &state.engine.live_workbench())?;
+    state.updates.cancel_scheduled();
+    Ok(Json(update_status_with_busy(&state)))
 }
 
 async fn session_status(
@@ -1501,6 +1708,14 @@ impl PipelineRunResponse {
 }
 
 impl PipelineRegistry {
+    /// Whether any analysis run is still in progress.
+    fn any_running(&self) -> bool {
+        self.runs.lock().is_ok_and(|runs| {
+            runs.values()
+                .any(|entry| entry.progress.status == PipelineRunStatus::Running)
+        })
+    }
+
     fn insert(&self, entry: PipelineRunEntry) -> Result<(), apiaxess_diagnostics::Diagnostic> {
         let mut runs = self
             .runs
@@ -3105,6 +3320,7 @@ mod tests {
             pairing: DevicePairingRegistry::default(),
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
+            updates: UpdateService::inert(),
         }
     }
 
@@ -3230,6 +3446,7 @@ mod tests {
             pairing: DevicePairingRegistry::default(),
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
+            updates: UpdateService::inert(),
         };
         let live = state.engine.live_workbench();
         let mut headers = HeaderMap::new();
@@ -3263,6 +3480,7 @@ mod tests {
             pairing: DevicePairingRegistry::default(),
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
+            updates: UpdateService::inert(),
         };
 
         // CA endpoint fails cleanly before the session CA is provisioned.
@@ -3421,6 +3639,7 @@ mod tests {
             pairing: DevicePairingRegistry::default(),
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
+            updates: UpdateService::inert(),
         };
 
         // A device presents a valid (serial-less) pairing token → pending.
@@ -3547,6 +3766,7 @@ mod tests {
             pairing: DevicePairingRegistry::default(),
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
+            updates: UpdateService::inert(),
         };
         let (code, Json(queued)) = start_pipeline(
             State(state.clone()),

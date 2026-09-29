@@ -791,6 +791,26 @@ pub mod catalogue {
         fix: "Open Settings, correct the named setting (or clear it to use the default), save, and restart APIaxess.",
     };
 
+    /// An in-app update action could not be carried out.
+    pub const UPDATE_REFUSED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "update.refused",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Warning,
+        what: "The update could not be started.",
+        why: "The update is not ready, or this install is updated outside the app.",
+        fix: "Check for updates again from Settings, or update with your package manager.",
+    };
+
+    /// An update install was requested while work is running.
+    pub const UPDATE_SESSION_BUSY: DiagnosticDefinition = DiagnosticDefinition {
+        id: "update.session-busy",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Warning,
+        what: "The update will not install in the middle of an engagement.",
+        why: "Installing restarts APIaxess, which would interrupt what is running.",
+        fix: "Finish or stop it first, or choose \"Install on next launch\" to install when this session ends.",
+    };
+
     /// A proxy was requested for a non-active session.
     pub const PROXY_SESSION_NOT_ACTIVE: DiagnosticDefinition = DiagnosticDefinition {
         id: "proxy.session-not-active",
@@ -1217,6 +1237,8 @@ pub mod catalogue {
         PROXY_PORT_IN_USE,
         PROXY_BACKEND_START_FAILED,
         SETTINGS_SAVED_VALUE_IGNORED,
+        UPDATE_REFUSED,
+        UPDATE_SESSION_BUSY,
         PROXY_SESSION_NOT_ACTIVE,
         WEB_TARGET_REQUIRED,
         DISCOVERY_WORDLIST_UNKNOWN,

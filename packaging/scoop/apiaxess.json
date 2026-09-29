@@ -11,6 +11,9 @@
         }
     },
     "bin": "bin\\apiaxess.exe",
+    "post_install": [
+        "Set-Content -LiteralPath \"$dir\\install-channel\" -Value scoop -NoNewline -Encoding ascii"
+    ],
     "shortcuts": [
         [
             "bin\\apiaxess-desktop.exe",

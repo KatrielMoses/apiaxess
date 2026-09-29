@@ -537,6 +537,11 @@ $runtimeLayout = [ordered]@{
     webview2Bootstrapper = "bin/MicrosoftEdgeWebview2Setup.exe"
 }
 $runtimeLayout | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stageRoot "runtime-layout.json") -Encoding utf8NoBOM
+# The install-channel marker tells the in-app updater how this copy is updated
+# (crates/updater/src/channel.rs): the MSI installs the new MSI itself. The
+# portable zip below rewrites it before zipping.
+$installChannelMarker = Join-Path $stageRoot "install-channel"
+Set-Content -LiteralPath $installChannelMarker -Value "msi" -NoNewline -Encoding ascii
 
 $wixDirectory = Join-Path $toolRoot "wix-$WixVersion"
 $wix = Join-Path $wixDirectory "wix.exe"
@@ -590,6 +595,9 @@ $msiHash = (Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash.ToLowerIn
 # share\, runtime\, ...), so it runs from wherever it is extracted; user data
 # still lives under %LOCALAPPDATA%\apiaxess, never beside the binaries.
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+# A hand-unpacked zip is replaced by hand; Scoop's post_install rewrites this
+# to "scoop" so the app shows `scoop update apiaxess` instead.
+Set-Content -LiteralPath $installChannelMarker -Value "portable" -NoNewline -Encoding ascii
 $zipName = "APIaxess-$productVersion-windows-$Architecture-portable.zip"
 $zipPath = Join-Path $OutputDirectory $zipName
 if (Test-Path -LiteralPath $zipPath) {

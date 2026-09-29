@@ -51,6 +51,16 @@ const KNOBS: &[Knob] = &[
         choices: &["desktop", "browser"],
     },
     Knob {
+        key: UPDATE_CHECK_KEY,
+        label: "Check for updates",
+        group: "General",
+        default_display: "on",
+        advanced: false,
+        restart_required: false,
+        description: "Once at startup and once a day, fetch the public release manifest from apiaxess.dev (a plain GET of a static file: no identifiers, nothing about you or your sessions). Off makes no update request at all.",
+        choices: &["on", "off"],
+    },
+    Knob {
         key: "APIAXESS_WORKBENCH_STORE_DIR",
         label: "Session store directory",
         group: "Storage",
@@ -224,6 +234,31 @@ const KNOBS: &[Knob] = &[
 
 const LAUNCH_MODE_KEY: &str = "APIAXESS_LAUNCH_MODE";
 
+/// The update-check toggle. Read live (see [`update_checks_enabled`]) rather
+/// than applied to the environment at startup, so switching it takes effect
+/// without a restart.
+const UPDATE_CHECK_KEY: &str = "APIAXESS_UPDATE_CHECK";
+
+/// Whether a value turns update checks off (`0`, `off`, `false`, `no`).
+fn is_off(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "off" | "false" | "no"
+    )
+}
+
+/// Whether update checks are on: `APIAXESS_UPDATE_CHECK` set outside the app
+/// wins (`0` turns them off), then the saved setting, then the default (on).
+#[must_use]
+pub fn update_checks_enabled() -> bool {
+    if let Ok(value) = env::var(UPDATE_CHECK_KEY) {
+        return !is_off(&value);
+    }
+    load_settings()
+        .get(UPDATE_CHECK_KEY)
+        .is_none_or(|value| !is_off(value))
+}
+
 /// Where a setting's effective value comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,6 +348,7 @@ pub fn persisted_env_overrides() -> Vec<(String, String)> {
         .into_iter()
         .filter(|(key, value)| {
             key != LAUNCH_MODE_KEY
+                && key != UPDATE_CHECK_KEY
                 && !value.trim().is_empty()
                 && env::var_os(key).is_none()
                 && saved_value_error(key, value).is_none()
@@ -608,6 +644,24 @@ mod tests {
         assert!(validate(mode, "desktop").is_ok());
         assert!(validate(mode, "browser").is_ok());
         assert!(validate(mode, "carrier-pigeon").is_err());
+    }
+
+    #[test]
+    fn update_check_values() {
+        let knob = KNOBS
+            .iter()
+            .find(|knob| knob.key == UPDATE_CHECK_KEY)
+            .unwrap();
+        assert!(validate(knob, "on").is_ok());
+        assert!(validate(knob, "off").is_ok());
+        assert!(validate(knob, "sometimes").is_err());
+        assert!(!knob.restart_required);
+        for off in ["0", "off", "OFF", "false", "no"] {
+            assert!(is_off(off), "{off}");
+        }
+        for on in ["1", "on", "yes", ""] {
+            assert!(!is_off(on), "{on}");
+        }
     }
 
     #[test]

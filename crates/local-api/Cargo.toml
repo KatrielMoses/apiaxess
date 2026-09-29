@@ -12,6 +12,7 @@ apiaxess-engine-shell = { path = "../engine-shell" }
 apiaxess-diagnostics = { path = "../diagnostics" }
 apiaxess-install-layout = { path = "../install-layout" }
 apiaxess-session = { path = "../session" }
+apiaxess-updater = { path = "../updater" }
 apiaxess-workbench-proxy = { path = "../workbench-proxy" }
 apiaxess-workbench-store = { path = "../workbench-store" }
 axum.workspace = true

@@ -441,6 +441,7 @@ mod tests {
             pairing: DevicePairingRegistry::default(),
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
+            updates: apiaxess_updater::service::UpdateService::inert(),
         }
     }
 

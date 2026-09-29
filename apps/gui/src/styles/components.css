@@ -1430,6 +1430,60 @@
   background: var(--color-surface-sunken);
 }
 
+/* In-app update notice: a strip across the top of the content column, above
+   whichever surface is open, so it never covers a control. "Later" dismisses
+   it until the next version. The column stacks the strip over the view. */
+.app-main {
+  flex-direction: column;
+}
+
+.app-main > .view {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.update-banner {
+  flex: none;
+  border-bottom: var(--border);
+}
+
+.update-banner[hidden] {
+  display: none;
+}
+
+.update-banner .notice {
+  align-items: center;
+  padding: var(--space-2) var(--space-5);
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+.update-banner .notice__body {
+  flex: 1;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: var(--space-4);
+  row-gap: var(--space-1);
+}
+
+.update-banner .update-actions {
+  margin-left: auto;
+}
+
+.update-actions {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.update-command {
+  max-height: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
 .toast-stack {
   position: fixed;
   right: var(--space-6);

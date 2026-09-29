@@ -58,6 +58,8 @@ catalogue test.
 | `proxy.port-in-use` | session | The session-scoped loopback listener could not bind. |
 | `proxy.backend-start-failed` | session | The embedded proxy backend failed to start or stay alive. |
 | `proxy.session-not-active` | session | Proxy startup was requested outside an active session. |
+| `update.refused` | session | An in-app update action (check, download, install) could not run: checks are off, nothing is downloaded and verified yet, or the install is updated by a package manager. |
+| `update.session-busy` | session | An immediate update install was refused because a capture, Fuzz or discovery job, APK analysis, or the Android target is running. |
 | `proxy.ca-generation-failed` | session | The ephemeral per-session CA or a leaf certificate could not be generated. |
 | `proxy.ca-export-failed` | session | An explicit CA export or purge failed. |
 | `proxy.upstream-unreachable` | session | The upstream target could not be reached. |

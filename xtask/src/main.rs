@@ -1,4 +1,6 @@
-//! Repository-local policy checks.
+//! Repository-local policy checks and release tooling.
+
+mod release_signing;
 
 use std::{collections::HashSet, env, error::Error, fs, path::Path};
 
@@ -24,7 +26,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "boundaries" => check_boundaries(root),
         "contracts" => check_contracts(root),
         "foundations" => check_foundations(root),
-        _ => Err("usage: cargo xtask <boundaries|contracts|foundations>".into()),
+        "update-keygen" => release_signing::keygen(&env::args().skip(2).collect::<Vec<_>>()),
+        "sign-manifest" => release_signing::sign(&env::args().skip(2).collect::<Vec<_>>()),
+        _ => Err(
+            "usage: cargo xtask <boundaries|contracts|foundations|update-keygen|sign-manifest>"
+                .into(),
+        ),
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "APIaxess repository policy checks"
+description = "APIaxess repository policy checks and release tooling"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+base64.workspace = true
+# ed25519 signing of the updater's release manifest (already in the lock).
+ring = "0.17.14"
 syn.workspace = true
 
 [lints]

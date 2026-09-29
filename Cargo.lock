@@ -82,6 +82,7 @@ dependencies = [
  "apiaxess-session",
  "apiaxess-target-apk",
  "apiaxess-test-fixtures",
+ "apiaxess-updater",
  "apiaxess-workbench-proxy",
  "apiaxess-workbench-store",
  "axum",
@@ -200,6 +201,7 @@ version = "0.1.0"
 dependencies = [
  "apiaxess-external-tools",
  "apiaxess-install-layout",
+ "apiaxess-updater",
  "open",
  "rfd",
  "serde",
@@ -307,6 +309,7 @@ dependencies = [
  "apiaxess-install-layout",
  "apiaxess-native-dialog",
  "apiaxess-session",
+ "apiaxess-updater",
  "apiaxess-workbench-proxy",
  "apiaxess-workbench-store",
  "axum",
@@ -483,6 +486,25 @@ dependencies = [
  "apiaxess-api-model",
  "apiaxess-diagnostics",
  "chrono",
+]
+
+[[package]]
+name = "apiaxess-updater"
+version = "0.1.0"
+dependencies = [
+ "apiaxess-external-tools",
+ "apiaxess-install-layout",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "reqwest 0.12.28",
+ "ring",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -6986,6 +7008,8 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "ring",
  "syn 2.0.119",
 ]
 
