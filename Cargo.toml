@@ -9,6 +9,7 @@ members = [
     "crates/engine-shell",
     "crates/external-tools",
     "crates/host-capabilities",
+    "crates/install-layout",
     "crates/local-api",
     "crates/native-dialog",
     "crates/network-routing",

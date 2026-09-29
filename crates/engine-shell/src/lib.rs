@@ -3207,9 +3207,20 @@ fn default_browser_executable(browser: BrowserKind) -> PathBuf {
 /// True when the process has no graphical display to open a browser window on
 /// (a headless server/VM). On such hosts the capture browser must run headless
 /// or it cannot create a window, so it never renders or navigates and captures
-/// no traffic. Only consulted on Unix; Windows always has a desktop compositor.
+/// no traffic. Only Linux (and other X11/Wayland Unix) hosts can lack one:
+/// Windows always has a desktop compositor, and macOS draws through its own
+/// window server with neither `DISPLAY` nor `WAYLAND_DISPLAY` set.
 fn no_graphical_display() -> bool {
-    cfg!(unix) && env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none()
+    lacks_x11_and_wayland(
+        cfg!(unix) && !cfg!(target_os = "macos"),
+        env::var_os("DISPLAY").is_some(),
+        env::var_os("WAYLAND_DISPLAY").is_some(),
+    )
+}
+
+/// The pure headless decision: an X11/Wayland platform with neither display.
+const fn lacks_x11_and_wayland(x11_platform: bool, display: bool, wayland: bool) -> bool {
+    x11_platform && !display && !wayland
 }
 
 fn chromium_launch_arguments(profile: &Path, proxy: std::net::SocketAddr) -> Vec<String> {
@@ -3272,20 +3283,7 @@ fn bundled_chromium_executable() -> Result<PathBuf, apiaxess_diagnostics::Diagno
     let install_bin = executable.parent().ok_or_else(|| {
         browser_launch_diagnostic("could not locate the APIaxess installation directory")
     })?;
-    let candidate = if cfg!(windows) {
-        install_bin
-            .join("..")
-            .join("runtime")
-            .join("chromium")
-            .join("chrome.exe")
-    } else {
-        install_bin
-            .join("..")
-            .join("share")
-            .join("apiaxess")
-            .join("chromium")
-            .join("chrome")
-    };
+    let candidate = chromium_in(install_bin);
     let candidate = candidate.canonicalize().map_err(|_| browser_launch_diagnostic("the bundled APIaxess Chromium binary is missing; reinstall APIaxess so its verified browser runtime is present"))?;
     if candidate.is_file() {
         Ok(candidate)
@@ -3324,23 +3322,29 @@ pub struct BundledToolStatus {
 
 /// The expected bundled Chromium path (non-failing, for status display).
 fn bundled_chromium_path() -> PathBuf {
-    let name = if cfg!(windows) {
+    apiaxess_install_layout::executable_directory().map_or_else(
+        || PathBuf::from(chromium_executable_name()),
+        |bin| chromium_in(&bin),
+    )
+}
+
+/// The bundled Chromium under the install layout's resource base: the MSI
+/// stages it in `runtime/chromium/`, the `.deb` directly in `chromium/`.
+fn chromium_in(install_bin: &Path) -> PathBuf {
+    let base = apiaxess_install_layout::Layout::CURRENT.resource_base_in(install_bin);
+    let directory = if cfg!(windows) {
+        base.join("runtime").join("chromium")
+    } else {
+        base.join("chromium")
+    };
+    directory.join(chromium_executable_name())
+}
+
+fn chromium_executable_name() -> &'static str {
+    if cfg!(windows) {
         "chrome.exe"
     } else {
         "chrome"
-    };
-    match env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    {
-        Some(bin) if cfg!(windows) => bin.join("..").join("runtime").join("chromium").join(name),
-        Some(bin) => bin
-            .join("..")
-            .join("share")
-            .join("apiaxess")
-            .join("chromium")
-            .join(name),
-        None => PathBuf::from(name),
     }
 }
 
@@ -3808,7 +3812,7 @@ pub fn default_export_root() -> PathBuf {
             home.join("Documents").join("APIaxess").join("exports")
         }
         Some(home) => home.join("APIaxess").join("exports"),
-        None => durable_data_root().join("apiaxess").join("exports"),
+        None => durable_data_root().join("exports"),
     }
 }
 
@@ -3816,39 +3820,18 @@ fn session_store_root() -> PathBuf {
     if let Some(configured) = env::var_os("APIAXESS_WORKBENCH_STORE_DIR") {
         return PathBuf::from(configured);
     }
-    durable_data_root().join("apiaxess").join("workbench")
+    durable_data_root().join("workbench")
 }
 
-/// Returns a durable, per-user application-data directory for session state.
+/// Returns the durable, per-user `APIaxess` data directory for session state.
 ///
 /// Sessions are the product's durability promise, so the default must survive
 /// reboots and Windows' periodic `%TEMP%` cleanup. The platform-native data
-/// directory is derived from standard environment variables (no extra
-/// dependency); `env::temp_dir()` is a last resort only when none are set,
-/// which effectively never happens on a real desktop session.
+/// directory comes from the shared install layout; the temp directory is a last
+/// resort only when none of its variables are set, which effectively never
+/// happens on a real desktop session.
 fn durable_data_root() -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Some(local) = env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(local);
-        }
-        if let Some(appdata) = env::var_os("APPDATA") {
-            return PathBuf::from(appdata);
-        }
-        if let Some(profile) = env::var_os("USERPROFILE") {
-            return PathBuf::from(profile).join("AppData").join("Local");
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(xdg);
-        }
-        if let Some(home) = env::var_os("HOME") {
-            return PathBuf::from(home).join(".local").join("share");
-        }
-    }
-    env::temp_dir()
+    apiaxess_install_layout::data_dir_or_temp()
 }
 
 fn pipeline_failure(
@@ -3968,8 +3951,32 @@ fn first_party_hints(
 
 #[cfg(test)]
 mod tests {
-    use super::{bundled_wordlist, chromium_launch_arguments};
+    use super::{bundled_wordlist, chromium_launch_arguments, lacks_x11_and_wayland};
     use std::{net::SocketAddr, path::Path};
+
+    #[test]
+    fn capture_runs_headless_only_on_an_x11_wayland_platform_without_a_display() {
+        // Linux server with neither display: headless.
+        assert!(lacks_x11_and_wayland(true, false, false));
+        // Linux desktop with either display: windowed.
+        assert!(!lacks_x11_and_wayland(true, true, false));
+        assert!(!lacks_x11_and_wayland(true, false, true));
+        // Windows and macOS never set DISPLAY/WAYLAND_DISPLAY yet always have a
+        // window server: windowed.
+        assert!(!lacks_x11_and_wayland(false, false, false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capture_browser_is_never_forced_headless() {
+        assert!(!super::no_graphical_display());
+        let arguments = chromium_launch_arguments(
+            Path::new("/tmp/apiaxess-chromium"),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+        );
+        assert!(!arguments.iter().any(|arg| arg.starts_with("--headless")));
+        assert!(!arguments.iter().any(|arg| arg == "--no-sandbox"));
+    }
 
     #[test]
     fn large_wordlist_is_real_curated_content_not_synthetic_placeholders() {

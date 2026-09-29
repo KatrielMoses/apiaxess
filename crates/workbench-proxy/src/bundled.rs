@@ -76,62 +76,30 @@ fn resolve_ffuf_with(override_path: Option<OsString>, base: &Path) -> FfufLaunch
     }
 }
 
-/// Points ffuf's user-config directory at an `APIaxess`-owned location. ffuf
-/// derives that directory from `os.UserConfigDir()`, which reads `APPDATA` on
-/// Windows and `XDG_CONFIG_HOME` on Unix; overriding just that variable for the
-/// child process confines ffuf's config/history without disturbing the host.
+/// Points ffuf's config directory at an `APIaxess`-owned location. ffuf 2.x
+/// derives it from `github.com/adrg/xdg`'s `ConfigHome`, which honours
+/// `XDG_CONFIG_HOME` first on every platform (Windows, macOS and Linux) before
+/// falling back to `%LOCALAPPDATA%`, `~/Library/Application Support` or
+/// `~/.config`. Setting that one variable for the child confines ffuf's
+/// `ffufrc`, history, scraper and autocalibration state without disturbing the
+/// host's own ffuf.
 fn controlled_environment() -> Vec<(String, String)> {
-    let config_dir = durable_data_root().join("apiaxess").join("ffuf");
+    let config_dir = apiaxess_install_layout::data_dir_or_temp().join("ffuf");
     // Best-effort: ffuf creates what it needs, but pre-creating keeps the path
     // present and predictable.
     let _ = std::fs::create_dir_all(&config_dir);
-    let key = if cfg!(windows) {
-        "APPDATA"
-    } else {
-        "XDG_CONFIG_HOME"
-    };
-    vec![(key.to_owned(), config_dir.display().to_string())]
+    vec![(
+        CONFIG_HOME_VARIABLE.to_owned(),
+        config_dir.display().to_string(),
+    )]
 }
 
-/// The directory holding `tools/`, relative to the installed executable.
-/// Windows keeps it beside `bin/`; the Unix prefix layout places it under
-/// `share/apiaxess/`, matching the other bundled components.
+/// The variable ffuf's config-directory lookup reads on every platform.
+const CONFIG_HOME_VARIABLE: &str = "XDG_CONFIG_HOME";
+
+/// The directory holding `tools/`: the shared install layout's resource base.
 pub(crate) fn resource_base() -> PathBuf {
-    let Some(bin) = env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        return PathBuf::from(".");
-    };
-    if cfg!(windows) {
-        bin.join("..")
-    } else {
-        bin.join("..").join("share").join("apiaxess")
-    }
-}
-
-/// A durable, per-user application-data root, derived from platform-standard
-/// environment variables (mirrors the engine's session store root logic).
-fn durable_data_root() -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Some(local) = env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(local);
-        }
-        if let Some(profile) = env::var_os("USERPROFILE") {
-            return PathBuf::from(profile).join("AppData").join("Local");
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(xdg);
-        }
-        if let Some(home) = env::var_os("HOME") {
-            return PathBuf::from(home).join(".local").join("share");
-        }
-    }
-    env::temp_dir()
+    apiaxess_install_layout::resource_base().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn ffuf_binary_name() -> &'static str {
@@ -141,14 +109,6 @@ fn ffuf_binary_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn controlled_env_key() -> &'static str {
-        if cfg!(windows) {
-            "APPDATA"
-        } else {
-            "XDG_CONFIG_HOME"
-        }
-    }
 
     #[test]
     fn default_resolution_is_the_absolute_bundled_binary() {
@@ -190,10 +150,18 @@ mod tests {
         let (key, value) = launch
             .environment
             .iter()
-            .find(|(key, _)| key == controlled_env_key())
+            .find(|(key, _)| key == CONFIG_HOME_VARIABLE)
             .expect("controlled config directory is set");
-        assert_eq!(key, controlled_env_key());
-        assert!(value.replace('\\', "/").ends_with("apiaxess/ffuf"));
+        assert_eq!(key, CONFIG_HOME_VARIABLE);
+        assert_eq!(
+            PathBuf::from(value),
+            apiaxess_install_layout::data_dir_or_temp().join("ffuf")
+        );
+        assert_eq!(
+            launch.environment.len(),
+            1,
+            "only the config home is overridden; ffuf does not read APPDATA"
+        );
     }
 
     /// Clean-host proof (Phase 11.2): the default `resolve_ffuf()` path runs a

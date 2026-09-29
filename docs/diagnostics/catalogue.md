@@ -132,6 +132,7 @@ catalogue test.
 | `sandbox.adb-cve-mitigation-unsatisfiable` | critical | The Android image did not prove the required security patch floor for wireless-ADB CVE mitigation. |
 | `sandbox.windows-home-unsupported` | host capability | Windows Home cannot provide the durable local WHPX/Hyper-V AVD path. |
 | `sandbox.windows-arm-unsupported` | host capability | Windows-on-ARM is outside the supported local AVD matrix. |
+| `sandbox.macos-dynamic-unavailable` | host capability | Local dynamic analysis is not yet available on macOS; static, web capture, Fuzz and Resend are unaffected. |
 | `sandbox.runtime-selected` | host capability | The runtime planner recorded the default, opt-in, and fallback selection from functional evidence. |
 | `sandbox.analysis-runtime-missing` | host capability | The optional, separately-downloaded Android-emulator analysis runtime is not installed. |
 | `sandbox.accelerated-mode-active` | host capability | Host virtualization is available; the bundled emulator runs accelerated. |

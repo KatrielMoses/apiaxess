@@ -1,0 +1,11 @@
+[package]
+name = "apiaxess-install-layout"
+description = "One resolver for the installed resource layout and the per-user data directory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

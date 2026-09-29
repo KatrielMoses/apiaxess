@@ -10,6 +10,7 @@ license.workspace = true
 apiaxess-artifact-intake = { path = "../../../crates/artifact-intake" }
 apiaxess-diagnostics = { path = "../../../crates/diagnostics" }
 apiaxess-external-tools = { path = "../../../crates/external-tools" }
+apiaxess-install-layout = { path = "../../../crates/install-layout" }
 apiaxess-protection-detector = { path = "../../../crates/protection-detector" }
 serde.workspace = true
 zip = "2.2.2"

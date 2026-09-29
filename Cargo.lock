@@ -77,6 +77,7 @@ dependencies = [
  "apiaxess-api-model",
  "apiaxess-diagnostics",
  "apiaxess-engine-shell",
+ "apiaxess-install-layout",
  "apiaxess-local-api",
  "apiaxess-session",
  "apiaxess-target-apk",
@@ -108,6 +109,7 @@ name = "apiaxess-app-crawler"
 version = "0.1.0"
 dependencies = [
  "apiaxess-diagnostics",
+ "apiaxess-install-layout",
  "apiaxess-sandbox",
  "apiaxess-session",
  "apiaxess-workbench-store",
@@ -197,6 +199,7 @@ name = "apiaxess-desktop"
 version = "0.1.0"
 dependencies = [
  "apiaxess-external-tools",
+ "apiaxess-install-layout",
  "open",
  "rfd",
  "serde",
@@ -239,6 +242,7 @@ dependencies = [
  "apiaxess-external-tools",
  "apiaxess-fusion",
  "apiaxess-host-capabilities",
+ "apiaxess-install-layout",
  "apiaxess-network-extraction",
  "apiaxess-network-routing",
  "apiaxess-openapi-emitter",
@@ -264,6 +268,7 @@ dependencies = [
 name = "apiaxess-external-tools"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "process-wrap",
  "thiserror 2.0.20",
  "windows 0.62.2",
@@ -284,8 +289,13 @@ version = "0.1.0"
 dependencies = [
  "apiaxess-diagnostics",
  "apiaxess-external-tools",
+ "apiaxess-install-layout",
  "serde",
 ]
+
+[[package]]
+name = "apiaxess-install-layout"
+version = "0.1.0"
 
 [[package]]
 name = "apiaxess-local-api"
@@ -294,6 +304,7 @@ dependencies = [
  "apiaxess-api-model",
  "apiaxess-diagnostics",
  "apiaxess-engine-shell",
+ "apiaxess-install-layout",
  "apiaxess-native-dialog",
  "apiaxess-session",
  "apiaxess-workbench-proxy",
@@ -393,6 +404,7 @@ dependencies = [
  "apiaxess-diagnostics",
  "apiaxess-external-tools",
  "apiaxess-host-capabilities",
+ "apiaxess-install-layout",
  "apiaxess-session",
  "apiaxess-test-fixtures",
  "apiaxess-workbench-proxy",
@@ -444,6 +456,7 @@ dependencies = [
  "apiaxess-dynamic-capture",
  "apiaxess-external-tools",
  "apiaxess-host-capabilities",
+ "apiaxess-install-layout",
  "apiaxess-network-extraction",
  "apiaxess-network-routing",
  "apiaxess-protection-detector",
@@ -478,6 +491,7 @@ version = "0.1.0"
 dependencies = [
  "apiaxess-diagnostics",
  "apiaxess-external-tools",
+ "apiaxess-install-layout",
  "apiaxess-session",
  "apiaxess-workbench-store",
  "base64 0.22.1",

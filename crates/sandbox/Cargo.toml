@@ -12,6 +12,7 @@ apiaxess-crypto-capture = { path = "../crypto-capture" }
 apiaxess-artifact-intake = { path = "../artifact-intake" }
 apiaxess-external-tools = { path = "../external-tools" }
 apiaxess-host-capabilities = { path = "../host-capabilities" }
+apiaxess-install-layout = { path = "../install-layout" }
 apiaxess-session = { path = "../session" }
 apiaxess-workbench-proxy = { path = "../workbench-proxy" }
 chrono.workspace = true

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 apiaxess-diagnostics = { path = "../diagnostics" }
+apiaxess-install-layout = { path = "../install-layout" }
 apiaxess-sandbox = { path = "../sandbox" }
 apiaxess-workbench-store = { path = "../workbench-store" }
 chrono.workspace = true

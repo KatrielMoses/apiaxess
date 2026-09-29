@@ -271,28 +271,14 @@ pub struct SettingsUpdate {
     values: BTreeMap<String, String>,
 }
 
-/// The per-user durable data root (mirrors the engine + shell logic).
-fn data_root() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        env::var_os("LOCALAPPDATA")
-            .or_else(|| env::var_os("APPDATA"))
-            .map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-        })
-    }
-}
-
+/// `settings.json` in the per-user data directory shared with the engine and
+/// the shell.
 fn settings_path() -> Option<PathBuf> {
-    Some(data_root()?.join("apiaxess").join("settings.json"))
+    Some(apiaxess_install_layout::data_dir()?.join("settings.json"))
 }
 
 fn launch_mode_path() -> Option<PathBuf> {
-    Some(data_root()?.join("apiaxess").join("launch-mode.json"))
+    Some(apiaxess_install_layout::data_dir()?.join("launch-mode.json"))
 }
 
 /// Loads the saved settings map (`{}` when absent or unreadable).

@@ -10,6 +10,7 @@ license.workspace = true
 apiaxess-api-model = { path = "../api-model" }
 apiaxess-engine-shell = { path = "../engine-shell" }
 apiaxess-diagnostics = { path = "../diagnostics" }
+apiaxess-install-layout = { path = "../install-layout" }
 apiaxess-session = { path = "../session" }
 apiaxess-workbench-proxy = { path = "../workbench-proxy" }
 apiaxess-workbench-store = { path = "../workbench-store" }

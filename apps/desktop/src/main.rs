@@ -230,7 +230,7 @@ fn prompt_launch_mode() -> LaunchMode {
 
 /// Path of the remembered launch-mode config, beside the engine's durable data.
 fn launch_config_path() -> Option<PathBuf> {
-    Some(data_root()?.join("apiaxess").join("launch-mode.json"))
+    Some(apiaxess_install_layout::data_dir()?.join("launch-mode.json"))
 }
 
 /// Loads the remembered launch mode, if any.
@@ -251,25 +251,6 @@ fn save_launch_mode(mode: LaunchMode) {
     }
     if let Ok(bytes) = serde_json::to_vec_pretty(&LaunchConfig { mode }) {
         let _ = std::fs::write(path, bytes);
-    }
-}
-
-/// The per-user durable data root, matching where the engine keeps its state.
-fn data_root() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("APPDATA"))
-            .map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join(".local").join("share"))
-            })
     }
 }
 

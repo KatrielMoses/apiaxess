@@ -279,7 +279,7 @@ if (-not $SkipStreaming) {
         # Build the distributable server bundle with the bundled Node's npm.
         Push-Location $wsRoot
         try {
-            $env:PATH = "$([System.IO.Path]::GetDirectoryName($nodeExe));$env:PATH"
+            $env:PATH = "$([System.IO.Path]::GetDirectoryName($nodeExe))$([System.IO.Path]::PathSeparator)$env:PATH"
             # --ignore-scripts: the only install scripts are node-pty's native build
             # (it fails on Windows with `spawn EINVAL` under Node >= 20.12, and the
             # shell it serves is compiled out above) and the iOS/appium setup, which

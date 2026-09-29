@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 apiaxess-api-model = { path = "../../crates/api-model" }
 apiaxess-engine-shell = { path = "../../crates/engine-shell" }
+apiaxess-install-layout = { path = "../../crates/install-layout" }
 apiaxess-local-api = { path = "../../crates/local-api" }
 apiaxess-diagnostics = { path = "../../crates/diagnostics" }
 apiaxess-session = { path = "../../crates/session" }

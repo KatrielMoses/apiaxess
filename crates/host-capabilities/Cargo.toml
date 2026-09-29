@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 apiaxess-diagnostics = { path = "../diagnostics" }
 apiaxess-external-tools = { path = "../external-tools" }
+apiaxess-install-layout = { path = "../install-layout" }
 serde.workspace = true
 
 [lints]

@@ -936,28 +936,18 @@ fn exe(name: &str) -> String {
 }
 
 /// The GUI Android target add-on root: an explicit `APIAXESS_ANDROID_TARGET`
-/// override, otherwise the `android-target/` directory beside the install
-/// (Windows) or under `share/apiaxess/` (Unix) — matching the other bundled
-/// components and the analysis runtime.
+/// override, otherwise `android-target/` under the shared install layout's
+/// resource base — matching the other bundled components and the analysis
+/// runtime.
 #[must_use]
 pub fn android_target_root() -> PathBuf {
     if let Some(configured) = std::env::var_os("APIAXESS_ANDROID_TARGET") {
         return PathBuf::from(configured);
     }
-    let Some(bin) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        return PathBuf::from("android-target");
-    };
-    if cfg!(windows) {
-        bin.join("..").join("android-target")
-    } else {
-        bin.join("..")
-            .join("share")
-            .join("apiaxess")
-            .join("android-target")
-    }
+    apiaxess_install_layout::resource_base().map_or_else(
+        || PathBuf::from("android-target"),
+        |base| base.join("android-target"),
+    )
 }
 
 #[cfg(test)]

@@ -429,6 +429,10 @@ impl HostCapabilityService {
     }
 }
 
+// TODO(macos-phase2): the bundled emulator's own preflight probes `-version` on
+// every platform (sandbox `BundledEmulatorBackend`), while this host probe uses
+// `--version` off Windows. Confirm which spelling the macOS emulator accepts
+// and make the two agree.
 fn emulator_version_argument() -> &'static str {
     if cfg!(target_os = "windows") {
         "-version"
@@ -489,20 +493,8 @@ fn analysis_runtime_roots() -> Vec<PathBuf> {
     if let Some(configured) = std::env::var_os("APIAXESS_ANALYSIS_RUNTIME") {
         roots.push(PathBuf::from(configured));
     }
-    if let Some(bin) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    {
-        if cfg!(windows) {
-            roots.push(bin.join("..").join("analysis-runtime"));
-        } else {
-            roots.push(
-                bin.join("..")
-                    .join("share")
-                    .join("apiaxess")
-                    .join("analysis-runtime"),
-            );
-        }
+    if let Some(base) = apiaxess_install_layout::resource_base() {
+        roots.push(base.join("analysis-runtime"));
     }
     roots
 }
@@ -626,6 +618,18 @@ fn detect_virtualization() -> CapabilityObservation {
             } else {
                 "Enable WHPX or select remote-offload.".to_owned()
             },
+            fallback_tier: Some("remote-offload".to_owned()),
+        }
+    } else if cfg!(target_os = "macos") {
+        // Hypervisor.framework acceleration is not probed yet: there is no macOS
+        // emulator runtime to accelerate.
+        CapabilityObservation {
+            capability_id: CAPABILITY_KVM.to_owned(),
+            availability: CapabilityAvailability::Unavailable,
+            evidence: "Dynamic analysis is not yet available on macOS: this build has no macOS Android emulator runtime or Hypervisor.framework acceleration path."
+                .to_owned(),
+            remediation: "Use remote-offload, or run dynamic analysis on a supported Windows or Linux host."
+                .to_owned(),
             fallback_tier: Some("remote-offload".to_owned()),
         }
     } else {

@@ -67,23 +67,15 @@ impl DroidBotFallback {
         if let Some(explicit) = &self.launcher_override {
             return explicit.is_file().then(|| explicit.clone());
         }
-        let exe = std::env::current_exe().ok()?;
-        let install_bin = exe.parent()?;
-        // Mirrors the resolver layout used by the other bundled analysis tools.
-        let candidates = [
-            install_bin
-                .join("..")
-                .join("runtime")
-                .join("droidbot")
-                .join("droidbot.exe"),
-            install_bin
-                .join("..")
-                .join("share")
-                .join("apiaxess")
-                .join("droidbot")
-                .join("droidbot"),
-        ];
-        candidates.into_iter().find(|candidate| candidate.is_file())
+        // Mirrors the resolver layout used by the other bundled analysis tools:
+        // `runtime/droidbot/` in the MSI, `droidbot/` elsewhere.
+        let base = apiaxess_install_layout::resource_base()?;
+        let candidate = if cfg!(windows) {
+            base.join("runtime").join("droidbot").join("droidbot.exe")
+        } else {
+            base.join("droidbot").join("droidbot")
+        };
+        candidate.is_file().then_some(candidate)
     }
 }
 

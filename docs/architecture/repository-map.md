@@ -12,6 +12,7 @@ crates/
   plugin-host/            only engine-facing plugin seam
   external-tools/         only external process/tool adapter boundary
   host-capabilities/      capability declaration/detection seam
+  install-layout/         one resolver for bundled-resource and per-user data paths
   sandbox/                local or remote sandbox backend port
   session/                scope, lifecycle, audit, workbench slot, durable envelope
   workbench-proxy/        future interception/TLS core

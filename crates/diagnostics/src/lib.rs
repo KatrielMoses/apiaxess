@@ -1861,6 +1861,16 @@ pub mod catalogue {
         fix: "Use remote-offload or run APIaxess on a supported native x86_64 Windows/Linux host.",
     };
 
+    /// Local dynamic analysis is not yet available on macOS.
+    pub const SANDBOX_MACOS_DYNAMIC_UNAVAILABLE: DiagnosticDefinition = DiagnosticDefinition {
+        id: "sandbox.macos-dynamic-unavailable",
+        category: DiagnosticCategory::HostCapability,
+        severity: DiagnosticSeverity::Warning,
+        what: "Dynamic analysis is not yet available on macOS.",
+        why: "This build has no macOS Android emulator runtime or Hypervisor.framework acceleration path yet; static analysis, web capture, Fuzz and Resend are unaffected.",
+        fix: "Use remote-offload, or run dynamic analysis on a supported Windows or Linux host.",
+    };
+
     /// The runtime planner selected a backend and recorded its reason.
     pub const SANDBOX_RUNTIME_SELECTED: DiagnosticDefinition = DiagnosticDefinition {
         id: "sandbox.runtime-selected",
@@ -1996,6 +2006,7 @@ pub mod catalogue {
         SANDBOX_RUNTIME_TRUST_DENIED,
         SANDBOX_WINDOWS_HOME_UNSUPPORTED,
         SANDBOX_WINDOWS_ARM_UNSUPPORTED,
+        SANDBOX_MACOS_DYNAMIC_UNAVAILABLE,
         SANDBOX_RUNTIME_SELECTED,
         SANDBOX_HQARROUM_IMAGE_DIGEST_MISMATCH,
         SANDBOX_HQARROUM_TCG_FALLBACK,

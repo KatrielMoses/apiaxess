@@ -1413,9 +1413,9 @@ fn resolve_gui_directory(
             if portable.join("index.html").is_file() {
                 return Some(portable);
             }
-            binary_directory
-                .parent()
-                .map(|install_root| install_root.join("share").join("apiaxess").join("gui"))
+            apiaxess_install_layout::Layout::CURRENT
+                .gui_base_in(binary_directory)
+                .map(|base| base.join("gui"))
         })
         .filter(|candidate| candidate.join("index.html").is_file());
     installed.unwrap_or_else(|| development.to_path_buf())
@@ -1513,7 +1513,10 @@ mod tests {
     fn packaged_gui_assets_are_resolved_relative_to_the_executable() {
         let root = temporary_path("packaged-gui");
         let binary = root.join("bin").join("apiaxess.exe");
-        let installed_gui = root.join("share").join("apiaxess").join("gui");
+        let installed_gui = apiaxess_install_layout::Layout::CURRENT
+            .gui_base_in(&root.join("bin"))
+            .expect("bin has a parent")
+            .join("gui");
         fs::create_dir_all(&installed_gui).expect("create installed GUI directory");
         fs::write(installed_gui.join("index.html"), b"installed").expect("write GUI entry point");
 

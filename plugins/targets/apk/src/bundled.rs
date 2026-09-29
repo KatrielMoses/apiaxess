@@ -226,26 +226,24 @@ fn resolve_jadx_all_jar(lib: &Path) -> Option<PathBuf> {
 }
 
 /// The directory holding `runtime/` and `tools/`, relative to the installed
-/// executable. Windows keeps them beside `bin/`; the Unix prefix layout places
-/// them under `share/apiaxess/`, matching the bundled Chromium convention.
+/// executable (the shared install layout: beside `bin/` on Windows, in the
+/// `.app`'s `Resources/` on macOS, under `share/apiaxess/` on Linux).
 fn resource_base() -> PathBuf {
-    let Some(bin) = env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        // current_exe should not fail on supported platforms; fall back to the
-        // working directory so the preflight still reports concrete paths.
-        return PathBuf::from(".");
-    };
-    if cfg!(windows) {
-        bin.join("..")
-    } else {
-        bin.join("..").join("share").join("apiaxess")
-    }
+    // current_exe should not fail on supported platforms; fall back to the
+    // working directory so the preflight still reports concrete paths.
+    apiaxess_install_layout::resource_base().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The per-platform directory under `runtime/java/` that the Java runtime
+/// fetch stages for this host.
 fn platform_dir() -> &'static str {
-    if cfg!(windows) { "windows" } else { "linux" }
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
 }
 
 fn java_executable_name() -> &'static str {

@@ -324,6 +324,11 @@ impl ToolProcess {
         {
             return Err(error);
         }
+        // Unix spawns every tool as its own process-group leader, so killing the
+        // group reaches grandchildren too. It runs even when the direct child has
+        // already exited: a launcher that returned can leave its workers behind.
+        #[cfg(unix)]
+        kill_process_group(child.id());
         if still_running(child)? {
             child.kill().map_err(|source| ExternalToolError::Kill {
                 tool_id: self.tool_id.clone(),
@@ -360,6 +365,18 @@ fn kill_process_tree(pid: u32, tool_id: &str) -> Result<(), ExternalToolError> {
         tool_id: tool_id.to_owned(),
         source: io::Error::other(detail),
     })
+}
+
+/// Sends `SIGKILL` to the process group led by `leader`. An already-empty group
+/// (`ESRCH`) is the expected outcome for a tool that left nothing behind.
+#[cfg(unix)]
+fn kill_process_group(leader: u32) {
+    if let Ok(leader) = i32::try_from(leader) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(leader),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
 }
 
 impl Drop for ToolProcess {
@@ -535,7 +552,16 @@ fn noninteractive_command(executable: &str) -> Command {
         }
         command
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new(executable);
+        // Each tool leads its own process group, so stopping it (or timing it
+        // out) can signal the whole group and not orphan helper grandchildren.
+        command.process_group(0);
+        command
+    }
+    #[cfg(not(any(windows, unix)))]
     Command::new(executable)
 }
 
@@ -590,6 +616,10 @@ fn run_capture(
             break status;
         }
         if started.elapsed() >= timeout {
+            // Kill the whole group first: a grandchild still holding the output
+            // pipes would otherwise keep the capture threads from finishing.
+            #[cfg(unix)]
+            kill_process_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
             let _ = stdout_reader.join();
@@ -741,5 +771,133 @@ mod tests {
             }
             .minimum
         );
+    }
+
+    /// Unix process-group teardown: a tool's grandchildren die with it.
+    #[cfg(unix)]
+    mod process_group {
+        use std::{
+            path::PathBuf,
+            time::{Duration, Instant},
+        };
+
+        use nix::{sys::signal::kill, unistd::Pid};
+
+        use crate::{
+            ExternalToolError, ExternalToolRunner, ProcessToolRunner, ToolInvocationRequest,
+            ToolProbe, ToolProcessRequest, ToolVersion,
+        };
+
+        fn shell_probe() -> ToolProbe {
+            ToolProbe {
+                tool_id: "sh".to_owned(),
+                executable: "/bin/sh".to_owned(),
+                version: ToolVersion {
+                    major: 0,
+                    minor: 0,
+                    patch: 0,
+                },
+                raw_output: String::new(),
+            }
+        }
+
+        fn pid_file(name: &str) -> PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "apiaxess-external-tools-{name}-{}.pid",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            path
+        }
+
+        /// A shell that backgrounds a long `sleep` (the grandchild), records
+        /// its pid, and waits on it.
+        fn launcher_arguments(pid_file: &std::path::Path) -> Vec<String> {
+            vec![
+                "-c".to_owned(),
+                format!("sleep 60 & echo $! > '{}'; wait", pid_file.display()),
+            ]
+        }
+
+        fn recorded_pid(pid_file: &std::path::Path) -> Pid {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(pid) = std::fs::read_to_string(pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return Pid::from_raw(pid);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "launcher never recorded its grandchild pid"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// True once `pid` no longer exists (it was killed and reaped by init).
+        fn exits_within(pid: Pid, limit: Duration) -> bool {
+            let deadline = Instant::now() + limit;
+            while Instant::now() < deadline {
+                if kill(pid, None).is_err() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+
+        #[test]
+        fn stopping_a_tool_also_kills_its_grandchildren() {
+            let pid_file = pid_file("stop");
+            let process = ProcessToolRunner
+                .spawn(&ToolProcessRequest {
+                    probe: shell_probe(),
+                    arguments: launcher_arguments(&pid_file),
+                    working_directory: None,
+                    environment: Vec::new(),
+                })
+                .expect("launcher spawns");
+            let grandchild = recorded_pid(&pid_file);
+            assert!(kill(grandchild, None).is_ok(), "grandchild is running");
+
+            process.stop().expect("tool stops");
+
+            let reaped = exits_within(grandchild, Duration::from_secs(10));
+            if !reaped {
+                let _ = kill(grandchild, nix::sys::signal::Signal::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&pid_file);
+            assert!(reaped, "stop() orphaned grandchild {grandchild}");
+        }
+
+        #[test]
+        fn a_timed_out_invocation_kills_its_grandchildren_and_returns() {
+            let pid_file = pid_file("timeout");
+            let started = Instant::now();
+            let result = ProcessToolRunner.invoke(&ToolInvocationRequest {
+                probe: shell_probe(),
+                arguments: launcher_arguments(&pid_file),
+                working_directory: None,
+                environment: Vec::new(),
+                timeout: Duration::from_secs(1),
+            });
+            // The grandchild inherits the output pipes; without the group kill
+            // the capture threads would wait for its full 60 s.
+            let returned_in = started.elapsed();
+            let grandchild = recorded_pid(&pid_file);
+            let reaped = exits_within(grandchild, Duration::from_secs(10));
+            if !reaped {
+                let _ = kill(grandchild, nix::sys::signal::Signal::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&pid_file);
+            assert!(matches!(result, Err(ExternalToolError::Timeout { .. })));
+            assert!(
+                returned_in < Duration::from_secs(20),
+                "timed-out invocation took {returned_in:?}"
+            );
+            assert!(reaped, "timeout orphaned grandchild {grandchild}");
+        }
     }
 }

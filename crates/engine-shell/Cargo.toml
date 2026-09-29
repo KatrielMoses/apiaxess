@@ -16,6 +16,7 @@ apiaxess-dynamic-capture = { path = "../dynamic-capture" }
 apiaxess-diagnostics = { path = "../diagnostics" }
 apiaxess-external-tools = { path = "../external-tools" }
 apiaxess-fusion = { path = "../fusion" }
+apiaxess-install-layout = { path = "../install-layout" }
 apiaxess-network-extraction = { path = "../network-extraction" }
 apiaxess-network-routing = { path = "../network-routing" }
 apiaxess-openapi-emitter = { path = "../openapi-emitter" }

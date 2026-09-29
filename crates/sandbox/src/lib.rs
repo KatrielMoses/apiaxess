@@ -147,6 +147,9 @@ pub enum RuntimeEnvironment {
     WindowsHome,
     /// Windows-on-`ARM`, outside the supported local `AVD` matrix.
     WindowsArm,
+    /// macOS, where local dynamic analysis is not yet available (no macOS
+    /// emulator runtime or `HVF` path yet).
+    MacOs,
     /// `APIaxess` is running inside a `VM` or nested virtualization boundary.
     InsideVm,
     /// `WSL2` exposed a usable nested `KVM` path for `HQarroum` `Docker`.
@@ -199,6 +202,8 @@ impl SandboxRuntimePlanner {
             } else {
                 RuntimeEnvironment::NativeLinux
             }
+        } else if cfg!(target_os = "macos") {
+            RuntimeEnvironment::MacOs
         } else {
             RuntimeEnvironment::InsideVm
         };
@@ -284,6 +289,13 @@ impl SandboxRuntimePlanner {
                 diagnostics.push(
                     catalogue::SANDBOX_WINDOWS_ARM_UNSUPPORTED
                         .instantiate(planner_context("windows-arm", "Windows-on-ARM")),
+                );
+                (SandboxTier::RemoteOffload, vec![SandboxTier::RemoteOffload])
+            }
+            RuntimeEnvironment::MacOs => {
+                diagnostics.push(
+                    catalogue::SANDBOX_MACOS_DYNAMIC_UNAVAILABLE
+                        .instantiate(planner_context("macos", "macOS")),
                 );
                 (SandboxTier::RemoteOffload, vec![SandboxTier::RemoteOffload])
             }
@@ -1845,26 +1857,16 @@ impl BundledEmulatorConfig {
 }
 
 /// The analysis-runtime root: an explicit `APIAXESS_ANALYSIS_RUNTIME` override,
-/// otherwise the `analysis-runtime/` directory beside the install (Windows) or
-/// under `share/apiaxess/` (Unix) — matching the other bundled components.
+/// otherwise `analysis-runtime/` under the shared install layout's resource
+/// base — matching the other bundled components.
 fn analysis_runtime_root() -> PathBuf {
     if let Some(configured) = std::env::var_os("APIAXESS_ANALYSIS_RUNTIME") {
         return PathBuf::from(configured);
     }
-    let Some(bin) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        return PathBuf::from("analysis-runtime");
-    };
-    if cfg!(windows) {
-        bin.join("..").join("analysis-runtime")
-    } else {
-        bin.join("..")
-            .join("share")
-            .join("apiaxess")
-            .join("analysis-runtime")
-    }
+    apiaxess_install_layout::resource_base().map_or_else(
+        || PathBuf::from("analysis-runtime"),
+        |base| base.join("analysis-runtime"),
+    )
 }
 
 /// Host path to the bundled device-side `frida-server` shipped in the analysis
@@ -2060,6 +2062,8 @@ impl SandboxBackend for BundledEmulatorBackend {
             &self.runner,
             "android.emulator",
             &self.config.emulator_executable.display().to_string(),
+            // TODO(macos-phase2): the host-capability probe uses `--version` off
+            // Windows; confirm which spelling the macOS emulator accepts.
             &["-version"],
         )
         .map_err(|error| vec![boot_diagnostic(self.backend_id(), error.to_string())])?;
@@ -3904,6 +3908,30 @@ mod tests {
                 vec![SandboxTier::BundledEmulator, SandboxTier::RemoteOffload]
             );
         }
+    }
+
+    #[test]
+    fn macos_reports_dynamic_unavailable_not_virtualized_host_guidance() {
+        let selection =
+            SandboxRuntimePlanner::for_environment(RuntimeEnvironment::MacOs, &report(Vec::new()));
+        let ids: Vec<&str> = selection
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id.as_ref())
+            .collect();
+        assert!(
+            ids.contains(&"sandbox.macos-dynamic-unavailable"),
+            "{ids:?}"
+        );
+        assert!(!ids.contains(&"sandbox.vm-guidance"), "{ids:?}");
+        assert_eq!(selection.fallback_tier, SandboxTier::RemoteOffload);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_host_is_detected_as_macos() {
+        let selection = SandboxRuntimePlanner::detect(&report(Vec::new()));
+        assert_eq!(selection.environment, RuntimeEnvironment::MacOs);
     }
 
     #[test]

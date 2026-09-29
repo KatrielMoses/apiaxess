@@ -11,6 +11,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 apiaxess-external-tools = { path = "../../crates/external-tools" }
+apiaxess-install-layout = { path = "../../crates/install-layout" }
 open = "5"
 # common-controls-v6 makes the custom button labels render on Windows.
 rfd = { version = "0.15", features = ["common-controls-v6"] }

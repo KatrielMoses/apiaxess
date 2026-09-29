@@ -14,6 +14,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # macOS (macos-14, Apple Silicon) is deferred until the macOS phase: the
+        # macOS cfg arms are pre-staged in code but not yet validated. Re-add
+        # macos-14 here when macOS development starts, alongside the .app/notarize job.
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:

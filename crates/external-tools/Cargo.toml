@@ -16,5 +16,10 @@ thiserror.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
+# Unix-only: killpg, so stopping a tool also reaps its grandchildren (e.g. qemu
+# under the emulator launcher). Already in the workspace lock via the sandbox.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal"] }
+
 [lints]
 workspace = true
