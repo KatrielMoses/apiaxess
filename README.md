@@ -37,24 +37,24 @@ Everything it needs is bundled: Chromium, a Java runtime, apktool, jadx, ffuf, F
 Nothing to install and wire up. It all runs on `127.0.0.1`, and the only thing it ever sends out is an
 optional update check you can turn off.
 
-## Demo
+## Walkthrough
 
-**Web capture into an API surface.** Point it at a web app, browse, and watch the surface build itself
-from what actually gets hit.
+**Recover a web app's API.** Point it at a target, browse through the bundled browser, and watch the
+surface build itself from what actually gets hit.
 
-<p align="center"><img src="assets/gifs/apiaxess-web-capture.gif" alt="Web capture into an API surface" width="820"></p>
+<p align="center"><img src="assets/gifs/apiaxess-web-capture.gif" alt="Recovering a web app's API" width="820"></p>
 
-**Fuzz.** Burp-Intruder-class attacks over the endpoints you just recovered.
+**Fuzz an endpoint.** Burp-Intruder-class attacks over the endpoints you just recovered.
 
-<p align="center"><img src="assets/gifs/apiaxess-fuzz.gif" alt="The Fuzz workbench" width="820"></p>
+<p align="center"><img src="assets/gifs/apiaxess-fuzz.gif" alt="Fuzzing an endpoint" width="820"></p>
 
-**Resend.** Replay and tweak any request. Repeater, but cleaner.
+**Replay and tweak requests.** Send anything back, change it, send it again. Repeater, but cleaner.
 
-<p align="center"><img src="assets/gifs/apiaxess-resend.gif" alt="The Resend workbench" width="820"></p>
+<p align="center"><img src="assets/gifs/apiaxess-resend.gif" alt="Replaying and tweaking a request" width="820"></p>
 
-**APK analysis.** Pull the static API surface straight out of an Android app.
+**Pull an Android app's API.** Unpack and decompile an APK down to its static API surface.
 
-<p align="center"><img src="assets/gifs/apiaxess-apk-analysis.gif" alt="Static analysis of an Android APK" width="820"></p>
+<p align="center"><img src="assets/gifs/apiaxess-apk-analysis.gif" alt="Pulling an Android app's API from its APK" width="820"></p>
 
 ## Install
 
