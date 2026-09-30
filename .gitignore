@@ -68,3 +68,6 @@ Thumbs.db
 # Internal docs — not for the public repo
 /PRODUCT-FACTS.md
 /architecture-audit.md
+
+# local README preview (not committed)
+/readme-preview.html
