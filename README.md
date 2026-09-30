@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="APIaxess" width="360">
+  <img src="assets/logo.png" alt="apiaxess" width="420">
 </p>
 
 <p align="center"><b>See what an app actually talks to.</b></p>
