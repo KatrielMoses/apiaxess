@@ -64,3 +64,7 @@ Thumbs.db
 
 # gstack browse-daemon local state (tool artifact, never committed).
 /.gstack/
+
+# Internal docs — not for the public repo
+/PRODUCT-FACTS.md
+/architecture-audit.md
