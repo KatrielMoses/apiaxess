@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 140" width="440" height="140" role="img" aria-label="APIaxess">
+  <rect width="440" height="140" rx="26" fill="#0D0D0D"/>
+  <g transform="translate(34,28) scale(0.45)" fill="none" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M138 60 L100 22 L22 100 L100 178 L138 140" stroke="#FFFFFF"/>
+    <path d="M50 100 H140" stroke="#2D7FF9"/>
+    <path d="M118 78 L142 100 L118 122" stroke="#2D7FF9"/>
+    <path d="M168 78 L142 100 L168 122" stroke="#FFFFFF"/>
+  </g>
+  <text x="132" y="90" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="54" font-weight="700" fill="#FFFFFF" letter-spacing="-1.5">APIaxess</text>
+</svg>
