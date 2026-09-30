@@ -204,10 +204,12 @@
 
             <div class="landing__foot">
               <section>
-                <p class="t-label">Everything stays local</p>
+                <p class="t-label">Local-first</p>
                 <p>
                   The engine, the capture proxy, and the session store all run on this machine at
-                  127.0.0.1. Nothing is uploaded.
+                  127.0.0.1; your captures and sessions are never sent anywhere. The app's own
+                  network use is an optional, identifier-free update check to apiaxess.dev (turn it
+                  off in Settings) and add-on downloads, only when you click them.
                 </p>
               </section>
               <section>
@@ -565,12 +567,14 @@
                         id="android-scope-host"
                         type="text"
                         spellcheck="false"
-                        placeholder="api.example.com"
+                        placeholder="api.example.com:443"
                       />
                       <button class="btn" id="android-scope-add" type="button">Add to scope</button>
                     </div>
                     <p class="field__hint">
-                      The app's backend and any third-party hosts you are authorized to capture.
+                      The app's backend and any third-party hosts you are authorized to capture,
+                      as <span class="t-mono">host:port</span>. A host without a port covers 80 and
+                      443; <span class="t-mono">*.example.com</span> also covers its subdomains.
                       Only in-scope traffic reaches the fused surface; traffic already captured
                       from a host is re-classified when you add it.
                     </p>
@@ -939,6 +943,31 @@
                       <br /><span class="t-subtle t-small">Raw captured traffic archive.</span>
                     </span>
                   </label>
+                  <div class="field" id="export-har-scope-field">
+                    <span class="field__label">HAR traffic</span>
+                    <div class="choice-group" role="radiogroup" aria-label="HAR traffic">
+                      <label class="choice">
+                        <input type="radio" name="export-har-scope" value="in" checked />
+                        <span class="choice__body">
+                          <span data-icon="shield" data-icon-size="18"></span>
+                          <span class="choice__text">
+                            <span class="choice__title">In scope only</span>
+                            <span class="choice__hint">Flows the declared scope covers. Default.</span>
+                          </span>
+                        </span>
+                      </label>
+                      <label class="choice">
+                        <input type="radio" name="export-har-scope" value="all" />
+                        <span class="choice__body">
+                          <span data-icon="alert" data-icon-size="18"></span>
+                          <span class="choice__text">
+                            <span class="choice__title">All captured traffic</span>
+                            <span class="choice__hint">Also out-of-scope and third-party calls, with their headers, cookies and bodies.</span>
+                          </span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
 
                   <hr class="rule" />
 

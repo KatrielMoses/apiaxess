@@ -36,7 +36,7 @@ use apiaxess_sandbox::{
 };
 use apiaxess_session::{
     ActionDescriptor, ActionOutcome, ActionRecordInput, ActionTarget, AnalysisPipelineState,
-    AuditActor, SessionLifecycle,
+    AuditActor, SessionLifecycle, TargetIdentifier,
 };
 use apiaxess_static_pass::StaticPassReport;
 use apiaxess_target_apk::{ApkIntakeConfig, ApkTarget, cleanup_intake_workspace};
@@ -442,6 +442,16 @@ pub fn run_pipeline(
         normalized.workspace_root.clone(),
     );
     diagnostics.extend(normalized.diagnostics.clone());
+    record_app_identity(runtime, &normalized).map_err(|diagnostic| {
+        fail(
+            runtime,
+            config,
+            &mut diagnostics,
+            PipelineStage::Intake,
+            vec![diagnostic],
+            dynamic_ran,
+        )
+    })?;
     complete(
         runtime,
         config,
@@ -1538,6 +1548,35 @@ fn commit_api_document(
     session.commit_api_document(document, Utc::now())?;
     runtime.replace_session(session)?;
     runtime.save().map(|_| ())
+}
+
+/// Records the analyzed app's package on the session target, so every later
+/// assembly of this session's surface (and its WebSocket/flow party labels)
+/// judges first- vs third-party against the app's own backends. A web
+/// session's target is never relabeled, and a target that already names a
+/// package keeps it.
+fn record_app_identity(
+    runtime: &SessionRuntime,
+    artifact: &NormalizedUnpackedArtifact,
+) -> Result<(), Diagnostic> {
+    let Ok(package) = package_name_from_artifact(artifact) else {
+        return Ok(());
+    };
+    let mut session = runtime.session_snapshot()?;
+    let mut scope = session.engagement_scope().clone();
+    let target = &mut scope.target;
+    let named = std::iter::once(&target.primary)
+        .chain(&target.aliases)
+        .any(|identifier| identifier.kind == "android.package");
+    if named || target.target_type == "web.url" {
+        return Ok(());
+    }
+    target.aliases.push(TargetIdentifier {
+        kind: "android.package".to_owned(),
+        value: package,
+    });
+    session.update_engagement_scope(scope, Utc::now())?;
+    runtime.replace_session(session)
 }
 
 fn commit_document(runtime: &SessionRuntime, report: &StaticPassReport) -> Result<(), Diagnostic> {

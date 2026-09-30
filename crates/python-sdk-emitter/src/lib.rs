@@ -367,6 +367,7 @@ impl<'a> ModelBuilder<'a> {
         });
         let mut field_text = String::new();
         let mut decode_text = String::new();
+        let mut encode_text = String::new();
         for (index, property) in fields {
             let field_name = python_field(property.name.as_str());
             let child_path = format!("{path}.properties[{index}].schema");
@@ -396,6 +397,18 @@ impl<'a> ModelBuilder<'a> {
                 "            {field_name}={decoded},  # {}",
                 requiredness_text(&property.requiredness, self.minimum)
             );
+            // Serialize under the wire name (`operationName`, not the Python
+            // field `operationname`), and leave unset optional fields out
+            // rather than sending explicit nulls the server never saw.
+            let wire = py_str(property.name.as_str());
+            if required {
+                let _ = writeln!(encode_text, "        data[{wire}] = self.{field_name}");
+            } else {
+                let _ = writeln!(
+                    encode_text,
+                    "        if self.{field_name} is not None:\n            data[{wire}] = self.{field_name}"
+                );
+            }
         }
         let openness_text = match openness {
             apiaxess_api_model::ObjectOpenness::Open => "additional properties may exist",
@@ -404,7 +417,7 @@ impl<'a> ModelBuilder<'a> {
         };
         let definition = format!(
             "@dataclass\nclass {name}:\n    \"\"\"Generated model; {confidence}; {openness}.\"\"\"\n{fields}\
-\n    @classmethod\n    def from_dict(cls, data: Mapping[str, Any]) -> \"{name}\":\n        return cls(\n{decode}        )\n",
+\n    @classmethod\n    def from_dict(cls, data: Mapping[str, Any]) -> \"{name}\":\n        return cls(\n{decode}        )\n\n    def to_dict(self) -> dict[str, Any]:\n        \"\"\"The JSON object as sent: wire key names, unset optional fields omitted.\"\"\"\n        data: dict[str, Any] = {{}}\n{encode}        return data\n",
             confidence = confidence_text(self.surface, path),
             openness = openness_text,
             fields = if field_text.is_empty() {
@@ -413,6 +426,7 @@ impl<'a> ModelBuilder<'a> {
                 field_text
             },
             decode = decode_text,
+            encode = encode_text,
         );
         self.definitions.insert(name.clone(), definition);
         name
@@ -708,7 +722,8 @@ from . import auth as _auth
 
 def _to_json(value: Any) -> Any:
     if value is None: return None
-    if is_dataclass(value): return {key: _to_json(item) for key, item in asdict(value).items()}
+    if hasattr(value, "to_dict"): return {key: _to_json(item) for key, item in value.to_dict().items()}
+    if is_dataclass(value): return {key: _to_json(item) for key, item in asdict(value).items() if item is not None}
     if isinstance(value, list): return [_to_json(item) for item in value]
     if isinstance(value, dict): return {key: _to_json(item) for key, item in value.items()}
     return value

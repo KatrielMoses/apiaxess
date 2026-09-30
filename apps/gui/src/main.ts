@@ -39,7 +39,8 @@ import { prettyBody } from "./http/body-view";
 import { isConfirmed, tallySurface } from "./surface/tally";
 import { graphqlOperationsOn, readProtocolOperations, type SurfaceOperation } from "./surface/operations";
 import { appendLiveEvents, grpcMethodOf, isEventTruncated, renderEventData, type SseEvent, type SseState, sseLabel } from "./http/flow-kind";
-import { ingestWsEvents, initWsTab, type LiveWsEvent, loadWsConnections } from "./ws/ws-tab";
+import { type ScopeRule, type ScopeTarget, scopeRuleCovers, scopeRuleDisplay, scopeTargetFor } from "./scope/scope-model";
+import { ingestWsEvents, initWsTab, type LiveWsEvent, loadWsConnections, resetWsTab } from "./ws/ws-tab";
 import { curlCommand, findAll, hexDump, inspectRequest, type InspectorItem, isBinaryBody, requestMethod, setRequestMethod, showNonPrintables, urlEncode } from "./http/message-tools";
 
 /* ==================================================================== *
@@ -3479,7 +3480,21 @@ const STAGE_LABELS: Record<string, string> = {
   surface: "Surface",
 };
 
+/** Whether an analysis run is in progress; Run stays disabled until it ends
+ *  (the engine also refuses a second run). */
+let pipelineActive = false;
+
+/** Keeps Run pipeline single-flight, saying why it is disabled. */
+function syncPipelineRunControl(): void {
+  const button = document.querySelector<HTMLButtonElement>("#apk-run");
+  if (button === null || button.getAttribute("aria-busy") === "true") return;
+  button.disabled = pipelineActive;
+  button.title = pipelineActive ? "A pipeline is already running — wait for it to finish" : "";
+}
+
 function renderPipeline(run: PipelineRun): void {
+  pipelineActive = run.status === "running";
+  syncPipelineRunControl();
   if (pipelineStatus === null || pipelineProgress === null) return;
   // Anchor an elapsed clock to when this run was first seen, so a long quiet
   // stage still visibly ticks even while the backend's fields are unchanged.
@@ -3487,7 +3502,8 @@ function renderPipeline(run: PipelineRun): void {
     pipelineStartedRunId = run.runId;
     pipelineStartedAt = Date.now();
   }
-  pipelineStatus.textContent = run.status + " · " + run.stage;
+  // A finished run's stage is "completed" too: say it once.
+  pipelineStatus.textContent = run.stage === run.status ? run.status : `${run.status} · ${run.stage}`;
   const percent = Math.min(100, Math.max(0, run.progressBasisPoints / 100));
   const stageIndex = pipelineStages.indexOf(run.stage);
   // While running with no measurable progress yet (a long intake stage), show an
@@ -3546,6 +3562,10 @@ function renderPipelineEmpty(): void {
 }
 
 async function startPipeline(): Promise<void> {
+  if (pipelineActive) {
+    showDiagnostic({ id: "pipeline.already-running", what: "An analysis pipeline is already running.", why: "Only one APK analysis runs at a time.", fix: "Wait for the current run to finish, then start another." });
+    return;
+  }
   const artifactPath = apkPath?.value.trim() ?? "";
   if (artifactPath === "") {
     const diag = { id: "pipeline.artifact-path-required", what: "An APK path is required.", why: "The analysis pipeline reads the artifact directly from this machine's filesystem.", fix: "Enter the full path to the APK and start the run again." };
@@ -3569,6 +3589,10 @@ async function startPipeline(): Promise<void> {
   } catch { /* the run itself still reports any problem */ }
   const staticOnly = apkStaticOnly?.checked === true;
   const dynamic = !staticOnly && apkDynamic?.checked === true;
+  // An app is analysed in its own session: another target's traffic and
+  // surface (a web session's pages, an earlier APK) must not mix into it.
+  const current = lastSessionStatus;
+  const newSession = current !== null && (current.flowCount > 0 || current.resendCount > 0 || current.fuzzerCount > 0 || (current.analysisPipeline ?? null) !== null || current.scope?.target?.target_type === "web.url");
   const confirmed = await confirmDialog({
     eyebrow: "Confirm before run",
     title: "Start the analysis pipeline",
@@ -3578,11 +3602,12 @@ async function startPipeline(): Promise<void> {
     facts: [
       { label: "Artifact", value: artifactPath },
       { label: "Passes", value: staticOnly ? "Static only" : dynamic ? "Static, dynamic, signing, fusion" : "Static, signing, fusion" },
+      ...(newSession && current !== null ? [{ label: "Session", value: `A new session; ${current.sessionId} is saved to its artifact first` }] : []),
     ],
     notice: dynamic
-      ? "Confirm you are authorized to analyse this artifact and to let it contact its backends."
-      : undefined,
-    noticeTone: "accent",
+      ? `Confirm you are authorized to analyse this artifact and to let it contact its backends.${newSession ? " The run replaces the active session so its traffic stays separate." : ""}`
+      : newSession ? "The run replaces the active session, so the app's surface is not mixed with the current session's traffic." : undefined,
+    noticeTone: newSession ? "caution" : "accent",
     confirmLabel: "Start pipeline",
   });
   if (!confirmed) return;
@@ -3627,7 +3652,7 @@ async function startPipeline(): Promise<void> {
 
   const runId = apkRunId?.value.trim() ?? "";
   const intakeRoot = apkIntakeRoot?.value.trim() ?? "";
-  const payload: Record<string, unknown> = { artifactPath, dynamic: effectiveDynamic, staticOnly };
+  const payload: Record<string, unknown> = { artifactPath, dynamic: effectiveDynamic, staticOnly, newSession };
   if (runId !== "") payload.runId = runId;
   if (intakeRoot !== "") payload.intakeOutputRoot = intakeRoot;
   if (credentials.length > 0) payload.credentials = credentials;
@@ -3640,9 +3665,11 @@ async function startPipeline(): Promise<void> {
       const run = (await response.json()) as PipelineRun;
       renderPipeline(run);
       toast(`Pipeline started · run ${run.runId}`, "success");
+      if (newSession) void refreshSession();
       if (pipelinePoll !== undefined) window.clearInterval(pipelinePoll);
       pipelinePoll = window.setInterval(() => void refreshPipeline(), 1000);
     });
+    syncPipelineRunControl();
   } catch (error) {
     const diag = errorDiagnostic(error, { id: "pipeline.start-failed", what: "The analysis pipeline could not start.", why: "", fix: "Check that the artifact path exists and is readable by the engine, then retry." });
     if (pipelineDiagnostics !== null) pipelineDiagnostics.innerHTML = diagnosticListHtml([diag], "");
@@ -4509,60 +4536,11 @@ function initWorkbenchTools(): void {
   renderFuzzList();
 }
 
-/** Right-click menu on a Live-traffic row: Resend or Fuzz that request. */
-/** The registrable domain to add to scope: `a.b.example.com` → `example.com`.
- *  A small compound-suffix table keeps common two-part TLDs (co.uk, com.au…)
- *  from collapsing to the public suffix. Presentation-grade, not a full PSL. */
-function registrableDomain(host: string): string {
-  const labels = host.toLowerCase().replace(/\.$/, "").split(".").filter((label) => label !== "");
-  if (labels.length <= 2) return labels.join(".");
-  const twoPartTlds = new Set(["co.uk", "org.uk", "gov.uk", "ac.uk", "co.in", "co.jp", "com.au", "com.br", "co.nz", "co.za", "com.cn", "com.mx", "com.sg", "com.hk"]);
-  const lastTwo = labels.slice(-2).join(".");
-  return twoPartTlds.has(lastTwo) ? labels.slice(-3).join(".") : lastTwo;
-}
-
-/** True for IP literals (IPv4/IPv6) and `localhost`. These must be scoped as an
- *  exact host — applying registrable-domain truncation to an address mangles it
- *  (e.g. `127.0.0.1` → `0.1`), producing a wrong, useless scope rule. */
-function isIpOrLocalhost(host: string): boolean {
-  const h = host.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
-  if (h === "localhost") return true;
-  if (h.includes(":")) return true; // IPv6 literal
-  return /^\d{1,3}(\.\d{1,3}){3}$/.test(h); // IPv4 dotted quad
-}
-
-interface ScopeTarget { readonly label: string; readonly kind: "exact" | "domain_suffix"; readonly value: string }
-
-/** The scope target for a captured host: an exact rule (verbatim, normalized
- *  host) for IPs/localhost, otherwise a DomainSuffix rule for the registrable
- *  domain. Returns `null` when there is no usable host. The `label` is the exact
- *  value being added, so the menu reads truthfully ("Add 127.0.0.1 to scope"). */
-function scopeTargetForHost(host: string): ScopeTarget | null {
-  const trimmed = host.trim();
-  if (trimmed === "") return null;
-  if (isIpOrLocalhost(trimmed)) {
-    const value = trimmed.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
-    return { label: value, kind: "exact", value };
-  }
-  const domain = registrableDomain(trimmed);
-  if (domain === "") return null;
-  return { label: domain, kind: "domain_suffix", value: domain };
-}
-
-/** Host component of a URL (or the string itself when it isn't a full URL). */
-function hostOf(url: string): string {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return url;
-  }
-}
-
-interface ScopeRule { id: string; host: { kind: string; domain?: string; host?: string }; ports: number[] }
-
-/** The label a scope rule is shown with: its exact host or its domain. */
-function scopeRuleLabel(rule: ScopeRule): string {
-  return rule.host.kind === "exact" ? (rule.host.host ?? "") : (rule.host.domain ?? "");
+/** The scope target for a captured flow: exactly its origin (host and port). */
+function scopeTargetForFlow(flow: FlowSummary | undefined): ScopeTarget | null {
+  if (flow === undefined) return null;
+  if (flow.url !== null && flow.url !== undefined && flow.url.includes("://")) return scopeTargetFor(flow.url);
+  return flow.host === null || flow.host === undefined ? null : scopeTargetFor(flowAuthority(flow));
 }
 
 /** Mirrors the scope/authorization state into the status bar, which carries it
@@ -4576,17 +4554,6 @@ function renderStatusScope(text: string, authorized: boolean): void {
   cell.classList.toggle("is-unscoped", !authorized);
 }
 
-/** A scope rule as the operator must read it: with its port restriction, so a
- *  host is never mistaken as authorized on every port (mirrors the engine's
- *  `AllowedNetworkTarget::label`). */
-function scopeRuleDisplay(rule: ScopeRule): string {
-  const raw = scopeRuleLabel(rule);
-  const host = rule.host.kind === "exact" ? (raw.includes(":") ? `[${raw}]` : raw) : `*.${raw}`;
-  if (rule.ports.length === 0) return `${host} (any port)`;
-  if (rule.ports.length === 1) return `${host}:${rule.ports[0]}`;
-  return `${host} (ports ${rule.ports.join(", ")})`;
-}
-
 /** Renders the declared scope on the Android target's Capture scope panel. */
 function renderAndroidScope(status: SessionStatus): void {
   if (androidScopeList === null) return;
@@ -4594,8 +4561,8 @@ function renderAndroidScope(status: SessionStatus): void {
   androidScopeList.replaceChildren(...rules.map((rule) => {
     const item = document.createElement("li");
     item.className = "scope-list__item";
-    const label = scopeRuleLabel(rule);
-    item.append(document.createTextNode(scopeRuleDisplay(rule)));
+    const label = scopeRuleDisplay(rule);
+    item.append(document.createTextNode(label));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "scope-list__remove";
@@ -4624,49 +4591,57 @@ async function removeScopeRule(ruleId: string, label: string): Promise<void> {
   }
 }
 
-/** Adds the host typed on the Android target's Capture scope panel. */
+/** Adds the origin typed on the Android target's Capture scope panel. */
 async function addAndroidScopeHost(): Promise<void> {
   if (androidScopeHost === null) return;
   const typed = androidScopeHost.value.trim();
   if (typed === "") {
-    showDiagnostic({ id: "android.scope-host-empty", what: "No host to add.", why: "The Host in scope field is empty.", fix: "Type the host the app talks to (for example api.example.com), then add it." });
+    showDiagnostic({ id: "android.scope-host-empty", what: "No host to add.", why: "The Host in scope field is empty.", fix: "Type the host the app talks to (for example api.example.com:443), then add it." });
     return;
   }
-  const host = hostOf(typed.includes("://") ? typed : `https://${typed}`);
-  if (scopeTargetForHost(host) === null) {
-    showDiagnostic({ id: "android.scope-host-invalid", what: `"${typed}" is not a host.`, why: "Scope rules name a host or domain.", fix: "Type a host such as api.example.com or an IP address." });
+  const target = scopeTargetFor(typed);
+  if (target === null) {
+    showDiagnostic({ id: "android.scope-host-invalid", what: `"${typed}" is not a host and port.`, why: "Scope rules name a host (or *.domain) and the ports it is authorized on.", fix: "Type a host such as api.example.com:443 or 127.0.0.1:9201. A host without a port covers 80 and 443." });
     return;
   }
-  await addHostToScope(host);
-  androidScopeHost.value = "";
+  if (await addScopeTarget(target)) androidScopeHost.value = "";
 }
 
-/** Adds a domain (and its subdomains) to the active session scope as a
- *  DomainSuffix allow rule, so its traffic is treated as in-scope. Adds the
- *  registrable domain, never the specific endpoint. */
-async function addHostToScope(host: string, exact = false): Promise<void> {
-  const normalized = host.trim().toLowerCase().replace(/\.$/, "");
-  const target: ScopeTarget | null = exact ? (normalized === "" ? null : { label: normalized, kind: "exact", value: normalized }) : scopeTargetForHost(host);
-  if (target === null) return;
+/** Adds exactly `target` (its host, on its ports) to the active session scope.
+ *  Ports an existing rule already covers are not added again; a new port on a
+ *  host already in scope becomes its own rule. Returns whether the scope now
+ *  covers the target. */
+async function addScopeTarget(target: ScopeTarget): Promise<boolean> {
   try {
     const current = await fetch("/api/v1/session/scope");
     if (!current.ok) {
       showDiagnostic({ id: "web.scope-unavailable", what: "There is no active scope to add to.", why: "A session scope is declared when you start a web session or run an APK analysis.", fix: "Start a web session first, then add hosts to its scope." });
-      return;
+      return false;
     }
     const scope = await current.json() as { allowed_targets?: ScopeRule[] };
     const rules = scope.allowed_targets ?? [];
-    const already = rules.some((rule) => (rule.host.kind === "domain_suffix" && rule.host.domain === target.value) || (rule.host.kind === "exact" && rule.host.host === target.value));
-    if (already) { toast(`${target.label} is already in scope`, "info"); return; }
+    const missing = target.ports.filter((port) => !rules.some((rule) => scopeRuleCovers(rule, target, port)));
+    if (missing.length === 0) {
+      const covering = rules.find((rule) => target.ports.every((port) => scopeRuleCovers(rule, target, port)));
+      const by = covering === undefined || scopeRuleDisplay(covering) === target.label ? "" : ` (covered by ${scopeRuleDisplay(covering)})`;
+      toast(`${target.label} is already in scope${by}`, "info");
+      return true;
+    }
     const hostMatch = target.kind === "exact" ? { kind: "exact", host: target.value } : { kind: "domain_suffix", domain: target.value };
-    rules.push({ id: `manual:${target.value}`, host: hostMatch, ports: [] });
+    const base = `manual:${target.kind === "domain_suffix" ? "suffix:" : ""}${target.value}:${missing.join("-")}`.toLowerCase().replace(/[^a-z0-9._:-]/g, "-");
+    let id = base;
+    for (let n = 2; rules.some((rule) => rule.id === id); n += 1) id = `${base}-${n}`;
+    const added: ScopeRule = { id, host: hostMatch, ports: missing };
+    rules.push(added);
     scope.allowed_targets = rules;
     const put = await fetch("/api/v1/session/scope", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(scope) });
     await requireOk(put, "scope update failed");
-    toast(`Added ${target.label} to scope`, "success");
+    toast(`Added ${scopeRuleDisplay(added)} to scope`, "success");
     await refreshSession();
+    return true;
   } catch (error) {
     reportUnexpected(error, { id: "web.scope-add-failed", what: "Could not add the host to scope.", why: "", fix: "Confirm a session is active, then retry." });
+    return false;
   }
 }
 
@@ -4677,8 +4652,8 @@ function showFlowMenu(x: number, y: number, flowId: number): void {
   menu.setAttribute("role", "menu");
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
-  const host = flows.get(flowId)?.host ?? "";
-  const scopeLabel = host === "" ? "" : (scopeTargetForHost(host)?.label ?? "");
+  const scopeTarget = scopeTargetForFlow(flows.get(flowId));
+  const scopeLabel = scopeTarget?.label ?? "";
   const scopeItem = scopeLabel === "" ? "" : `<button class="context-menu__item" type="button" role="menuitem" data-flow-scope>${icon("shield", { size: 14 })}<span>Add ${escapeHtml(scopeLabel)} to scope</span></button>`;
   menu.innerHTML = `<button class="context-menu__item" type="button" role="menuitem" data-flow-resend>${icon("send", { size: 14 })}<span>Resend</span></button><button class="context-menu__item" type="button" role="menuitem" data-flow-fuzz>${icon("discovery", { size: 14 })}<span>Fuzz</span></button>${scopeItem}`;
   const close = (): void => {
@@ -4699,7 +4674,7 @@ function showFlowMenu(x: number, y: number, flowId: number): void {
   });
   menu.querySelector("[data-flow-scope]")?.addEventListener("click", () => {
     close();
-    void addHostToScope(host);
+    if (scopeTarget !== null) void addScopeTarget(scopeTarget);
   });
   document.body.append(menu);
   const rect = menu.getBoundingClientRect();
@@ -4714,9 +4689,9 @@ function showFlowMenu(x: number, y: number, flowId: number): void {
 /** A one-item context menu offering to add a URL's registrable domain to scope.
  *  Used on Resend/Fuzz queue rows, where scope violations surface. */
 function showHostScopeMenu(x: number, y: number, url: string): void {
-  const host = hostOf(url);
-  const scopeLabel = host === "" ? "" : (scopeTargetForHost(host)?.label ?? "");
-  if (scopeLabel === "") return;
+  const scopeTarget = scopeTargetFor(url);
+  if (scopeTarget === null) return;
+  const scopeLabel = scopeTarget.label;
   document.querySelector(".context-menu")?.remove();
   const menu = document.createElement("div");
   menu.className = "context-menu";
@@ -4734,7 +4709,7 @@ function showHostScopeMenu(x: number, y: number, url: string): void {
   };
   menu.querySelector("[data-scope-add]")?.addEventListener("click", () => {
     close();
-    void addHostToScope(host);
+    void addScopeTarget(scopeTarget);
   });
   document.body.append(menu);
   const rect = menu.getBoundingClientRect();
@@ -5606,23 +5581,37 @@ function renderHarScopeNotice(): void {
   notice.querySelector<HTMLButtonElement>("[data-har-dismiss]")?.addEventListener("click", () => { harScope = null; renderHarScopeNotice(); });
 }
 
-async function removeHarScopeHost(host: string): Promise<void> {
+/** Narrows the scope by one origin (`host:port`) the HAR banner lists. */
+async function removeHarScopeHost(origin: string): Promise<void> {
+  const target = scopeTargetFor(origin);
   try {
     const current = await fetch("/api/v1/session/scope");
     await requireOk(current, "scope read failed");
     const scope = await current.json() as { allowed_targets?: ScopeRule[] };
-    const rule = (scope.allowed_targets ?? []).find((candidate) => candidate.host.kind === "exact" && candidate.host.host === host);
-    if (rule !== undefined) await removeScopeRule(rule.id, host);
-    if (harScope !== null) harScope = { ...harScope, hosts: harScope.hosts.filter((value) => value !== host), excludedHosts: [...harScope.excludedHosts, host], outside: harScope.outside + (harScope.outsideCounts[host] ?? 0) };
+    const rule = target === null ? undefined : (scope.allowed_targets ?? []).find((candidate) => candidate.host.kind === "exact" && target.ports.every((port) => scopeRuleCovers(candidate, target, port)));
+    if (rule !== undefined && target !== null) {
+      const remaining = rule.ports.filter((port) => !target.ports.includes(port));
+      if (rule.ports.length === 0 || remaining.length === 0) await removeScopeRule(rule.id, target.label);
+      else {
+        scope.allowed_targets = (scope.allowed_targets ?? []).map((candidate) => candidate.id === rule.id ? { ...candidate, ports: remaining } : candidate);
+        const put = await fetch("/api/v1/session/scope", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(scope) });
+        await requireOk(put, "scope update failed");
+        toast(`Removed ${target.label} from scope`, "success");
+        await refreshSession();
+      }
+    }
+    if (harScope !== null) harScope = { ...harScope, hosts: harScope.hosts.filter((value) => value !== origin), excludedHosts: [...harScope.excludedHosts, origin], outside: harScope.outside + (harScope.outsideCounts[origin] ?? 0) };
     renderHarScopeNotice();
   } catch (error) {
     reportUnexpected(error, { id: "web.scope-remove-failed", what: "Could not remove the host from scope.", why: "", fix: "Confirm a session is active, then retry." });
   }
 }
 
-async function addHarScopeHost(host: string): Promise<void> {
-  await addHostToScope(host, true);
-  if (harScope !== null) harScope = { ...harScope, hosts: [...harScope.hosts, host], excludedHosts: harScope.excludedHosts.filter((value) => value !== host), outside: Math.max(0, harScope.outside - (harScope.outsideCounts[host] ?? 0)) };
+/** Adds one origin (`host:port`) the HAR banner lists as outside the scope. */
+async function addHarScopeHost(origin: string): Promise<void> {
+  const target = scopeTargetFor(origin);
+  if (target === null || !(await addScopeTarget(target))) return;
+  if (harScope !== null) harScope = { ...harScope, hosts: [...harScope.hosts, origin], excludedHosts: harScope.excludedHosts.filter((value) => value !== origin), outside: Math.max(0, harScope.outside - (harScope.outsideCounts[origin] ?? 0)) };
   renderHarScopeNotice();
 }
 
@@ -5931,6 +5920,21 @@ function renderDiscovery(): void {
   job.diagnostics.forEach(showDiagnostic);
 }
 
+/** Returns the discovery panel to its never-run state (a replaced session's
+ *  estimate, progress and hits are not this session's). */
+function resetDiscoveryPanel(): void {
+  lastDiscoveryEstimate = null;
+  lastDiscoveryEstimateKey = null;
+  if (discoveryBadge !== null) discoveryBadge.textContent = "idle";
+  if (discoveryProgress !== null) discoveryProgress.innerHTML = "";
+  if (discoveryStatus !== null) discoveryStatus.textContent = "";
+  if (discoveryResultsCount !== null) discoveryResultsCount.textContent = "0 hits";
+  if (discoveryEstimateView !== null) {
+    discoveryEstimateView.innerHTML = stateBlock({ icon: "clock", title: "Not estimated yet", body: "Estimate first to see how many requests this will send and how long it will take before anything is probed.", compact: true });
+  }
+  renderDiscoveryIdle();
+}
+
 function renderDiscoveryIdle(): void {
   if (discoveryResults !== null) {
     discoveryResults.innerHTML = stateBlock({
@@ -6090,10 +6094,26 @@ async function runExport(): Promise<void> {
     exportDir?.focus();
     return;
   }
+  // The HAR carries in-scope traffic unless the operator deliberately opts
+  // into everything — out-of-scope flows can hold other hosts' credentials.
+  const harScope = formats.includes("har") ? selectedHarScope() : "in";
+  if (harScope === "all") {
+    const proceed = await confirmDialog({
+      eyebrow: "Export HAR",
+      title: "Include out-of-scope traffic?",
+      message: "The HAR will contain every captured flow, including requests to hosts outside the declared scope and third-party calls, with their headers, cookies and bodies.",
+      notice: "Out-of-scope traffic can carry credentials and personal data for services you are not authorized to test. Share this file only where that is acceptable.",
+      noticeTone: "danger",
+      noticeIcon: "alert",
+      confirmLabel: "Export all traffic",
+      tone: "danger",
+    });
+    if (!proceed) return;
+  }
   const button = document.querySelector<HTMLButtonElement>("#export-run");
   try {
     await withBusy(button, "Exporting…", async () => {
-      const response = await fetch("/api/v1/export", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ formats, outputDir }) });
+      const response = await fetch("/api/v1/export", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ formats, outputDir, harScope }) });
       await requireOk(response, "artifact export failed");
       const report = (await response.json()) as ExportReport;
       const files = report.files ?? [];
@@ -6103,7 +6123,7 @@ async function runExport(): Promise<void> {
         // The resolved absolute paths, exactly as written — never the path as typed.
         exportResult.innerHTML = `<div class="stack">
 <div class="notice notice--success"><span class="notice__icon">${icon("check", { size: 18 })}</span><div class="notice__body"><p class="notice__title">Export complete</p><p>${files.length} file${files.length === 1 ? "" : "s"} written for ${formats.length} format${formats.length === 1 ? "" : "s"}.</p></div></div>
-<dl class="kv"><dt>Directory</dt><dd class="t-mono">${escapeHtml(report.outputDir)}</dd><dt>Formats</dt><dd class="t-mono">${escapeHtml(formats.join(", "))}</dd></dl>
+<dl class="kv"><dt>Directory</dt><dd class="t-mono">${escapeHtml(report.outputDir)}</dd><dt>Formats</dt><dd class="t-mono">${escapeHtml(formats.join(", "))}</dd>${harSummaryRow(report.har)}</dl>
 <ul class="export-files t-mono t-small">${files.map((file) => `<li>${escapeHtml(file)}</li>`).join("")}</ul>
 <div class="row"><button class="btn btn--sm" type="button" data-export-open>${icon("export", { size: 14 })}<span>Open folder</span></button></div>
 </div>`;
@@ -6120,7 +6140,34 @@ async function runExport(): Promise<void> {
   }
 }
 
-interface ExportReport { readonly outputDir: string; readonly files?: readonly string[]; }
+interface HarExportSummary { readonly scope: "in" | "all"; readonly entries: number; readonly leftOut: number; }
+interface ExportReport { readonly outputDir: string; readonly files?: readonly string[]; readonly har?: HarExportSummary | null; }
+
+/** Keeps the Export controls honest: the HAR traffic choice applies only when
+ *  HAR is selected, and Export needs at least one format (it says why). */
+function syncExportControls(): void {
+  const formats = selectedFormats();
+  document.querySelectorAll<HTMLInputElement>('input[name="export-har-scope"]').forEach((input) => { input.disabled = !formats.includes("har"); });
+  const run = document.querySelector<HTMLButtonElement>("#export-run");
+  if (run === null) return;
+  run.disabled = formats.length === 0;
+  run.title = formats.length === 0 ? "Select at least one format to export" : "";
+}
+
+/** Which traffic the Export page's HAR should carry (in scope unless chosen). */
+function selectedHarScope(): "in" | "all" {
+  return document.querySelector<HTMLInputElement>('input[name="export-har-scope"]:checked')?.value === "all" ? "all" : "in";
+}
+
+/** The result row saying what the HAR carried and what it left out. */
+function harSummaryRow(har: HarExportSummary | null | undefined): string {
+  if (har === null || har === undefined) return "";
+  const entries = `${har.entries} entr${har.entries === 1 ? "y" : "ies"}`;
+  const text = har.scope === "all"
+    ? `${entries} · all captured traffic, including out of scope`
+    : `${entries} in scope${har.leftOut > 0 ? ` · ${har.leftOut} out-of-scope flow${har.leftOut === 1 ? "" : "s"} left out` : ""}`;
+  return `<dt>HAR</dt><dd>${escapeHtml(text)}</dd>`;
+}
 
 async function openExportFolder(): Promise<void> {
   try {
@@ -6157,6 +6204,11 @@ function renderExportIdle(): void {
 
 function renderSession(status: SessionStatus): void {
   const sessionChanged = lastSessionStatus?.sessionId !== status.sessionId;
+  // The engine switched sessions under the GUI (a web session replaced the
+  // active one): drop the old session's data before showing the new one.
+  const replaced = sessionStateOwner !== null && sessionStateOwner !== status.sessionId;
+  if (replaced) clearReplacedSessionState();
+  sessionStateOwner = status.sessionId;
   lastSessionStatus = status;
   if (headerSession !== null) {
     headerSession.textContent = status.sessionId;
@@ -6172,6 +6224,7 @@ function renderSession(status: SessionStatus): void {
   // Layout is keyed per session; now that the id is known, restore this
   // session's persisted pane widths (#9).
   if (sessionChanged) refreshLayoutForSession();
+  if (replaced) queueMicrotask(() => void reloadSessionState());
   if (sessionBadge !== null) sessionBadge.textContent = status.lifecycle;
   updateScopePill(status);
   renderAndroidScope(status);
@@ -6303,15 +6356,23 @@ async function refreshSession(): Promise<void> {
   }
 }
 
+/** The session whose data the GUI currently holds; `null` right after that
+ *  data was cleared, until the next session's status adopts it. */
+let sessionStateOwner: string | null = null;
+
 /**
  * Drops what the GUI still shows from the replaced session: its flows, the
- * selected flow, its surface, its Fuzz/Resend/Intercept workbench state, and a
- * web target it had authorized. A new session starts unscoped, so the web
- * form asks for authorization again. Everything is then re-read from the
- * engine (see {@link reloadSessionState}), which is the source of truth.
+ * selected flow, its surface, its Fuzz/Resend/Intercept/WebSocket workbench
+ * state, a HAR-import banner and the discovery panel. Runs for every way a
+ * session is replaced — New, Open, and starting a web session — so nothing
+ * from one session is shown (or acted on) in the next. Everything is then
+ * re-read from the engine (see {@link reloadSessionState}).
  */
-function resetForFreshSession(): void {
+function clearReplacedSessionState(): void {
+  sessionStateOwner = null;
   resetWorkbenchState();
+  resetWsTab();
+  resetDiscoveryPanel();
   flows.clear();
   selectedFlow = null;
   if (editor !== null) editor.hidden = true;
@@ -6325,6 +6386,15 @@ function resetForFreshSession(): void {
   harScope = null;
   harProposal = null;
   renderHarScopeNotice();
+}
+
+/**
+ * {@link clearReplacedSessionState}, plus the web target the replaced session
+ * had authorized: a new or opened session starts from its own scope, so the
+ * web form asks for authorization again.
+ */
+function resetForFreshSession(): void {
+  clearReplacedSessionState();
   if (webTarget !== null) webTarget.value = "";
   if (webAuthorize !== null) webAuthorize.checked = false;
   if (webAuthorization !== null) webAuthorization.hidden = false;
@@ -6940,6 +7010,8 @@ async function browseForApk(): Promise<void> {
   apkFile?.click();
 }
 document.querySelector("#export-run")?.addEventListener("click", () => void runExport());
+document.querySelectorAll<HTMLInputElement>("[data-format]").forEach((input) => input.addEventListener("change", syncExportControls));
+syncExportControls();
 document.querySelector("#session-new")?.addEventListener("click", () => void newSession());
 document.querySelector("#session-open")?.addEventListener("click", () => void openSession());
 document.querySelector("#session-save")?.addEventListener("click", () => void saveSession());

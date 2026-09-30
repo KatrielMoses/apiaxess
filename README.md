@@ -11,7 +11,9 @@ into one auditable API surface you can resend, fuzz, and export.
 
 Everything is bundled — Chromium, a Java runtime, apktool, jadx, ffuf, Frida, and an
 Android emulator — so there is nothing to install and wire up. It all runs locally on
-`127.0.0.1`; nothing is uploaded.
+`127.0.0.1`, and your captures and sessions are never sent anywhere. The app's only calls
+out are an optional, identifier-free update check to apiaxess.dev (off with one setting)
+and add-on downloads when you click them.
 
 [Website](https://apiaxess.dev) · [License](LICENSE) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 

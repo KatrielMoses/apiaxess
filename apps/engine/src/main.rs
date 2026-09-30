@@ -12,7 +12,7 @@ use std::{
 use apiaxess_api_model::{ApiDocument, ApiSurface, ProvenanceRegistry};
 use apiaxess_diagnostics::{Diagnostic, DiagnosticContext, DiagnosticValue, catalogue};
 use apiaxess_engine_shell::SessionRuntime;
-use apiaxess_engine_shell::{Engine, ExportConfig};
+use apiaxess_engine_shell::{Engine, ExportConfig, HarScope};
 use apiaxess_session::{
     AllowedNetworkTarget, EngagementScope, HostMatch, Session, SessionId, SessionLifecycle,
     TargetIdentifier, TargetIdentity,
@@ -327,6 +327,7 @@ struct ExportOptions {
     session_path: Option<PathBuf>,
     output_dir: Option<PathBuf>,
     formats: Vec<String>,
+    har_scope: Option<String>,
     json: bool,
     help: bool,
 }
@@ -710,8 +711,13 @@ fn run_export_cli(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
     } else {
         options.formats
     };
+    let har_scope = match options.har_scope.as_deref() {
+        None => HarScope::default(),
+        Some(value) => HarScope::parse(value)?,
+    };
     let config = ExportConfig::from_names(output_dir, names)
-        .map_err(|diagnostic| cli_diagnostic_error(&diagnostic))?;
+        .map_err(|diagnostic| cli_diagnostic_error(&diagnostic))?
+        .with_har_scope(har_scope);
     let engine = Engine::new();
     engine
         .open_session(&session_path)
@@ -738,6 +744,14 @@ fn run_export_cli(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 artifact.paths.join(", ")
             );
         }
+        if let Some(har) = &report.har {
+            if har.scope == HarScope::In && har.left_out > 0 {
+                println!(
+                    "har: {} in-scope entries; {} out-of-scope flow(s) left out (--har-scope all includes them)",
+                    har.entries, har.left_out
+                );
+            }
+        }
         for diagnostic in &report.diagnostics {
             print_cli_diagnostic(diagnostic);
         }
@@ -761,13 +775,15 @@ fn parse_export_options(arguments: &[String]) -> Result<ExportOptions, Box<dyn s
         };
         match argument.as_str() {
             "--format" => options.formats.push(value(&mut index, argument)?),
+            "--har-scope" => options.har_scope = Some(value(&mut index, argument)?),
             "--out" | "--output" => {
                 options.output_dir = Some(PathBuf::from(value(&mut index, argument)?));
             }
             "--json" => options.json = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: apiaxess export <session.json> --format <openapi|sdk|postman|har|all> --out <dir> [--json]"
+                    "Usage: apiaxess export <session.json> --format <openapi|sdk|postman|har|all> --out <dir> [--har-scope <in|all>] [--json]
+  --har-scope  in (default): the HAR carries only in-scope traffic; all: also out-of-scope and third-party traffic"
                 );
                 options.help = true;
             }

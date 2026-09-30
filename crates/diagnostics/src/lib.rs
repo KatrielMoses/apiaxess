@@ -3723,9 +3723,22 @@ pub mod catalogue {
         PIPELINE_COMPLETED,
     ];
 
+    /// A second analysis run was requested while one is still running.
+    pub const PIPELINE_ALREADY_RUNNING: DiagnosticDefinition = DiagnosticDefinition {
+        id: "pipeline.already-running",
+        category: DiagnosticCategory::Session,
+        severity: DiagnosticSeverity::Error,
+        what: "An analysis pipeline is already running.",
+        why: "Only one APK analysis runs at a time, so a second run cannot start while one is in progress.",
+        fix: "Wait for the current run to finish, then start another.",
+    };
+
     /// Every Phase 8.4 CLI/API pipeline-surface definition.
-    pub const PHASE_8_4: &[DiagnosticDefinition] =
-        &[PIPELINE_RUN_NOT_FOUND, PIPELINE_SURFACE_NOT_READY];
+    pub const PHASE_8_4: &[DiagnosticDefinition] = &[
+        PIPELINE_RUN_NOT_FOUND,
+        PIPELINE_SURFACE_NOT_READY,
+        PIPELINE_ALREADY_RUNNING,
+    ];
 
     /// The requested session has no completed unified surface to export.
     pub const EXPORT_SURFACE_NOT_READY: DiagnosticDefinition = DiagnosticDefinition {

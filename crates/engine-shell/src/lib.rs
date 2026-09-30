@@ -10,7 +10,8 @@ mod pipeline;
 mod session_runtime;
 
 pub use export::{
-    ExportConfig, ExportFormat, ExportReport, ExportedArtifact, export_session_artifacts,
+    ExportConfig, ExportFormat, ExportReport, ExportedArtifact, HarExportSummary, HarScope,
+    export_session_artifacts,
 };
 pub use pipeline::{
     PipelineConfig, PipelineFailure, PipelineProgress, PipelineProgressCallback, PipelineReport,
@@ -5100,7 +5101,10 @@ print("RESULT " + json.dumps({"names": names, "sent": sent, "type": type(respons
         assert_eq!(report.in_scope, 0);
         assert_eq!(
             report.outside_scope.into_iter().collect::<Vec<_>>(),
-            vec![("127.0.0.1".to_owned(), 5), ("localhost".to_owned(), 1)]
+            vec![
+                ("127.0.0.1:9201".to_owned(), 5),
+                ("localhost:9202".to_owned(), 1)
+            ]
         );
     }
 
@@ -5300,7 +5304,17 @@ for name in names:
     method = getattr(client, name)
     required = {p.name: "7" for p in list(inspect.signature(method).parameters.values()) if p.default is inspect.Parameter.empty and p.kind == p.KEYWORD_ONLY}
     results[name] = type(method(**required)).__name__
-print("RESULT " + json.dumps({"sent": sent, "results": results}))
+# A typed request model sends its wire keys (camelCase kept) and leaves
+# unset optional fields out instead of sending nulls.
+import dataclasses
+from apiaxess_client import models
+graphql_model = next(cls for cls in vars(models).values() if dataclasses.is_dataclass(cls) and "operationname" in {f.name for f in dataclasses.fields(cls)})
+values = {"operationname": "GetProfile", "query": "query GetProfile { profile { id } }"}
+typed = graphql_model(**{f.name: values.get(f.name, "x") for f in dataclasses.fields(graphql_model) if f.default is dataclasses.MISSING or f.name in values})
+before = len(sent)
+client.post_graphql(body=typed)
+typed_body = json.loads(sent[before]["body"])
+print("RESULT " + json.dumps({"sent": sent, "results": results, "typed": typed_body}))
 "#;
         let output =
             match apiaxess_python_sdk_emitter::testing::run_generated_python(&sdk.files, script) {
@@ -5350,6 +5364,13 @@ print("RESULT " + json.dumps({"sent": sent, "results": results}))
         );
         assert_eq!(result["results"]["get_api_v1_stream"], "Response");
         assert_eq!(result["results"].as_object().expect("results").len(), 7);
+        let typed = result["typed"].as_object().expect("typed body");
+        assert_eq!(typed["operationName"], "GetProfile", "{typed:?}");
+        assert!(!typed.contains_key("operationname"), "{typed:?}");
+        assert!(
+            typed.values().all(|value| !value.is_null()),
+            "unset fields are omitted, not sent as null: {typed:?}"
+        );
     }
 
     #[test]

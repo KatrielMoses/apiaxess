@@ -27,7 +27,8 @@ use std::{
 
 use apiaxess_diagnostics::{DiagnosticContext, DiagnosticValue, catalogue};
 use apiaxess_engine_shell::{
-    Engine, ExportConfig, PipelineConfig, PipelineProgress, PipelineRunStatus, PipelineStage,
+    Engine, ExportConfig, HarScope, PipelineConfig, PipelineProgress, PipelineRunStatus,
+    PipelineStage,
 };
 use apiaxess_session::EngagementScope;
 use apiaxess_workbench_proxy::{
@@ -477,6 +478,9 @@ struct StartPipelineRequest {
     static_only: Option<bool>,
     session_path: Option<String>,
     scope: Option<EngagementScope>,
+    /// Run the analysis in a fresh session (the current one is saved first),
+    /// so another target's traffic and surface never mix into the app's.
+    new_session: Option<bool>,
     intake_output_root: Option<String>,
     /// Pre-run "feed credentials now" values for a login-gated crawl. Held in
     /// memory only for the run, wrapped as zeroize-on-drop secrets immediately,
@@ -499,6 +503,8 @@ struct ExportRequest {
     format: Option<String>,
     formats: Option<Vec<String>>,
     output_dir: Option<String>,
+    /// `in` (default) or `all`: which captured traffic the HAR carries.
+    har_scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1339,11 +1345,30 @@ async fn start_pipeline(
             )
         })?
         .0;
+    // Refuse before touching the session or its scope: a second start must
+    // not switch the session out from under the run in progress.
+    if state.pipeline_runs.any_running() {
+        return Err(pipeline_response(
+            catalogue::PIPELINE_ALREADY_RUNNING.instantiate(DiagnosticContext::new()),
+        ));
+    }
     if let Some(path) = input.session_path.as_deref() {
         state
             .engine
             .open_session(Path::new(path))
             .map_err(session_response)?;
+    } else {
+        // An app's analysis never runs inside a web session: its captured
+        // pages, endpoints and first-party host are another target's, and
+        // would show up under the app (and relabel the app's own backend as
+        // third-party). Start it in its own session instead.
+        let in_web_session = state
+            .engine
+            .session_status()
+            .is_ok_and(|status| status.scope.target.target_type == "web.url");
+        if input.new_session.unwrap_or(false) || in_web_session {
+            state.engine.new_session().map_err(session_response)?;
+        }
     }
     if let Some(scope) = input.scope {
         state
@@ -1698,8 +1723,21 @@ async fn export_artifacts(
     if names.is_empty() {
         names.push("all".to_owned());
     }
+    let har_scope = match input.har_scope.as_deref() {
+        None => HarScope::default(),
+        Some(value) => HarScope::parse(value).map_err(|detail| {
+            let mut context = DiagnosticContext::new();
+            context.insert(
+                "harScope".to_owned(),
+                DiagnosticValue::String(value.to_owned()),
+            );
+            context.insert("detail".to_owned(), DiagnosticValue::String(detail));
+            export_response(vec![catalogue::EXPORT_INVALID_REQUEST.instantiate(context)])
+        })?,
+    };
     let config = ExportConfig::from_names(output_dir, names)
-        .map_err(|diagnostics| export_response(vec![diagnostics]))?;
+        .map_err(|diagnostics| export_response(vec![diagnostics]))?
+        .with_har_scope(har_scope);
     state
         .engine
         .export_session_artifacts(&config)
@@ -1770,7 +1808,7 @@ fn pipeline_response(
 ) -> (StatusCode, Json<apiaxess_diagnostics::Diagnostic>) {
     let status = match diagnostic.id.as_ref() {
         "pipeline.run-not-found" => StatusCode::NOT_FOUND,
-        "pipeline.surface-not-ready" => StatusCode::CONFLICT,
+        "pipeline.surface-not-ready" | "pipeline.already-running" => StatusCode::CONFLICT,
         "pipeline.stage-failed" => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1812,11 +1850,18 @@ impl PipelineRegistry {
             .runs
             .lock()
             .map_err(|_| catalogue::PIPELINE_STAGE_FAILED.instantiate(DiagnosticContext::new()))?;
-        if runs
-            .get(&entry.progress.run_id)
-            .is_some_and(|existing| existing.progress.status == PipelineRunStatus::Running)
+        // Single-flight: one analysis at a time. Checked under the same lock
+        // that records the new run, so two concurrent starts cannot both pass.
+        if let Some(active) = runs
+            .values()
+            .find(|existing| existing.progress.status == PipelineRunStatus::Running)
         {
-            return Err(catalogue::PIPELINE_STAGE_FAILED.instantiate(DiagnosticContext::new()));
+            let mut context = DiagnosticContext::new();
+            context.insert(
+                "run_id".to_owned(),
+                DiagnosticValue::String(active.progress.run_id.clone()),
+            );
+            return Err(catalogue::PIPELINE_ALREADY_RUNNING.instantiate(context));
         }
         runs.insert(entry.progress.run_id.clone(), entry);
         Ok(())
@@ -3817,6 +3862,46 @@ mod tests {
         assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn a_second_pipeline_cannot_start_while_one_is_running() {
+        let registry = PipelineRegistry::default();
+        let entry = |run_id: &str, status: PipelineRunStatus| PipelineRunEntry {
+            progress: PipelineProgress {
+                run_id: run_id.to_owned(),
+                stage: PipelineStage::Intake,
+                status,
+                progress_basis_points: 0,
+                message: String::new(),
+                diagnostics: Vec::new(),
+                dynamic_ran: false,
+                updated_at: chrono::Utc::now(),
+            },
+            diagnostics: Vec::new(),
+            artifact_path: PathBuf::from("app.apk"),
+            surface: None,
+        };
+        registry
+            .insert(entry("run-1", PipelineRunStatus::Running))
+            .expect("first run");
+        assert!(registry.any_running());
+        let refused = registry
+            .insert(entry("run-2", PipelineRunStatus::Running))
+            .expect_err("second run refused");
+        assert_eq!(refused.id.as_ref(), "pipeline.already-running");
+        assert_eq!(pipeline_response(refused).0, StatusCode::CONFLICT);
+        registry
+            .finish(
+                "run-1",
+                entry("run-1", PipelineRunStatus::Completed).progress,
+                Vec::new(),
+                None,
+            )
+            .expect("finish");
+        registry
+            .insert(entry("run-2", PipelineRunStatus::Running))
+            .expect("a run can start once the previous one finished");
+    }
+
     #[tokio::test]
     async fn pipeline_start_is_queryable_and_retains_stage_diagnostics() {
         let root = std::env::temp_dir().join(format!(
@@ -3890,6 +3975,75 @@ mod tests {
         let status = observed.expect("failed intake becomes queryable");
         assert_eq!(status.stage, PipelineStage::Intake);
         assert!(!status.diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_apk_analysis_started_in_a_web_session_runs_in_its_own_session() {
+        let root = std::env::temp_dir().join(format!(
+            "apiaxess-local-api-apk-in-web-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let session_id = apiaxess_session::SessionId::new(format!(
+            "session:api-apk-in-web-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+        .expect("session ID");
+        let now = chrono::Utc::now();
+        let mut scope = test_scope();
+        scope.target.target_type = "web.url".to_owned();
+        scope.target.primary = apiaxess_session::TargetIdentifier {
+            kind: "url.origin".to_owned(),
+            value: "http://127.0.0.1:9111".to_owned(),
+        };
+        let mut session = apiaxess_session::Session::new(
+            session_id.clone(),
+            scope,
+            apiaxess_api_model::ApiDocument::new(apiaxess_api_model::ApiSurface {
+                provenance: apiaxess_api_model::ProvenanceRegistry::default(),
+                endpoints: Vec::new(),
+                protocol_operations: Vec::new(),
+                loose_findings: Vec::new(),
+                signers: Vec::new(),
+            }),
+            now,
+        );
+        session.activate(now).expect("activate session");
+        let store = Arc::new(
+            apiaxess_workbench_store::TrafficStore::open(&root, session.id().as_str())
+                .expect("open test store"),
+        );
+        let engine = Engine::new();
+        engine
+            .attach_session_runtime(Arc::new(apiaxess_engine_shell::SessionRuntime::new(
+                session,
+                store,
+                root.join("session.json"),
+            )))
+            .expect("attach runtime");
+        let state = ApiState {
+            engine,
+            expected_origin: Arc::from("http://127.0.0.1:7777"),
+            pipeline_runs: PipelineRegistry::default(),
+            pairing: DevicePairingRegistry::default(),
+            pending_pairing: PendingPairingRegistry::default(),
+            gui_port: 7777,
+            updates: UpdateService::inert(),
+            addons: addons::addon_service(),
+        };
+        let (code, _) = start_pipeline(
+            State(state.clone()),
+            Some(Json(StartPipelineRequest {
+                artifact_path: root.join("missing.apk").display().to_string(),
+                ..StartPipelineRequest::default()
+            })),
+        )
+        .await
+        .expect("queue pipeline");
+        assert_eq!(code, StatusCode::ACCEPTED);
+        let status = state.engine.session_status().expect("status");
+        assert_ne!(status.session_id, session_id.as_str(), "a fresh session");
+        assert_ne!(status.scope.target.target_type, "web.url");
+        assert_eq!(status.flow_count, 0);
     }
 
     /// The packaged GUI must be served with cache headers that survive a rebuild:

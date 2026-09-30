@@ -2450,9 +2450,11 @@ impl TrafficStore {
             if scope == ScopeDisposition::InScope {
                 outcome.in_scope += 1;
             } else {
+                // Keyed by origin (`host:port`): scope is port-specific, so
+                // "127.0.0.1" alone would not say which service is excluded.
                 *outcome
                     .outside_scope
-                    .entry(host.clone().unwrap_or_default())
+                    .entry(origin_of(&entry.request.url, host.as_deref()))
                     .or_default() += 1;
             }
             let flow = FlowCapture {
@@ -2526,8 +2528,28 @@ impl TrafficStore {
     ///
     /// See [`Self::export_har`].
     pub fn export_har_filtered(&self, in_scope_only: bool) -> Result<Vec<u8>, Diagnostic> {
+        self.export_har_report(in_scope_only)
+            .map(|export| export.bytes)
+    }
+
+    /// [`Self::export_har_filtered`], also reporting how many captured flows
+    /// the scope filter left out, so the caller can say so.
+    ///
+    /// Event streams carry their captured events as the response text, and a
+    /// WebSocket upgrade carries its connection's messages as
+    /// `_webSocketMessages` (the de-facto HAR extension browsers write).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::export_har`].
+    pub fn export_har_report(&self, in_scope_only: bool) -> Result<HarExport, Diagnostic> {
         let mut entries = Vec::new();
         let mut left_out = 0_usize;
+        let mut connections: Vec<WsConnectionRecord> = self
+            .ws_connections()?
+            .into_iter()
+            .filter(|connection| connection.origin == FlowOrigin::Capture)
+            .collect();
         for summary in self.summaries()? {
             // Observed traffic only: Resend/Fuzz requests are tool-synthesized,
             // and re-imported as captures they would fuse into endpoints nobody
@@ -2546,12 +2568,26 @@ impl TrafficStore {
                 continue;
             }
             if let Some(flow) = self.get(summary.id)? {
-                let sse_events = summary.sse.map(|state| state.event_count);
+                let sse = match summary.sse {
+                    Some(state) => Some((state, self.sse_events(summary.id, None, usize::MAX)?)),
+                    None => None,
+                };
+                let ws = match take_ws_connection(&flow, &mut connections) {
+                    Some(connection) => Some(self.ws_messages(connection.id, None, usize::MAX)?),
+                    None => None,
+                };
                 let withheld = self.withheld_body_sizes(summary.id)?;
-                entries.push(HarEntryOut::from_capture(&flow, sse_events, withheld));
+                entries.push(HarEntryOut::from_capture(
+                    &flow,
+                    sse.as_ref()
+                        .map(|(state, events)| (*state, events.as_slice())),
+                    ws.as_deref(),
+                    withheld,
+                ));
             }
         }
-        serde_json::to_vec_pretty(&HarDocumentOut {
+        let entry_count = entries.len();
+        let bytes = serde_json::to_vec_pretty(&HarDocumentOut {
             log: HarLogOut {
                 version: "1.2".to_owned(),
                 creator: HarCreator {
@@ -2569,7 +2605,12 @@ impl TrafficStore {
                 ),
             },
         })
-        .map_err(|e| interchange_diag("export", &e.to_string()))
+        .map_err(|e| interchange_diag("export", &e.to_string()))?;
+        Ok(HarExport {
+            bytes,
+            entries: entry_count,
+            left_out,
+        })
     }
 
     /// Persists one resend context and its append-only history.
@@ -3843,6 +3884,48 @@ struct HarHeader {
     value: String,
 }
 
+/// A HAR export and what the scope filter left out of it.
+#[derive(Clone, Debug)]
+pub struct HarExport {
+    /// The HAR 1.2 document.
+    pub bytes: Vec<u8>,
+    /// Entries written.
+    pub entries: usize,
+    /// Captured flows left out because they were not in scope.
+    pub left_out: usize,
+}
+
+/// The captured WebSocket connection a `101`/`Upgrade: websocket` flow opened:
+/// the first not-yet-claimed one with the same host and path, opened at or
+/// after the upgrade was recorded (a few seconds of clock slack allowed).
+/// Claimed connections are removed so each attaches to one entry.
+fn take_ws_connection(
+    flow: &FlowCapture,
+    connections: &mut Vec<WsConnectionRecord>,
+) -> Option<WsConnectionRecord> {
+    let upgrade = flow.status == Some(101)
+        || flow.request_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
+        });
+    if !upgrade {
+        return None;
+    }
+    let path = flow.path.as_deref().unwrap_or("/");
+    let host = flow.host.as_deref().map(str::to_ascii_lowercase);
+    let slack = chrono::Duration::seconds(5);
+    let index = connections
+        .iter()
+        .enumerate()
+        .filter(|(_, connection)| {
+            connection.host.as_deref().map(str::to_ascii_lowercase) == host
+                && connection.path.as_deref().unwrap_or("/") == path
+                && connection.opened_at + slack >= flow.captured_at
+        })
+        .min_by_key(|(_, connection)| (connection.opened_at - flow.captured_at).abs())
+        .map(|(index, _)| index)?;
+    Some(connections.remove(index))
+}
+
 /// What a HAR import did: how many entries it imported, and how many landed
 /// in scope. Entries outside the declared scope are imported but do not fuse,
 /// so the caller must say so rather than report bare success.
@@ -3853,7 +3936,7 @@ pub struct HarImportOutcome {
     pub imported: usize,
     /// Entries classified in scope (these fuse).
     pub in_scope: usize,
-    /// Entries not in scope, by host.
+    /// Entries not in scope, by origin (`host:port`).
     pub outside_scope: std::collections::BTreeMap<String, usize>,
     /// Distinct hosts across every imported entry.
     pub hosts: usize,
@@ -3887,8 +3970,21 @@ struct HarEntryOut {
     response: HarResponseOut,
     cache: HarCacheOut,
     timings: HarTimingsOut,
+    #[serde(rename = "_webSocketMessages", skip_serializing_if = "Option::is_none")]
+    web_socket_messages: Option<Vec<HarWsMessageOut>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
+}
+/// One WebSocket message in the `_webSocketMessages` extension browsers write:
+/// `type` send/receive, `time` in epoch seconds, the frame `opcode`, and
+/// `data` (text as-is; binary base64, as Chrome does).
+#[derive(Serialize)]
+struct HarWsMessageOut {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    time: f64,
+    opcode: u8,
+    data: String,
 }
 #[derive(Serialize)]
 struct HarCacheOut {}
@@ -3965,16 +4061,21 @@ struct HarContentOut {
 }
 
 impl HarEntryOut {
-    /// One HAR entry for a captured flow. `sse_events` is the event count of a
-    /// flow whose response was an event stream (its events are stored apart
-    /// from the flow, not as one body). `withheld` are the sizes of request and
-    /// response bodies the store did not keep (out of scope): their sizes are
-    /// reported and the entry says why there is no text.
+    /// One HAR entry for a captured flow. `sse` is the stream state and
+    /// captured events of a flow whose response was an event stream (stored
+    /// apart from the flow, not as one body); they become the response text.
+    /// `ws` are the messages of the WebSocket connection an upgrade opened.
+    /// `withheld` are the sizes of request and response bodies the store did
+    /// not keep (out of scope): their sizes are reported and the entry says
+    /// why there is no text.
+    #[allow(clippy::too_many_lines)]
     fn from_capture(
         flow: &FlowCapture,
-        sse_events: Option<u64>,
+        sse: Option<(SseStreamState, &[SseEventRecord])>,
+        ws: Option<&[WsMessageRecord]>,
         withheld: (Option<u64>, Option<u64>),
     ) -> Self {
+        let sse_events = sse.map(|(state, _)| state.event_count);
         let size = |bytes: u64| i64::try_from(bytes).unwrap_or(i64::MAX);
         let header = |headers: &[(String, String)], name: &str| {
             headers
@@ -3990,7 +4091,7 @@ impl HarEntryOut {
         if duration.is_none() {
             notes.push("No duration was recorded for this exchange.");
         }
-        let mut content = har_response_content(flow, sse_events);
+        let mut content = har_response_content(flow, sse);
         if let Some(bytes) = withheld.1 {
             content.size = size(bytes);
             content.comment = Some(format!(
@@ -4005,7 +4106,11 @@ impl HarEntryOut {
                 if header(&flow.request_headers, "upgrade")
                     .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
                 {
-                    "WebSocket upgrade: the connection's messages are in APIaxess's WebSocket view, not in HAR."
+                    if ws.is_some() {
+                        "WebSocket upgrade: the connection's messages are in _webSocketMessages."
+                    } else {
+                        "WebSocket upgrade: no messages were captured for this connection."
+                    }
                 } else {
                     "No response was recorded for this request."
                 },
@@ -4057,7 +4162,7 @@ impl HarEntryOut {
                 body_size: match (&flow.response_body, sse_events, withheld.1) {
                     (Some(body), _, _) => i64::try_from(body.len()).unwrap_or(i64::MAX),
                     (None, _, Some(bytes)) => size(bytes),
-                    (None, Some(_), None) => -1,
+                    (None, Some(_), None) => content.size,
                     (None, None, None) => 0,
                 },
                 content,
@@ -4072,9 +4177,59 @@ impl HarEntryOut {
                 receive: 0.0,
                 ssl: -1.0,
             },
+            web_socket_messages: ws.map(|messages| messages.iter().map(har_ws_message).collect()),
             comment: (!notes.is_empty()).then(|| notes.join(" ")),
         }
     }
+}
+
+fn har_ws_message(message: &WsMessageRecord) -> HarWsMessageOut {
+    let (opcode, data) = match message.kind {
+        WsMessageKind::Text => (1, String::from_utf8_lossy(&message.payload).into_owned()),
+        WsMessageKind::Binary | WsMessageKind::Frame => (2, BASE64.encode(&message.payload)),
+        WsMessageKind::Close => (8, BASE64.encode(&message.payload)),
+        WsMessageKind::Ping => (9, BASE64.encode(&message.payload)),
+        WsMessageKind::Pong => (10, BASE64.encode(&message.payload)),
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let time = message.observed_at.timestamp_micros() as f64 / 1_000_000.0;
+    HarWsMessageOut {
+        kind: match message.direction {
+            WsDirection::ClientToServer => "send",
+            WsDirection::ServerToClient => "receive",
+        },
+        time,
+        opcode,
+        data,
+    }
+}
+
+/// An event stream's captured events written back as `text/event-stream`
+/// text (`event:`/`id:`/`retry:`/`data:` fields, blank-line separated).
+fn sse_stream_text(events: &[SseEventRecord]) -> String {
+    fn field(text: &mut String, name: &str, value: &str) {
+        text.push_str(name);
+        text.push_str(": ");
+        text.push_str(value);
+        text.push('\n');
+    }
+    let mut text = String::new();
+    for event in events {
+        if let Some(kind) = &event.event {
+            field(&mut text, "event", kind);
+        }
+        if let Some(id) = &event.id {
+            field(&mut text, "id", id);
+        }
+        if let Some(retry) = event.retry_ms {
+            field(&mut text, "retry", &retry.to_string());
+        }
+        for line in event.data.split('\n') {
+            field(&mut text, "data", line);
+        }
+        text.push('\n');
+    }
+    text
 }
 
 /// The entry URL: the recorded one, which keeps its scheme and port. Only a
@@ -4092,13 +4247,16 @@ fn har_url(flow: &FlowCapture, notes: &mut Vec<&'static str>) -> String {
 }
 
 /// The response content: the retained body, or a note on why there is none.
-fn har_response_content(flow: &FlowCapture, sse_events: Option<u64>) -> HarContentOut {
+fn har_response_content(
+    flow: &FlowCapture,
+    sse: Option<(SseStreamState, &[SseEventRecord])>,
+) -> HarContentOut {
     let response_type = flow
         .response_headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.clone());
-    match (&flow.response_body, sse_events) {
+    match (&flow.response_body, sse) {
         (Some(body), _) => {
             let (text, encoding) = har_text(body);
             HarContentOut {
@@ -4111,17 +4269,34 @@ fn har_response_content(flow: &FlowCapture, sse_events: Option<u64>) -> HarConte
                 comment: None,
             }
         }
-        (None, Some(count)) => HarContentOut {
-            size: -1,
-            mime_type: response_type
-                .clone()
-                .unwrap_or_else(|| "text/event-stream".to_owned()),
-            text: None,
-            encoding: None,
-            comment: Some(format!(
-                "Server-Sent Events stream: its {count} event(s) are captured per flow in APIaxess, not as one body."
-            )),
-        },
+        (None, Some((state, events))) => {
+            let text = sse_stream_text(events);
+            let truncated = events.iter().any(|event| {
+                event.data_bytes > u64::try_from(event.data.len()).unwrap_or(u64::MAX)
+            });
+            HarContentOut {
+                size: i64::try_from(text.len()).unwrap_or(i64::MAX),
+                mime_type: response_type
+                    .clone()
+                    .unwrap_or_else(|| "text/event-stream".to_owned()),
+                text: Some(text),
+                encoding: None,
+                comment: Some(format!(
+                    "Server-Sent Events stream rebuilt from its {} captured event(s){}{}.",
+                    events.len(),
+                    if state.closed {
+                        ""
+                    } else {
+                        "; the stream was still open at export"
+                    },
+                    if truncated {
+                        "; some event data was truncated at capture"
+                    } else {
+                        ""
+                    },
+                )),
+            }
+        }
         (None, None) => HarContentOut {
             size: 0,
             mime_type: response_type
@@ -4303,6 +4478,40 @@ fn split_url(url: &str) -> (Option<String>, Option<String>) {
             .map_or(authority, |(host, _)| host),
     };
     (Some(host.to_owned()), Some(format!("/{path}")))
+}
+
+/// `host:port` of a URL, with the scheme's default port when none is written
+/// and IPv6 literals bracketed. Falls back to the bare host when the URL has
+/// no recognizable scheme or port.
+fn origin_of(url: &str, host: Option<&str>) -> String {
+    let host = host.unwrap_or_default();
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, v)| v);
+    let after_host = match authority.strip_prefix('[') {
+        Some(literal) => literal.split_once(']').map_or("", |(_, tail)| tail),
+        None => authority.split_once(':').map_or("", |(_, port)| port),
+    };
+    let port = after_host.trim_start_matches(':');
+    let port = if port.is_empty() {
+        match scheme.to_ascii_lowercase().as_str() {
+            "http" | "ws" => "80",
+            "https" | "wss" => "443",
+            _ => "",
+        }
+    } else {
+        port
+    };
+    let shown = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    if port.is_empty() {
+        shown
+    } else {
+        format!("{shown}:{port}")
+    }
 }
 
 /// The request hosts of a HAR document, with how many entries each carries.
@@ -4634,6 +4843,171 @@ mod tests {
             provenance: "proxy.hudsucker".to_owned(),
             origin: FlowOrigin::Capture,
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn har_export_leaves_out_of_scope_traffic_and_carries_sse_and_websocket_content() {
+        let store = store();
+        let now = Utc::now();
+        store.upsert(&flow(1)).expect("in scope");
+        let mut login = flow(2);
+        login.host = Some("127.0.0.1".to_owned());
+        login.url = Some("http://127.0.0.1:9111/api/login".to_owned());
+        login.path = Some("/api/login".to_owned());
+        login.request_body = Some(br#"{"user":"a","pass":"secret"}"#.to_vec());
+        login.scope = ScopeDisposition::OutsideDeclaredScope;
+        store.upsert(&login).expect("out of scope");
+
+        let mut stream = flow(3);
+        stream.method = Some("GET".to_owned());
+        stream.url = Some("https://api.example.test/stream".to_owned());
+        stream.path = Some("/stream".to_owned());
+        stream.request_body = None;
+        stream.response_body = None;
+        stream.response_headers = vec![("content-type".to_owned(), "text/event-stream".to_owned())];
+        store.upsert(&stream).expect("sse flow");
+        store.open_sse_stream(3, now).expect("open");
+        for (sequence, event, data) in [
+            (1, Some("price"), "{\"p\":1}"),
+            (
+                2, None, "a
+b",
+            ),
+        ] {
+            store
+                .append_sse_event(&SseEventRecord {
+                    flow_id: 3,
+                    sequence,
+                    event: event.map(str::to_owned),
+                    data: data.to_owned(),
+                    data_bytes: data.len() as u64,
+                    id: (sequence == 2).then(|| "7".to_owned()),
+                    retry_ms: None,
+                    observed_at: now,
+                })
+                .expect("event");
+        }
+        store.close_sse_stream(3, now).expect("close");
+
+        let mut upgrade = flow(4);
+        upgrade.method = Some("GET".to_owned());
+        upgrade.url = Some("https://api.example.test/socket".to_owned());
+        upgrade.path = Some("/socket".to_owned());
+        upgrade.status = Some(101);
+        upgrade.request_body = None;
+        upgrade.response_body = None;
+        upgrade.request_headers = vec![("upgrade".to_owned(), "websocket".to_owned())];
+        store.upsert(&upgrade).expect("upgrade");
+        let connection_id = store.allocate_ws_connection_id();
+        store
+            .upsert_ws_connection(&WsConnectionRecord {
+                id: connection_id,
+                url: "wss://api.example.test/socket".to_owned(),
+                host: Some("api.example.test".to_owned()),
+                path: Some("/socket".to_owned()),
+                scope: ScopeDisposition::InScope,
+                origin: FlowOrigin::Capture,
+                opened_at: upgrade.captured_at,
+                closed_at: None,
+                close_code: None,
+                message_count: 0,
+                provenance: "proxy.hudsucker".to_owned(),
+            })
+            .expect("connection");
+        for (sequence, direction, kind, payload) in [
+            (
+                1,
+                WsDirection::ClientToServer,
+                WsMessageKind::Text,
+                b"hello".to_vec(),
+            ),
+            (
+                2,
+                WsDirection::ServerToClient,
+                WsMessageKind::Binary,
+                vec![0, 1, 255],
+            ),
+        ] {
+            store
+                .append_ws_message(&WsMessageRecord {
+                    connection_id,
+                    sequence,
+                    direction,
+                    kind,
+                    payload_bytes: payload.len() as u64,
+                    payload,
+                    observed_at: now,
+                })
+                .expect("message");
+        }
+
+        // In scope only: the out-of-scope login (and its password) is left
+        // out, and the export says how many flows it dropped.
+        let export = store.export_har_report(true).expect("har");
+        assert_eq!((export.entries, export.left_out), (3, 1));
+        let text = String::from_utf8(export.bytes.clone()).expect("utf-8");
+        assert!(!text.contains("secret") && !text.contains("127.0.0.1:9111"));
+        let har: serde_json::Value = serde_json::from_slice(&export.bytes).expect("json");
+        let entries = har["log"]["entries"].as_array().expect("entries");
+
+        // The event stream carries its events as text/event-stream.
+        let sse = entries
+            .iter()
+            .find(|entry| entry["request"]["url"] == "https://api.example.test/stream")
+            .expect("sse entry");
+        assert_eq!(
+            sse["response"]["content"]["text"],
+            "event: price
+data: {\"p\":1}
+
+id: 7
+data: a
+data: b
+
+"
+        );
+
+        // The upgrade carries its connection's frames.
+        let ws = entries
+            .iter()
+            .find(|entry| entry["request"]["url"] == "https://api.example.test/socket")
+            .expect("ws entry");
+        let messages = ws["_webSocketMessages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            (
+                &messages[0]["type"],
+                &messages[0]["opcode"],
+                &messages[0]["data"]
+            ),
+            (
+                &serde_json::json!("send"),
+                &serde_json::json!(1),
+                &serde_json::json!("hello")
+            )
+        );
+        assert_eq!(
+            (
+                &messages[1]["type"],
+                &messages[1]["opcode"],
+                &messages[1]["data"]
+            ),
+            (
+                &serde_json::json!("receive"),
+                &serde_json::json!(2),
+                &serde_json::json!("AAH/")
+            )
+        );
+
+        // All traffic is a deliberate opt-in, and then includes the login.
+        let all = store.export_har_report(false).expect("har");
+        assert_eq!((all.entries, all.left_out), (4, 0));
+        assert!(
+            String::from_utf8(all.bytes)
+                .expect("utf-8")
+                .contains("9111")
+        );
     }
 
     /// Scrubs one fixed secret, as the credential layer does.
@@ -5449,7 +5823,9 @@ mod tests {
         assert_eq!(api_entry["response"]["statusText"], "OK");
         assert_eq!(api_entry["request"]["postData"]["mimeType"], "");
         assert_eq!(entries[1]["response"]["content"]["encoding"], "base64");
-        assert_eq!(entries[2]["response"]["bodySize"], -1);
+        // An open stream with no events yet: an empty event-stream body.
+        assert_eq!(entries[2]["response"]["bodySize"], 0);
+        assert_eq!(entries[2]["response"]["content"]["text"], "");
         assert!(
             entries[2]["response"]["content"]["comment"]
                 .as_str()
@@ -5523,7 +5899,7 @@ mod tests {
         assert_eq!(outcome.in_scope, 1);
         assert_eq!(
             outcome.outside_scope.into_iter().collect::<Vec<_>>(),
-            vec![("cdn.other.test".to_owned(), 1)]
+            vec![("cdn.other.test:443".to_owned(), 1)]
         );
         let flow = target
             .get(target.summaries().expect("summaries")[0].id)

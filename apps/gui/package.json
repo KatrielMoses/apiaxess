@@ -17,6 +17,7 @@
     "lint:surface-operations": "node scripts/check-surface-operations.mjs",
     "lint:update-model": "node scripts/check-update-model.mjs",
     "lint:addons-model": "node scripts/check-addons-model.mjs",
+    "lint:scope-model": "node scripts/check-scope-model.mjs",
     "dev": "vite --host 127.0.0.1"
   },
   "devDependencies": {

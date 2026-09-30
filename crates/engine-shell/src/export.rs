@@ -69,6 +69,36 @@ impl ExportFormat {
     }
 }
 
+/// Which captured traffic a HAR export carries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HarScope {
+    /// Only flows the declared scope covers (the default): out-of-scope
+    /// traffic, and whatever credentials it carried, never leaves by default.
+    #[default]
+    In,
+    /// Every captured flow, including out-of-scope and third-party calls.
+    /// A deliberate opt-in.
+    All,
+}
+
+impl HarScope {
+    /// Parses a CLI/API HAR scope name (`in`/`in-scope` or `all`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an explanation when the name is not recognized.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "in" | "in-scope" | "scope" => Ok(Self::In),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "unsupported HAR scope `{other}`; use in (default) or all"
+            )),
+        }
+    }
+}
+
 /// Export selection and destination.
 #[derive(Clone, Debug)]
 pub struct ExportConfig {
@@ -76,6 +106,9 @@ pub struct ExportConfig {
     pub formats: BTreeSet<ExportFormat>,
     /// Directory receiving artifacts and the evidence sidecar.
     pub output_dir: PathBuf,
+    /// Which captured traffic the HAR carries; in-scope only unless the
+    /// caller opts into all of it.
+    pub har_scope: HarScope,
 }
 
 impl ExportConfig {
@@ -96,6 +129,7 @@ impl ExportConfig {
         Ok(Self {
             formats,
             output_dir,
+            har_scope: HarScope::default(),
         })
     }
 
@@ -129,6 +163,13 @@ impl ExportConfig {
         }
         Self::new(output_dir, formats)
     }
+
+    /// Sets which captured traffic the HAR carries.
+    #[must_use]
+    pub fn with_har_scope(mut self, har_scope: HarScope) -> Self {
+        self.har_scope = har_scope;
+        self
+    }
 }
 
 /// One written artifact or generated SDK file set.
@@ -160,6 +201,23 @@ pub struct ExportReport {
     pub evidence_sidecar: String,
     /// Non-fatal emitter and interchange diagnostics.
     pub diagnostics: Vec<Diagnostic>,
+    /// What a captured-traffic HAR carried, when one was written from
+    /// captured flows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub har: Option<HarExportSummary>,
+}
+
+/// Which traffic a HAR export carried, so the operator can see what was left
+/// out.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarExportSummary {
+    /// The scope filter applied.
+    pub scope: HarScope,
+    /// Entries written.
+    pub entries: usize,
+    /// Captured flows left out because they were outside the declared scope.
+    pub left_out: usize,
 }
 
 struct PendingArtifact {
@@ -248,6 +306,7 @@ pub fn export_session_artifacts(
         }
     }
     let collections = CollectionsEmitter::default();
+    let mut har_summary = None;
     if config.formats.contains(&ExportFormat::Postman) {
         match collections.emit_collection(&surface) {
             Ok(emission) => {
@@ -271,13 +330,23 @@ pub fn export_session_artifacts(
     }
     if config.formats.contains(&ExportFormat::Har) {
         match runtime.store().summaries() {
-            Ok(summaries) if !summaries.is_empty() => match runtime.store().export_har() {
-                Ok(bytes) => pending.push(PendingArtifact {
-                    format: ExportFormat::Har,
-                    relative_path: PathBuf::from("traffic.har.json"),
-                    bytes,
-                    sidecar: false,
-                }),
+            Ok(summaries) if !summaries.is_empty() => match runtime
+                .store()
+                .export_har_report(config.har_scope == HarScope::In)
+            {
+                Ok(export) => {
+                    har_summary = Some(HarExportSummary {
+                        scope: config.har_scope,
+                        entries: export.entries,
+                        left_out: export.left_out,
+                    });
+                    pending.push(PendingArtifact {
+                        format: ExportFormat::Har,
+                        relative_path: PathBuf::from("traffic.har.json"),
+                        bytes: export.bytes,
+                        sidecar: false,
+                    });
+                }
                 Err(error) => {
                     return finish_export_failure(runtime, &session_id, config, vec![error]);
                 }
@@ -380,6 +449,7 @@ pub fn export_session_artifacts(
         artifacts,
         evidence_sidecar: "apiaxess-evidence.json".to_owned(),
         diagnostics,
+        har: har_summary,
     })
 }
 

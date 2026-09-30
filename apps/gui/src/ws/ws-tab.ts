@@ -89,12 +89,32 @@ export function initWsTab(): void {
   renderDetail();
 }
 
+/** Forgets every connection and cached message of the replaced session.
+ *  Connection ids restart at 1 in each session, so a cache kept across
+ *  sessions would show one session's frames under another's connection. */
+export function resetWsTab(): void {
+  connections = [];
+  loaded.clear();
+  selectedConnection = null;
+  selectedMessage = null;
+  findQuery = "";
+  renderList();
+  renderDetail();
+}
+
 /** Loads the session's WebSocket connections (on opening the tab). */
 export async function loadWsConnections(): Promise<void> {
   try {
     const response = await fetch("/api/v1/workbench/ws-connections");
     if (!response.ok) return;
-    connections = (await response.json()) as WsConnection[];
+    const fresh = (await response.json()) as WsConnection[];
+    // A cached page belongs to one connection: if the id now names a
+    // different one (opened at another time), the cache is not its.
+    for (const connection of fresh) {
+      const known = connections.find((candidate) => candidate.id === connection.id);
+      if (known !== undefined && known.openedAt !== connection.openedAt) loaded.delete(connection.id);
+    }
+    connections = fresh;
     renderList();
     if (selectedConnection !== null) renderDetail();
   } catch {
