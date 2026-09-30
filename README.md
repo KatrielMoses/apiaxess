@@ -30,13 +30,11 @@ sends out is an optional update check you can turn off.
 
 ## Demo
 
-<!-- placeholders — drop the GIFs at assets/gifs/*.gif (see assets/gifs/README.md) -->
-
-| Web capture → surface | Fuzz |
+| Web capture → API surface | Fuzz |
 | --- | --- |
-| ![Web capture to API surface](assets/gifs/web-capture.gif) | ![Fuzz workbench](assets/gifs/fuzz.gif) |
-| **Android target** | **Export** |
-| ![Drivable Android target](assets/gifs/android.gif) | ![Export formats](assets/gifs/export.gif) |
+| ![Point at a web app and watch the API surface build](assets/gifs/apiaxess-web-capture.gif) | ![The Fuzz workbench running an attack](assets/gifs/apiaxess-fuzz.gif) |
+| **Resend** | **APK analysis** |
+| ![Replay and tweak a request](assets/gifs/apiaxess-resend.gif) | ![Static analysis of an Android APK](assets/gifs/apiaxess-apk-analysis.gif) |
 
 ## Install
 
