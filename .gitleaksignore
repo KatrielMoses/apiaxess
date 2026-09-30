@@ -1,0 +1,8 @@
+# Reviewed false positives (verified 2026-09-30, gitleaks 8.30.1). No real secrets.
+# 1-3: a redaction security TEST using an obviously-fake value ("hunter2-SECRET" on echo.test)
+#      that asserts secrets never reach disk — crates/workbench-store test module.
+# 4: documentation prose ("Android API mismatch"), matched by the generic-api-key rule.
+c405badae57df96d3b5b1dec3b36976831a57cc2:crates/workbench-store/src/lib.rs:generic-api-key:3651
+c405badae57df96d3b5b1dec3b36976831a57cc2:crates/workbench-store/src/lib.rs:generic-api-key:3730
+c405badae57df96d3b5b1dec3b36976831a57cc2:crates/workbench-store/src/lib.rs:generic-api-key:3737
+06adcf8846cf7d5bdf9ae9fa07b3811cdeba77e2:docs/sandbox/phase-3.1.3-intake-resolution.md:generic-api-key:31
