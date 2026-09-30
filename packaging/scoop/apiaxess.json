@@ -7,7 +7,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/KatrielMoses/apiaxess/releases/download/v0.1.0/APIaxess-0.1.0-windows-x64-portable.zip",
-            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            "hash": "5010da7cf36c8004c54d76812e2b37244a072bc874e2dd96330f70e68776fe7e"
         }
     },
     "bin": "bin\\apiaxess.exe",
