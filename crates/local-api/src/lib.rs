@@ -1,5 +1,6 @@
 //! Loopback HTTP/WebSocket transport and static GUI asset serving.
 
+mod addons;
 mod pairing;
 mod settings;
 mod stream_proxy;
@@ -9,7 +10,10 @@ pub use settings::{
     value_is_from_saved_settings,
 };
 
-use apiaxess_updater::service::{UpdateService, UpdateStatus};
+use apiaxess_updater::{
+    assets::{AssetService, AssetsStatus},
+    service::{UpdateService, UpdateStatus},
+};
 
 use pairing::{DevicePairingRegistry, PairingOutcome, PendingPairingRegistry};
 
@@ -109,6 +113,7 @@ pub fn router_with_updates(
         pending_pairing: PendingPairingRegistry::default(),
         gui_port: port,
         updates,
+        addons: addons::addon_service(),
     };
 
     Ok(Router::new()
@@ -126,6 +131,15 @@ pub fn router_with_updates(
         .route(
             "/api/v1/update/install",
             axum::routing::post(update_install).delete(update_cancel),
+        )
+        .route("/api/v1/addons", get(addons_status))
+        .route(
+            "/api/v1/addons/catalog",
+            axum::routing::post(addons_catalog),
+        )
+        .route(
+            "/api/v1/addons/{slug}/install",
+            axum::routing::post(addon_install).delete(addon_cancel),
         )
         .route(
             "/api/v1/pipeline/check",
@@ -370,6 +384,8 @@ struct ApiState {
     gui_port: u16,
     /// The in-app updater (inert unless the composition root supplied one).
     updates: UpdateService,
+    /// On-demand add-ons from apiaxess.dev (fetches only when asked).
+    addons: AssetService,
 }
 
 #[derive(Clone, Default)]
@@ -907,7 +923,82 @@ fn busy_reasons(state: &ApiState) -> Vec<String> {
     if state.pipeline_runs.any_running() {
         reasons.push("an APK analysis is running".to_owned());
     }
+    if state.addons.busy() {
+        reasons.push("an add-on is downloading".to_owned());
+    }
     reasons
+}
+
+fn addon_refused(why: impl Into<String>) -> ApiError {
+    let mut diagnostic = catalogue::ADDON_REFUSED.instantiate(DiagnosticContext::new());
+    diagnostic.why = why.into().into_boxed_str();
+    (StatusCode::CONFLICT, Json(diagnostic))
+}
+
+async fn addons_status(State(state): State<ApiState>) -> Json<AssetsStatus> {
+    Json(state.addons.status())
+}
+
+/// Fetches the add-on catalog from apiaxess.dev: the operator asked (the
+/// panel never fetches on its own).
+async fn addons_catalog(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<AssetsStatus>, ApiError> {
+    require_operator(&state, &headers, &state.engine.live_workbench())?;
+    state
+        .addons
+        .refresh_catalog()
+        .await
+        .map_err(addon_refused)?;
+    Ok(Json(state.addons.status()))
+}
+
+/// What is using `slug` right now, so it cannot be replaced.
+fn addon_in_use(state: &ApiState, slug: &str) -> Option<&'static str> {
+    match slug {
+        "android-target"
+            if !matches!(
+                state.engine.android_target_status().phase,
+                apiaxess_engine_shell::AndroidTargetPhase::Idle
+                    | apiaxess_engine_shell::AndroidTargetPhase::Error
+            ) =>
+        {
+            Some("the Android target is running; stop it first")
+        }
+        "analysis-runtime" if state.pipeline_runs.any_running() => {
+            Some("an APK analysis is running; let it finish first")
+        }
+        _ => None,
+    }
+}
+
+/// Downloads, verifies and installs one add-on in the background.
+async fn addon_install(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<AssetsStatus>, ApiError> {
+    require_operator(&state, &headers, &state.engine.live_workbench())?;
+    if let Some(why) = addon_in_use(&state, &slug) {
+        return Err(addon_refused(why));
+    }
+    state
+        .addons
+        .start_install(&slug)
+        .await
+        .map_err(addon_refused)?;
+    Ok(Json(state.addons.status()))
+}
+
+async fn addon_cancel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<AssetsStatus>, ApiError> {
+    require_operator(&state, &headers, &state.engine.live_workbench())?;
+    state.addons.cancel(&slug);
+    Ok(Json(state.addons.status()))
 }
 
 fn update_refused(why: impl Into<String>, fix: &str) -> ApiError {
@@ -3321,6 +3412,7 @@ mod tests {
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
             updates: UpdateService::inert(),
+            addons: addons::addon_service(),
         }
     }
 
@@ -3447,6 +3539,7 @@ mod tests {
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
             updates: UpdateService::inert(),
+            addons: addons::addon_service(),
         };
         let live = state.engine.live_workbench();
         let mut headers = HeaderMap::new();
@@ -3481,6 +3574,7 @@ mod tests {
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
             updates: UpdateService::inert(),
+            addons: addons::addon_service(),
         };
 
         // CA endpoint fails cleanly before the session CA is provisioned.
@@ -3640,6 +3734,7 @@ mod tests {
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
             updates: UpdateService::inert(),
+            addons: addons::addon_service(),
         };
 
         // A device presents a valid (serial-less) pairing token → pending.
@@ -3767,6 +3862,7 @@ mod tests {
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
             updates: UpdateService::inert(),
+            addons: addons::addon_service(),
         };
         let (code, Json(queued)) = start_pipeline(
             State(state.clone()),

@@ -88,9 +88,14 @@ updated (see `crates/updater/src/channel.rs`).
    `latest.json` (and `latest.json.sig`, once signing is on) to
    `/releases/` — assets first, manifest last, so no app is ever pointed at a
    file that is not there yet.
-5. Copy `scoop/apiaxess.json` to `bucket/apiaxess.json` in the
+5. When an add-on changed (or for the first release), build and publish the
+   on-demand add-ons: `assets/build-addon-artifact.ps1` per add-on and platform,
+   then `assets/update-asset-catalog.ps1`, then sign `assets/index.json` once the
+   key exists (see `assets/README.md`, "Delivery from apiaxess.dev"). Add-ons are
+   versioned on their own; an app release does not need new ones.
+6. Copy `scoop/apiaxess.json` to `bucket/apiaxess.json` in the
    `KatrielMoses/scoop-apiaxess` bucket repo. Later versions can be bumped there by
    Scoop's `checkver`/`autoupdate`, which reads the hash from `SHA256SUMS`.
-6. `choco pack chocolatey/apiaxess.nuspec` and `choco push` to the community
+7. `choco pack chocolatey/apiaxess.nuspec` and `choco push` to the community
    repository (moderation takes days; the package downloads the release MSI and
    verifies its SHA-256).

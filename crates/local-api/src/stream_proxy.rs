@@ -442,6 +442,7 @@ mod tests {
             pending_pairing: PendingPairingRegistry::default(),
             gui_port: 7777,
             updates: apiaxess_updater::service::UpdateService::inert(),
+            addons: crate::addons::addon_service(),
         }
     }
 

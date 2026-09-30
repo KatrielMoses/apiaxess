@@ -42,11 +42,13 @@ pub fn keygen(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `cargo xtask sign-manifest <private-key.pk8> <latest.json>`: writes
-/// `<latest.json>.sig` beside it and checks it verifies.
+/// `cargo xtask sign-manifest <private-key.pk8> <file>`: writes `<file>.sig`
+/// beside `releases/latest.json` or `assets/index.json` and checks it verifies.
 pub fn sign(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let [key, manifest] = arguments else {
-        return Err("usage: cargo xtask sign-manifest <private-key.pk8> <latest.json>".into());
+        return Err(
+            "usage: cargo xtask sign-manifest <private-key.pk8> <latest.json | index.json>".into(),
+        );
     };
     let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&fs::read(key)?)
         .map_err(|_| format!("{key} is not an ed25519 PKCS#8 key"))?;
@@ -72,8 +74,8 @@ pub fn sign(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// A light sanity check that the file is the manifest (a JSON object with a
-/// version), so the wrong file is not signed by mistake.
+/// A light sanity check that the file is a release manifest or add-on catalog
+/// (a JSON object naming a version), so the wrong file is not signed by mistake.
 fn looks_like_manifest(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let text = std::str::from_utf8(bytes).map_err(|_| "the manifest is not UTF-8")?;
     let trimmed = text.trim_start_matches('\u{feff}').trim_start();
@@ -81,7 +83,7 @@ fn looks_like_manifest(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         return Err("the manifest starts with a byte-order mark; write it without one".into());
     }
     if !trimmed.starts_with('{') || !trimmed.contains("\"version\"") {
-        return Err("this does not look like latest.json".into());
+        return Err("this does not look like latest.json or assets/index.json".into());
     }
     Ok(())
 }

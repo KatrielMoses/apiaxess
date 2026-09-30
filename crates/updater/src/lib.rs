@@ -7,7 +7,11 @@
 //! helper after the engine exits. [`channel`] says which of those applies to
 //! this install. The asset-delivery work reuses the same pieces.
 
+#[cfg(feature = "client")]
+pub mod assets;
 pub mod channel;
+#[cfg(feature = "client")]
+pub mod fetch;
 pub mod handoff;
 pub mod manifest;
 #[cfg(feature = "client")]

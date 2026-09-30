@@ -1,8 +1,44 @@
 # Heavy asset delivery
 
-Reserved for signed manifests and download/verification metadata. Android images
-and other heavyweight payloads are downloaded on demand and never committed or
-baked into a native installer.
+Android images and other heavyweight payloads are downloaded on demand and never
+committed or baked into a native installer.
+
+## Delivery from apiaxess.dev (in-app Download)
+
+The two optional add-ons — `analysis-runtime` and `android-target` — are what a
+user downloads from Settings → Add-ons (or the inline "not installed → Download"
+on the APK and Android surfaces). The app never pulls their parts from a third
+party at runtime: the release pipeline assembles each one here, from the pins in
+`<slug>.toml`, into a single artifact per platform, and the app downloads only
+that finished file from apiaxess.dev.
+
+1. `pwsh packaging/assets/build-addon-artifact.ps1 -Slug <slug> -Platform <windows_x64|linux_x64> -SiteRoot <site>`
+   runs `fetch-<slug>.ps1` (or packs an already-assembled `-PayloadDirectory`)
+   and writes `<site>/assets/<slug>/<version>/<slug>-<windows-x64|linux-amd64>.tar.zst`
+   plus `.sha256` and `.json` (sizes). The archive holds the payload root; state a
+   booted emulator leaves behind (userdata, snapshots, locks, adb keys) is left
+   out, so even a used payload packs clean. zstd level 19 by default (the zstd
+   CLI, or Windows' own `tar.exe` when zstd is not installed). Build each
+   platform on that platform (the Android SDK packages are per-OS).
+2. `pwsh packaging/assets/update-asset-catalog.ps1 -SiteRoot <site>` re-hashes the
+   artifacts and writes `<site>/assets/index.json` (name, purpose, version, and per
+   platform: URL, SHA-256, size, installed size). Pin a version with
+   `-Version analysis-runtime=<v>`.
+3. Once the release key exists: `cargo xtask sign-manifest <key.pk8> <site>/assets/index.json`
+   (writes `index.json.sig`; never re-save the JSON afterwards).
+4. Upload `<site>/assets/` to the website: artifacts first, `index.json` (and
+   `.sig`) last. Hosting: each artifact is ~1.2–1.4 GB (4.5–6 GB installed); the
+   host must serve HTTP range requests so interrupted downloads resume.
+
+In the app (`crates/updater/src/assets.rs`): the catalog is fetched only when the
+operator clicks Download, the artifact is kept only if its SHA-256 matches, it is
+unpacked beside its destination (entries escaping the root are refused), the
+AVD's absolute `path=` is rewritten for the new home, and it is swapped into
+place in one rename. It installs to the per-user data directory
+(`%LOCALAPPDATA%\apiaxess\<slug>`, `~/.local/share/apiaxess/<slug>`), which the
+engine resolves after an explicit `APIAXESS_ANALYSIS_RUNTIME` /
+`APIAXESS_ANDROID_TARGET` override and before a copy beside the install
+(`install_layout::addon_root`). With an override set the app never downloads.
 
 `chromium.toml` is the release gate for the owned APIaxess Browser runtime. It
 names an official Chromium snapshot and its SHA-256. `fetch-chromium.ps1`

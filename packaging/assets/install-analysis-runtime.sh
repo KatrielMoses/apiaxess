@@ -10,10 +10,11 @@
 # set; a dynamic run without it reports the honest sandbox.analysis-runtime-missing
 # diagnostic (Phase 12.1).
 #
-# By default this installs into a user-writable directory and prints the
-# APIAXESS_ANALYSIS_RUNTIME export to activate it (no root needed). Pass --system
-# to install into /usr/share/apiaxess/analysis-runtime (needs sudo), which the
-# engine then resolves automatically. It drives sdkmanager with the product's own
+# By default this installs into the per-user data directory
+# ($XDG_DATA_HOME/apiaxess/analysis-runtime), the same place the app's
+# Settings → Add-ons download puts it, which the engine resolves automatically
+# (no root, no export). Pass --system to install into
+# /usr/share/apiaxess/analysis-runtime (needs sudo) instead. It drives sdkmanager with the product's own
 # bundled Java runtime (/usr/share/apiaxess/runtime/java/linux) so no host JDK is
 # required. Needs pwsh (the shared fetch manifests are PowerShell).
 
@@ -73,9 +74,10 @@ if [ ! -x "$destination/emulator/emulator" ]; then
 fi
 
 echo "Analysis runtime installed at $destination."
-if [ "$destination" != "$system_root" ]; then
+user_root="${XDG_DATA_HOME:-$HOME/.local/share}/apiaxess/analysis-runtime"
+if [ "$destination" = "$system_root" ] || [ "$destination" = "$user_root" ]; then
+    echo "The installed engine resolves it automatically (no export needed)."
+else
     echo "Activate it by exporting (add to your shell profile to persist):"
     echo "  export APIAXESS_ANALYSIS_RUNTIME=\"$destination\""
-else
-    echo "The installed engine resolves it automatically; dynamic analysis is now enabled."
 fi

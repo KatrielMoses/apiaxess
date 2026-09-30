@@ -10,6 +10,8 @@ use axum::{
 use base64::Engine as _;
 use ring::signature::KeyPair as _;
 
+use sha2::{Digest as _, Sha256};
+
 use super::*;
 
 const PAYLOAD: &[u8] = b"pretend this is an MSI";

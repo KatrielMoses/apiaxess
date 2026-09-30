@@ -127,6 +127,38 @@ pub fn data_dir_or_temp() -> PathBuf {
     data_dir().unwrap_or_else(|| env::temp_dir().join("apiaxess"))
 }
 
+/// Where the app installs an optional add-on it downloads (`analysis-runtime`,
+/// `android-target`): the per-user data directory, which is writable on every
+/// platform (the `.deb` install tree under `/usr` is not). `install-*.sh`
+/// installs there too.
+#[must_use]
+pub fn addon_user_dir(slug: &str) -> PathBuf {
+    data_dir_or_temp().join(slug)
+}
+
+/// Where the engine looks for an optional add-on: an explicit `env_key`
+/// override (air-gapped and manual installs), else the per-user copy, else a
+/// copy beside the install (where `install-*.ps1` puts it), else the per-user
+/// directory a download would fill.
+#[must_use]
+pub fn addon_root(slug: &str, env_key: &str) -> PathBuf {
+    if let Some(configured) = env::var_os(env_key) {
+        return PathBuf::from(configured);
+    }
+    addon_root_in(
+        addon_user_dir(slug),
+        resource_base().map(|base| base.join(slug)),
+    )
+}
+
+/// [`addon_root`]'s choice between the per-user and install-tree copies.
+fn addon_root_in(user: PathBuf, install_tree: Option<PathBuf>) -> PathBuf {
+    if user.is_dir() {
+        return user;
+    }
+    install_tree.filter(|tree| tree.is_dir()).unwrap_or(user)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +266,23 @@ mod tests {
             )
         );
         assert_eq!(Layout::MacOs.data_dir_with(vars(&[])), None);
+    }
+
+    #[test]
+    fn a_per_user_addon_wins_then_the_install_tree_then_the_download_target() {
+        let root = env::temp_dir().join(format!("apiaxess-addon-root-{}", std::process::id()));
+        let user = root.join("user").join("analysis-runtime");
+        let tree = root.join("tree").join("analysis-runtime");
+        let _ = std::fs::remove_dir_all(&root);
+        // Neither exists: the download target.
+        assert_eq!(addon_root_in(user.clone(), Some(tree.clone())), user);
+        assert_eq!(addon_root_in(user.clone(), None), user);
+        // Only the install tree has one (install-analysis-runtime.ps1).
+        std::fs::create_dir_all(&tree).unwrap();
+        assert_eq!(addon_root_in(user.clone(), Some(tree.clone())), tree);
+        // A per-user copy (downloaded in-app) takes over.
+        std::fs::create_dir_all(&user).unwrap();
+        assert_eq!(addon_root_in(user.clone(), Some(tree)), user);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

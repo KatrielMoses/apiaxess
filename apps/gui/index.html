@@ -301,6 +301,7 @@
                         >
                       </span>
                     </label>
+                    <div id="apk-addon-note" hidden></div>
                     <label class="check">
                       <input id="apk-static-only" type="checkbox" />
                       <span>
@@ -1087,6 +1088,22 @@
                   only the app's version and platform (to pick the right download) — no identifiers, nothing about you
                   or your sessions. Turn it off with "Check for updates" below or <span class="t-mono">APIAXESS_UPDATE_CHECK=0</span>.
                   Downloads are checked against their published SHA-256 before anything is installed.
+                </p>
+              </div>
+            </article>
+            <article class="panel" id="settings-addons">
+              <div class="panel__header">
+                <div class="panel__heading"><span data-icon="apk"></span><h2>Add-ons</h2></div>
+                <span class="panel__hint">optional, downloaded on demand</span>
+              </div>
+              <div class="panel__body stack">
+                <div id="addons-list" class="stack"></div>
+                <p class="field__hint">
+                  The heavy Android add-ons are not part of the installer. Download fetches one pre-assembled file
+                  from apiaxess.dev only — never a third party — checks it against its published SHA-256, and
+                  installs it for your user. Nothing about you or your sessions is sent. To manage one yourself
+                  (air-gapped or a custom copy), point <span class="t-mono">APIAXESS_ANALYSIS_RUNTIME</span> or
+                  <span class="t-mono">APIAXESS_ANDROID_TARGET</span> at it; the app then never downloads over it.
                 </p>
               </div>
             </article>

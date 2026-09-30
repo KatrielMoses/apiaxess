@@ -1857,16 +1857,12 @@ impl BundledEmulatorConfig {
 }
 
 /// The analysis-runtime root: an explicit `APIAXESS_ANALYSIS_RUNTIME` override,
-/// otherwise `analysis-runtime/` under the shared install layout's resource
-/// base — matching the other bundled components.
-fn analysis_runtime_root() -> PathBuf {
-    if let Some(configured) = std::env::var_os("APIAXESS_ANALYSIS_RUNTIME") {
-        return PathBuf::from(configured);
-    }
-    apiaxess_install_layout::resource_base().map_or_else(
-        || PathBuf::from("analysis-runtime"),
-        |base| base.join("analysis-runtime"),
-    )
+/// otherwise the per-user copy the app downloads (or `install-*.sh` stages),
+/// otherwise `analysis-runtime/` beside the install — see
+/// [`apiaxess_install_layout::addon_root`].
+#[must_use]
+pub fn analysis_runtime_root() -> PathBuf {
+    apiaxess_install_layout::addon_root("analysis-runtime", "APIAXESS_ANALYSIS_RUNTIME")
 }
 
 /// Host path to the bundled device-side `frida-server` shipped in the analysis
@@ -3448,7 +3444,8 @@ const EMULATOR_MIN_FREE_MB_DEFAULT: u64 = 7_400;
 /// Resolves the emulator free-space requirement in bytes, honoring the advanced
 /// `APIAXESS_EMULATOR_MIN_FREE_MB` override for non-default images. A missing,
 /// empty, unparseable, or zero value falls back to the default.
-fn emulator_min_free_bytes() -> u64 {
+#[must_use]
+pub fn emulator_min_free_bytes() -> u64 {
     resolve_min_free_bytes(std::env::var("APIAXESS_EMULATOR_MIN_FREE_MB").ok())
 }
 
@@ -3466,7 +3463,8 @@ fn resolve_min_free_bytes(raw_override: Option<String>) -> u64 {
 /// be determined. The leaf may not exist yet on a first run (the AVD home is
 /// created at boot), so this measures the nearest existing ancestor, which is on
 /// the same volume.
-fn available_space(path: &Path) -> Option<u64> {
+#[must_use]
+pub fn available_space(path: &Path) -> Option<u64> {
     let mut probe = path;
     let existing = loop {
         if probe.exists() {

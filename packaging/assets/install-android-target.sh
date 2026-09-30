@@ -11,10 +11,11 @@
 # launching a GUI target without it reports the honest sandbox.android-target-missing
 # diagnostic.
 #
-# By default this installs into a user-writable directory and prints the
-# APIAXESS_ANDROID_TARGET export to activate it (no root needed). Pass --system to
-# install into /usr/share/apiaxess/android-target (needs sudo), which the engine
-# then resolves automatically. It drives sdkmanager with the product's own bundled
+# By default this installs into the per-user data directory
+# ($XDG_DATA_HOME/apiaxess/android-target), the same place the app's
+# Settings → Add-ons download puts it, which the engine resolves automatically
+# (no root, no export). Pass --system to install into
+# /usr/share/apiaxess/android-target (needs sudo) instead. It drives sdkmanager with the product's own bundled
 # Java runtime (/usr/share/apiaxess/runtime/java/linux) so no host JDK is required.
 # Needs pwsh (the shared fetch manifests are PowerShell).
 
@@ -77,9 +78,10 @@ if [ ! -x "$destination/emulator/emulator" ]; then
 fi
 
 echo "GUI Android target installed at $destination."
-if [ "$destination" != "$system_root" ]; then
+user_root="${XDG_DATA_HOME:-$HOME/.local/share}/apiaxess/android-target"
+if [ "$destination" = "$system_root" ] || [ "$destination" = "$user_root" ]; then
+    echo "The installed engine resolves it automatically (no export needed)."
+else
     echo "Activate it by exporting (add to your shell profile to persist):"
     echo "  export APIAXESS_ANDROID_TARGET=\"$destination\""
-else
-    echo "The installed engine resolves it automatically; launching a GUI Android target is now enabled."
 fi

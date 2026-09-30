@@ -9,7 +9,6 @@
 //! manifest's own origin, and failures are silent (retried on the next tick).
 
 use std::{
-    io::Write as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -17,11 +16,11 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use crate::{
     channel::InstallChannel,
+    fetch::{Download, Fetcher},
     handoff::{self, InstallHandoff, InstallWhen},
     manifest::{self, ReleaseAsset, ReleaseManifest},
     verify,
@@ -32,18 +31,6 @@ pub const DEFAULT_MANIFEST_URL: &str = "https://apiaxess.dev/releases/latest.jso
 
 /// How often the check repeats.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Largest detached signature file read.
-const MAX_SIGNATURE_BYTES: usize = 1024;
-
-/// Largest asset downloaded, whatever the manifest says.
-const MAX_ASSET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
-/// How long a manifest request may take in total.
-const MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long a download may stall between chunks.
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Everything the service needs to know about this install.
 #[derive(Clone, Debug)]
@@ -115,9 +102,10 @@ pub fn user_agent(version: &semver::Version) -> String {
     )
 }
 
-fn parse_manifest_url(value: &str) -> Result<Url, String> {
-    let url =
-        Url::parse(value).map_err(|error| format!("APIAXESS_UPDATE_MANIFEST_URL: {error}"))?;
+/// Parses a test-only URL override from `variable`: `https`, or `http` on a
+/// loopback address (a local test server).
+pub(crate) fn parse_test_url(variable: &str, value: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|error| format!("{variable}: {error}"))?;
     let loopback = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
@@ -127,11 +115,14 @@ fn parse_manifest_url(value: &str) -> Result<Url, String> {
     match url.scheme() {
         "https" => Ok(url),
         "http" if loopback => Ok(url),
-        _ => Err(
-            "APIAXESS_UPDATE_MANIFEST_URL must be https (http only on a loopback address)"
-                .to_owned(),
-        ),
+        _ => Err(format!(
+            "{variable} must be https (http only on a loopback address)"
+        )),
     }
+}
+
+fn parse_manifest_url(value: &str) -> Result<Url, String> {
+    parse_test_url("APIAXESS_UPDATE_MANIFEST_URL", value)
 }
 
 /// Whether the manifest was signature-checked.
@@ -715,178 +706,43 @@ fn file_version(name: &str) -> Option<semver::Version> {
         .find_map(|part| semver::Version::parse(part).ok())
 }
 
-fn http_client(config: &UpdateConfig) -> Result<reqwest::Client, String> {
-    let origin = config.manifest_url.origin();
-    reqwest::Client::builder()
-        .user_agent(&config.user_agent)
-        .referer(false)
-        .https_only(config.manifest_url.scheme() == "https")
-        .connect_timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= 5 {
-                attempt.error("too many redirects")
-            } else if attempt.url().origin() == origin {
-                attempt.follow()
-            } else {
-                attempt.error("a redirect left the release server")
-            }
-        }))
-        .build()
-        .map_err(|error| format!("the update client could not start: {error}"))
-}
-
-/// Reads a response body, refusing more than `limit` bytes.
-async fn read_capped(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("the release server connection failed: {error}"))?
-    {
-        if body.len() + chunk.len() > limit {
-            return Err("the release server sent more than expected".to_owned());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-async fn get(client: &reqwest::Client, url: &Url) -> Result<reqwest::Response, String> {
-    let response = client.get(url.clone()).send().await.map_err(|error| {
-        format!(
-            "could not reach {}: {error}",
-            url.host_str().unwrap_or("the release server")
-        )
-    })?;
-    if !response.status().is_success() {
-        return Err(format!("{url} answered {}", response.status()));
-    }
-    Ok(response)
-}
-
 /// Fetches the manifest (and, when a key is embedded, its signature), and
 /// trusts its contents only after the signature verifies.
 async fn fetch_manifest(config: &UpdateConfig) -> Result<ReleaseManifest, String> {
-    let client = http_client(config)?;
-    let fetch = async {
-        let bytes = read_capped(
-            get(&client, &config.manifest_url).await?,
+    let fetcher = Fetcher::new(&config.manifest_url, &config.user_agent)?;
+    let bytes = fetcher
+        .fetch_signed(
+            &config.manifest_url,
             manifest::MAX_MANIFEST_BYTES,
+            config.public_key.as_ref(),
         )
         .await?;
-        if let Some(key) = &config.public_key {
-            let mut signature_url = config.manifest_url.clone();
-            signature_url.set_path(&format!("{}.sig", config.manifest_url.path()));
-            let signature =
-                read_capped(get(&client, &signature_url).await?, MAX_SIGNATURE_BYTES).await?;
-            verify::verify_manifest_signature(&bytes, &signature, key)?;
-        }
-        ReleaseManifest::parse(&bytes, &config.manifest_url).map_err(|error| error.to_string())
-    };
-    tokio::time::timeout(MANIFEST_TIMEOUT, fetch)
-        .await
-        .map_err(|_| "the release server did not answer in time".to_owned())?
+    ReleaseManifest::parse(&bytes, &config.manifest_url).map_err(|error| error.to_string())
 }
 
-/// Downloads `asset` to the updates directory through a `.partial` file,
-/// hashing as it goes; only a file whose SHA-256 matches the manifest is
-/// renamed into place. Anything else is deleted.
+/// Downloads `asset` to the updates directory, kept only when its SHA-256
+/// matches the manifest.
 async fn download_asset(
     config: &UpdateConfig,
     asset: &ReleaseAsset,
     url: &Url,
     progress: impl Fn(u64),
 ) -> Result<PathBuf, String> {
-    let name = manifest::asset_file_name(url).ok_or("the asset has no safe file name")?;
-    std::fs::create_dir_all(&config.updates_dir)
-        .map_err(|error| format!("{}: {error}", config.updates_dir.display()))?;
-    let destination = config.updates_dir.join(&name);
-    let expected = asset.sha256.to_ascii_lowercase();
-    if destination.is_file() {
-        let existing = destination.clone();
-        let reusable = tokio::task::spawn_blocking(move || verify::sha256_file(&existing))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .is_some_and(|actual| actual == expected);
-        if reusable {
-            return Ok(destination);
-        }
-        let _ = std::fs::remove_file(&destination);
-    }
-    let partial = config.updates_dir.join(format!("{name}.partial"));
-    let result = stream_to(config, asset, url, &partial, &expected, progress).await;
-    match result {
-        Ok(()) => std::fs::rename(&partial, &destination)
-            .map(|()| destination)
-            .map_err(|error| {
-                let _ = std::fs::remove_file(&partial);
-                format!("the verified download could not be saved: {error}")
-            }),
-        Err(why) => {
-            let _ = std::fs::remove_file(&partial);
-            Err(why)
-        }
-    }
-}
-
-async fn stream_to(
-    config: &UpdateConfig,
-    asset: &ReleaseAsset,
-    url: &Url,
-    partial: &Path,
-    expected: &str,
-    progress: impl Fn(u64),
-) -> Result<(), String> {
-    let limit = if asset.size > 0 {
-        asset.size
-    } else {
-        MAX_ASSET_BYTES
-    };
-    let client = http_client(config)?;
-    let mut response = get(&client, url).await?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit)
-    {
-        return Err("the download is larger than the release manifest says".to_owned());
-    }
-    let mut file = std::fs::File::create(partial)
-        .map_err(|error| format!("{}: {error}", partial.display()))?;
-    let mut hasher = Sha256::new();
-    let mut received: u64 = 0;
-    loop {
-        let chunk = tokio::time::timeout(CHUNK_TIMEOUT, response.chunk())
-            .await
-            .map_err(|_| "the download stalled".to_owned())?
-            .map_err(|error| format!("the download failed: {error}"))?;
-        let Some(chunk) = chunk else {
-            break;
-        };
-        received += chunk.len() as u64;
-        if received > limit {
-            return Err("the download is larger than the release manifest says".to_owned());
-        }
-        hasher.update(&chunk);
-        file.write_all(&chunk)
-            .map_err(|error| format!("the download could not be written: {error}"))?;
-        progress(received);
-    }
-    if asset.size > 0 && received != asset.size {
-        return Err(format!(
-            "the download ended early ({received} of {} bytes); nothing was installed",
-            asset.size
-        ));
-    }
-    file.sync_all()
-        .map_err(|error| format!("the download could not be written: {error}"))?;
-    let actual = verify::hex(&hasher.finalize());
-    if actual != expected {
-        return Err(format!(
-            "the download does not match its published SHA-256 (expected {expected}, got {actual}); it was deleted and nothing was installed"
-        ));
-    }
-    Ok(())
+    let fetcher = Fetcher::new(&config.manifest_url, &config.user_agent)?;
+    fetcher
+        .download(
+            Download {
+                url,
+                sha256: &asset.sha256,
+                size: asset.size,
+                dir: &config.updates_dir,
+                resumable: false,
+            },
+            progress,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

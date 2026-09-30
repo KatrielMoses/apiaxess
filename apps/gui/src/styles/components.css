@@ -1468,7 +1468,22 @@
   row-gap: var(--space-1);
 }
 
-.update-banner .update-actions {
+.update-banner /* Add-on download / unpack progress. */
+.addon-progress {
+  height: 4px;
+  background: var(--color-surface-sunken);
+  border: var(--border);
+  overflow: hidden;
+}
+
+.addon-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+  transition: width 0.3s ease;
+}
+
+.update-actions {
   margin-left: auto;
 }
 

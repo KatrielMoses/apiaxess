@@ -811,6 +811,16 @@ pub mod catalogue {
         fix: "Finish or stop it first, or choose \"Install on next launch\" to install when this session ends.",
     };
 
+    /// An add-on download or install could not start or finish.
+    pub const ADDON_REFUSED: DiagnosticDefinition = DiagnosticDefinition {
+        id: "addon.refused",
+        category: DiagnosticCategory::ExternalTool,
+        severity: DiagnosticSeverity::Warning,
+        what: "The add-on was not downloaded.",
+        why: "The catalog could not be fetched, the disk is too full, or the add-on is in use or managed outside the app.",
+        fix: "Read the reason, fix it, and click Download again; nothing was installed.",
+    };
+
     /// A proxy was requested for a non-active session.
     pub const PROXY_SESSION_NOT_ACTIVE: DiagnosticDefinition = DiagnosticDefinition {
         id: "proxy.session-not-active",
@@ -1239,6 +1249,7 @@ pub mod catalogue {
         SETTINGS_SAVED_VALUE_IGNORED,
         UPDATE_REFUSED,
         UPDATE_SESSION_BUSY,
+        ADDON_REFUSED,
         PROXY_SESSION_NOT_ACTIVE,
         WEB_TARGET_REQUIRED,
         DISCOVERY_WORDLIST_UNKNOWN,
@@ -1964,7 +1975,7 @@ pub mod catalogue {
         severity: DiagnosticSeverity::Error,
         what: "The APIaxess analysis runtime (Android emulator) is not installed.",
         why: "Dynamic analysis uses a bundled QEMU + owned Android image shipped as a separate, optional download that is not part of the base application.",
-        fix: "Install the APIaxess analysis runtime payload to enable dynamic analysis; static and web workflows do not require it.",
+        fix: "Download the analysis runtime in Settings → Add-ons (it comes from apiaxess.dev and is SHA-256-verified), or point APIAXESS_ANALYSIS_RUNTIME at an installed copy; static and web workflows do not require it.",
     };
 
     /// Hardware virtualization was detected; the bundled emulator runs accelerated.
@@ -2434,7 +2445,7 @@ pub mod catalogue {
         severity: DiagnosticSeverity::Error,
         what: "The GUI Android target add-on is not installed.",
         why: "A GUI-drivable Android target runs a slim no-GApps AOSP emulator shipped as a separate, optional download that is not part of the base application.",
-        fix: "Install the GUI Android target add-on (install-android-target.ps1 / .sh) to enable a GUI-drivable target; static, web, and autonomous-dynamic workflows do not require it.",
+        fix: "Download the Android target in Settings → Add-ons (or from the Android target panel), or point APIAXESS_ANDROID_TARGET at an installed copy; static, web, and autonomous-dynamic workflows do not require it.",
     };
 
     /// The installed GUI Android target add-on predates what this engine needs.
@@ -2449,7 +2460,7 @@ pub mod catalogue {
         severity: DiagnosticSeverity::Error,
         what: "The installed GUI Android target add-on is out of date.",
         why: "It is older than this version of APIaxess supports: its screen stream is not built for the path the engine serves the device view under, so the device screen would stay blank. The APIaxess installer does not update the separately installed add-on.",
-        fix: "Update the add-on by re-running install-android-target.ps1 (Windows) or install-android-target.sh (Linux), then launch the Android target again.",
+        fix: "Download the current Android target in Settings → Add-ons (or re-run install-android-target.ps1 / .sh), then launch the Android target again.",
     };
 
     /// The GUI Android target add-on manifest is missing or malformed.
@@ -2536,7 +2547,7 @@ pub mod catalogue {
         severity: DiagnosticSeverity::Error,
         what: "The Android target's screen stream is not being served.",
         why: "ws-scrcpy started but did not answer with the device view at its base path (the context has what it answered), so the screen would be blank. This happens when the add-on's ws-scrcpy build predates base-path support, or when it failed to start.",
-        fix: "Update the GUI Android target add-on (re-run install-android-target.ps1 or .sh), then relaunch the target. It still boots and captures traffic without the screen.",
+        fix: "Update the GUI Android target add-on (Settings → Add-ons → Download, or re-run install-android-target.ps1 / .sh), then relaunch the target. It still boots and captures traffic without the screen.",
     };
 
     /// The GUI Android target's screen stream (ws-scrcpy) started on loopback.

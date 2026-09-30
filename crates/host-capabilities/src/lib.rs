@@ -485,18 +485,14 @@ impl Default for HostDetectionConfig {
     }
 }
 
-/// Candidate roots for the bundled analysis-runtime, mirroring
-/// `sandbox::analysis_runtime_root()`: the `APIAXESS_ANALYSIS_RUNTIME` override
-/// first, otherwise the install-relative `analysis-runtime/` directory.
+/// Candidate roots for the bundled analysis-runtime: exactly the one
+/// `sandbox::analysis_runtime_root()` boots from (the shared add-on resolver),
+/// so the capability probes inspect that emulator.
 fn analysis_runtime_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(configured) = std::env::var_os("APIAXESS_ANALYSIS_RUNTIME") {
-        roots.push(PathBuf::from(configured));
-    }
-    if let Some(base) = apiaxess_install_layout::resource_base() {
-        roots.push(base.join("analysis-runtime"));
-    }
-    roots
+    vec![apiaxess_install_layout::addon_root(
+        "analysis-runtime",
+        "APIAXESS_ANALYSIS_RUNTIME",
+    )]
 }
 
 fn default_android_tool(directory: &str, executable: &str) -> String {

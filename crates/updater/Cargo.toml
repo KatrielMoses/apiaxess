@@ -1,6 +1,6 @@
 [package]
 name = "apiaxess-updater"
-description = "In-app update check, verified download, and installer handoff"
+description = "In-app updates and on-demand add-ons from apiaxess.dev: verified download, install, and installer handoff"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,7 @@ default = ["client"]
 # The network side: the daily manifest check, signature verification, and the
 # verified download. The desktop shell only consumes an install handoff, so it
 # builds without this.
-client = ["dep:reqwest", "dep:ring", "dep:tokio"]
+client = ["dep:reqwest", "dep:ring", "dep:tokio", "dep:tar", "dep:zstd"]
 
 [dependencies]
 apiaxess-external-tools = { path = "../external-tools" }
@@ -29,6 +29,9 @@ url = "2.5.8"
 ring = { version = "0.17.14", optional = true }
 reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+# Add-on artifacts are .tar.zst (zstd is already in the lock through zip).
+tar = { version = "0.4", optional = true }
+zstd = { version = "0.13.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

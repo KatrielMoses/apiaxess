@@ -25,6 +25,7 @@ import { initTheme } from "./ui/theme";
 import { type CredentialDialogField, choiceDialog, confirmDialog, credentialDialog, promptDialog } from "./ui/overlay";
 import { toast } from "./ui/toast";
 import { type UpdateAction, type UpdateNotice, type UpdateStatus, updateView } from "./update/model";
+import { type AddonView, type AddonsStatus, addonCard, anyActive, downloadConfirmation } from "./addons/model";
 import {
   FUZZ_MARK,
   type ParsedTemplate,
@@ -6695,6 +6696,162 @@ document.querySelector<HTMLButtonElement>("#update-check")?.addEventListener("cl
 });
 
 /* ==================================================================== *
+ * 19c. Add-ons — the analysis runtime and Android target, on demand
+ *
+ * The engine owns the catalog, the verified download, and the install. The
+ * catalog is fetched only when the operator clicks Download; this view shows
+ * local state until then. What each state says lives in addons/model.ts.
+ * ==================================================================== */
+
+let addonsStatus: AddonsStatus | null = null;
+let addonsPoll: number | undefined;
+
+function addonView(slug: string): AddonView | undefined {
+  return addonsStatus?.addons.find((addon) => addon.slug === slug);
+}
+
+/** One add-on as a notice: its state, progress, and actions. */
+function addonCardHtml(view: AddonView, compact = false): string {
+  const card = addonCard(view, addonsStatus?.platform ?? null);
+  const tone = card.tone === "neutral" ? "" : ` notice--${card.tone}`;
+  const iconName = card.tone === "success" ? "check" : card.tone === "danger" || card.tone === "caution" ? "alert" : "apk";
+  const progress = card.progress === null ? "" : `<div class="addon-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${card.progress}"><span style="width:${card.progress}%"></span></div>`;
+  const actions = card.actions.length === 0 ? "" : `<div class="row update-actions">${card.actions.map((action) => `<button class="btn btn--sm${action.primary === true ? " btn--primary" : ""}" type="button" data-addon-action="${action.kind}" data-addon="${escapeHtml(view.slug)}">${escapeHtml(action.label)}</button>`).join("")}</div>`;
+  const lines = (compact ? card.lines.slice(-1) : card.lines).map((line) => `<p>${escapeHtml(line)}</p>`).join("");
+  const signature = `${card.tone}|${card.progress === null ? "" : "p"}|${card.actions.map((action) => `${action.kind}:${action.label}`).join(",")}`;
+  return `<div class="notice${tone}" data-addon-card="${escapeHtml(view.slug)}" data-signature="${escapeHtml(signature)}"><span class="notice__icon">${icon(iconName, { size: 18 })}</span><div class="notice__body"><div class="row row--between"><p class="notice__title">${escapeHtml(view.name)}</p><span class="badge" data-addon-badge>${escapeHtml(card.badge)}</span></div><div data-addon-lines>${lines}</div>${progress}${actions}</div></div>`;
+}
+
+/** Puts `view`'s card into `host`. A card whose tone and buttons are unchanged
+ *  is updated in place (text, badge, progress), so a button is never swapped
+ *  out under the pointer while a download reports progress every second. */
+function placeAddonCard(host: HTMLElement, view: AddonView, compact = false): void {
+  const html = addonCardHtml(view, compact);
+  const scratch = document.createElement("div");
+  scratch.innerHTML = html;
+  const next = scratch.firstElementChild as HTMLElement | null;
+  const current = host.querySelector<HTMLElement>(`[data-addon-card="${CSS.escape(view.slug)}"]`);
+  if (next === null) return;
+  if (current !== null && current.dataset.signature === next.dataset.signature) {
+    const copy = (selector: string): void => {
+      const from = next.querySelector<HTMLElement>(selector);
+      const to = current.querySelector<HTMLElement>(selector);
+      if (from !== null && to !== null && to.innerHTML !== from.innerHTML) to.innerHTML = from.innerHTML;
+    };
+    copy("[data-addon-badge]");
+    copy("[data-addon-lines]");
+    const bar = next.querySelector<HTMLElement>(".addon-progress");
+    const currentBar = current.querySelector<HTMLElement>(".addon-progress");
+    if (bar !== null && currentBar !== null) {
+      currentBar.setAttribute("aria-valuenow", bar.getAttribute("aria-valuenow") ?? "0");
+      const fill = currentBar.querySelector<HTMLElement>("span");
+      const width = bar.querySelector<HTMLElement>("span")?.style.width ?? "0%";
+      if (fill !== null) fill.style.width = width;
+    }
+    return;
+  }
+  if (current !== null) current.replaceWith(next);
+  else { host.innerHTML = ""; host.append(next); }
+}
+
+function renderAddons(): void {
+  const list = document.querySelector<HTMLElement>("#addons-list");
+  if (list !== null) {
+    if (addonsStatus === null) {
+      list.innerHTML = '<p class="t-small t-subtle">Add-on status is unavailable.</p>';
+    } else {
+      list.querySelector(":scope > p")?.remove();
+      for (const view of addonsStatus.addons) {
+        let slot = list.querySelector<HTMLElement>(`[data-addon-host="${CSS.escape(view.slug)}"]`);
+        if (slot === null) {
+          slot = document.createElement("div");
+          slot.dataset.addonHost = view.slug;
+          list.append(slot);
+        }
+        placeAddonCard(slot, view);
+      }
+      let error = list.querySelector<HTMLElement>("[data-addon-catalog-error]");
+      if (addonsStatus.catalogError === null) error?.remove();
+      else {
+        if (error === null) {
+          error = document.createElement("p");
+          error.className = "t-small t-subtle";
+          error.dataset.addonCatalogError = "";
+          list.append(error);
+        }
+        error.textContent = `Last catalog check: ${addonsStatus.catalogError}`;
+      }
+    }
+  }
+  // The APK form: say so up front when the dynamic pass has no runtime.
+  const note = document.querySelector<HTMLElement>("#apk-addon-note");
+  const runtime = addonView("analysis-runtime");
+  if (note !== null) {
+    const missing = runtime !== undefined && (!runtime.installed || runtime.job.phase !== "idle") && runtime.job.phase !== "installed";
+    note.hidden = !missing;
+    if (missing && runtime !== undefined) placeAddonCard(note, runtime, true);
+    else note.innerHTML = "";
+  }
+  // The Android panel re-renders from its own poll; refresh its add-on slot.
+  const androidSlot = document.querySelector<HTMLElement>("[data-addon-slot='android-target']");
+  const target = addonView("android-target");
+  if (androidSlot !== null && target !== undefined) placeAddonCard(androidSlot, target);
+}
+
+async function refreshAddons(): Promise<void> {
+  try {
+    const response = await fetch("/api/v1/addons");
+    if (!response.ok) return;
+    addonsStatus = (await response.json()) as AddonsStatus;
+  } catch {
+    return;
+  }
+  renderAddons();
+  window.clearInterval(addonsPoll);
+  addonsPoll = undefined;
+  if (anyActive(addonsStatus)) addonsPoll = window.setInterval(() => void refreshAddons(), 1000);
+  else if (addonsStatus.addons.some((addon) => addon.job.phase === "installed")) void refreshAndroidStatus();
+}
+
+async function postAddons(path: string, method = "POST"): Promise<void> {
+  const response = await fetch(path, { method, headers: pairingHeaders() });
+  await requireOk(response, "the add-on request failed");
+  addonsStatus = (await response.json()) as AddonsStatus;
+  renderAddons();
+}
+
+/** Download: fetch the catalog if this run has not, confirm the size, start. */
+async function downloadAddon(slug: string, button: HTMLButtonElement): Promise<void> {
+  try {
+    if (addonView(slug)?.available == null) {
+      await withBusy(button, "Checking apiaxess.dev…", () => postAddons("/api/v1/addons/catalog"));
+    }
+    const view = addonView(slug);
+    if (view === undefined) return;
+    if (view.available === null) {
+      toast(`apiaxess.dev does not offer ${view.name} for this platform yet.`, "danger");
+      return;
+    }
+    const confirm = downloadConfirmation(view);
+    const accepted = await confirmDialog({ eyebrow: "Add-on", title: confirm.title, message: confirm.message, facts: confirm.facts, confirmLabel: "Download" });
+    if (!accepted) return;
+    await postAddons(`/api/v1/addons/${encodeURIComponent(slug)}/install`);
+    void refreshAddons();
+  } catch (error) {
+    if (!(error instanceof ApiRequestError)) reportUnexpected(error, { id: "addon.download-failed", what: "The add-on download did not start.", why: "", fix: "Check the connection to apiaxess.dev and try again." });
+    void refreshAddons();
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("[data-addon-action]");
+  if (button === null || button === undefined || button.disabled) return;
+  const slug = button.dataset.addon ?? "";
+  if (button.dataset.addonAction === "download") void downloadAddon(slug, button);
+  if (button.dataset.addonAction === "cancel") void postAddons(`/api/v1/addons/${encodeURIComponent(slug)}/install`, "DELETE").catch(() => undefined);
+});
+
+/* ==================================================================== *
  * Wiring
  * ==================================================================== */
 
@@ -7091,6 +7248,7 @@ function paintShell(): void {
       void refreshResendList();
       void refreshFuzzList();
     }
+    if (view === "settings" || view === "apk" || view === "android") void refreshAddons();
     if (view === "settings") {
       void refreshSettings();
       void refreshUpdateStatus();
@@ -7226,6 +7384,7 @@ async function boot(): Promise<void> {
     await refreshBrowserStatus();
     await restoreWorkbench();
     void refreshUpdateStatus();
+    void refreshAddons();
     window.setInterval(() => void refreshPending(), 500);
     window.setInterval(() => void refreshHealth(), 5000);
     pipelinePoll = window.setInterval(() => void refreshPipeline(), 1000);
@@ -7643,11 +7802,11 @@ function androidDiagnosticNotices(status: AndroidTargetStatus): string {
 
 function androidStatusBody(status: AndroidTargetStatus): string {
   if (!status.addonPresent) {
-    return stateBlock({ icon: "apk", title: "Android target add-on not installed", body: "The GUI Android target is a separate, optional download. Install it with install-android-target.ps1 (Windows) or .sh (Linux), then launch it here." });
+    return `${stateBlock({ icon: "apk", title: "Android target add-on not installed", body: "The GUI Android target is a separate, optional download from apiaxess.dev. Download it here, then launch it." })}<div data-addon-slot="android-target"></div>`;
   }
   const outdated = status.addonOutdated ?? null;
   if (outdated !== null && (status.phase === "idle" || status.phase === "error")) {
-    return `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">The Android target add-on is out of date</p><p>Version ${escapeHtml(outdated.installed)} is installed; this APIaxess needs ${escapeHtml(outdated.required)} or newer. The older add-on's screen stream does not serve the device view this version uses, so its screen would stay blank. The APIaxess installer does not update the add-on.</p><p class="t-small t-subtle">Update it by re-running install-android-target.ps1 (Windows) or install-android-target.sh (Linux), then launch the target here.</p></div></div>`;
+    return `<div class="notice notice--caution"><span class="notice__icon">${icon("alert", { size: 18 })}</span><div class="notice__body"><p class="notice__title">The Android target add-on is out of date</p><p>Version ${escapeHtml(outdated.installed)} is installed; this APIaxess needs ${escapeHtml(outdated.required)} or newer. The older add-on's screen stream does not serve the device view this version uses, so its screen would stay blank. The APIaxess installer does not include the add-on.</p><p class="t-small t-subtle">Download the current version below, then launch the target here.</p></div></div><div data-addon-slot="android-target"></div>`;
   }
   if (status.phase === "idle") {
     return stateBlock({ icon: "play", title: "No Android target running", body: "Launch to boot the AVD, provision it (client app, session CA, instrumentation), and start the screen stream — one click." });
@@ -7777,13 +7936,27 @@ function renderAndroidStatus(status: AndroidTargetStatus): void {
   if (androidStop !== null) androidStop.hidden = !(inFlight || status.phase === "ready");
   if (androidInstallPanel !== null) androidInstallPanel.hidden = status.phase !== "ready";
   updateAndroidInstalled(status);
-  if (androidStatus !== null) { androidStatus.innerHTML = androidStatusBody(status); hydrateIcons(androidStatus); }
+  // The panel polls every second: only replace the markup when it changed, so
+  // a button inside it (Download) is not swapped out mid-click.
+  if (androidStatus !== null) {
+    const markup = androidStatusBody(status);
+    if (androidStatus.dataset.rendered !== markup) {
+      androidStatus.dataset.rendered = markup;
+      androidStatus.innerHTML = markup;
+      hydrateIcons(androidStatus);
+      // The add-on card fills its slot and updates in place from the add-on poll.
+      const slot = androidStatus.querySelector<HTMLElement>("[data-addon-slot='android-target']");
+      const target = addonView("android-target");
+      if (slot !== null && target !== undefined) placeAddonCard(slot, target);
+    }
+  }
   updateAndroidScreen(status);
 }
 
 function renderAndroidUnavailable(): void {
   if (androidStatus !== null) {
     androidStatus.innerHTML = stateBlock({ icon: "lock", title: "Workbench session not ready", body: "The operator token is not available yet. Reload once the local engine is up." });
+    delete androidStatus.dataset.rendered;
     hydrateIcons(androidStatus);
   }
   if (androidLaunch !== null) androidLaunch.disabled = true;

@@ -3471,7 +3471,7 @@ pub fn bundled_tool_status() -> Vec<BundledToolStatus> {
         optional: true,
         problem: android_addon_version_gap().map(|gap| {
             format!(
-                "Out of date: version {} is installed, this APIaxess needs {} or newer. Re-run install-android-target to update it.",
+                "Out of date: version {} is installed, this APIaxess needs {} or newer. Download the current one in Settings → Add-ons.",
                 gap.installed, gap.required
             )
         }),
