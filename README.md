@@ -30,13 +30,13 @@ sends out is an optional update check you can turn off.
 
 ## Demo
 
-<!-- placeholders — drop the GIFs at docs/demo/*.gif (see docs/demo/README.md) -->
+<!-- placeholders — drop the GIFs at assets/gifs/*.gif (see assets/gifs/README.md) -->
 
 | Web capture → surface | Fuzz |
 | --- | --- |
-| ![Web capture to API surface](docs/demo/web-capture.gif) | ![Fuzz workbench](docs/demo/fuzz.gif) |
+| ![Web capture to API surface](assets/gifs/web-capture.gif) | ![Fuzz workbench](assets/gifs/fuzz.gif) |
 | **Android target** | **Export** |
-| ![Drivable Android target](docs/demo/android.gif) | ![Export formats](docs/demo/export.gif) |
+| ![Drivable Android target](assets/gifs/android.gif) | ![Export formats](assets/gifs/export.gif) |
 
 ## Install
 

@@ -1,6 +1,6 @@
 # Demo media
 
-The four demo GIFs referenced by the top-level `README.md` live here:
+The four demo GIFs referenced by the top-level the top-level `README.md` live here:
 
 - `web-capture.gif` — point at a web app → live capture → one fused API surface
 - `fuzz.gif` — the Fuzz workbench (Burp-Intruder-class) running an attack
